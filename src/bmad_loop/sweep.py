@@ -48,6 +48,9 @@ _BUNDLE_NAME_SAFE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
 # A cycle-1 key always has "-" straight after "dw", so the cycle group matches
 # empty and the split stays unambiguous even for a bundle named "2fix".
 BUNDLE_KEY_RE = re.compile(r"^dw(\d*)-(.+)\Z")
+# The token `_write_intent` emits and `_bundle_intent_reason` parses back out of
+# a persisted intent.md. One definition so the writer and the grader cannot drift.
+_INTENT_DW_IDS_PREFIX = "dw_ids: "
 DECISION_EFFECTS = ("build", "close", "keep-open")
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 DW_ID_RE = re.compile(r"DW-\d+\Z")
@@ -1034,9 +1037,12 @@ def _rearm_generation(task: StoryTask) -> None:
     the engine persists), and its own bump there is harmless: the re-arm leaves the task
     PENDING, so this restart arm does not fire on top of it.
 
-    Call ONLY from the ``Phase.ESCALATED`` arm. A non-escalated restart keeps its
-    attempt counter, so ``attempt += 1`` already yields a fresh id; bumping there would
-    move the namespace for nothing and break the "every id already on disk stays
+    Call ONLY where the task is taking a genuinely fresh attempt budget: the
+    ``Phase.ESCALATED`` restart arms, and ``Sweep._reset_superseded_bundle_state``
+    (a reset bundle task adopting a DIFFERENT bundle's ids never attempted that
+    bundle at all). An ordinary non-escalated restart keeps its attempt counter, so
+    ``attempt += 1`` already yields a fresh id; bumping there would move the
+    namespace for nothing and break the "every id already on disk stays
     byte-identical" property the suffix rule exists to hold.
     """
     task.generation += 1
@@ -1523,6 +1529,102 @@ class SweepEngine(Engine):
         )
         return None
 
+    def _reset_superseded_bundle_state(self, task: StoryTask) -> None:
+        """Drop the per-bundle state a reset task still carries from the bundle it
+        was minted for, once `_run_bundle` adopts a DIFFERENT bundle's ids onto it
+        (DW-162, DW-163, DW-165). The four ids are one behavior: on divergent
+        adoption the task stops owning the superseded bundle's state, so the clears
+        live together and this docstring is the record of what is deliberately
+        absent from them.
+
+        Every field cleared here NAMES or BUDGETS the superseded bundle:
+
+        - ``bundle_closes_intended`` -- the previous bundle's intended ledger
+          closes. ``_carry_isolated_ledger_writes`` and the engine's post-rollback
+          replay predicate both key on it, so a stale list closes ids this task
+          never ran.
+        - ``spec_file`` -- the superseded bundle's amended contract.
+          ``_generic_bundle_prompt`` selects the restore-review prompt naming it
+          (paired with ``restore_patch``), and ``Engine._record_dev_spec`` is a
+          no-op once set, so a survivor would also refuse the replacement bundle's
+          own spec on escalation.
+        - ``restore_patch`` -- the diff of the superseded bundle's attempt.
+        - ``attempt`` + ``review_cycle`` + ``followup_reviews_spent`` -- reset the
+          retry and review counters; clear the associated ``defer_reason`` and
+          advance ``generation`` for fresh session ids. These operations follow
+          ``runs._rearm_escalation_locked``. A sweep bundle runs the base engine's
+          review loop, so a
+          replacement inheriting an exhausted review budget would force-converge or
+          defer on its first round. ``attempt`` and ``generation`` in particular are
+          inseparable: zeroing ``attempt`` alone re-mints a byte-equal session id
+          (see ``_rearm_generation``).
+
+        ``resolved_redrive`` is deliberately NOT cleared (DW-165's recorded
+        2026-09-07 decision): it records that a HUMAN resolved this task, which is
+        a fact about the task, not a statement about which spec the task owns.
+        Nor is any of the following, each for its own reason:
+
+        - ``sessions`` -- an append-only audit trail; ``_rearm_generation``'s fresh
+          id namespace is what keeps the replacement's records distinct.
+        - ``bundle_file`` -- the single most bundle-naming field here, and the one
+          exception: the caller OVERWRITES it two lines later with this bundle's
+          freshly written ``intent.md``, so clearing it would be dead code. Nothing
+          reads it in between.
+        - ``isolated_ledger_carried`` / ``harvest_carry_commit_pending`` -- the
+          ledger-carry replay latches (``Engine._replay_unlatched_ledger_carries``
+          skips a task already latched, which WOULD strand the replacement
+          bundle's own close). Safe because both are set only on legs that have
+          already reached a TERMINAL phase -- the ``_defer`` leg (DEFERRED) and
+          past a unit merge (DONE / AWAITING_OPERATOR) -- and ``_run_bundle``
+          returns on a terminal task before ever reaching this branch.
+        - ``commit_sha`` -- names a commit that really happened; a later commit
+          overwrites it.
+        - ``rearmed`` -- ``_recover_inflight_bundle`` already cleared it on the
+          reset that got us here.
+        - ``preserve_ref`` / ``preserve_partial`` -- a ref to a rolled-back
+          worktree that still exists on disk; clearing the name would orphan it
+          rather than release it.
+        - the ``baseline_*`` pair and ``worktree_path`` / ``branch`` -- mount and
+          rollback anchors owned by the reset, not by either bundle.
+        - ``dispatched_spec_file`` / ``dispatched_spec_snapshot`` -- ``Sweep``
+          overrides ``_dispatched_spec_for_attempt`` to ``None`` and
+          ``_requires_dispatched_spec_snapshot`` to ``False``, so a sweep task never
+          binds them and a clear would be unablatable dead code.
+
+        These clears are DEFENSIVE. No reachable sequence was demonstrated that
+        strands a task with a superseded ``spec_file`` / ``restore_patch``
+        (DW-162, DW-165) -- but ``_warn_stranded_bundles`` concedes an in-flight
+        survivor is possible at all, so the guard makes the hazard structurally
+        impossible instead of argued unreachable.
+
+        An EMPTY persisted ``task.dw_ids`` reaches here and takes the FULL reset:
+        it satisfies the divergence gate, which is exactly the reading
+        ``_run_bundle`` already takes of an empty list for id adoption (that task
+        genuinely has no ids and must take the bundle's). Nothing it holds is
+        exempt on account of having no ids.
+
+        Why the rearm is gated on DIVERGENCE here rather than added to
+        ``_recover_inflight_bundle``'s reset tail: that tail mirrors
+        ``Engine._finish_inflight``'s restart arm, which deliberately KEEPS a plain
+        crash-restart's budget -- zeroing it there would let a crash-looping run
+        never exhaust ``limits.max_attempts``. The two siblings that do zero
+        (``_ensure_migration``'s reset, the triage reset) each gate on
+        ``Phase.ESCALATED``, i.e. "the human resumed deliberately"; ESCALATED is
+        terminal and so never reaches ``_recover_inflight_bundle`` at all.
+        Divergent adoption is this seam's equivalent gate. Do not widen the scope
+        to the agreeing (or merely reordered) re-dispatch: that is the same bundle
+        the task already attempted, and its budget, spec ownership and intended
+        closes are rightfully its own.
+        """
+        task.bundle_closes_intended = []
+        task.spec_file = None
+        task.restore_patch = None
+        task.attempt = 0
+        task.review_cycle = 0
+        task.followup_reviews_spent = 0
+        task.defer_reason = None
+        _rearm_generation(task)
+
     def _run_bundle(self, bundle: Bundle, cycle: int) -> str | None:
         """Run one bundle; returns the task key it ran under, or None when no key
         was available (see `_bundle_name_for`). `_cycle` grades progress on the
@@ -1556,13 +1658,14 @@ class SweepEngine(Engine):
         elif self._recover_inflight_bundle(task):
             return key
         else:
-            # DW-144. Recovery reset the task to PENDING and handed the dispatch
-            # back to us — and the intent written below is THIS bundle's, not the
-            # one the persisted task was minted for. `_bundle_name_for`'s dedupe
-            # is scoped to TERMINAL tasks, so a non-terminal task at the key keeps
-            # the key whatever its ids are. Stale task ids can reject a dev result
-            # for this bundle or make `_close_bundle_ledger_when_spec_status`
-            # derive `bundle_closes_intended` from the previous bundle's ids.
+            # DW-144 (+DW-162, DW-163, DW-165). Recovery reset the task to
+            # PENDING and handed the dispatch back to us — and the intent written
+            # below is THIS bundle's, not the one the persisted task was minted
+            # for. `_bundle_name_for`'s dedupe is scoped to TERMINAL tasks, so a
+            # non-terminal task at the key keeps the key whatever its ids are.
+            # Stale task ids can reject a dev result for this bundle or make
+            # `_close_bundle_ledger_when_spec_status` derive
+            # `bundle_closes_intended` from the previous bundle's ids.
             #
             # Journal only on divergence but assign unconditionally: a bundle's
             # identity is its ids under SET equality (a regenerated triage may
@@ -1577,6 +1680,12 @@ class SweepEngine(Engine):
                     previous_dw_ids=list(task.dw_ids),
                     dw_ids=list(bundle.dw_ids),
                 )
+                # DW-162/163/165. Ids are not the only per-bundle field the reset
+                # task carries: everything else naming or budgeting the superseded
+                # bundle goes with them. It rides THIS gate — the same divergence
+                # test the append above rides — and nothing else about its
+                # placement is load-bearing: it never touches `task.dw_ids`.
+                self._reset_superseded_bundle_state(task)
             task.dw_ids = list(bundle.dw_ids)
         dirname = name if cycle == 1 else f"c{cycle}-{name}"
         # The document has to agree with the directory it lands in and with the
@@ -1607,7 +1716,18 @@ class SweepEngine(Engine):
         post-session window still restarts rather than replaying its recorded
         result. Lifting that is a resume-fidelity change of its own. The
         COMMITTING window IS recovered, though — same as the base engine's
-        resume-commit arm (#115)."""
+        resume-commit arm (#115).
+
+        The reset tail below deliberately does NOT zero `attempt` or re-arm the
+        session-id generation: like the base restart arm it mirrors, a plain
+        crash-restart keeps its budget, so zeroing here would let a crash-looping
+        run never exhaust `limits.max_attempts`. The fresh budget belongs to the
+        ADOPTION site instead — `_run_bundle`'s divergence branch, via
+        `_reset_superseded_bundle_state`, which is reached only when the caller
+        hands this task a different bundle's ids. Those superseded-state clears
+        are defensive: no reachable sequence was demonstrated for DW-162 or
+        DW-165; the adoption-site guard makes that hazard structurally impossible.
+        """
         if task.worktree_path:
             # Sweep replaces Engine._loop, so it performs Engine._finish_inflight's
             # mount-relative re-anchor itself. Accepted receipts reopen this mount
@@ -2817,7 +2937,7 @@ class SweepEngine(Engine):
             f"# Deferred-work bundle: {bundle.name}",
             "",
             f"bundle_name: {bundle.name}",
-            f"dw_ids: {', '.join(bundle.dw_ids)}",
+            _INTENT_DW_IDS_PREFIX + ", ".join(bundle.dw_ids),
             "",
             "## Intent",
             "",
@@ -2837,16 +2957,63 @@ class SweepEngine(Engine):
         atomic_write_text(path, neutralize_surrogates("\n".join(lines)))
         return path
 
+    def _bundle_intent_reason(self, task: StoryTask) -> str | None:
+        """Grade the persisted intent document against the task that owns it.
+        Returns ``None`` to reuse it untouched, or the reason
+        `_ensure_bundle_intent` must regenerate: ``"missing"`` (no `bundle_file`,
+        or it is not a file), ``"dw-ids-mismatch"`` (the document's ``dw_ids:``
+        line names a different SET than `task.dw_ids`, or carries no such line at
+        all), ``"unreadable"`` (the read faulted or the bytes would not decode).
+
+        DW-164: `_run_bundle` writes `task.bundle_file` and only then `_save()`s
+        the adopted ids, so a crash between them leaves the persisted ids OLD and
+        the document NEW. Re-ordering the two writes does not close that hole, it
+        only inverts it — persisted ids NEW, document OLD — and both shapes pair a
+        task with a document naming other ids. Grading the document against
+        `task.dw_ids` (the field the ledger close, the key dedupe and the dev
+        prompt all key on) is TOTAL over both, and the degraded rebuild it triggers
+        is exactly the recovery `_ensure_bundle_intent` already exists to perform.
+
+        An EMPTY `task.dw_ids` is deliberately NOT an authority: that is the
+        pre-`dw_ids` `state.json` shape, and grading a real document against it
+        would trade the bundle's actual brief for a degraded one naming nothing.
+        Such a task keeps whatever document it has.
+
+        Bundle identity is SET equality here, as `_bundle_name_for` and
+        `_run_bundle` already define it, so a `_write_intent` line whose ids are
+        merely reordered still agrees."""
+        if not task.bundle_file:
+            return "missing"
+        path = Path(task.bundle_file)
+        if not path.is_file():
+            return "missing"
+        if not task.dw_ids:
+            return None
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return "unreadable"
+        for line in text.splitlines():
+            if not line.startswith(_INTENT_DW_IDS_PREFIX):
+                continue
+            rest = line[len(_INTENT_DW_IDS_PREFIX) :]
+            found = {part.strip() for part in rest.split(",") if part.strip()}
+            return None if found == set(task.dw_ids) else "dw-ids-mismatch"
+        return "dw-ids-mismatch"
+
     def _ensure_bundle_intent(self, task: StoryTask) -> None:
         """Guarantee a recovered bundle has the intent file its dev prompt points
-        at. The rendered intent.md persists in the run dir and the prompt consumes
-        nothing else from the plan, so the normal case is to reuse it untouched.
+        at, and that the file it points at is the one for THIS task's ids. The
+        rendered intent.md persists in the run dir and the prompt consumes nothing
+        else from the plan, so the normal case is to reuse it untouched.
 
-        Only when it is gone do we rebuild a degraded one from the task itself.
-        The triage session's authored intent prose is the single unrecoverable
-        piece; the verbatim ledger entries _write_intent re-attaches carry the
-        actual work, so say plainly that they are now the contract."""
-        if task.bundle_file and Path(task.bundle_file).is_file():
+        Only when `_bundle_intent_reason` rejects it — gone, unreadable, or naming
+        other ids — do we rebuild a degraded one from the task itself. The triage
+        session's authored intent prose is the single unrecoverable piece; the
+        verbatim ledger entries _write_intent re-attaches carry the actual work, so
+        say plainly that they are now the contract."""
+        reason = self._bundle_intent_reason(task)
+        if reason is None:
             return
         match = BUNDLE_KEY_RE.match(task.story_key)
         if match is None:  # pragma: no cover - callers filter on BUNDLE_KEY_RE
@@ -2870,6 +3037,11 @@ class SweepEngine(Engine):
             story_key=task.story_key,
             dw_ids=list(task.dw_ids),
             path=task.bundle_file,
+            # `regen_cause`, not `reason`: `diagnostics._JOURNAL_DROP_FIELDS` holds
+            # `reason` as free text and renders it as a presence boolean, which
+            # would defeat this field's whole purpose. Closed-slug siblings in
+            # this file (`drop_cause`) use the same convention for the same reason.
+            regen_cause=reason,
         )
 
     # ------------------------------------------------------ override seams

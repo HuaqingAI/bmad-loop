@@ -602,6 +602,13 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "refiled",
         "refs",
         "refused",
+        # `sweep-intent-regenerated` (DW-164): which of `missing` /
+        # `dw-ids-mismatch` / `unreadable` made `_ensure_bundle_intent` rebuild a
+        # bundle intent document. A closed enum for the same reason `drop_cause`
+        # above is one — `reason` sits in `diagnostics._JOURNAL_DROP_FIELDS` and
+        # would ship as a presence boolean, erasing the distinction the field
+        # exists to draw. Names no path, identifier or prose.
+        "regen_cause",
         "remaining",
         "reset_from",
         "restore",

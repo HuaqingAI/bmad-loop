@@ -10842,6 +10842,335 @@ def test_run_bundle_adopts_nothing_when_recovery_finished_the_bundle(project, mo
     assert not _records(engine, "sweep-bundle-dwids-adopted")
 
 
+@pytest.mark.parametrize("persisted", [["DW-1"], []], ids=["diverging-ids", "legacy-empty"])
+def test_run_bundle_clears_superseded_bundle_state_on_divergent_adoption(
+    project, monkeypatch, persisted
+):
+    """DW-162/163/165: adopting another bundle's ids also drops every OTHER field
+    that names or budgets the superseded bundle, so the dispatched task owns only
+    the replacement. `bundle_closes_intended` would mis-close the previous
+    bundle's ids on the DONE leg; `spec_file` + `restore_patch` would make
+    `_generic_bundle_prompt` hand the session the superseded amended contract
+    (and `Engine._record_dev_spec`, "no-op once set", would refuse the
+    replacement's own spec); and the five spent budgets are a budget for work this
+    task never attempted — `attempt`/`generation` for the dev leg, plus
+    `review_cycle`/`followup_reviews_spent`/`defer_reason` for the review loop a
+    sweep bundle also runs, cleared as one set exactly as
+    `runs._rearm_escalation_locked` clears them.
+
+    The `legacy-empty` case pins that a persisted EMPTY `dw_ids` (the pre-`dw_ids`
+    `state.json` shape) satisfies the divergence gate and so takes the FULL reset
+    — the same reading `_run_bundle` already takes of an empty list for id
+    adoption. Ablation: insert `if not task.dw_ids: return` at the top of
+    `_reset_superseded_bundle_state` and only this case reddens.
+
+    Ablation: restore ANY one line of `_reset_superseded_bundle_state` (delete
+    `task.spec_file = None`, say, or `task.review_cycle = 0`) and exactly the
+    matching assert below reddens. The two prompt asserts grade the PAIR, not
+    either half: `_generic_bundle_prompt`'s restore branch is gated
+    `if task.restore_patch and task.spec_file:`, so ablating one clear alone
+    short-circuits the `and`, the restore branch is not taken, and both prompt
+    asserts stay green — the direct field asserts are what pin each half, and only
+    ablating BOTH clears together reddens the prompt. The `resolved_redrive`
+    assert is the inverse ablation: ADD `task.resolved_redrive = False` to the
+    helper (the `Engine._finalize_commit_phase` commit-boundary shape someone
+    would copy) and it reddens.
+    """
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    task = _bundle_task(engine, "dw-fix", persisted, phase=Phase.DEV_RUNNING)
+    task.bundle_closes_intended = ["DW-1"]
+    task.spec_file = "spec-superseded-dw-1.md"
+    task.restore_patch = "diff --git a/x b/x\n"
+    task.attempt = 2
+    task.review_cycle = 3
+    task.followup_reviews_spent = 2
+    task.defer_reason = "superseded bundle ran out of review budget"
+    task.resolved_redrive = True
+    generation = task.generation
+    dispatched = _stub_run_story(engine, monkeypatch)
+
+    key = engine._run_bundle(Bundle(name="fix", dw_ids=("DW-2",), intent="second"), 1)
+
+    assert key == "dw-fix" and dispatched == [task]
+    assert task.dw_ids == ["DW-2"]
+    assert task.bundle_closes_intended == []
+    assert task.spec_file is None
+    assert task.restore_patch is None
+    # Reset retry/review counters and defer state; advance the session generation.
+    assert task.attempt == 0
+    assert task.generation == generation + 1
+    assert task.review_cycle == 0
+    assert task.followup_reviews_spent == 0
+    assert task.defer_reason is None
+    # a HUMAN resolved this task; that is not a claim about which spec it owns
+    assert task.resolved_redrive is True
+    # ...and the prompt now names the replacement intent, not the superseded spec
+    prompt = engine._generic_bundle_prompt(task, None)
+    assert task.bundle_file is not None and task.bundle_file in prompt
+    assert "spec-superseded-dw-1.md" not in prompt
+
+
+@pytest.mark.parametrize(
+    "persisted", [["DW-1", "DW-2"], ["DW-2", "DW-1"]], ids=["same-order", "reordered"]
+)
+def test_run_bundle_keeps_bundle_state_when_the_reset_task_already_agrees(
+    project, monkeypatch, persisted
+):
+    """The gate on the clears is DIVERGENCE, and divergence is SET equality. An
+    agreeing (or merely reordered) re-dispatch is the SAME bundle this task
+    already attempted: its retry budget, its spec ownership and its intended
+    closes are rightfully its own, and zeroing them would hand a crash-looping
+    bundle an unbounded supply of attempts.
+
+    Ablation: hoist `self._reset_superseded_bundle_state(task)` out of the
+    `if set(task.dw_ids) != set(bundle.dw_ids):` branch (the "just always reset"
+    simplification) and every assert below reddens."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    task = _bundle_task(engine, "dw-fix", persisted, phase=Phase.DEV_RUNNING)
+    task.bundle_closes_intended = ["DW-1", "DW-2"]
+    task.spec_file = "spec-dw-1-dw-2.md"
+    task.restore_patch = "diff --git a/x b/x\n"
+    task.attempt = 2
+    task.review_cycle = 3
+    task.followup_reviews_spent = 2
+    task.defer_reason = "same bundle, mid review loop"
+    generation = task.generation
+    _stub_run_story(engine, monkeypatch)
+
+    engine._run_bundle(Bundle(name="fix", dw_ids=("DW-1", "DW-2"), intent="again"), 1)
+
+    assert task.bundle_closes_intended == ["DW-1", "DW-2"]
+    assert task.spec_file == "spec-dw-1-dw-2.md"
+    assert task.restore_patch == "diff --git a/x b/x\n"
+    # The same bundle keeps its counters, generation, and defer state.
+    assert task.attempt == 2 and task.generation == generation
+    assert task.review_cycle == 3
+    assert task.followup_reviews_spent == 2
+    assert task.defer_reason == "same bundle, mid review loop"
+
+
+def test_run_bundle_clears_nothing_when_recovery_finished_the_bundle(project, monkeypatch):
+    """The clear rides the adoption, and the adoption sits on the
+    recovery-returned-FALSE arm alone. A persisted receipt that carried the
+    bundle through commit returns True and the caller is done — clearing there
+    would strip a FINISHED task's record of what it closed.
+
+    Ablation: move the `_reset_superseded_bundle_state` call above the
+    `elif self._recover_inflight_bundle(task):` arm and `bundle_closes_intended`
+    reddens at `[]`."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    task = _bundle_task(engine, "dw-fix", ["DW-1"], phase=Phase.COMMITTING)
+    task.bundle_closes_intended = ["DW-1"]
+    task.spec_file = "spec-dw-1.md"
+    task.attempt = 2
+    dispatched = _stub_run_story(engine, monkeypatch)
+    monkeypatch.setattr(engine, "_finalize_commit_phase", lambda t: None)
+
+    engine._run_bundle(Bundle(name="fix", dw_ids=("DW-2",), intent="second"), 1)
+
+    assert not dispatched
+    assert task.bundle_closes_intended == ["DW-1"]
+    assert task.spec_file == "spec-dw-1.md" and task.attempt == 2
+
+
+def _intent_task(engine, dw_ids, document_ids) -> StoryTask:
+    """A persisted bundle task whose intent.md names `document_ids` while the task
+    itself carries `dw_ids` — the DW-164 crash window, materialized."""
+    task = _bundle_task(engine, "dw-fix", dw_ids, phase=Phase.PENDING)
+    written = engine._write_intent(
+        Bundle(name="fix", dw_ids=tuple(document_ids), intent="original prose"), "fix"
+    )
+    task.bundle_file = str(written)
+    return task
+
+
+def test_ensure_bundle_intent_regenerates_when_the_document_names_other_ids(project):
+    """DW-164: `_run_bundle` writes `task.bundle_file` and only then `_save()`s the
+    adopted ids, so a crash between them leaves a task paired with a document
+    naming other ids. Re-ordering the two writes only INVERTS that pairing; the
+    total fix is to grade the document against `task.dw_ids`, the field the ledger
+    close, the key dedupe and the dev prompt all key on.
+
+    Ablation: restore `_bundle_intent_reason`'s early return to the old
+    `if task.bundle_file and Path(task.bundle_file).is_file(): return "..." is None`
+    shape — i.e. drop the `dw_ids:` comparison — and the document keeps naming
+    DW-9 while the task carries DW-1/DW-2."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    task = _intent_task(engine, ["DW-1", "DW-2"], ["DW-9"])
+
+    engine._ensure_bundle_intent(task)
+
+    text = Path(task.bundle_file).read_text(encoding="utf-8")
+    assert "dw_ids: DW-1, DW-2" in text and "DW-9" not in text
+    assert "authoritative" in text  # the degraded rebuild, ledger entries as contract
+    (rec,) = _records(engine, "sweep-intent-regenerated")
+    assert rec["story_key"] == "dw-fix" and rec["dw_ids"] == ["DW-1", "DW-2"]
+    assert rec["regen_cause"] == "dw-ids-mismatch"
+
+
+@pytest.mark.parametrize(
+    "document_ids", [["DW-1", "DW-2"], ["DW-2", "DW-1"]], ids=["same-order", "reordered"]
+)
+def test_ensure_bundle_intent_reuses_a_document_whose_ids_agree(project, document_ids):
+    """Agreement is SET equality, as `_bundle_name_for` and `_run_bundle` already
+    define bundle identity — so a document whose line merely reorders the ids is
+    still this bundle's, and its triage-authored prose (the one unrecoverable
+    piece) survives.
+
+    Ablation: compare the parsed ids as an ordered LIST instead of a set and the
+    `reordered` case regenerates, losing 'original prose'."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    task = _intent_task(engine, ["DW-1", "DW-2"], document_ids)
+    before = Path(task.bundle_file).read_bytes()
+
+    engine._ensure_bundle_intent(task)
+
+    assert Path(task.bundle_file).read_bytes() == before
+    assert "original prose" in before.decode("utf-8")
+    # `_records` reads the journal file, which a run that wrote nothing never minted
+    assert not [e for e in engine.journal.entries() if e["kind"] == "sweep-intent-regenerated"]
+
+
+def test_ensure_bundle_intent_reuses_a_document_for_a_task_with_no_dw_ids(project):
+    """An EMPTY `task.dw_ids` is the pre-`dw_ids` `state.json` shape, not an
+    authority. Grading a real document against it would trade the bundle's actual
+    brief for a degraded rebuild naming NOTHING — strictly worse than the file it
+    replaced, and unrecoverable.
+
+    Ablation: delete `if not task.dw_ids: return None` from
+    `_bundle_intent_reason` and the document is rewritten with an empty `dw_ids:`
+    line and no ledger entries at all."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [])
+    task = _intent_task(engine, [], ["DW-1"])
+    before = Path(task.bundle_file).read_bytes()
+
+    engine._ensure_bundle_intent(task)
+
+    assert Path(task.bundle_file).read_bytes() == before
+    assert not [e for e in engine.journal.entries() if e["kind"] == "sweep-intent-regenerated"]
+
+
+@pytest.mark.parametrize("read_error", ["decode", "oserror"])
+def test_ensure_bundle_intent_regenerates_when_the_document_cannot_be_read(
+    project, monkeypatch, read_error
+):
+    """A document we cannot read is a document we cannot grade, and observation
+    degrading is not a reason to hand the session an unverified brief. Regenerate
+    rather than raise — the caller is mid-recovery.
+
+    Ablation: remove the selected exception type from the handler in
+    `_bundle_intent_reason` and its case raises instead of regenerating."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [])
+    task = _intent_task(engine, ["DW-1"], ["DW-1"])
+    path = Path(task.bundle_file)
+    if read_error == "decode":
+        path.write_bytes(b"# bundle\n\ndw_ids: \xff\xfe not utf-8\n")
+
+    original_read = Path.read_text
+
+    def fail_intent_read(self, *args, **kwargs):
+        if self == path:
+            raise OSError("intent read failed")
+        return original_read(self, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        if read_error == "oserror":
+            patch.setattr(Path, "read_text", fail_intent_read)
+        engine._ensure_bundle_intent(task)
+
+    text = Path(task.bundle_file).read_text(encoding="utf-8")
+    assert "dw_ids: DW-1" in text and "authoritative" in text
+    (rec,) = _records(engine, "sweep-intent-regenerated")
+    assert rec["regen_cause"] == "unreadable"
+
+
+@pytest.mark.parametrize("cause", ["missing", "dw-ids-mismatch", "unreadable"])
+def test_bundle_intent_regeneration_cause_survives_diagnostics(project, cause):
+    """Export the producer's actual cause through the diagnostics journal seam.
+
+    Ablation: rename the producer field to `reason` or add `regen_cause` to
+    diagnostics' dropped fields; the exported cause assertion then fails.
+    """
+    from bmad_loop import diagnostics, sanitize
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    task = _intent_task(engine, ["DW-1"], ["DW-2"])
+    path = Path(task.bundle_file)
+    if cause == "missing":
+        path.unlink()
+    elif cause == "unreadable":
+        path.write_bytes(b"\xff")
+
+    engine._ensure_bundle_intent(task)
+
+    exported = diagnostics.summarize_journal(
+        _records(engine, "sweep-intent-regenerated"),
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        cap=10,
+    )
+    (record,) = exported.entries
+    assert record["regen_cause"] == cause
+
+
+@pytest.mark.parametrize("unset_pointer", [False, True], ids=["not-a-file", "no-bundle-file"])
+def test_ensure_bundle_intent_reports_a_missing_document_as_missing(project, unset_pointer):
+    """The pre-DW-164 lane keeps its behavior and gains only the cause field, so an
+    operator reading the journal can tell a lost file from a document that named
+    the wrong work. Both shapes of "no document" regenerate: a `bundle_file`
+    pointing at nothing, and no `bundle_file` at all.
+
+    Ablation: return `"dw-ids-mismatch"` for the not-a-file case and the
+    `not-a-file` cause assert reddens. Flip `if not task.bundle_file:` to
+    `return None` (the "an unset pointer has nothing to grade" reading) and
+    `no-bundle-file` reddens on the is_file assert — that shape would skip
+    regeneration entirely and leave `_generic_bundle_prompt` falling back to the
+    bare `task.story_key` as its `bundle_ref`."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [])
+    task = _intent_task(engine, ["DW-1"], ["DW-1"])
+    Path(task.bundle_file).unlink()
+    if unset_pointer:
+        task.bundle_file = None
+
+    engine._ensure_bundle_intent(task)
+
+    assert task.bundle_file is not None and Path(task.bundle_file).is_file()
+    (rec,) = _records(engine, "sweep-intent-regenerated")
+    assert rec["regen_cause"] == "missing"
+
+
+def test_ensure_bundle_intent_regenerates_a_document_with_no_dw_ids_line(project):
+    """A document carrying no `dw_ids:` line at all cannot be graded, so it is not
+    this task's brief until proven otherwise — a truncated or externally mangled
+    intent.md would otherwise be handed to the session verbatim as its contract.
+
+    Ablation: change `_bundle_intent_reason`'s trailing `return "dw-ids-mismatch"`
+    (the no-header-line fall-through) to `return None` and this row reddens; every
+    other row stays green, which is why the case needs one of its own."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [])
+    task = _intent_task(engine, ["DW-1"], ["DW-1"])
+    path = Path(task.bundle_file)
+    kept = [ln for ln in path.read_text(encoding="utf-8").splitlines() if "dw_ids:" not in ln]
+    path.write_text("\n".join(kept), encoding="utf-8")
+
+    engine._ensure_bundle_intent(task)
+
+    text = path.read_text(encoding="utf-8")
+    assert "dw_ids: DW-1" in text and "authoritative" in text
+    (rec,) = _records(engine, "sweep-intent-regenerated")
+    assert rec["regen_cause"] == "dw-ids-mismatch"
+
+
 def test_run_bundle_refuses_when_every_candidate_key_is_taken(project, monkeypatch):
     """The suffix search is bounded at 2-9 so it is provably finite. Exhausting
     it is loud on both surfaces and mints nothing — the ids stay open for the
