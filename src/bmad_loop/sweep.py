@@ -1314,6 +1314,29 @@ class SweepEngine(Engine):
             self.journal.append("bundle-start", story_key=key, dw_ids=list(bundle.dw_ids))
         elif self._recover_inflight_bundle(task):
             return key
+        else:
+            # DW-144. Recovery reset the task to PENDING and handed the dispatch
+            # back to us — and the intent written below is THIS bundle's, not the
+            # one the persisted task was minted for. `_bundle_name_for`'s dedupe
+            # is scoped to TERMINAL tasks, so a non-terminal task at the key keeps
+            # the key whatever its ids are. Stale task ids can reject a dev result
+            # for this bundle or make `_close_bundle_ledger_when_spec_status`
+            # derive `bundle_closes_intended` from the previous bundle's ids.
+            #
+            # Journal only on divergence but assign unconditionally: a bundle's
+            # identity is its ids under SET equality (a regenerated triage may
+            # reorder them, per `_bundle_name_for`), so a pure reorder is not
+            # worth announcing once per resume. A persisted EMPTY list is the
+            # pre-`dw_ids` `state.json` shape and reads as divergence here, which
+            # is right — that task genuinely has no ids and must take these.
+            if set(task.dw_ids) != set(bundle.dw_ids):
+                self.journal.append(
+                    "sweep-bundle-dwids-adopted",
+                    story_key=key,
+                    previous_dw_ids=list(task.dw_ids),
+                    dw_ids=list(bundle.dw_ids),
+                )
+            task.dw_ids = list(bundle.dw_ids)
         dirname = name if cycle == 1 else f"c{cycle}-{name}"
         # The document has to agree with the directory it lands in and with the
         # name `_ensure_bundle_intent` recovers back out of the story key.

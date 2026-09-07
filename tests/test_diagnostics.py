@@ -1471,6 +1471,62 @@ def test_scalar_story_keys_fails_closed_instead_of_shipping_verbatim():
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
+def test_adopted_bundle_dw_ids_alias_into_the_same_namespace_as_dw_ids():
+    """`sweep-bundle-dwids-adopted` (DW-144) is the one record carrying TWO
+    deferred-work id lists: `dw_ids`, routed by name, and `previous_dw_ids`, routed
+    by KIND in `_JOURNAL_KIND_KEYLIST_FIELDS`. The kind-scoped table names a
+    namespace per field, and picking the wrong one is silent — the field is still
+    aliased, still element-wise, still nothing verbatim, so every canary sweep and
+    the portability guard's routed/benign decision stay green while one ledger
+    entry acquires TWO aliases and the record stops being readable as "these ids
+    became those ids".
+
+    So the namespace itself is what this grades, the way
+    `test_stranded_bundle_story_keys_are_aliased_element_wise` grades `story_keys`'.
+    The same id is journalled under `previous_dw_ids` here and under `dw_ids` on a
+    neighbouring `sweep-bundle-closed`, and the two must resolve to ONE alias.
+
+    Ablation: repoint the `previous_dw_ids` row from `"dw"` to `"story"` (or any
+    other namespace) and the cross-field identity assertion reddens; delete the row
+    and the ids come back verbatim."""
+    carried, adopted = "DW-41", "DW-42"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "sweep-bundle-dwids-adopted",
+            "story_key": STORY_KEY,
+            "previous_dw_ids": [carried],
+            "dw_ids": [adopted],
+        },
+        pseudo,
+        {STORY_KEY: 1},
+        1.0,
+    )
+    # the SAME ledger entry, journalled as `dw_ids` by a neighbouring record: the
+    # cross-field identity is the whole reason the previous ids are aliased into
+    # `dw` rather than into a namespace of their own
+    closed = diagnostics._scrub_entry(
+        {"ts": 3.0, "kind": "sweep-bundle-closed", "story_key": STORY_KEY, "dw_ids": [carried]},
+        pseudo,
+        {STORY_KEY: 1},
+        1.0,
+    )
+
+    assert scrubbed["previous_dw_ids"] == closed["dw_ids"]
+    # ...and the two lists on the one record stay DISTINGUISHABLE, so the record is
+    # still read as "these ids became those ids"
+    assert scrubbed["previous_dw_ids"] != scrubbed["dw_ids"]
+    assert all(a.startswith("dw-") for a in scrubbed["previous_dw_ids"] + scrubbed["dw_ids"])
+    # nothing landed in the `story` namespace, which is where a mis-pointed row
+    # would have put them — and where the epic-prefixed story aliases live
+    assert [orig for ns, orig, _a in pseudo.entries() if ns == "story"] == [STORY_KEY]
+
+    rendered = json.dumps([scrubbed, closed])
+    for canary in (carried, adopted, STORY_KEY, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
 def test_off_schema_preference_escalation_keys_are_collapsed_to_presence():
     """`engine._review_and_commit` splats `escalation.preference_escalations(rj)`
     into `journal.append`, and those entries come out of a session's own

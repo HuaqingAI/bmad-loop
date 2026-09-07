@@ -391,6 +391,14 @@ _JOURNAL_KEYLIST_FIELDS = frozenset({"keys", "dw_ids", "story_keys"})
 # adds no diagnostic value and would put the proprietary names into the legend.
 _JOURNAL_KIND_KEYLIST_FIELDS: dict[str, dict[str, str]] = {
     "stale-restore-commits": {"commits": "commit"},
+    # `sweep-bundle-dwids-adopted` carries TWO deferred-work id lists: the ids the
+    # reset task held and the ids it adopted from the bundle now being run. The
+    # new ones ride the by-name `dw_ids` rule above; the previous ones are the
+    # same kind of identifier and must land in the SAME `dw` namespace, or one
+    # dump would carry two aliases for one ledger entry — and unrouted they would
+    # ship verbatim, `scrub_json` being the identity on a list of
+    # identifier-shaped strings.
+    "sweep-bundle-dwids-adopted": {"previous_dw_ids": "dw"},
 }
 _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
     "merge-preflight-refused": frozenset({"tolerated"}),

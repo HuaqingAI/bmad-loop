@@ -9686,6 +9686,8 @@ def test_run_bundle_dedupes_when_a_terminal_task_holds_the_key_for_other_ids(pro
     assert rec["attempt"] == 2 and rec["dw_ids"] == ["DW-2"]
     (start,) = _records(engine, "bundle-start")
     assert start["story_key"] == "dw-fix-2"
+    # a freshly minted task is born with the bundle's ids: nothing to adopt (DW-144)
+    assert not _records(engine, "sweep-bundle-dwids-adopted")
 
 
 def test_run_bundle_skips_a_deduped_key_without_re_announcing_the_rename(project, monkeypatch):
@@ -9745,6 +9747,134 @@ def test_run_bundle_leaves_a_non_terminal_task_to_the_inflight_recovery(project,
     assert engine.state.tasks["dw-fix"].phase == Phase.PENDING  # reset by the recovery
     assert not _records(engine, "sweep-bundle-key-deduped")
     assert (engine.run_dir / "bundles" / "fix" / "intent.md").is_file()
+
+
+def test_run_bundle_adopts_the_bundle_dw_ids_onto_a_reset_inflight_task(project, monkeypatch):
+    """DW-144: adopt before publishing the new intent, then close only its ids.
+
+    Ablation: delete `task.dw_ids = list(bundle.dw_ids)` from `_run_bundle`.
+    The write-boundary assertion fails with ["DW-1"] instead of ["DW-2"],
+    before dispatch can reject mismatched dev results and exhaust the script.
+    Deleting only the adoption journal append fails the record assertions.
+    """
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(
+        project,
+        [bundle_dev_effect(project, "fix", ["DW-2"], mark_ledger=False, followup_review=False)],
+    )
+    task = _bundle_task(engine, "dw-fix", ["DW-1"], phase=Phase.DEV_RUNNING)
+    write_intent = engine._write_intent
+
+    def assert_adopted_before_write(bundle, dirname):
+        assert task.dw_ids == list(bundle.dw_ids) == ["DW-2"]
+        return write_intent(bundle, dirname)
+
+    monkeypatch.setattr(engine, "_write_intent", assert_adopted_before_write)
+
+    key = engine._run_bundle(Bundle(name="fix", dw_ids=("DW-2",), intent="second"), 1)
+
+    task = engine.state.tasks["dw-fix"]
+    assert key == "dw-fix" and list(engine.state.tasks) == ["dw-fix"]
+    assert task.dw_ids == ["DW-2"]
+    # the document, the task and the close all name ONE set of ids
+    intent = (engine.run_dir / "bundles" / "fix" / "intent.md").read_text(encoding="utf-8")
+    assert "dw_ids: DW-2" in intent and "DW-1" not in intent
+    assert task.bundle_closes_intended == ["DW-2"]
+    entries = ledger_entries(project)
+    assert not entries["DW-2"].open and entries["DW-1"].open
+    (rec,) = _records(engine, "sweep-bundle-dwids-adopted")
+    assert rec["story_key"] == "dw-fix"
+    assert rec["previous_dw_ids"] == ["DW-1"] and rec["dw_ids"] == ["DW-2"]
+
+
+@pytest.mark.parametrize(
+    "persisted", [["DW-1", "DW-2"], ["DW-2", "DW-1"]], ids=["same-order", "reordered"]
+)
+def test_run_bundle_adopts_silently_when_the_reset_task_already_agrees(
+    project, monkeypatch, persisted
+):
+    """Assign unconditionally, announce only on divergence: a bundle's identity is
+    its ids under SET equality (`_bundle_name_for` says so), so a regenerated
+    triage that merely reorders them is not a divergence worth a record on every
+    resume.
+
+    The name says "silently", but the `reordered` case is carrying a second and
+    less obvious claim: it is the row that pins the assignment as UNCONDITIONAL.
+    `same-order` cannot — with the persisted ids already equal to the bundle's,
+    adoption and no-adoption are indistinguishable, so that case grades only the
+    silence. Under `reordered` the two differ, and the assert on the bundle's own
+    ORDER is what fails if someone folds the assignment inside the divergence
+    check. So the pair is not collapsible to assign-only-on-divergence, and
+    neither case is redundant."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    _bundle_task(engine, "dw-fix", persisted, phase=Phase.DEV_RUNNING)
+    dispatched = _stub_run_story(engine, monkeypatch)
+
+    key = engine._run_bundle(Bundle(name="fix", dw_ids=("DW-1", "DW-2"), intent="again"), 1)
+
+    assert key == "dw-fix" and dispatched == [engine.state.tasks["dw-fix"]]
+    # the bundle's OWN order, so the task agrees with the document written beside it
+    assert engine.state.tasks["dw-fix"].dw_ids == ["DW-1", "DW-2"]
+    assert not _records(engine, "sweep-bundle-dwids-adopted")
+
+
+def test_run_bundle_adopts_onto_a_reset_task_with_no_persisted_dw_ids(project, monkeypatch):
+    """The pre-`dw_ids` `state.json` shape (`model.py` loads a missing key as `[]`)
+    on the reset path, where it means the OPPOSITE of what it means to DW-125 —
+    which is why it gets a row of its own rather than riding along on the sibling
+    above.
+
+    `_bundle_name_for` reads an empty persisted list as agreeing with anything, so
+    a paused legacy run is not re-driven bundle by bundle. Here the same emptiness
+    is a divergence: the task genuinely has no ids, nothing else will supply them,
+    and dispatching it without adopting the bundle's would hand
+    `_close_bundle_ledger_when_spec_status` an empty `bundle_closes_intended` and
+    close nothing at all. Both readings are correct for their own question, and
+    the `_run_bundle` comment claims exactly this — so it is pinned here.
+
+    Ablation: guard the assignment with `if task.dw_ids:` (the shape someone
+    copying DW-125's empty-agrees-with-anything rule would write) and the adopted
+    assert reddens at `[]`."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    _bundle_task(engine, "dw-fix", [], phase=Phase.DEV_RUNNING)
+    dispatched = _stub_run_story(engine, monkeypatch)
+
+    key = engine._run_bundle(Bundle(name="fix", dw_ids=("DW-2",), intent="second"), 1)
+
+    assert key == "dw-fix" and dispatched == [engine.state.tasks["dw-fix"]]
+    assert engine.state.tasks["dw-fix"].dw_ids == ["DW-2"]
+    # emptiness is announced like any other divergence — the record is what tells an
+    # operator a legacy task took ids it was never minted with
+    (rec,) = _records(engine, "sweep-bundle-dwids-adopted")
+    assert rec["story_key"] == "dw-fix"
+    assert rec["previous_dw_ids"] == [] and rec["dw_ids"] == ["DW-2"]
+
+
+def test_run_bundle_adopts_nothing_when_recovery_finished_the_bundle(project, monkeypatch):
+    """The adoption sits on the recovery-returned-FALSE arm alone. A persisted
+    receipt that carries the bundle through commit returns True, and the caller is
+    done: no intent is written over it, and the finished task keeps the ids it
+    actually ran — writing this bundle's ids onto it would misname work already
+    closed under the previous ones.
+
+    `_finalize_commit_phase` is stubbed the way its sibling recovery rows stub it:
+    this is about what `_run_bundle` does with a True, not about the commit."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    task = _bundle_task(engine, "dw-fix", ["DW-1"], phase=Phase.COMMITTING)
+    dispatched = _stub_run_story(engine, monkeypatch)
+    finalized: list[str] = []
+    monkeypatch.setattr(engine, "_finalize_commit_phase", lambda t: finalized.append(t.story_key))
+
+    key = engine._run_bundle(Bundle(name="fix", dw_ids=("DW-2",), intent="second"), 1)
+
+    assert key == "dw-fix" and finalized == ["dw-fix"] and not dispatched
+    assert task.dw_ids == ["DW-1"]  # the ids it ran under, untouched
+    assert task.bundle_file is None  # never pointed at this bundle's document
+    assert not (engine.run_dir / "bundles" / "fix" / "intent.md").exists()
+    assert not _records(engine, "sweep-bundle-dwids-adopted")
 
 
 def test_run_bundle_refuses_when_every_candidate_key_is_taken(project, monkeypatch):

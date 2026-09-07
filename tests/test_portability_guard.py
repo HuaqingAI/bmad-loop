@@ -976,6 +976,11 @@ JOURNAL_KINDS = frozenset(
         "sweep-bundle-close-carried",
         "sweep-bundle-close-carry-uncommitted",
         "sweep-bundle-closed",
+        # DW-144. A reset in-flight bundle task adopting the ids of the bundle now
+        # being run. Both id lists are routed (`dw_ids` by name, `previous_dw_ids`
+        # by kind in `_JOURNAL_KIND_KEYLIST_FIELDS`) so the divergence stays
+        # auditable in a dump without the ledger ids shipping verbatim.
+        "sweep-bundle-dwids-adopted",
         "sweep-bundle-key-collision",
         "sweep-bundle-key-deduped",
         "sweep-bundle-name-deduped",
