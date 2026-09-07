@@ -4157,6 +4157,63 @@ def test_ledger_lock_is_not_reentrant(tmp_path, monkeypatch):
     assert len(acquired) == 2
 
 
+def test_ledger_lock_refuses_to_nest_across_two_different_paths(tmp_path, monkeypatch):
+    """The guard is PATH-AGNOSTIC: nesting on a DIFFERENT file is refused too, and
+    refused before the OS lock is reached.
+
+    The row above nests the same path, where a refusal is indistinguishable from
+    the POSIX self-deadlock the guard exists to convert — two spellings of one
+    file rendezvous on one sidecar, so the OS lock alone would already wedge.
+    Different paths take DIFFERENT sidecars (`lock_path_for` keys each on
+    `sha256(resolved path)[:16]`), so the kernel would happily grant the second
+    acquisition and nothing but this guard refuses it. That refusal is what
+    `ledger_lock`'s docstring now claims as the benefit of the pre-answer store
+    reusing this helper instead of minting its own (DW-161): the two files share
+    no OS lock, only this guard, and its whole consequence is that no caller may
+    hold both at once, in either order.
+
+    The counter is what says it refused ABOVE the kernel rather than after a
+    successful acquire — the same oracle, and the same reason, as the same-path
+    row: a guard that raised after acquiring would leave the second sidecar held
+    and this process holding two locks it can never release in order.
+
+    Ablation is deliberately NOT run, exactly as above: dropping the depth guard
+    makes this pass silently (the kernel grants both), so the row grades the
+    guard's PRESENCE and the same-path row grades the deadlock conversion.
+
+    The tail runs the OTHER order, which is the half a one-way test cannot see:
+    a guard keyed on the first path rather than on the thread would refuse
+    ledger-then-store and permit store-then-ledger, which is precisely the
+    lock-ordering hazard the shared guard is claimed to remove."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    first = write_ledger(tmp_path / "a")
+    second = write_ledger(tmp_path / "b")
+    assert runs.lock_path_for(first) != runs.lock_path_for(second)  # different sidecars
+    real_file_lock = deferredwork.file_lock
+    acquired = []
+
+    @contextlib.contextmanager
+    def counting(lock_path, **kwargs):
+        acquired.append(lock_path)
+        with real_file_lock(lock_path, **kwargs):
+            yield
+
+    monkeypatch.setattr(deferredwork, "file_lock", counting)
+
+    with deferredwork.ledger_lock(first):
+        with pytest.raises(RuntimeError, match="not reentrant"):
+            with deferredwork.ledger_lock(second):
+                pass  # pragma: no cover — the guard raises on entry
+    assert len(acquired) == 1  # the nested entry never reached the OS lock
+
+    with deferredwork.ledger_lock(second):  # the reverse order is refused too
+        with pytest.raises(RuntimeError, match="not reentrant"):
+            with deferredwork.ledger_lock(first):
+                pass  # pragma: no cover — the guard raises on entry
+    assert len(acquired) == 2
+
+
 def test_a_failed_acquisition_does_not_leak_the_reentrancy_guard(tmp_path, monkeypatch):
     """An acquisition that raises must still leave this thread unmarked.
 

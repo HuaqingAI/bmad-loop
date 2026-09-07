@@ -1366,18 +1366,30 @@ class SweepEngine(Engine):
         # and pruning from bytes nobody could read would drop live answers.
         text = deferredwork.read_for_write(ledger) or ""
         # The store lives under the project that owns `run_dir`, never
-        # `self.workspace.root`: under the `repo_root` override the two diverge
-        # and a workspace-rooted prune trimmed a store that does not exist,
-        # leaving consumed entries behind (the comment in `_decisions_phase`
-        # says why the run dir is the stable anchor). The ledger read above is
-        # unaffected — `deferred_work` hangs off `implementation_artifacts`,
-        # which stays project-rooted under the override.
-        dropped = decisions_store.prune_pre_answers(
-            _project_of_run_dir(self.run_dir), deferredwork.open_ids(text)
-        )
+        # `self.workspace.root`: where `repo_root` names a tree DISJOINT from the
+        # project the two diverge and a workspace-rooted prune trimmed a store
+        # that does not exist, leaving consumed entries behind (the comment in
+        # `_decisions_phase` says why the run dir is the stable anchor). Scoped
+        # to the disjoint shape on purpose — in the NESTED/monorepo shape
+        # (`conftest.nested_repo_root_paths`) `repo_root` is an ANCESTOR of the
+        # project, so the store sits inside it and a workspace-rooted spelling
+        # found the same file. The ledger read above is unaffected either way —
+        # `deferred_work` hangs off `implementation_artifacts`, which stays
+        # project-rooted under the override.
+        project = _project_of_run_dir(self.run_dir)
+        dropped = decisions_store.prune_pre_answers(project, deferredwork.open_ids(text))
         if dropped:
             self.journal.append("decision-preanswers-pruned", dw_ids=dropped)
-            self._commit_ledger("chore(sweep): drop consumed deferred-work pre-answers")
+            # Committed in the STORE's root, not the workspace's: the same
+            # divergence that made the prune miss its file made the commit miss
+            # its tree (DW-160). The claim is about the STORE alone — that is the
+            # only file this prune writes, and `implementation_artifacts` may be
+            # configured outside the project tree entirely (see
+            # `ProjectPaths.rebased`), so this root is not a general home for
+            # everything a sweep edits.
+            self._commit_ledger(
+                "chore(sweep): drop consumed deferred-work pre-answers", root=project
+            )
 
     def _prune_dropped_pre_answer(self, dw_id: str, drop_cause: str) -> None:
         """Retire the PROJECT-level pre-answer a just-dropped stale answer came
@@ -1412,18 +1424,24 @@ class SweepEngine(Engine):
         id and the drop cause alone — no answer prose, no store path."""
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
-        # `_project_of_run_dir`, never `self.workspace.root`: under the `repo_root`
-        # override the two diverge and only the run dir stays anchored to the
-        # project that owns the store (see `_decisions_phase` and
-        # `_prune_pre_answers`, which resolve it the same way).
-        if not decisions_store.drop_pre_answer(_project_of_run_dir(self.run_dir), dw_id):
+        # `_project_of_run_dir`, never `self.workspace.root`: where `repo_root`
+        # names a tree DISJOINT from the project the two diverge and only the run
+        # dir stays anchored to the project that owns the store (see
+        # `_decisions_phase` and `_prune_pre_answers`, which resolve it the same
+        # way). The nested/monorepo shape is unaffected — `repo_root` is an
+        # ancestor there, so the store sits inside it.
+        project = _project_of_run_dir(self.run_dir)
+        if not decisions_store.drop_pre_answer(project, dw_id):
             return  # run-local-only answer: no store entry, so no write and no row
         self.journal.append(
             "sweep-decision-preanswer-pruned", decision=dw_id, drop_cause=drop_cause
         )
         # Committed like `_prune_pre_answers`': `_materialize_bundles` runs ahead of
-        # this cycle's bundles, and bundles need a clean baseline.
-        self._commit_ledger("chore(sweep): drop stale deferred-work pre-answer")
+        # this cycle's bundles, and bundles need a clean baseline. In the STORE's
+        # root for the same reason the removal used it — where `repo_root` names a
+        # DISJOINT tree, `workspace.root` is a separate repo and a clean check
+        # there says nothing about the tree this write dirtied (DW-160).
+        self._commit_ledger("chore(sweep): drop stale deferred-work pre-answer", root=project)
 
     def _drive_story(self, task: StoryTask) -> None:
         # no spec-approval gate for bundles: the bundle intent came from the
@@ -2339,12 +2357,59 @@ class SweepEngine(Engine):
             ledger, decision.id, self._today(), option.label, detail, close_note=close_note
         )
 
-    def _commit_ledger(self, message: str) -> None:
+    def _commit_ledger(self, message: str, *, root: Path | None = None) -> None:
         """Commit pending orchestrator ledger edits; bundles need a clean
-        baseline. No-op when the tree is already clean."""
-        if verify.worktree_clean(self.workspace.root):
+        baseline. No-op when the tree is already clean.
+
+        `root` is the tree the clean check and the commit both run against,
+        defaulting to `self.workspace.root`. The two pre-answer prunes pass it
+        explicitly because the file they just wrote is the pre-answer STORE,
+        which lives under `_project_of_run_dir(self.run_dir)`: where `repo_root`
+        names a tree DISJOINT from the project, committing the store's edit
+        against the code repo checked a tree the write never touched (DW-160) —
+        the clean check passed, nothing was committed, and the project worktree
+        stayed dirty ahead of this cycle's bundles.
+
+        ⚠️ The five default-root callers are KNOWN WRONG in that same shape and
+        are left that way deliberately, not vouched for here. They publish the
+        deferred-work ledger, which hangs off `implementation_artifacts` and so
+        stays project-rooted under the override, while this default hands
+        `workspace.root` — so a disjoint code root checks and commits the wrong
+        tree for them exactly as it did for the prunes. Fixing them is out of
+        scope for DW-160, which is bounded to the two prune sites; they keep
+        today's root until that is picked up.
+
+        A `verify.GitError` from an EXPLICITLY-rooted call degrades to a journal
+        row naming the tree and the error instead of propagating. Passing a root
+        newly makes `worktree_clean` reachable on a project that is not a git
+        repo at all — the `cli` sweep precondition only requires `paths.repo_root`
+        to be one — where it raises `git status failed ...: fatal: not a git
+        repository`. Before the root argument that call ran against the code repo
+        and the store write simply stayed uncommitted; letting the raise through
+        would abort the whole sweep out of a prune whose on-disk write already
+        succeeded. `decisions.apply_pre_answer` already degrades on `GitError`
+        for this very file ("best effort, so a non-git or dirty tree never blocks
+        the on-disk record") and this keeps the two agreeing. The default-root
+        callers keep failing loud: their raise is the pre-existing contract, and
+        nothing here should quiet a commit failure nobody asked to re-root."""
+        target = self.workspace.root if root is None else root
+        try:
+            if verify.worktree_clean(target):
+                return
+            sha = verify.commit_story(target, message)
+        except verify.GitError as e:
+            if root is None:
+                raise  # the five default-root callers keep failing loud
+            # `repo` (not `root`): an absolute host path naming a git tree,
+            # already routed out of diagnostics dumps, exactly as
+            # `rearm-baseline-advance-failed` spells the same value.
+            self.journal.append(
+                "sweep-ledger-commit-unavailable",
+                message=message,
+                repo=str(target),
+                error=str(e),
+            )
             return
-        sha = verify.commit_story(self.workspace.root, message)
         self.journal.append("sweep-ledger-commit", message=message, commit=sha)
 
     # ---------------------------------------------------------- bundles

@@ -18,6 +18,35 @@ the entry simply leaves the open set.
 
 Layering note: this module sits above sweep.py (it reuses Decision/validate_triage
 and the deterministic ledger helpers). sweep.py imports it lazily to avoid a cycle.
+
+Concurrency (#286/#469, DW-161): the store is a second orchestrator-written file
+with the ledger's exact exposure — a `bmad-loop decisions` answer, the TUI
+decision modal and a sweep can all reach it at once, and each writer here is a
+read->edit->write of the WHOLE file, so unserialized they trade last-write-wins
+and a human's answer vanishes. All three writers (`record_pre_answer`,
+`prune_pre_answers`, `drop_pre_answer`) therefore run their whole cycle under
+:func:`deferredwork.ledger_lock` keyed on the STORE path.
+
+Reused rather than twinned, and precisely one thing is shared. NOT the OS lock:
+`runs.lock_path_for` keys each sidecar on `sha256(resolved path)[:16]`, so the
+ledger and the store take DIFFERENT locks and exclude nobody from each other —
+correctly, since they are different files with different writers. What is shared
+is `ledger_lock`'s thread-local NESTING guard, which is path-agnostic, and its
+consequence is the whole point: no caller may hold both at once, in either
+order. A second helper would mean two independent guards, and a caller could
+then hold the ledger and the store simultaneously with neither noticing — the
+lock-ordering hazard this avoids by construction rather than by convention. The
+hold covers file I/O only, never a subprocess: `apply_pre_answer`'s commit stays
+outside it, and it takes the two locks in sequence, never nested.
+
+Readers stay lock-free on purpose (`load_pre_answers`, `pending_missed_decisions`,
+`_decisions_phase`'s seeding read): every write replaces the file atomically, so
+a reader already sees one whole version or another. And a conditional writer
+handed nothing to do answers from ONE advisory read taken above the lock (#736)
+— it publishes no bytes, so it linearizes at that read and there is nothing for a
+rival to interleave with. That is what keeps `drop_pre_answer` for an id the
+store never held — the common case — from newly failing on an acquisition it did
+not need.
 """
 
 from __future__ import annotations
@@ -101,30 +130,83 @@ def _write_store(project: Path, data: dict) -> None:
 def record_pre_answer(project: Path, dw_id: str, option: DecisionOption, *, date: str) -> None:
     """Persist a chosen option so a future sweep applies it without asking. The
     option's full semantics are stored (not just its key): a later triage may
-    renumber options, so the sweep reads effect/intent from here directly."""
-    data = load_pre_answers(project)
-    data[dw_id] = {
-        "key": option.key,
-        "label": option.label,
-        "effect": option.effect,
-        "intent": option.intent,
-        "resolution": option.resolution,
-        "bundle_name": option.bundle_name,
-        "answered_at": date,
-    }
-    _write_store(project, data)
+    renumber options, so the sweep reads effect/intent from here directly.
+
+    ONE locked read->edit->write (#286/#469, DW-161): unserialized, an answer
+    recorded here between a rival writer's load and its write was overwritten
+    wholesale — the store is read-modify-written in full, so the loser's entry
+    does not survive as a merge, it disappears. No advisory probe: this writer
+    always publishes bytes, so there is no read-provable no-op to answer above
+    the lock. Called as `deferredwork.ledger_lock(...)` — the module attribute,
+    not a `from ... import` binding — which is how this module reaches every
+    `deferredwork` entry point it uses: the lock lives next to the ledger it was
+    written for, and calling it through its home module keeps that ownership
+    legible at the call site instead of aliasing it in here."""
+    path = store_path(project)
+    with deferredwork.ledger_lock(path):
+        data = load_pre_answers(project)
+        data[dw_id] = {
+            "key": option.key,
+            "label": option.label,
+            "effect": option.effect,
+            "intent": option.intent,
+            "resolution": option.resolution,
+            "bundle_name": option.bundle_name,
+            "answered_at": date,
+        }
+        _write_store(project, data)
+
+
+def _prunable_ids(data: dict[str, dict], open_ids: set[str]) -> list[str]:
+    """The store ids `prune_pre_answers` drops: those no longer in the open set.
+
+    Pure, and module-level rather than inlined at each arm, for the reason
+    `deferredwork`'s Concurrency note requires of every #736 probe — the advisory
+    read and the authoritative locked read must run "the same pure decision
+    helper ... so the two cannot drift". Two identical comprehensions satisfy
+    that only by textual coincidence: edit one and the probe starts answering a
+    question the hold does not ask, which is a silent lost update in the one
+    direction the probe is allowed to skip the lock."""
+    return [k for k in data if k not in open_ids]
 
 
 def prune_pre_answers(project: Path, open_ids: set[str]) -> list[str]:
     """Drop store entries whose DW id is no longer open (built or closed). No-op
-    write when nothing is dropped. Returns the dropped ids."""
-    data = load_pre_answers(project)
-    dropped = [k for k in data if k not in open_ids]
-    if dropped:
-        for k in dropped:
-            del data[k]
-        _write_store(project, data)
-    return dropped
+    write when nothing is dropped. Returns the dropped ids.
+
+    ONE locked read->edit->write (#286/#469, DW-161), like every writer here: the
+    read that decides WHICH ids survive and the write that publishes them sit
+    inside one hold, so a `bmad-loop decisions` answer recorded in that window is
+    read by this prune rather than erased by it.
+
+    The pre-lock read is an ADVISORY probe (#736) running :func:`_prunable_ids`,
+    the same pure selection the locked pass runs, and only its "nothing to drop"
+    answer is acted on — the overwhelmingly common outcome, since most cycles
+    consume no pre-answer. Such a call publishes no bytes and linearizes at the
+    probe read. Any other answer falls through to the hold, which re-reads and
+    re-decides authoritatively.
+
+    No `try:` around the probe, and that is a DIFFERENT arrangement from
+    `record_decision`'s, not a shorter spelling of it. That probe wraps its raw
+    `read_text` in `except Exception` so a read fault falls THROUGH to the hold,
+    which re-reads and decides. Here `load_pre_answers` is total — a missing,
+    unreadable, unparseable, non-UTF-8 or non-dict store all degrade to `{}` — so
+    a read fault does not fall through at all: it becomes a decisive "nothing to
+    prune" and the hold is skipped. That is exactly what an unreadable store did
+    before DW-161, when this function was unlocked and read through the same
+    total helper, so it is PRESERVED behavior rather than a new degradation — and
+    it is the tolerant reader this module refuses to turn into a repair site."""
+    path = store_path(project)
+    if not _prunable_ids(load_pre_answers(project), open_ids):
+        return []  # ADVISORY probe (#736): nothing to write, so nothing to serialize
+    with deferredwork.ledger_lock(path):
+        data = load_pre_answers(project)
+        dropped = _prunable_ids(data, open_ids)
+        if dropped:
+            for k in dropped:
+                del data[k]
+            _write_store(project, data)
+        return dropped
 
 
 def drop_pre_answer(project: Path, dw_id: str) -> bool:
@@ -139,13 +221,36 @@ def drop_pre_answer(project: Path, dw_id: str) -> bool:
     `<run>/decisions.json` leaves the project store's bytes (and mtime) untouched.
     A removal goes through `_write_store`, so an operator-locked store still raises
     `PermissionError` rather than silently skipping — deleting a human-authored
-    answer is a store write, never a repair."""
-    data = load_pre_answers(project)
-    if dw_id not in data:
-        return False
-    del data[dw_id]
-    _write_store(project, data)
-    return True
+    answer is a store write, never a repair. The `PermissionError` is raised under
+    the hold and propagates through it; the lock is released on the way out.
+
+    ONE locked read->edit->write (#286/#469, DW-161) with an ADVISORY pre-lock
+    probe (#736): an absent id is answered from the probe read, so the no-op keeps
+    taking no lock at all. That is load-bearing rather than an optimization — the
+    absent-id case is the ordinary one (a stale answer that only ever lived in
+    `<run>/decisions.json` has no store entry), `_prune_dropped_pre_answer`
+    swallows nothing, and without the probe those calls would newly raise
+    `runs.StateRootError` where no state root is derivable, or a Windows
+    acquisition timeout, on a call that used to return `False` in silence.
+
+    The probe needs no `try:`, and for a different reason than
+    `record_decision`'s has one. That probe guards a raw `read_text` so a fault
+    falls THROUGH to the hold; `load_pre_answers` is total, so a fault here is
+    already an answer — an unreadable store reads as `{}`, the id is absent, and
+    the call returns `False` without locking. That is what an unreadable store
+    did before DW-161 too, when this read was unlocked and used the same total
+    helper: PRESERVED behavior, not a new degradation, and consistent with this
+    module's refusal to repair the store on the way past."""
+    path = store_path(project)
+    if dw_id not in load_pre_answers(project):
+        return False  # ADVISORY probe (#736): nothing to write, so nothing to serialize
+    with deferredwork.ledger_lock(path):
+        data = load_pre_answers(project)
+        if dw_id not in data:
+            return False
+        del data[dw_id]
+        _write_store(project, data)
+        return True
 
 
 # ------------------------------------------------------- discovery + apply

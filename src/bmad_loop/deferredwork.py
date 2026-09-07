@@ -901,15 +901,25 @@ def ledger_lock(path: Path) -> Iterator[None]:
     engine's rollback/restore windows, which span git spawns, get compare-and-set
     semantics instead of a lock around the window.
 
-    Acquired in exactly two strata: the leaf mutators in this module, and the
-    engine's CAS restores, which do pure in-memory text work under the hold.
-    Never call a mutator while holding it — every mutator takes this lock itself,
-    and the nested acquisition would deadlock.
+    Acquired in exactly three strata: the leaf mutators in this module, the
+    engine's CAS restores, which do pure in-memory text work under the hold, and
+    — keyed on a different file entirely — the pre-answer store's three writers
+    in :mod:`~bmad_loop.decisions` (DW-161). Never call a mutator while holding
+    it — every mutator takes this lock itself, and the nested acquisition would
+    deadlock.
 
     Nesting raises :class:`RuntimeError` rather than deadlocking. The guard is
     deliberately path-agnostic: two *different* ledgers would not self-deadlock
     on the OS lock, but nesting is still a lock-ordering hazard, and no caller
-    has a reason to hold two ledgers at once. The lock file itself lives out of
+    has a reason to hold two ledgers at once. That path-agnosticism is also why
+    the store reuses this helper rather than minting a twin. What the two files
+    share is ONLY this nesting guard — never an OS lock:
+    :func:`~bmad_loop.runs.lock_path_for` keys each sidecar on
+    ``sha256(resolved path)[:16]``, so the ledger and the store take different
+    locks and exclude nobody from each other. The guard's consequence is the
+    benefit: no caller may hold both at once, in either order. Two independent
+    guards would let a caller hold the ledger and the store simultaneously with
+    neither one noticing. The lock file itself lives out of
     the repository — see :func:`~bmad_loop.runs.lock_path_for` for why a sidecar
     beside the tracked ledger would be committed by the engine's own `git add
     -A`. Propagates `OSError` from acquisition and

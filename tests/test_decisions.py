@@ -6,7 +6,7 @@ import sys
 import pytest
 from conftest import fault_read_text, install_bmad_config, write_ledger
 
-from bmad_loop import decisions, deferredwork, platform_util
+from bmad_loop import decisions, deferredwork, platform_util, runs
 from bmad_loop.sweep import DecisionOption
 
 
@@ -697,6 +697,42 @@ def test_the_store_write_refuses_a_readonly_store(project):
     assert store.read_bytes() == before  # the second answer never landed
 
 
+def test_a_removal_refuses_a_readonly_store_rather_than_skipping(project):
+    """The REMOVAL half of the row above. Deleting a human-authored answer is a
+    store write, never a repair, so an operator-locked store is answered with the
+    `PermissionError` `_write_store` raises rather than treated as "already gone"
+    — a silent skip would report the entry retired while it stayed on disk to be
+    re-seeded and re-dropped by every later run.
+
+    Load-bearing since DW-161 put the removal behind an advisory pre-lock probe:
+    the probe decides only "is there anything to write", never whether the write
+    can succeed, so the refusal has to come from under the hold and propagate out
+    through it. A probe widened to swallow the write's fault, or one that answered
+    `False` on an unwritable store, would turn this raise into exactly the silent
+    skip the drop exists to prevent.
+
+    chmod is on the per-test copy and restored in a `finally`, for the reasons the
+    row above spells out.
+
+    Ablation: make `drop_pre_answer` return `False` instead of writing when the
+    store is not writable (or drop `require_writable_target=True` from
+    `_write_store`) and this fails `DID NOT RAISE`, with the entry gone from a
+    file still reading 0444."""
+    _answer(project, "DW-7")
+    _answer(project, "DW-9", date="2026-06-14")
+    store = decisions.store_path(project.project)
+    before = store.read_bytes()
+    store.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            decisions.drop_pre_answer(project.project, "DW-7")
+    finally:
+        store.chmod(0o644)
+
+    assert store.read_bytes() == before  # the removal never landed
+    assert set(decisions.load_pre_answers(project.project)) == {"DW-7", "DW-9"}
+
+
 @pytest.mark.parametrize(
     ("effect", "label", "extra", "close_note"),
     [
@@ -721,14 +757,27 @@ def test_apply_pre_answer_is_one_ledger_transaction(
     carrying a decision that says "close it" over a status that still says open.
     Byte equality alone passes just as well for the released pair.
 
+    The BUILD variant acquires twice, and the second acquisition is a different
+    file: `build`/`keep-open` also lands in the pre-answer store, and since
+    DW-161 `record_pre_answer` runs its own read->edit->write under this same
+    lock keyed on the STORE path. Two sequential holds on two files, never one
+    nested inside the other — `ledger_lock`'s reentrancy guard is path-agnostic,
+    so a nesting here would raise rather than pass. The CLOSE variant writes no
+    store entry (the flip to done takes the id out of the open set now), so its
+    count stays at one; the ORDER is asserted too, because the ledger's audit
+    line is what the store entry is only a scheduling hint for, and recording the
+    hint first would leave a window where a store answer points at a ledger entry
+    carrying no decision.
+
     Ablation: restore the pair in `decisions.apply_pre_answer`. The golden assert
-    still passes — that is the point — and `acquisitions` goes to 2 on the CLOSE
-    variant, which is the one that grades the collapse. The build variant stays
-    green under that ablation and is known to: with `close_note=None` there is no
-    second call to make, and `append_decision` is itself a one-acquisition
-    delegate to `record_decision`, so the two spellings are the same transaction.
-    It is kept for the claim it does decide — that the no-close path still writes
-    the pair's bytes and leaves the entry open — not as a second count oracle.
+    still passes — that is the point — and the CLOSE variant's `acquisitions`
+    goes to 2 on the LEDGER path, which is the one that grades the collapse. The
+    build variant stays green on that count under that ablation and is known to:
+    with `close_note=None` there is no second call to make, and `append_decision`
+    is itself a one-acquisition delegate to `record_decision`, so the two
+    spellings are the same transaction. It is kept for the claims it does decide
+    — that the no-close path still writes the pair's bytes, leaves the entry
+    open, and serializes its store write behind the ledger's.
     """
     import contextlib
 
@@ -762,4 +811,231 @@ def test_apply_pre_answer_is_one_ledger_transaction(
     decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13", commit=False)
 
     assert project.deferred_work.read_text(encoding="utf-8") == golden.read_text(encoding="utf-8")
-    assert acquisitions == [project.deferred_work]  # ONE, and on the project's ledger
+    # ONE hold per file written, ledger first, and never the same file twice
+    expected = [project.deferred_work]
+    if effect != "close":
+        expected.append(decisions.store_path(project.project))
+    assert acquisitions == expected
+
+
+# ------------------------------------ the store's write discipline (DW-161)
+#
+# The store is the ledger's twin exposure: `bmad-loop decisions`, the TUI
+# decision modal and a sweep all reach it, and every writer here read-modify-
+# writes the WHOLE file. The rows below are the store-side siblings of
+# tests/test_deferredwork.py's `test_scripted_interleave_loses_no_update`,
+# `test_every_mutator_holds_the_ledger_lock` and
+# `test_a_read_dependent_noop_takes_no_lock`, and they grade the same three
+# claims: the hold spans read AND write, every writer takes it, and a call a
+# read proves will write nothing takes nothing.
+
+_OPT = DecisionOption(key="1", label="Build it", effect="build", intent="do it")
+
+
+def _seed_store(project, ids):
+    """Plant `ids` in the store through the real writer, before any spy exists."""
+    for dw_id in ids:
+        decisions.record_pre_answer(project.project, dw_id, _OPT, date="2026-06-13")
+    return decisions.store_path(project.project)
+
+
+# Each row is seeded to WRITE. A no-op row would grade nothing here: the advisory
+# pre-lock probe (#736) answers a read-provable no-op above the acquisition these
+# rows spy on — that inverse is `test_a_read_dependent_store_noop_takes_no_lock`.
+_LOCKED_WRITERS = {
+    "record_pre_answer": (
+        lambda p: None,
+        lambda p: decisions.record_pre_answer(p.project, "DW-7", _OPT, date="2026-06-13"),
+    ),
+    "prune_pre_answers": (
+        lambda p: _seed_store(p, ["DW-7"]),
+        lambda p: decisions.prune_pre_answers(p.project, {"DW-9"}),
+    ),
+    "drop_pre_answer": (
+        lambda p: _seed_store(p, ["DW-7"]),
+        lambda p: decisions.drop_pre_answer(p.project, "DW-7"),
+    ),
+}
+
+# The read-provable no-ops. `record_pre_answer` has none — it always publishes
+# bytes — so it is absent by construction rather than by omission.
+_NOOP_WRITERS = {
+    "prune_pre_answers": (
+        lambda p: decisions.prune_pre_answers(p.project, {"DW-7"}),  # nothing to drop
+        [],
+    ),
+    "drop_pre_answer": (lambda p: decisions.drop_pre_answer(p.project, "DW-404"), False),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_LOCKED_WRITERS))
+def test_every_store_writer_holds_the_lock_on_the_store_path(project, monkeypatch, name):
+    """Each of the three writers takes the lock exactly once, on the STORE's own
+    path, and the hold really excludes.
+
+    Three claims and each is needed. That the spy fired at all says the writer
+    routes through `deferredwork.ledger_lock` rather than writing unserialized —
+    before DW-161 none of them did. That it fired ONCE says the whole
+    read->edit->write sits in a single acquisition rather than a per-step hold a
+    rival can slip between. The path says it locked the file it is writing: the
+    ledger's sidecar is keyed on the ledger, so locking that would serialize the
+    store's writers against the wrong file and against nobody who matters. The
+    probe from inside the critical section says the acquisition is a real OS lock
+    and not a yielding stub, which would satisfy the count and exclude no one.
+
+    Ablation: delete this writer's `with deferredwork.ledger_lock(path):` and
+    dedent its body — `acquisitions` is empty and `held` stays empty, and the row
+    reds."""
+    import contextlib
+
+    seed, call = _LOCKED_WRITERS[name]
+    seed(project)
+    store = decisions.store_path(project.project)
+    real_lock = deferredwork.ledger_lock
+    acquisitions, held = [], []
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        acquisitions.append(p)
+        with real_lock(p):
+            try:
+                with platform_util.file_lock(runs.lock_path_for(p), blocking=False):
+                    held.append(False)
+            except OSError:
+                held.append(True)  # the sidecar cannot be taken: a real exclusion
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+
+    call(project)
+
+    assert acquisitions == [store]  # ONE, and on the store — never the ledger
+    assert held == [True]
+
+
+@pytest.mark.parametrize("name", sorted(_NOOP_WRITERS))
+def test_a_read_dependent_store_noop_takes_no_lock(project, monkeypatch, name):
+    """The exact inverse of the row above, over the writers that can no-op: a call
+    ONE read proves will write nothing acquires nothing and leaves the file alone.
+
+    Both readings of "the lock is load-bearing" have to hold or the fix has traded
+    one failure for another. This is the direction that actually regressed users:
+    `_prune_dropped_pre_answer` calls `drop_pre_answer` for ids that usually have
+    no store entry and swallows nothing, so an unconditional hold would turn a
+    silent `False` into a `StateRootError` (or a Windows acquisition timeout) on
+    the ordinary path.
+
+    Bytes AND mtime, not just the count. The probe reaches its answer through the
+    same read the locked pass would fold, so a probe that reported "no write"
+    where the authority WOULD have written shows up as changed bytes rather than
+    as a count; and mtime catches the rewrite that re-serializes identical
+    content, which is the store repair this codebase refuses.
+
+    Ablation: delete this writer's advisory pre-lock probe — `acquisitions`
+    counts one and the row reds."""
+    import contextlib
+
+    call, expected = _NOOP_WRITERS[name]
+    store = _seed_store(project, ["DW-7"])
+    before, before_mtime = store.read_bytes(), store.stat().st_mtime_ns
+    real_lock = deferredwork.ledger_lock
+    acquisitions = []
+
+    @contextlib.contextmanager
+    def spy_lock(p):
+        acquisitions.append(p)
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
+
+    assert call(project) == expected
+
+    assert acquisitions == []
+    assert store.read_bytes() == before
+    assert store.stat().st_mtime_ns == before_mtime
+
+
+def test_a_scripted_interleave_loses_no_pre_answer(project, monkeypatch):
+    """DW-161's lost-update scenario, made deterministic: a rival writer records a
+    whole answer between writer A's call and A's acquisition, and A must still see
+    it.
+
+    Writer A records DW-1; writer B records DW-2. B is run to completion —
+    acquire, read, write, release — immediately BEFORE A delegates to the real
+    lock, which is the worst legal interleaving the lock permits. A therefore has
+    to read the store B just wrote, not one it snapshotted earlier, or A's write
+    reverts B's answer wholesale: the store is read-modify-written in full, so a
+    lost update here is a human's answer silently gone, not a stale field.
+
+    `record_pre_answer` is the writer under test because it is the one with no
+    advisory probe — it always publishes, so its read is unconditionally inside
+    the hold and the hoist below is a real ablation rather than a probe artifact.
+
+    Ablation: hoist `record_pre_answer`'s `load_pre_answers` above its
+    `with deferredwork.ledger_lock(path):` and write from it — A's read then
+    happens before the spy fires, A publishes its stale snapshot, and DW-2 is gone
+    from the final store."""
+    import contextlib
+
+    real_lock = deferredwork.ledger_lock
+    rival_ran = []
+
+    @contextlib.contextmanager
+    def rival_first(p):
+        if not rival_ran:
+            rival_ran.append(True)  # once: B's own write re-enters this spy
+            decisions.record_pre_answer(
+                project.project,
+                "DW-2",
+                DecisionOption(key="2", label="Keep", effect="keep-open"),
+                date="2026-06-14",
+            )
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", rival_first)
+
+    decisions.record_pre_answer(project.project, "DW-1", _OPT, date="2026-06-13")
+
+    stored = decisions.load_pre_answers(project.project)
+    assert set(stored) == {"DW-1", "DW-2"}  # B's answer survived A's write
+    assert stored["DW-2"]["effect"] == "keep-open"  # ...whole, not a merged husk
+    assert stored["DW-2"]["answered_at"] == "2026-06-14"
+    assert stored["DW-1"]["effect"] == "build"  # ...and A's own answer landed
+
+
+@pytest.mark.parametrize("name", sorted(_NOOP_WRITERS))
+def test_a_store_noop_succeeds_when_no_state_root_is_derivable(project, monkeypatch, name):
+    """Where no state root can be derived there is no sidecar to lock, and the
+    read-provable no-ops still have to succeed — while a real write still fails
+    loudly rather than proceeding unserialized.
+
+    `runs.StateRootError` is raised while DERIVING the sidecar path, before any OS
+    lock is attempted, so it reaches every caller of `ledger_lock`; it is not an
+    `OSError`, so no caller's net catches it. Answering the no-op above the
+    acquisition is what stops such an environment from failing calls that were
+    never going to write.
+
+    The write-shaped control is not decoration: it is what says the patch is live.
+    Without it a `lock_path_for` stub that silently never fired would make the
+    no-op rows above vacuously green.
+
+    Ablation: delete either probe — that row raises `StateRootError` instead of
+    returning, and reds."""
+    call, expected = _NOOP_WRITERS[name]
+    store = _seed_store(project, ["DW-7"])
+    before = store.read_bytes()
+
+    def no_state_root(_path, **_kwargs):
+        raise runs.StateRootError("no state root in this environment")
+
+    monkeypatch.setattr(runs, "lock_path_for", no_state_root)
+
+    assert call(project) == expected
+    assert store.read_bytes() == before
+
+    with pytest.raises(runs.StateRootError):
+        decisions.record_pre_answer(project.project, "DW-9", _OPT, date="2026-06-13")
+
+    assert store.read_bytes() == before  # the real write raised rather than writing unlocked

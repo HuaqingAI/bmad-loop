@@ -3,6 +3,7 @@
 import contextlib
 import json
 import re
+import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -7172,6 +7173,186 @@ def test_prune_dropped_pre_answer_keys_on_the_run_dir_project_not_workspace_root
     [pruned] = _records(engine, "sweep-decision-preanswer-pruned")
     assert pruned["decision"] == "DW-1"
     assert list(elsewhere.rglob("decisions*")) == []  # the code repo was never the store
+
+
+def _prune_consumed_in_a_divergent_project(project, engine):
+    """`_prune_pre_answers`' divergent-root setup and call: DW-1 is consumed (absent
+    from the open set) while DW-2 stays open, both answered in the PROJECT store."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-2": "open"})
+    for dw in ("DW-1", "DW-2"):
+        decisions_store.record_pre_answer(
+            project.project,
+            dw,
+            DecisionOption(key="2", label="Keep", effect="keep-open"),
+            date="2026-06-12",
+        )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "out-of-band pre-answers")
+    return lambda: engine._prune_pre_answers()
+
+
+def _drop_stale_in_a_divergent_project(project, engine):
+    """`_prune_dropped_pre_answer`' divergent-root setup and call, reached the way a
+    real cycle reaches it: through the keep-open drop lane of `_materialize_bundles`."""
+    write_ledger(project, {"DW-1": "open"})
+    _seed_project_keep_open_answer(project, others={"DW-2": _STALE_KEEP_OPEN_ANSWER})
+    return lambda: engine._materialize_bundles(
+        _stale_keep_open_plan(), {"DW-1": _STALE_KEEP_OPEN_ANSWER}
+    )
+
+
+def test_a_prune_in_a_non_git_project_keeps_the_store_write_and_journals(project, tmp_path):
+    """Re-rooting `_commit_ledger` newly makes `verify.worktree_clean` reachable on
+    a project that is not a git repository, and that must not abort the sweep.
+
+    Nothing requires the project to be a repo: `cli`'s sweep precondition checks
+    `paths.repo_root` alone, so a project whose artifacts live under a code root
+    elsewhere need never have been `git init`-ed. Before DW-160 the prune's commit
+    ran against `workspace.root` — a real repo — and a non-git project simply left
+    the store write uncommitted. Rooted at the store, `git status` there answers
+    `fatal: not a git repository`, `verify` raises `GitError`, and an unguarded
+    raise would tear down the whole sweep out of a prune whose on-disk write had
+    already succeeded — losing the cycle over bookkeeping that was always best
+    effort. `decisions.apply_pre_answer` degrades on `GitError` for this very file
+    ("best effort, so a non-git or dirty tree never blocks the on-disk record");
+    this keeps the two agreeing.
+
+    Three claims: the sweep does not raise, the store write SURVIVES (the degrade
+    is about the commit, never the file), and the failure is announced rather than
+    swallowed — `sweep-ledger-commit-unavailable` naming the tree and the error,
+    so an operator reading the journal learns the store is uncommitted.
+
+    Scoped to the EXPLICITLY-rooted callers: the five default-root `_commit_ledger`
+    calls keep propagating, which `test_a_default_rooted_commit_failure_still_raises`
+    below pins.
+
+    Ablation: drop the `except verify.GitError` arm in `_commit_ledger` and this
+    reds with the `GitError` escaping `_prune_pre_answers`."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-2": "open"})
+    for dw in ("DW-1", "DW-2"):
+        decisions_store.record_pre_answer(
+            project.project,
+            dw,
+            DecisionOption(key="2", label="Keep", effect="keep-open"),
+            date="2026-06-12",
+        )
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    # the project stops being a repo; the run dir and the store stay exactly as they are
+    shutil.rmtree(project.project / ".git")
+    assert not (project.project / ".git").exists()
+
+    engine._prune_pre_answers()  # must not raise
+
+    assert set(decisions_store.load_pre_answers(project.project)) == {"DW-2"}  # write survived
+    assert _records(engine, "sweep-ledger-commit") == []  # nothing could be committed
+    [failed] = _records(engine, "sweep-ledger-commit-unavailable")
+    assert failed["repo"] == str(project.project)
+    assert "not a git repository" in failed["error"]
+
+
+def test_a_default_rooted_commit_failure_still_raises(project, monkeypatch):
+    """The other half of the degrade: it is scoped to callers that passed a root.
+
+    The five default-root `_commit_ledger` calls publish the deferred-work ledger
+    and their raise is the pre-existing contract — nothing about re-rooting the two
+    prunes earns them a new silent-failure path, and a commit failure there is a
+    real defect an operator must see. Without this row the degrade could widen to
+    every caller and no test would notice.
+
+    Ablation: drop the `if root is None: raise` line in `_commit_ledger`'s handler
+    and this reds `DID NOT RAISE`, with a journal row in place of the failure."""
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    def boom(_repo):
+        raise verify.GitError("git status failed: contrived")
+
+    monkeypatch.setattr(verify, "worktree_clean", boom)
+
+    with pytest.raises(verify.GitError, match="contrived"):
+        engine._commit_ledger("chore(sweep): a default-rooted commit")
+
+    # nothing was journalled AT ALL — no degrade row, and no commit row either.
+    # Asserted as the file's absence rather than through `_records`, which cannot
+    # read a journal that was never created: the raise is the only thing that
+    # happened, which is the whole claim.
+    assert not (engine.run_dir / "journal.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    "setup", [_prune_consumed_in_a_divergent_project, _drop_stale_in_a_divergent_project]
+)
+def test_a_divergent_root_prune_is_committed_in_the_project_tree(project, tmp_path, setup):
+    """The commit half of the two rows above (DW-160). They fixed WHICH store the
+    prune writes; this fixes which tree the write is committed in, and it is the
+    same divergence both times.
+
+    Both prune sites resolve the store with `_project_of_run_dir(self.run_dir)` and
+    then committed through `_commit_ledger`, which ran `verify.worktree_clean` and
+    `verify.commit_story` against `self.workspace.root`. Under the `repo_root`
+    override those are different repositories: the clean check interrogated the
+    CODE repo, which the prune never touched, found it clean, and returned — so
+    nothing was committed and the PROJECT worktree was left dirty carrying the
+    rewritten store, immediately ahead of `_materialize_bundles` and this cycle's
+    bundles, which need a clean baseline.
+
+    Why the two rows above cannot catch this: they point `engine.workspace` at a
+    freshly `git init`-ed empty repo, which is clean by construction, so their
+    commit tail is a guaranteed no-op and passes identically with the root wrong.
+    Committing the PROJECT tree is what makes it observable — the assertion is on
+    the `HEAD` blob, not the working file, so a prune that wrote but never
+    committed reds even though `load_pre_answers` would still say the id is gone.
+
+    The code repo is asserted to receive NOTHING, which is the other half: a fix
+    that committed in both trees would satisfy the blob assert while sweeping the
+    project's entire `git add -A` into a repository that is not its own.
+
+    The premise is guarded before the outcome, as every divergent-root row here
+    must be (docs/testing.md): the two roots are compared RESOLVED, and asserted
+    DISJOINT rather than merely unequal. Disjointness is the shape DW-160
+    actually bites in — nested (`conftest.nested_repo_root_paths`), `repo_root`
+    is an ANCESTOR of the project, so `git -C repo_root status` did see the store
+    edit and the old code committed it. A guard that only checked inequality
+    would keep passing if this fixture ever drifted into the nested shape, and
+    the row would then be grading nothing.
+
+    Ablation: drop `root=project` at either prune site (back to
+    `self.workspace.root`) — that row reds with the dropped id still in the `HEAD`
+    blob, the project tree dirty, and no `sweep-ledger-commit` row."""
+    from bmad_loop import decisions as decisions_store
+    from bmad_loop.workspace import Workspace
+
+    engine, _ = make_sweep(project, [])
+    call = setup(project, engine)
+    elsewhere = tmp_path / "code-repo"
+    elsewhere.mkdir()
+    git(elsewhere, "init")
+    engine.workspace = Workspace(root=elsewhere, paths=engine.workspace.paths)
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    # premise before outcome: resolved, and DISJOINT — not merely unequal, since
+    # the nested shape commits correctly under the old code and would grade nothing
+    code_root, store_root = engine.workspace.root.resolve(), project.project.resolve()
+    assert code_root != store_root
+    assert store_root not in code_root.parents and code_root not in store_root.parents
+    assert git(project.project, "status", "--porcelain") == ""  # only the prune's edit follows
+
+    call()
+
+    # the pruned store is COMMITTED in the project tree, not merely written there
+    store_rel = str(decisions_store.STORE_REL).replace("\\", "/")
+    committed = json.loads(git(project.project, "show", f"HEAD:{store_rel}"))
+    assert set(committed) == {"DW-2"}  # DW-1 gone from the blob at HEAD
+    assert git(project.project, "status", "--porcelain") == ""  # clean for this cycle's bundles
+    [commit] = _records(engine, "sweep-ledger-commit")
+    assert commit["commit"] == git(project.project, "rev-parse", "HEAD")
+    # ...and the code repo, whose tree the prune never touched, receives nothing
+    assert git(elsewhere, "rev-list", "--all", "--count") == "0"
+    assert list(elsewhere.rglob("decisions*")) == []
 
 
 def test_a_run_local_only_stale_answer_writes_nothing_to_the_project_store(project):
