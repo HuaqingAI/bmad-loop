@@ -42,8 +42,13 @@ zero-token real-tmux success path.
 the renderer script unit and central config from the index. The real tmux session
 can start only if runtime provisioning reconstructs the ignored `_bmad` surface.
 
+(12) injects a detached-child identity publication failure (DW-149). An independent
+`observed-child.id` channel lets the row prove the recorder hit the poisoned
+temporary directory, the orchestrator reaped that exact child, and the worktree
+teardown remained clean despite the missing normal identity record.
+
 Alongside those scenarios the file also holds local-process `/proc`+pidfd harness
-rows covering the reap-identity helpers the two teardown E2Es depend on. Those rows
+rows covering the reap-identity helpers the three teardown E2Es depend on. Those rows
 spawn and reap their own short-lived children, but run no tmux or orchestrator session.
 """
 
@@ -326,6 +331,39 @@ printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \
 sleep 600
 """
 )
+
+
+# The publication-fault fake records its child outside the normal channel so the
+# test can authenticate it even when fake-child.pid cannot be published.
+OBSERVED_CHILD_GLOB = ".bmad-loop/runs/*/tasks/*/observed-child.id"
+
+_PUBLICATION_FAULT_FRAGMENT = (
+    r"""idfile="$rd/tasks/$tid/observed-child.id"
+"""
+    + RECORD_CHILD_IDENTITY_SH
+    + r"""idfile="$rd/tasks/$tid/fake-child.pid"
+mkdir -p "$idfile.tmp"
+# A plain subshell preserves its own errexit. Using (...) || true would suppress
+# errexit inside and let mv rename the poison directory into the normal channel.
+set +e
+(
+export LC_ALL=C
+set -e
+"""
+    + RECORD_CHILD_IDENTITY_SH
+    + r""") 2> "$rd/tasks/$tid/recorder.stderr"
+recorder_status=$?
+set -e
+printf '%s\n' "$recorder_status" > "$rd/tasks/$tid/recorder.status"
+"""
+)
+
+# Substitute only the identity step; the detached fake and recorder stay unchanged.
+assert DETACHED_WRITER_FAKE_CLI.count(RECORD_CHILD_IDENTITY_SH) == 1
+PUBLICATION_FAULT_FAKE_CLI = DETACHED_WRITER_FAKE_CLI.replace(
+    RECORD_CHILD_IDENTITY_SH, _PUBLICATION_FAULT_FRAGMENT, 1
+)
+assert PUBLICATION_FAULT_FAKE_CLI.count(RECORD_CHILD_IDENTITY_SH) == 2
 
 
 def _git(root: Path, *args: str) -> None:
@@ -1168,14 +1206,17 @@ def test_reap_identity_fails_loudly_when_pidfd_is_unsupported(monkeypatch):
         _reap(proc)
 
 
-def _plant_recorded_identity(root: Path, raw: str, task: str = "t0") -> Path:
+def _plant_recorded_identity(
+    root: Path, raw: str, task: str = "t0", *, filename: str = "fake-child.pid"
+) -> Path:
     """Write ``raw`` where a fake CLI would record ``task``'s child identity.
 
     ``task`` is a parameter because the sweeper's central promise is that ONE bad
     file does not end the sweep; proving that needs two identities under one root,
     and `sorted()` over the glob makes the task-dir name the sweep order.
+    ``filename`` selects an observation channel without changing existing callers.
     """
-    pid_file = root / ".bmad-loop" / "runs" / "r0" / "tasks" / task / "fake-child.pid"
+    pid_file = root / ".bmad-loop" / "runs" / "r0" / "tasks" / task / filename
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     pid_file.write_text(raw, encoding="utf-8")
     return pid_file
@@ -1381,6 +1422,7 @@ def test_recorded_children_swept_is_a_noop_without_identity_files(tmp_path):
     [
         "test_e2e_session_timeout_teardown",
         "test_e2e_detached_writer_reaped_before_worktree_teardown",
+        "test_e2e_detached_writer_publication_fault_still_reaped",
     ],
 )
 def test_reap_e2e_preflight_failure_prevents_run(tmp_path, monkeypatch, surface_name):
@@ -1430,6 +1472,46 @@ def test_reap_e2e_sweeps_a_recorded_child_when_the_run_fails(tmp_path, monkeypat
             patch.setattr(sys.modules[__name__], "_run", failing_run)
             with pytest.raises(RuntimeError, match="run refused"):
                 globals()[surface_name](tmp_path, monkeypatch, False)
+        assert proc.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        _reap(proc)
+
+
+def test_recorded_children_swept_sweeps_only_the_named_channel(tmp_path):
+    observed, observed_start = _live_child()
+    recorded, recorded_start = _live_child()
+    try:
+        _plant_recorded_identity(
+            tmp_path, f"{observed.pid} {observed_start}\n", filename="observed-child.id"
+        )
+        _plant_recorded_identity(tmp_path, f"{recorded.pid} {recorded_start}\n")
+        with pytest.raises(RuntimeError, match="pre-bind boom"):
+            with recorded_children_swept(tmp_path, glob=OBSERVED_CHILD_GLOB):
+                raise RuntimeError("pre-bind boom")
+        assert observed.wait(timeout=10) == -signal.SIGKILL
+        assert recorded.poll() is None, "the unnamed channel must remain unswept"
+    finally:
+        _reap(observed)
+        _reap(recorded)
+
+
+def test_reap_e2e_sweeps_an_observed_child_when_the_run_fails(tmp_path, monkeypatch):
+    proc, starttime = _live_child()
+    try:
+        _plant_recorded_identity(
+            tmp_path / "sbx", f"{proc.pid} {starttime}\n", filename="observed-child.id"
+        )
+
+        def failing_run(*_args, **_kwargs):
+            raise RuntimeError("run refused")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(sys.modules[__name__], "_scaffold_sprint", lambda *_a, **_kw: None)
+            patch.setattr(sys.modules[__name__], "_run", failing_run)
+            with pytest.raises(RuntimeError, match="run refused"):
+                test_e2e_detached_writer_publication_fault_still_reaped(
+                    tmp_path, monkeypatch, False
+                )
         assert proc.wait(timeout=10) == -signal.SIGKILL
     finally:
         _reap(proc)
@@ -1701,6 +1783,157 @@ def test_e2e_detached_writer_reaped_before_worktree_teardown(
                 poll_failure = exc
                 if not force_live_reap_assertion:
                     raise
+    finally:
+        try:
+            try:
+                kill_recorded_child(poll_fd)
+                if injected_child is not None:
+                    injected_exit = injected_child.wait(timeout=10)
+            finally:
+                kill_recorded_child(recorded_fd)
+        finally:
+            if injected_child is not None and injected_child.poll() is None:
+                _reap(injected_child)
+
+    if force_live_reap_assertion:
+        assert str(poll_failure).splitlines()[0] == (f"detached child {poll_pid} survived teardown")
+        assert injected_exit == -signal.SIGKILL
+
+
+@pytest.mark.parametrize(
+    "force_live_reap_assertion", [False, True], ids=["reaped", "live-assertion"]
+)
+def test_e2e_detached_writer_publication_fault_still_reaped(
+    tmp_path, monkeypatch, force_live_reap_assertion
+):
+    """DW-149: failed identity publication still permits exact-child reap attribution.
+
+    The test owns a separate observer record, so it can grade child death and the
+    straggler-reap breadcrumb despite the normal recorder's demonstrated failure.
+    """
+    root = tmp_path / "sbx"
+    story = "1-1-pubfault"
+    _scaffold_sprint(
+        root,
+        story,
+        fake_cli=PUBLICATION_FAULT_FAKE_CLI,
+        extra_policy=(
+            '\n[scm]\nisolation = "worktree"\n\n'
+            "[limits]\nmax_dev_attempts = 1\nteardown_grace_s = 10\n"
+        ),
+    )
+    preflight_pidfd_support()
+    # Initialized BEFORE the try so the finally below stays correct no matter how
+    # early the setup region raises.
+    recorded_fd: int | None = None
+    poll_fd: int | None = None
+    injected_child: subprocess.Popen | None = None
+    poll_failure: AssertionError | None = None
+    injected_exit: int | None = None
+    try:
+        # Sweep the channel this fake actually publishes before any fd owns it.
+        with recorded_children_swept(root, glob=OBSERVED_CHILD_GLOB):
+            proc = _run(root, "run", timeout=120)
+            assert proc.returncode == 0, proc.stderr or proc.stdout
+
+            run_id = _run_id(root)
+            run_dir = root / ".bmad-loop" / "runs" / run_id
+            pid_files = list(root.glob(OBSERVED_CHILD_GLOB))
+            assert len(pid_files) == 1, f"expected exactly one observation record: {pid_files}"
+            tdir = pid_files[0].parent
+            assert tdir.parent == run_dir / "tasks"
+            assert (tdir / "fake-child.pid.tmp").is_dir(), "publication poison is missing"
+            assert not set(
+                root.glob(RECORDED_CHILD_GLOB)
+            ), "normal publication unexpectedly succeeded"
+            assert not list(run_dir.rglob("fake-child.pid"))
+
+            # Persisted evidence of the actual invocation: an unexecuted recorder
+            # with a poison directory and an absent record must not satisfy the row.
+            recorder_status = int((tdir / "recorder.status").read_text(encoding="utf-8"))
+            recorder_stderr = (tdir / "recorder.stderr").read_text(encoding="utf-8")
+            assert recorder_status != 0, "publication recorder did not fail"
+            assert (
+                f"{tdir / 'fake-child.pid.tmp'}: Is a directory" in recorder_stderr
+            ), f"publication recorder did not hit the poisoned directory: {recorder_stderr!r}"
+            recorded_pid, recorded_start = recorded_child(pid_files[0])
+            recorded_fd = bind_recorded_child(recorded_pid, recorded_start)
+            if recorded_fd is None:
+                assert proc_starttime(recorded_pid) != recorded_start, (
+                    f"bind returned None while pid {recorded_pid} still carries the recorded "
+                    f"start time {recorded_start}: the reap poll would be skipped blind"
+                )
+
+        poll_pid = recorded_pid
+        if force_live_reap_assertion:
+            # Verify or safely clean the real straggler before the injected child takes
+            # over the protected poll; keep the two identities distinct throughout.
+            real_fd, recorded_fd = recorded_fd, None
+            kill_recorded_child(real_fd)
+            injected_child, injected_start = _live_child()
+            poll_pid = injected_child.pid
+            poll_fd = bind_recorded_child(poll_pid, injected_start)
+            assert poll_fd is not None, "the forced-live child must bind before the reap poll"
+        else:
+            poll_fd, recorded_fd = recorded_fd, None
+
+        # (1) clean end: the story landed done and merged, not a timeout/stall
+        assert _sprint_status(root, story) == "done"
+        journal = [
+            json.loads(ln)
+            for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        kinds = [j["kind"] for j in journal]
+        assert "unit-merged" in kinds, kinds
+        # (2) the #139 failure signature is ABSENT — the worktree teardown was clean
+        assert "worktree-teardown-degraded" not in kinds, kinds
+
+        # (3) no unit worktree survives (git sees only the main checkout)
+        wt = subprocess.run(
+            ["git", "-C", str(root), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+        )
+        mounts = [ln for ln in wt.stdout.splitlines() if ln.startswith("worktree ")]
+        assert len(mounts) == 1, wt.stdout  # only the primary checkout remains
+
+        # (4) poll the start-time-authenticated pidfd. Signal 0 preserves the old
+        # alive-or-zombie semantics, while the bound identity cannot follow pid reuse.
+        # A zombie can linger until init runs and a starved scheduler can stretch that
+        # wait, so the shared hang ceiling remains deliberately distinct from the 10s
+        # teardown_grace_s; a reap that never happens still fails at the ceiling.
+        with monkeypatch.context() as clock_patch:
+            if force_live_reap_assertion:
+                moments = iter([0.0, REAL_MUX_HANG_CEILING_S])
+                clock_patch.setattr(time, "monotonic", lambda: next(moments))
+            try:
+                deadline = time.monotonic() + REAL_MUX_HANG_CEILING_S
+                while poll_fd is not None:
+                    try:
+                        signal.pidfd_send_signal(poll_fd, 0)
+                    except ProcessLookupError:
+                        break  # reaped by the descendant sweep
+                    assert (
+                        time.monotonic() < deadline
+                    ), f"detached child {poll_pid} survived teardown"
+                    time.sleep(0.1)
+            except AssertionError as exc:
+                poll_failure = exc
+                if not force_live_reap_assertion:
+                    raise
+
+        # (5) Require attribution to this exact child. kill-escalated identifies
+        # pane roots and cannot prove the observed descendant was reaped.
+        lifecycle = [
+            json.loads(line)
+            for line in (tdir / "session-lifecycle.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert any(
+            event.get("event") == "straggler-reap" and recorded_pid in event.get("pids", [])
+            for event in lifecycle
+        ), f"no straggler-reap names observed child {recorded_pid}: {lifecycle}"
     finally:
         try:
             try:

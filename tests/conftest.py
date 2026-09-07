@@ -110,8 +110,8 @@ real_mux_e2e = pytest.mark.xdist_group(REAL_MUX_XDIST_GROUP)
 # Ceiling: `--dist loadgroup` now serializes every one of these onto ONE worker, so a
 # SYSTEMIC regression pays the wait once per test rather than in parallel, and the
 # Linux test job is capped at `timeout-minutes: 15` — 900s (.github/workflows/ci.yml).
-# Eight collected uses (five hook-completion cases, one crash case, and the two stories
-# reap polls) can consume up to 720s for these waits alone. The stories subprocess
+# Nine collected uses (five hook-completion cases, one crash case, and the three stories
+# reap polls) can consume up to 810s for these waits alone. The stories subprocess
 # budgets (`_run(..., timeout=90/120)`) and other overhead sit OUTSIDE this constant and
 # are additional, so this ceiling does not guarantee the whole job fits within its cap.
 REAL_MUX_HANG_CEILING_S = 90.0
@@ -222,7 +222,7 @@ RECORDED_CHILD_GLOB = ".bmad-loop/runs/*/tasks/*/fake-child.pid"
 
 
 @contextlib.contextmanager
-def recorded_children_swept(root: Path) -> Iterator[None]:
+def recorded_children_swept(root: Path, *, glob: str = RECORDED_CHILD_GLOB) -> Iterator[None]:
     """Reap recorded children a block abandoned before it could bind their pidfds.
 
     The window this closes is exactly the one in which NO fd exists yet: a test
@@ -232,6 +232,10 @@ def recorded_children_swept(root: Path) -> Iterator[None]:
     Cleanup there must rediscover identities from disk and authenticate them again,
     exactly as the happy path would have. Missing or malformed identities remain
     unsignalled by design because they cannot safely identify a process.
+
+    ``glob`` names the channel the caller published on, relative to ``root``.
+    It defaults to ``RECORDED_CHILD_GLOB``; callers publishing elsewhere must name
+    that channel so the pre-bind cleanup can find their identities.
 
     Fires on exception ONLY. On a clean exit the block has already bound the fds and
     its own ``finally`` owns them; sweeping there would re-bind the same identity and
@@ -248,7 +252,7 @@ def recorded_children_swept(root: Path) -> Iterator[None]:
     except BaseException:
         pid_files: list[Path] = []
         try:
-            pid_files.extend(root.glob(RECORDED_CHILD_GLOB))
+            pid_files.extend(root.glob(glob))
         except Exception as exc:
             _warn_unswept_child(root, exc)
         for pid_file in sorted(pid_files):

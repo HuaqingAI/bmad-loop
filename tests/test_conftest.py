@@ -816,13 +816,14 @@ def test_session_wall_detector_leaves_scripted_clock_waits_alone():
     assert offenders == []
 
 
-# DW-108: the stories E2E polls two reap deadlines off `time.monotonic()`. They were
+# DW-108: the stories E2E polls three reap deadlines off `time.monotonic()`. They were
 # bare 10-second budgets — the same load-sensitivity class DW-95 removed from the
 # generic-tmux SessionSpec walls — and this file was the one real-tmux module the
 # wall guard above deliberately excluded, so nothing stopped a reintroduction.
 _EXPECTED_REAP_DEADLINE_SITES = {
     "test_e2e_session_timeout_teardown": 1,
     "test_e2e_detached_writer_reaped_before_worktree_teardown": 1,
+    "test_e2e_detached_writer_publication_fault_still_reaped": 1,
 }
 
 
