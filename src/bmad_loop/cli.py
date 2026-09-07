@@ -1596,6 +1596,10 @@ def _validate_deferred_ledger(
     here, and swapping the two lines changes no severity and no exit code.
     """
     ledger = paths.deferred_work
+    # OBSERVATION arm of the ledger-read contract (DW-146), kept inline rather than
+    # routed through `read_for_observation`: `validate` writes nothing, but it has
+    # to REPORT the fault as a graded problem rather than degrade quietly to an
+    # empty ledger — see the reasoning below. Same classification, richer response.
     try:
         text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
     except (OSError, UnicodeDecodeError) as e:
@@ -2597,7 +2601,14 @@ def _sweep_dry_run(
                 return ExitCode.FAILURE
         print(f"no deferred-work ledger at {ledger}")
         return 0
-    text = ledger.read_text(encoding="utf-8")
+    # OBSERVATION arm of the ledger-read contract (DW-146): this listing writes
+    # nothing, but it is an OPERATOR SURFACE, so degrading to an empty document
+    # would report "0 open" for a ledger nobody could read — a fabricated listing
+    # is worse than no listing. Say which file and which fault, and fail.
+    text, fault = deferredwork.read_for_observation(ledger)
+    if fault is not None:
+        print(f"error: {ledger} cannot be read ({fault})", file=sys.stderr)
+        return ExitCode.FAILURE
     entries = deferredwork.parse_ledger(text)
     open_entries = [e for e in entries if e.open]
     legacy = deferredwork.parse_legacy(text)
@@ -4007,10 +4018,36 @@ def cmd_decisions(args: argparse.Namespace) -> int:
 
     project = _project(args)
     try:
+        paths = bmadconfig.load_paths(project)
         pending = decisions.pending_missed_decisions(project)
     except bmadconfig.BmadConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    # The OBSERVATION arm's evidence, surfaced HERE because it cannot be surfaced
+    # where the degrade happens (DW-146). `pending_missed_decisions` reads the
+    # ledger through `read_for_observation` and discards the fault, because no
+    # journal is reachable from a module-level function handed only a project path
+    # — so an unreadable ledger yields no open ids and this command would print
+    # "no unanswered decisions from past sweeps" and exit 0. That is indisputably
+    # the WRONG silence: the answer is not "nothing is pending", it is "nothing
+    # could be read". The contract says an observation site degrades with an
+    # attributed fault, and for this one the operator's own terminal is the only
+    # place the attribution can land. Same probe the helper runs, so the two
+    # cannot disagree about whether the file is readable.
+    #
+    # stderr, never stdout: `--json` promises exactly one document on stdout, and
+    # a note there would corrupt the contract for every machine consumer. Exit
+    # stays 0 for the same reason `_sweep_dry_run` does NOT — nothing here is
+    # fabricated, the empty listing is honest once the note explains it, and an
+    # operator answering an unrelated decision must not be blocked by a ledger
+    # this command was not asked to repair.
+    _, ledger_fault = deferredwork.read_for_observation(paths.deferred_work)
+    if ledger_fault is not None:
+        print(
+            f"note: {paths.deferred_work} cannot be read ({ledger_fault}) — "
+            "no pending decisions could be resolved from it",
+            file=sys.stderr,
+        )
     if args.json:
         # Before the empty-set early return (nothing pending is a valid empty
         # document, not the text line), and regardless of --list: --json *is*

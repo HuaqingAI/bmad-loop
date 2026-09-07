@@ -201,6 +201,26 @@ def test_sweep_dry_run_warns_when_preflight_would_abort(project, capsys):
     assert "NOT runnable" in capsys.readouterr().err
 
 
+def test_sweep_dry_run_refuses_an_undecodable_ledger(project, capsys):
+    """DW-146 at an operator surface. The listing read was unguarded, so
+    undecodable bytes aborted `sweep --dry-run` with `main`'s anonymous backstop.
+    It is the OBSERVATION arm — nothing is written — but degrading to an empty
+    document would print "0 open, 0 closed" for a ledger nobody could read, which
+    an operator would act on. Name the file, name the fault, and fail instead.
+    Ablation: revert the read to a bare `ledger.read_text(encoding="utf-8")` and
+    this reddens with `UnicodeDecodeError` rather than the attributed error."""
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+
+    assert cli._sweep_dry_run(project, pol) == cli.ExitCode.FAILURE
+    out, err = capsys.readouterr()
+    assert str(project.deferred_work) in err
+    assert "UnicodeDecodeError" in err
+    assert "open," not in out  # never a fabricated listing
+
+
 def test_dry_run_is_silent_when_preflight_would_pass(project, capsys):
     """The banner must be evidence, not decoration: a complete install prints
     nothing to stderr. Without this the warning could be unconditional and every
@@ -727,6 +747,37 @@ def test_decisions_json_survives_an_undecodable_triage_cache(project, capsys):
 
     doc = _decisions_json(project, capsys, "--list")
     assert [d["id"] for d in doc["decisions"]] == ["DW-1"]
+
+
+def test_decisions_json_survives_an_undecodable_ledger(project, capsys):
+    """DW-146's observation row at the surface a caller actually sees, mirroring
+    DW-145's. `cmd_decisions` catches `BmadConfigError` alone, so the unguarded
+    ledger read in `pending_missed_decisions` reached `main`'s broad backstop:
+    exit 1 and NO document at all. The command now still emits exactly one JSON
+    document and exits 0, listing nothing pending — an unreadable ledger has no
+    open ids to reconcile a triage against.
+
+    ...but degrading SILENTLY would be its own bug: an empty listing is
+    indistinguishable from "nothing is pending", when the truth is "nothing could
+    be read". `pending_missed_decisions` cannot say so (no journal is reachable
+    from it), so `cmd_decisions` re-probes and puts the attributed note on STDERR
+    — which is also the assertion that it stays off stdout, since `machine_json`
+    parses the whole of stdout as one document.
+    Ablation: revert that read to
+    `ledger.read_text(encoding="utf-8") if ledger.is_file() else ""` and this
+    reddens — exit 1, empty stdout; drop the `cmd_decisions` probe and it reddens
+    on the missing note instead."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+
+    doc = _decisions_json(
+        project, capsys, "--list", err_contains=f"note: {project.deferred_work} cannot be read"
+    )
+    assert doc["decisions"] == []
 
 
 def test_decisions_answer_records_and_carries_forward(project, capsys, monkeypatch):

@@ -1095,6 +1095,20 @@ def test_deferred_entries_unavailable(tmp_path, project):
     assert data.deferred_entries(project.project) is None
 
 
+def test_deferred_entries_undecodable_ledger_is_unavailable(project):
+    """The pane already had an "unavailable" degrade (`items = None`), but reached it
+    only for `OSError` — and `UnicodeDecodeError` is a `ValueError` (DW-146), so
+    undecodable bytes escaped the whole refresh instead of rendering the pane
+    unavailable. Same answer as a missing ledger: the dashboard cannot show entries
+    it could not read.
+    Ablation: revert the except tuple to `OSError` alone and this reddens with
+    `UnicodeDecodeError` escaping rather than `None`."""
+    install_bmad_config(project)
+    project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+
+    assert data.deferred_entries(project.project) is None
+
+
 def test_severity_extraction():
     cases = {
         "severity: high\n": "high",

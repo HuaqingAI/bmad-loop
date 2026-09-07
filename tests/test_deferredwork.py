@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
+from conftest import fault_read_text
 
 from bmad_loop import deferredwork, fences, platform_util, runs
 from bmad_loop.deferredwork import (
@@ -4609,3 +4610,120 @@ def test_two_processes_append_concurrently_produce_distinct_ids(tmp_path):
     reported = [line for d in dones for line in d.read_text(encoding="utf-8").splitlines()]
     assert "None" not in reported  # no append was silently deduped away
     assert sorted(reported) == sorted(e.id for e in entries)
+
+
+# ------------------------------------------- ledger-read contract (DW-146)
+
+
+def test_read_for_write_returns_none_for_an_absent_ledger(tmp_path):
+    """Absence is the REPAIR/WRITE arm's `None`, never a fault: the sites that
+    treat a missing ledger like an empty one spell that `or ""` themselves."""
+    assert deferredwork.read_for_write(tmp_path / "nope" / "deferred-work.md") is None
+
+
+def test_read_for_write_returns_the_text_verbatim(tmp_path):
+    path = write_ledger(tmp_path)
+    assert deferredwork.read_for_write(path) == LEDGER
+
+
+def test_read_for_write_retypes_undecodable_bytes(tmp_path):
+    """The whole point of the REPAIR/WRITE arm (DW-146). `UnicodeDecodeError` is a
+    `ValueError`, so it slipped past every `except OSError` in the repo and reached
+    callers as an unattributable codec error from somewhere. It is now
+    `LedgerReadError`, naming the ledger, with the codec error chained as
+    `__cause__` so the byte offset is still recoverable.
+    Ablation: revert the body to a bare `path.read_text(encoding="utf-8")` and this
+    reddens with `UnicodeDecodeError` where `LedgerReadError` was expected."""
+    path = tmp_path / "deferred-work.md"
+    path.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+
+    with pytest.raises(deferredwork.LedgerReadError) as excinfo:
+        deferredwork.read_for_write(path)
+
+    assert str(path) in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, UnicodeDecodeError)
+
+
+def test_ledger_read_error_is_not_caught_by_an_existing_handler():
+    """`LedgerReadError` is a plain `Exception` deliberately: an `OSError` or
+    `ValueError` subclass would be swallowed by the very `except` arms this fault
+    escaped — `verify.verify_review_bundle` and `tui.data.deferred_entries`, which
+    caught `OSError` alone until DW-146 widened them, and
+    `Engine._refuse_gated_story` and `cli._validate_deferred_ledger`, which already
+    caught the pair. That silence is exactly what DW-146 exists to end.
+    Ablation: derive it from `OSError` (or `ValueError`) and this reddens."""
+    assert not issubclass(deferredwork.LedgerReadError, OSError)
+    assert not issubclass(deferredwork.LedgerReadError, ValueError)
+
+
+def test_read_for_write_propagates_oserror_unchanged(tmp_path, monkeypatch):
+    """Only the undecodable-bytes case changes shape. An `OSError` out of the read
+    itself — EACCES on a regular file, an I/O fault, a file replaced by a directory
+    between the `is_file` check and the read — reaches the caller as the same
+    `OSError` it always did, so no `except OSError` already in the repo changes
+    behavior. (A directory standing AT the ledger path is the absence arm instead:
+    `is_file()` is False for it, exactly as it was at every converted site.)
+    Ablation: widen the except clause to `(UnicodeDecodeError, OSError)` and this
+    reddens with `LedgerReadError`."""
+    path = write_ledger(tmp_path)
+    fault_read_text(monkeypatch, path)
+
+    with pytest.raises(PermissionError):
+        deferredwork.read_for_write(path)
+
+
+def test_read_for_observation_reports_absence_as_no_fault(tmp_path):
+    assert deferredwork.read_for_observation(tmp_path / "gone.md") == ("", None)
+
+
+def test_read_for_observation_returns_the_text_verbatim(tmp_path):
+    path = write_ledger(tmp_path)
+    assert deferredwork.read_for_observation(path) == (LEDGER, None)
+
+
+def test_read_for_observation_degrades_on_undecodable_bytes(tmp_path):
+    """The OBSERVATION arm never raises — it hands back an empty text plus an
+    ATTRIBUTED fault, so a caller holding a journal records which fault it degraded
+    on rather than reporting an empty ledger.
+    Ablation: drop `UnicodeDecodeError` from the except tuple and this reddens with
+    that exception escaping instead of a `("", fault)` pair."""
+    path = tmp_path / "deferred-work.md"
+    path.write_bytes(b"\xff")
+
+    text, fault = deferredwork.read_for_observation(path)
+
+    assert text == ""
+    assert fault is not None and fault.startswith("UnicodeDecodeError: ")
+
+
+def test_read_for_observation_degrades_on_oserror(tmp_path, monkeypatch):
+    """The other half of the OBSERVATION arm's tuple, and the reason it is a tuple
+    rather than a bare `str`: an unreadable LOCATION degrades the same way as
+    unreadable bytes, attributed by class so the two are distinguishable downstream.
+    Ablation: drop `OSError` from the except tuple and this reddens."""
+    path = write_ledger(tmp_path)
+    fault_read_text(monkeypatch, path)
+
+    text, fault = deferredwork.read_for_observation(path)
+
+    assert text == ""
+    assert fault is not None and fault.startswith("PermissionError: ")
+
+
+def test_mark_done_many_raises_on_an_undecodable_ledger_and_writes_nothing(tmp_path):
+    """The REPAIR/WRITE row of the DW-146 matrix at a real mutator. The pre-lock
+    advisory probe swallows the codec error by design (it decides nothing), so the
+    LOCKED read is what must escalate — and it must escalate rather than publish,
+    because a mutator that read no text would otherwise write a ledger built from
+    `""`, silently erasing every entry it could not decode.
+    Ablation: revert `_mark_done_many`'s locked read to
+    `path.read_text(encoding="utf-8")` and this reddens with `UnicodeDecodeError`
+    where `LedgerReadError` was expected."""
+    path = tmp_path / "deferred-work.md"
+    raw = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
+    path.write_bytes(raw)
+
+    with pytest.raises(deferredwork.LedgerReadError):
+        mark_done_many(path, ["DW-1"], "2026-06-11", "fixed")
+
+    assert path.read_bytes() == raw

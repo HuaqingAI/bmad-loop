@@ -7214,6 +7214,41 @@ def test_budget_exhausted_finalized_work_commits(project):
     )
 
 
+def test_review_budget_journal_survives_an_undecodable_ledger(project):
+    """DW-146's OBSERVATION row inside the engine. `_journal_review_budget_spent`
+    reads the ledger for ONE purpose — the `re_review_capped` flag on the row it is
+    about to write — and writes nothing to the ledger itself. Raising a
+    `UnicodeDecodeError` out of a journaling helper is the wrong failure: the story
+    is already committed and verify-green by the time this runs, so the fault would
+    abort a run over a flag. It degrades to the flag's own default (`False`: no
+    evidence this story came from a follow-up entry) and journals the attributed
+    fault, so the missing evidence is visible rather than indistinguishable from a
+    genuine `False`.
+    Ablation: revert the read to
+    `deferredwork.parse_ledger(ledger.read_text(encoding="utf-8"))` under an
+    `is_file()` guard and this reddens with `UnicodeDecodeError` escaping."""
+    engine, _ = make_engine(
+        project, [], policy=Policy(gates=GatesPolicy(mode="none"), notify=QUIET)
+    )
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.dw_ids = ["DW-1"]
+    ledger = engine.workspace.paths.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n")
+
+    engine._journal_review_budget_spent(task)
+
+    entries = engine.journal.entries()
+    faults = [e for e in entries if e["kind"] == "review-budget-ledger-unreadable"]
+    assert len(faults) == 1
+    assert faults[0]["ledger"] == str(ledger) and faults[0]["dw_ids"] == ["DW-1"]
+    assert faults[0]["error"].startswith("UnicodeDecodeError: ")
+    committed = [e for e in entries if e["kind"] == "review-budget-committed"]
+    assert len(committed) == 1 and committed[0]["re_review_capped"] is False
+    # nothing was written to the ledger by a journaling helper
+    assert ledger.read_bytes().endswith(b"status: open\n")
+
+
 def test_budget_exhausted_unfinalized_defers(project):
     """Genuine non-convergence: the review never finalizes the spec (status stays
     in-progress, so the post-budget verify gate fails). Budget exhaustion defers

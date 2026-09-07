@@ -86,6 +86,48 @@ TMUX_BACKENDS = {"adapters/tmux_base.py", "adapters/tmux_backend.py"}
 # TUI checkpoint modal, and a probe ignoring `limits.git_timeout_s`.
 GIT_CHOKEPOINT = {"verify.py"}
 
+# The deferred-work ledger-read contract (DW-146), as a chokepoint. Every read of
+# the ledger in `src/bmad_loop` must name its arm — `deferredwork.read_for_write`
+# (repair/write) or `deferredwork.read_for_observation` (observation) — so the
+# classification lives in the CALL rather than in a comment a future reader may not
+# write. Comments were the only thing holding the contract when it landed, which is
+# how the pre-DW-146 tree ended up with a dozen sites each guarded, unguarded or
+# broadly swallowed on its own reasoning.
+#
+# The exemptions below are the sites that implement an arm inline because they
+# carry behavior the helper cannot, keyed by `(rel, enclosing function)` rather
+# than by line so the allowlist survives edits above them:
+#
+#   * `cli._validate_deferred_ledger` — grades the fault as a validation problem
+#     (a warning would exit 0 having evaluated no hard gate at all).
+#   * `verify.verify_review_bundle` — turns it into a retryable VerifyOutcome.
+#   * `Engine._refuse_gated_story` — journals, notifies, and REFUSES the story.
+#   * `Engine._close_declared_deferred` — must split absence from a dangling
+#     symlink, which the helper deliberately collapses. (Named for the function that
+#     OWNS the read: the DW-146 audit filed this site under its caller,
+#     `_finalize_commit_phase`, and this guard is what caught the mislabel.)
+#   * `tui.data.deferred_entries` — degrades the pane to "unavailable".
+#
+# Being on this list buys the FUNCTION its inline read and nothing else: a bare
+# read anywhere else in those same files is still an offender.
+LEDGER_READ_INLINE = {
+    ("cli.py", "_validate_deferred_ledger"),
+    ("verify.py", "verify_review_bundle"),
+    ("engine.py", "_refuse_gated_story"),
+    ("engine.py", "_close_declared_deferred"),
+    ("tui/data.py", "deferred_entries"),
+}
+# Receivers whose `.read_text(...)` is a deferred-work ledger read. `path` and
+# `archive_path` are ledger spellings only inside `deferredwork.py`, which is the
+# module that owns the file and names its own parameter `path`; elsewhere `path` is
+# far too generic to flag, and the ledger travels under the names below.
+LEDGER_RECEIVER_NAMES = {"ledger", "ledger_path", "deferred_work"}
+LEDGER_OWNER_RECEIVER_NAMES = {"path", "archive_path"}
+LEDGER_OWNER = "deferredwork.py"
+# The two arms' own bodies: the one place a bare `read_text` of the ledger is the
+# point rather than a bypass.
+LEDGER_READER_BODIES = {"read_for_write", "read_for_observation"}
+
 # The one file allowed to CALL ``verify_commands_outcome`` — and within it, only
 # from inside ``_verify_review_commands``, the helper that resolves the review
 # gates' command cwd to ``paths.repo_root``. Three gates used to call the
@@ -845,6 +887,7 @@ JOURNAL_KINDS = frozenset(
         "resume-unit-merge",
         "resume-verify",
         "review-budget-committed",
+        "review-budget-ledger-unreadable",
         "review-followup-damped",
         "review-not-recommended",
         "review-result",
@@ -2028,6 +2071,24 @@ def _scan_source(src: str, rel: str):
     }
     git_heads, git_commands = _git_name_bindings(tree)
 
+    # Calls inside the value of a `probe = ...` assignment — `deferredwork.py`'s
+    # ADVISORY pre-lock probes (#736), which are neither arm of the DW-146 contract
+    # and keep their bare read on purpose: they decide nothing, and the locked read
+    # below each one is the repair/write site that does. Matched on the ASSIGNED
+    # NAME rather than on the enclosing function, deliberately — allowlisting
+    # `_mark_done_many` wholesale would re-sanction the very locked read the
+    # contract exists to route, since the two live in the same function. The walk
+    # of `assign.value` covers the `probe = ... if path.is_file() else ""` spelling,
+    # where the call is nested inside an IfExp rather than being the value itself.
+    advisory_probe_calls = {
+        id(call)
+        for assign in ast.walk(tree)
+        if isinstance(assign, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "probe" for t in assign.targets)
+        for call in ast.walk(assign.value)
+        if isinstance(call, ast.Call)
+    }
+
     # `verify_commands_outcome(...)` calls that sit inside a
     # `_verify_review_commands` definition — the review gates' single sanctioned
     # composition point. Collected up front, exactly like `run_git_argvs` above,
@@ -2333,6 +2394,35 @@ def _scan_source(src: str, rel: str):
                                 (field, fn_name, kind),
                             )
                         )
+
+        # Deferred-work ledger reads (DW-146). A `<recv>.read_text(...)` whose
+        # receiver names the ledger — `ledger`/`ledger_path`/`deferred_work` anywhere,
+        # plus `path`/`archive_path` inside the owning module — carries a
+        # `sanctioned` bit so the guard can separate "names its arm" from "bare".
+        # An attribute receiver (`paths.deferred_work`, `self.workspace.paths.deferred_work`)
+        # is matched on the trailing attribute, which is how every call site in the
+        # tree spells it.
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "read_text"
+        ):
+            recv = node.func.value
+            names = LEDGER_RECEIVER_NAMES | (
+                LEDGER_OWNER_RECEIVER_NAMES if rel == LEDGER_OWNER else set()
+            )
+            is_ledger = (isinstance(recv, ast.Name) and recv.id in names) or (
+                isinstance(recv, ast.Attribute) and recv.attr == "deferred_work"
+            )
+            if is_ledger:
+                fn_name = enclosing_names.get(id(node))
+                sanctioned = (
+                    rel == LEDGER_OWNER
+                    and (id(node) in advisory_probe_calls or fn_name in LEDGER_READER_BODIES)
+                ) or (rel, fn_name) in LEDGER_READ_INLINE
+                findings.append(
+                    ("ledgerread", rel, node.lineno, line_at(node.lineno), fn_name, sanctioned)
+                )
 
         # signal.SIGKILL attribute access (the guarded form is a "SIGKILL"
         # *string* passed to getattr — not an attribute access — so it's clean)
@@ -2719,6 +2809,126 @@ def test_no_git_invocation_outside_verify():
         "verify.git_bytes or a sibling helper instead:\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
     )
+
+
+def _ledger_read_offenders(findings) -> list[tuple[str, int, str, str]]:
+    """The DW-146 contract as a filter: a deferred-work ledger read is sanctioned
+    only when it NAMES its arm (in which case the detector never fires — a
+    `read_for_write(...)` call has no `.read_text` attribute to match) or when its
+    `(file, function)` is one of the classified inline sites."""
+    return [(rel, ln, txt, fn) for _, rel, ln, txt, fn, sanctioned in findings if not sanctioned]
+
+
+def test_no_bare_deferred_work_ledger_read():
+    """Every deferred-work ledger read in `src/bmad_loop` names its arm
+    (`deferredwork.read_for_write` / `read_for_observation`) or sits on
+    `LEDGER_READ_INLINE`, the explicit list of sites that implement an arm inline
+    because they carry behavior the helper cannot.
+
+    This is what makes DW-146 "settled repo-wide" rather than "settled today".
+    The contract's whole failure mode is silent drift: a new read is a single
+    `read_text` line that looks locally reasonable, works on every valid ledger, and
+    is wrong only for the one input nobody tests with — which is exactly how the
+    pre-DW-146 tree accumulated a dozen sites each guarded, unguarded or broadly
+    swallowed on its own reasoning. Comments cannot hold that line; this can, the
+    same way `_run_git` holds the git chokepoint.
+
+    Ablation: revert any converted site to a bare `read_text` — e.g.
+    `deferredwork._mark_done_many`'s locked read, or `sweep._write_intent`'s — and
+    this reddens naming that file, line and function (verified for both). Adding
+    the reverted site's function to `LEDGER_READ_INLINE` greens it again, which is
+    the intended escape hatch and why the list is annotated per entry."""
+    offenders = _ledger_read_offenders(_of("ledgerread"))
+    assert not offenders, (
+        "deferred-work ledger read outside the DW-146 contract — route it through "
+        "deferredwork.read_for_write (repair/write: the text decides published "
+        "bytes) or deferredwork.read_for_observation (observation: nothing is "
+        "written from it), or add it to LEDGER_READ_INLINE with the reason it "
+        "must implement its arm inline:\n"
+        + "\n".join(f"  {rel}:{ln} (in {fn}): {txt.strip()}" for rel, ln, txt, fn in offenders)
+    )
+
+
+def test_ledger_read_allowlist_has_no_stale_rows():
+    """`LEDGER_READ_INLINE` is graded in both directions, like every other
+    inventory here. A row whose function was renamed, deleted, or converted to a
+    named arm stops describing anything — and a stale exemption is worse than a
+    missing one, because it silently pre-authorizes a bare read the next time that
+    name comes back.
+
+    Ablation: convert `tui.data.deferred_entries` to `read_for_observation` without
+    dropping its row, and this reddens naming the row."""
+    seen = {(rel, fn) for _, rel, _, _, fn, _ in _of("ledgerread")}
+    stale = LEDGER_READ_INLINE - seen
+    assert (
+        not stale
+    ), "LEDGER_READ_INLINE rows that no longer name a ledger read — drop them:\n" + "\n".join(
+        f"  {rel}: {fn}" for rel, fn in sorted(stale)
+    )
+
+
+# The ledger-read detector's scoping, as rows: `(label, rel, source, is_offender)`.
+# The real tree is all-green by construction once the contract holds, so only
+# synthetic sources can show that the detector still detects — the same reason the
+# git rows below exist.
+LEDGER_READ_SCOPE_CASES = [
+    # The shape the contract exists to refuse, in the two receiver spellings the
+    # tree actually uses.
+    ("bare-local", "sweep.py", 'text = ledger.read_text(encoding="utf-8")\n', True),
+    (
+        "bare-attribute",
+        "engine.py",
+        'text = self.workspace.paths.deferred_work.read_text(encoding="utf-8")\n',
+        True,
+    ),
+    # A named arm is invisible to the detector: there is no `.read_text` to match.
+    ("named-arm", "sweep.py", 'text = deferredwork.read_for_write(ledger) or ""\n', False),
+    # `path` is a ledger spelling ONLY in the owning module...
+    ("owner-bare-path", "deferredwork.py", 'text = path.read_text(encoding="utf-8")\n', True),
+    # ...and stays generic everywhere else, or the guard would flag every spec,
+    # manifest and config read in the tree.
+    ("foreign-path", "engine.py", 'text = path.read_text(encoding="utf-8")\n', False),
+    # The advisory probes keep their bare read, matched on the ASSIGNED NAME so the
+    # exemption cannot spread to the locked read in the same function.
+    ("owner-probe", "deferredwork.py", 'probe = path.read_text(encoding="utf-8")\n', False),
+    (
+        "owner-probe-ifexp",
+        "deferredwork.py",
+        'probe = path.read_text(encoding="utf-8") if path.is_file() else ""\n',
+        False,
+    ),
+    # An allowlisted FUNCTION keeps its inline read...
+    (
+        "allowlisted-fn",
+        "tui/data.py",
+        'def deferred_entries(p):\n    return ledger.read_text(encoding="utf-8")\n',
+        False,
+    ),
+    # ...and being in an allowlisted FILE buys a different function nothing.
+    (
+        "allowlisted-file-other-fn",
+        "tui/data.py",
+        'def something_else(p):\n    return ledger.read_text(encoding="utf-8")\n',
+        True,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "rel", "source", "is_offender"),
+    LEDGER_READ_SCOPE_CASES,
+    ids=[c[0] for c in LEDGER_READ_SCOPE_CASES],
+)
+def test_ledger_read_detector_scoping(label, rel, source, is_offender):
+    """Drive known-good and known-bad sources through the REAL scan path
+    (`_scan_source`), so "the tree is clean" and "the detector stopped detecting"
+    stop being indistinguishable."""
+    offenders = _ledger_read_offenders(
+        [f for f in _scan_source(source, rel) if f[0] == "ledgerread"]
+    )
+    assert (
+        bool(offenders) is is_offender
+    ), f"{label!r} was {'not ' if is_offender else ''}flagged unexpectedly:\n{source}"
 
 
 def test_proof_quiet_diff_is_owned_by_the_central_tri_state_probe():

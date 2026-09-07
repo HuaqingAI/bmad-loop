@@ -315,6 +315,27 @@ def test_pending_missed_decisions_skips_an_undecodable_triage_cache(project):
     assert [d.id for d in decisions.pending_missed_decisions(project.project)] == ["DW-1"]
 
 
+def test_pending_missed_decisions_survives_an_undecodable_ledger(project):
+    """DW-146's OBSERVATION row. This helper's ledger read sat outside any guard,
+    one function over from the triage-cache read DW-145 hardened — and it faults
+    the same way, because `UnicodeDecodeError` is a `ValueError` that no
+    `except OSError` above it catches. Every caller is a read-only surface
+    (`cmd_decisions`, `cmd_status`, the TUI), so one undecodable byte must not take
+    the whole listing down: an unreadable ledger yields no open ids, which is [].
+    The degradation is silent here because no journal is reachable from a
+    module-level function handed only a project path — the same reason the triage
+    read below it degrades silently.
+    Ablation: revert the read to
+    `ledger.read_text(encoding="utf-8") if ledger.is_file() else ""` and this
+    reddens with `UnicodeDecodeError` escaping rather than []."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run(project, "20260101-000000-aaaa", _triage(["DW-1"], [_decision("DW-1")]))
+    project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+
+    assert decisions.pending_missed_decisions(project.project) == []
+
+
 def test_pending_missed_decisions_skips_an_unparseable_triage_cache(project):
     """The sibling arm the DW-145 widening sits beside: truncated JSON is skipped
     the same way, and the other run still contributes. Guards against a widening

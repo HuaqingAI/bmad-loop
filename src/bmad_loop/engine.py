@@ -1302,6 +1302,10 @@ class Engine:
         with no session at all. The arm's own unwinding is the stronger guarantee.
         """
         ledger = self.paths.deferred_work
+        # OBSERVATION arm of the ledger-read contract (DW-146), kept inline rather
+        # than routed through `read_for_observation`: this site carries behavior
+        # the helper cannot — it notifies the human and REFUSES the story instead
+        # of degrading to an empty ledger. Same classification, richer response.
         try:
             text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
         except (OSError, UnicodeDecodeError) as e:
@@ -4201,7 +4205,9 @@ class Engine:
         # before any ledger write) is preserved by the reorder — both writes,
         # the seen-again marks and the appends, still run after the record save.
         ledger = self.workspace.paths.deferred_work
-        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        # REPAIR/WRITE (DW-146): the seen-again match derived here decides which
+        # findings are appended, and both writes run off this text.
+        text = deferredwork.read_for_write(ledger) or ""
         seen = deferredwork.parse_ledger(text)
 
         # Cross-spec dedupe (DW-88 vs DW-65). A real finding that is not this
@@ -4544,6 +4550,11 @@ class Engine:
         if not ids:
             return
         ledger = self.workspace.paths.deferred_work
+        # OBSERVATION arm of the ledger-read contract (DW-146), kept inline rather
+        # than routed through `read_for_observation`: the helper collapses absence
+        # and fault, and this site has to split them — a MISSING ledger classifies
+        # every id unmatched, while a dangling symlink is an outage that must be
+        # journaled and written nothing from. Either way this site writes nothing.
         try:
             text = ledger.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -5009,9 +5020,15 @@ class Engine:
         return
 
     def _ledger_text(self) -> str | None:
-        """Return the active workspace ledger text, preserving absence."""
+        """Return the active workspace ledger text, preserving absence.
+
+        REPAIR/WRITE arm (DW-146): this feeds proof-of-work attribution, so reads
+        stay fail-loud — guessing either equality answer misjudges the session's
+        work. Absence is preserved because an absent and an empty ledger are a
+        real distinction to the caller.
+        """
         ledger = self.workspace.paths.deferred_work
-        return ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+        return deferredwork.read_for_write(ledger)
 
     def _ledger_digest(self) -> str:
         """Digest the current ledger text for proof-of-work attribution.
@@ -6762,10 +6779,24 @@ class Engine:
                 f"is filed."
             )
         re_review = False
-        if task.dw_ids and ledger.is_file():
-            entries = {
-                e.id: e for e in deferredwork.parse_ledger(ledger.read_text(encoding="utf-8"))
-            }
+        if task.dw_ids:
+            # OBSERVATION arm (DW-146): this read decides only the
+            # `re_review_capped` flag on the journal row below — nothing is
+            # written to the ledger here, and the story is already committed and
+            # verify-green, so an unreadable ledger must not raise out of a
+            # journaling helper. Degrade to `re_review = False` (the flag's own
+            # default: no evidence this story came from a follow-up entry) and
+            # record the attributed fault so the missing evidence is visible.
+            text, fault = deferredwork.read_for_observation(ledger)
+            if fault is not None:
+                self.journal.append(
+                    "review-budget-ledger-unreadable",
+                    story_key=task.story_key,
+                    dw_ids=list(task.dw_ids),
+                    ledger=str(ledger),
+                    error=fault,
+                )
+            entries = {e.id: e for e in deferredwork.parse_ledger(text)}
             re_review = any(
                 i in entries
                 and deferredwork.field_line_present(
@@ -6922,9 +6953,10 @@ class Engine:
         if task.baseline_commit:
             self._stash_deferred_artifacts(task)
             deferred_work = self.workspace.paths.deferred_work
-            snapshot = (
-                deferred_work.read_text(encoding="utf-8") if deferred_work.is_file() else None
-            )
+            # REPAIR/WRITE (DW-146), absence preserved: this snapshot is the input
+            # to `_restore_defer_ledger`, so a snapshot taken from bytes nobody
+            # could read would be republished over the real ledger.
+            snapshot = deferredwork.read_for_write(deferred_work)
             try:
                 self._rollback_or_pause(task)
             except RunPaused:
@@ -7188,7 +7220,9 @@ class Engine:
         if not task.harvested_deferrals:
             return
         ledger = self.paths.deferred_work
-        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        # REPAIR/WRITE (DW-146): this one fresh read is the whole on-disk guard
+        # for the `append_entries` write below it.
+        text = deferredwork.read_for_write(ledger) or ""
         seen = deferredwork.parse_ledger(text)
         specs: list[deferredwork.EntrySpec] = []
         for item in task.harvested_deferrals:

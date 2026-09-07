@@ -3819,6 +3819,29 @@ def test_verify_review_bundle_ledger_oserror_degrades_to_retry(project, monkeypa
     assert "DW-1" not in out.reason  # not the "entries not marked done" verdict
 
 
+def test_verify_review_bundle_ledger_undecodable_degrades_to_retry(project):
+    """The sibling the `PermissionError` row above could never cover (DW-146): this
+    site caught `except OSError` alone, and `UnicodeDecodeError` is a `ValueError`,
+    so undecodable bytes flew straight past a degrade arm sitting right there and
+    aborted the verify instead of retrying it. The outcome must be the SAME shape as
+    the OSError row — retryable, not fixable — and name the fault so an operator
+    knows the ledger is unreadable rather than incomplete.
+    Ablation: revert the except tuple to `OSError` alone and this reddens with
+    `UnicodeDecodeError` escaping rather than a retryable outcome."""
+    task = make_bundle_task(project)
+    sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "done", task.baseline_commit)
+    task.spec_file = str(sp)
+    bundle_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
+    project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+
+    out = verify.verify_review_bundle(task, project, Policy())
+    assert not out.ok and out.retryable and not out.fixable
+    assert "deferred-work ledger unreadable" in out.reason
+    assert "UnicodeDecodeError" in out.reason
+    assert "DW-1" not in out.reason  # not the "entries not marked done" verdict
+
+
 def test_safe_rollback_reverts_tracked_and_removes_run_created(project):
     repo = project.project
     baseline = verify.rev_parse_head(repo)

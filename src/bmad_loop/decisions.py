@@ -160,7 +160,17 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
     number."""
     paths = bmadconfig.load_paths(project)
     ledger = paths.deferred_work
-    text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+    # OBSERVATION arm of the ledger-read contract (DW-146). This helper writes
+    # nothing: every caller is a read-only surface (`cmd_decisions`, `cmd_status`,
+    # the TUI), so an undecodable ledger must not take the whole listing down —
+    # `UnicodeDecodeError` is a `ValueError` and escaped every `except OSError`
+    # above it, exactly as it did for the triage-cache read below (DW-145).
+    # The degradation is SILENT here, unlike the engine's observation sites: no
+    # journal is reachable from a module-level function handed only a project
+    # path, and the same is true of the triage read below. An empty ledger means
+    # no open ids, which returns [] — the honest answer for a file nobody could
+    # read, and the one the surfaces above already render.
+    text, _fault = deferredwork.read_for_observation(ledger)
     open_now = deferredwork.open_ids(text)
     if not open_now:
         return []

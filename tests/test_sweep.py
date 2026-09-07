@@ -116,6 +116,23 @@ def make_sweep(
     return engine, adapter
 
 
+def test_remaining_estimate_is_none_for_an_undecodable_ledger(project):
+    """`None` and `0` mean opposite things to the graceful stop, and both are
+    PUBLISHED — in the `run-stop` journal row and the stop notice. `None` is "no
+    estimate"; `0` is a positive claim that a resume would pick up nothing. Routing
+    this read through `read_for_observation` (DW-146) put a fault one `if` away from
+    being reported as `0 remaining` for a ledger nobody could read — the fabricated
+    answer `cli._sweep_dry_run` refuses to print. The fault is checked, not
+    discarded.
+    Ablation: drop the `if fault is not None: return None` arm and this reddens
+    with `0`, because the degraded empty text has no open ids."""
+    install_bmad_config(project)
+    engine, _ = make_sweep(project, [])
+    project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+
+    assert engine._remaining_estimate() is None
+
+
 def resume_sweep(project, engine, script, answers=(), prompting=False, **kwargs):
     state = load_state(engine.run_dir)
     state.clear_pause()

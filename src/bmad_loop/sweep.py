@@ -923,7 +923,20 @@ class SweepEngine(Engine):
         unreadable/invalid ledger returns None rather than derailing the stop."""
         try:
             ledger = self.workspace.paths.deferred_work
-            text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+            # OBSERVATION arm (DW-146): a graceful-stop hint, nothing written from
+            # it. The outer guard stays — it also covers `open_ids` — but routing
+            # the read through the named arm is what records the classification.
+            #
+            # The fault is CHECKED rather than discarded, because this helper's
+            # `None` and its `0` mean opposite things to the stop: `None` is "no
+            # estimate", while `0` is a positive claim that a resume would pick up
+            # nothing — and that number is published, in the `run-stop` journal row
+            # and the graceful-stop notice. Degrading an unreadable ledger to the
+            # empty text would report "0 remaining" for a file nobody could read,
+            # the same fabricated answer `cli._sweep_dry_run` refuses to print.
+            text, fault = deferredwork.read_for_observation(ledger)
+            if fault is not None:
+                return None
             selection = select_entries(
                 deferredwork.parse_ledger(text),
                 only_ids=self.only_ids,
@@ -952,7 +965,9 @@ class SweepEngine(Engine):
             self._check_stop_request()
             self.state.sweep_cycle = cycle
             self._save()
-            text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+            # REPAIR/WRITE (DW-146): this text drives migration and the whole
+            # write-bearing cycle below it.
+            text = deferredwork.read_for_write(ledger) or ""
             if deferredwork.has_legacy(text):
                 if cycle > 1:
                     # freeform text appeared mid-run; _ensure_migration assumes
@@ -968,7 +983,8 @@ class SweepEngine(Engine):
                     )
                     return
                 self._ensure_migration(text)
-                text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+                # REPAIR/WRITE (DW-146): same cycle, re-read after migration.
+                text = deferredwork.read_for_write(ledger) or ""
             entries = deferredwork.parse_ledger(text)
             selection = select_entries(
                 entries,
@@ -1141,7 +1157,9 @@ class SweepEngine(Engine):
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
         ledger = self.workspace.paths.deferred_work
-        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        # REPAIR/WRITE (DW-146): the open set derived here decides a store write,
+        # and pruning from bytes nobody could read would drop live answers.
+        text = deferredwork.read_for_write(ledger) or ""
         # The store lives under the project that owns `run_dir`, never
         # `self.workspace.root`: under the `repo_root` override the two diverge
         # and a workspace-rooted prune trimmed a store that does not exist,
@@ -1451,7 +1469,8 @@ class SweepEngine(Engine):
                 _rearm_generation(task)  # ...and into a fresh session-id namespace
             if task.baseline_commit and not verify.worktree_clean(self.workspace.root):
                 self._safe_reset(task)  # a session died mid-rewrite; restore our ledger
-                text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+                # REPAIR/WRITE (DW-146): the restored text this migration grades.
+                text = deferredwork.read_for_write(ledger) or ""
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition
         # **The invariant: a refusal that dispatches nothing leaves this task
         # owning NO baseline.** It takes both halves below. Sitting above the
@@ -1565,7 +1584,9 @@ class SweepEngine(Engine):
             # this rejected rewrite — the exact text this attempt graded — is the
             # anchor instead, so flattening `None` to `""` here would make the
             # deleted-ledger case indistinguishable from a rival's empty write.
-            rewrite = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+            # REPAIR/WRITE (DW-146), absence preserved: `None` is the restore
+            # anchor's "the session deleted it", distinct from an empty write.
+            rewrite = deferredwork.read_for_write(ledger)
             new_text = rewrite if rewrite is not None else ""
             if result.status != "completed":
                 errors = [session_failure_reason("migration", result)]
@@ -1627,7 +1648,9 @@ class SweepEngine(Engine):
             with deferredwork.ledger_lock(ledger):
                 # PURE TEXT ONLY under the hold — `ledger_lock` is not reentrant
                 # and every mutator takes it.
-                current = ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+                # REPAIR/WRITE (DW-146), absence preserved: this compare-and-set
+                # authorizes the restore write below, and `None` is a real answer.
+                current = deferredwork.read_for_write(ledger)
                 if anchor is _LedgerAnchor.NO_RESET_CONTENT and current == text:
                     # ALREADY the text this restore exists to write, so it is
                     # done and there is nothing to escalate. Reachable without
@@ -2504,7 +2527,10 @@ class SweepEngine(Engine):
 
     def _write_intent(self, bundle: Bundle, dirname: str) -> Path:
         ledger = self.workspace.paths.deferred_work
-        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        # REPAIR/WRITE (DW-146): these bytes become the bundle intent file a
+        # session is dispatched on — an empty one would brief the session on
+        # nothing at all.
+        text = deferredwork.read_for_write(ledger) or ""
         entries = {e.id: e for e in deferredwork.parse_ledger(text)}
         blocks = [entries[i].body.rstrip() for i in bundle.dw_ids if i in entries]
         lines = [

@@ -4854,9 +4854,13 @@ def verify_review_bundle(
     ledger = paths.deferred_work
     # Same TOCTOU class as the spec read above: the ledger is rewritten by the
     # orchestrator's own mark_done between the dev and review gates.
+    # OBSERVATION arm of the ledger-read contract (DW-146): this check writes
+    # nothing and already degrades into the `retry` it returns. `UnicodeDecodeError`
+    # joins the tuple because it is a `ValueError`, not an `OSError` — undecodable
+    # bytes escaped this arm entirely and aborted the verify instead of retrying it.
     try:
         text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         return VerifyOutcome.retry(
             f"deferred-work ledger unreadable ({exc.__class__.__name__}: {exc}): {ledger}"
         )

@@ -40,6 +40,44 @@ never needed — an `OSError` from acquisition, or a
 :class:`~bmad_loop.runs.StateRootError` from deriving the sidecar path where no
 state root exists — which a replayed rollback, a re-run sweep and
 ``sweep --archive`` all reach routinely.
+
+Ledger-read contract (DW-146). Every deferred-work ledger read in
+``src/bmad_loop`` belongs to one of exactly three cases, and the reader's NAME is
+the classification recorded at the site:
+
+* REPAIR/WRITE — :func:`read_for_write`. The text decides published bytes: it is
+  edited and written back, or it becomes an artifact a session is dispatched on.
+  Absence answers ``None``; ``OSError`` propagates; undecodable bytes raise
+  :class:`LedgerReadError` with the ``UnicodeDecodeError`` chained as
+  ``__cause__``. A repair write must never proceed from bytes nobody could read.
+* OBSERVATION — :func:`read_for_observation`. The text informs a report, a hint,
+  or a flag, and nothing is written from it. Absence answers ``("", None)``; both
+  ``OSError`` and ``UnicodeDecodeError`` degrade to ``("", "<Class>: <msg>")`` so
+  the caller can journal the attributed fault and carry on. It never raises.
+  The helper never raising does not oblige its CALLER to stay quiet: the arm is
+  about who WRITES, not about how loud the response is. An observation caller may
+  legitimately answer louder than a silent degrade — ``cli._sweep_dry_run`` fails
+  the command rather than print a fabricated listing,
+  ``cli._validate_deferred_ledger`` grades a problem, and
+  ``Engine._refuse_gated_story`` notifies the human and refuses the story — and
+  three such sites keep their read inline for exactly that reason.
+* ADVISORY — the pre-lock probes above, which keep their ``except Exception`` and
+  decide nothing. Neither arm: the locked read below each one is the repair/write
+  site, and a fault in a probe simply falls through to it.
+
+Only the undecodable-bytes case is retyped, and deliberately so.
+``UnicodeDecodeError`` is a ``ValueError``, so a handler spelled ``except
+OSError`` never caught it. Two sites were spelled that way — ``verify``'s
+``verify_review_bundle`` and ``tui.data.deferred_entries`` — and both had a
+degrade arm sitting right there (a retryable outcome, an unavailable pane) that
+undecodable bytes flew straight past; each now catches both. The other two
+inline observation sites, ``Engine._refuse_gated_story`` and
+``cli._validate_deferred_ledger``, already caught the pair and are unchanged.
+No repair/write site's ``OSError`` behavior changes anywhere: ``read_for_write``
+lets it propagate untouched. :class:`LedgerReadError` derives from ``Exception``
+rather than ``OSError`` or ``ValueError`` so that neither those two widened
+handlers nor any future ``except OSError`` silently swallows the one fault this
+contract exists to attribute.
 """
 
 from __future__ import annotations
@@ -57,6 +95,50 @@ from pathlib import Path
 from . import sprintstatus
 from .fences import fenced_spans
 from .platform_util import atomic_write_text, file_lock, neutralize_surrogates
+
+
+class LedgerReadError(Exception):
+    """A repair/write site could not decode the deferred-work ledger.
+
+    A plain ``Exception`` on purpose (DW-146): an ``OSError`` or ``ValueError``
+    subclass would be swallowed by the very ``except`` arms this fault escaped.
+    """
+
+
+def read_for_write(path: Path) -> str | None:
+    """REPAIR/WRITE arm of the ledger-read contract (DW-146).
+
+    Absence answers ``None`` — callers that treat an absent ledger like an empty
+    one spell that ``or ""`` at the site, which is exact because ``open_ids("")``
+    and ``parse_ledger("")`` already answer identically for both. ``OSError``
+    propagates unchanged. Undecodable bytes become :class:`LedgerReadError`, so a
+    site about to publish bytes escalates instead of writing from a text nobody
+    could read.
+    """
+    if not path.is_file():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        raise LedgerReadError(f"{path} is not valid UTF-8: {e}") from e
+
+
+def read_for_observation(path: Path) -> tuple[str, str | None]:
+    """OBSERVATION arm of the ledger-read contract (DW-146).
+
+    Returns ``(text, fault)``. Absence is not a fault: it answers ``("", None)``,
+    the empty text every observation site already read for a missing ledger. Both
+    ``OSError`` and ``UnicodeDecodeError`` degrade to ``("", "<Class>: <msg>")``
+    — attributed, so a caller holding a journal can record WHICH fault it
+    degraded on rather than reporting an empty ledger. Never raises.
+    """
+    if not path.is_file():
+        return "", None
+    try:
+        return path.read_text(encoding="utf-8"), None
+    except (OSError, UnicodeDecodeError) as e:
+        return "", f"{e.__class__.__name__}: {e}"
+
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
 # Where a canonical entry ENDS, in every shape CommonMark spells an ATX heading:
@@ -950,11 +1032,15 @@ def _mark_done_many(
         if not _apply_done_many(probe, dw_ids, date, note, notes, undo_owner)[1]:
             return []
     except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        # Neither arm of the DW-146 ledger-read contract, and deliberately
+        # broader than both: this probe decides nothing on a fault, and the
+        # locked read below is the REPAIR/WRITE site that does.
         pass
     with ledger_lock(path):
         if not path.is_file():
             return []
-        text = path.read_text(encoding="utf-8")
+        # REPAIR/WRITE (DW-146): this text is edited and published below.
+        text = read_for_write(path) or ""
         text, marked = _apply_done_many(text, dw_ids, date, note, notes, undo_owner)
         if not marked:
             return []
@@ -1080,7 +1166,8 @@ def mark_seen_again_many(
     with ledger_lock(path):
         if not path.is_file():
             return [False for _ in dw_ids], None, list(dw_ids), None
-        preimage = path.read_text(encoding="utf-8")
+        # REPAIR/WRITE (DW-146): the preimage this call anchors its write on.
+        preimage = read_for_write(path) or ""
         text = preimage
         applied: list[bool] = []
         stale: list[str] = []
@@ -1262,11 +1349,15 @@ def mark_open_many(path: Path, dw_ids: Sequence[str], note: str, operation_id: s
         if not _apply_open_many(probe, dw_ids, note, undo_owner)[1]:
             return []
     except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        # Neither arm of the DW-146 ledger-read contract, and deliberately
+        # broader than both: this probe decides nothing on a fault, and the
+        # locked read below is the REPAIR/WRITE site that does.
         pass
     with ledger_lock(path):
         if not path.is_file():
             return []
-        text = path.read_text(encoding="utf-8")
+        # REPAIR/WRITE (DW-146): this text is edited and published below.
+        text = read_for_write(path) or ""
         text, reopened = _apply_open_many(text, dw_ids, note, undo_owner)
         if not reopened:
             return []
@@ -1378,11 +1469,15 @@ def record_decision(
         if _apply_decision(probe, dw_id, date, label, detail) is None:
             return False
     except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        # Neither arm of the DW-146 ledger-read contract, and deliberately
+        # broader than both: this probe decides nothing on a fault, and the
+        # locked read below is the REPAIR/WRITE site that does.
         pass
     with ledger_lock(path):
         if not path.is_file():
             return False
-        text = path.read_text(encoding="utf-8")
+        # REPAIR/WRITE (DW-146): this text is edited and published below.
+        text = read_for_write(path) or ""
         updated = _apply_decision(text, dw_id, date, label, detail)
         if updated is None:
             return False
@@ -1648,9 +1743,14 @@ def append_entries_published(
             # from — and nothing was written for an anchor to claim either.
             return minted, None, None
     except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        # Neither arm of the DW-146 ledger-read contract, and deliberately
+        # broader than both: this probe decides nothing on a fault, and the
+        # locked read below is the REPAIR/WRITE site that does.
         pass
     with ledger_lock(path):
-        preimage = path.read_text(encoding="utf-8") if path.is_file() else None
+        # REPAIR/WRITE (DW-146), absence preserved: `None` still means "no
+        # ledger", which the returned preimage carries to the caller's anchor.
+        preimage = read_for_write(path)
         text, minted = _apply_appends(preimage or "", specs)
         if all(dw_id is None for dw_id in minted):
             return minted, None, preimage
@@ -1975,11 +2075,15 @@ def archive_closed(
         if not _eligible_for_archive(probe, before):
             return []
     except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        # Neither arm of the DW-146 ledger-read contract, and deliberately
+        # broader than both: this probe decides nothing on a fault, and the
+        # locked read below is the REPAIR/WRITE site that does.
         pass
     with ledger_lock(path):
         if not path.is_file():
             return []
-        text = path.read_text(encoding="utf-8")
+        # REPAIR/WRITE (DW-146): this text is stubbed and published below.
+        text = read_for_write(path) or ""
         to_archive = _eligible_for_archive(text, before)
         if not to_archive:
             return []
@@ -1988,7 +2092,11 @@ def archive_closed(
             return archived_ids
         stamp = archive_date or calendar_date.today().isoformat()
         archive_path = path.parent / ARCHIVE_REL
-        existing = archive_path.read_text(encoding="utf-8") if archive_path.is_file() else ""
+        # REPAIR/WRITE (DW-146): the archive sidecar is republished with these
+        # entries appended, so undecodable bytes here must escalate rather than
+        # publish an archive rebuilt from "" — the same class as the ledger read
+        # above, applied to the other file this mutator writes.
+        existing = read_for_write(archive_path) or ""
         # Append an `archived:` line after each entry's status line. The status
         # span is body-relative, so the insertion works within the body slice —
         # same offset math as `_insert_after_status`, applied to the body.
