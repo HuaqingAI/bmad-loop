@@ -7039,7 +7039,6 @@ _UNUSABLE_SHAPES = [
 _USABLE_SHAPES = [
     pytest.param({"effect": "build", "intent": "x"}, id="minimal-build"),
     pytest.param({"key": "1", "label": "Keep", "effect": "keep-open"}, id="minimal-keep-open"),
-    pytest.param({"key": "1", "label": "W", "effect": "close"}, id="close-from-the-in-run-writer"),
     pytest.param(
         {"key": "1", "effect": "keep-open", "intent": ["a", "b"], "bundle_name": 7},
         id="keep-open-with-build-only-fields-corrupt",
@@ -7051,26 +7050,84 @@ _USABLE_SHAPES = [
 ]
 
 
+@pytest.mark.parametrize("allow_close", [True, False], ids=["run-store", "project-store"])
 @pytest.mark.parametrize("value,reason", _UNUSABLE_SHAPES)
-def test_unusable_answer_reason_names_the_defect(value, reason):
+def test_unusable_answer_reason_names_the_defect(value, reason, allow_close):
     """The predicate itself, at the lowest layer that can catch a regression — its
     reason strings are the `malformed` rows' wording AND the boundary both readers
     agree on, so pinning them only through journal assertions left the pure
     function untested. Ids, field names and type names only: never the answer's
-    prose (`journal.append` neither truncates nor sanitizes what it is handed)."""
-    assert sweep_mod.unusable_answer_reason(value) == reason
+    prose (`journal.append` neither truncates nor sanitizes what it is handed).
+
+    Run over BOTH stores (DW-147): the store gate splits `close` and nothing else,
+    so every shape here has to report the identical reason either way — a gate that
+    reordered or swallowed one of these checks reddens on one store alone."""
+    assert sweep_mod.unusable_answer_reason(value, allow_close=allow_close) == reason
 
 
+@pytest.mark.parametrize("allow_close", [True, False], ids=["run-store", "project-store"])
 @pytest.mark.parametrize("value", _USABLE_SHAPES)
-def test_unusable_answer_reason_accepts_what_readers_can_consume(value):
+def test_unusable_answer_reason_accepts_what_readers_can_consume(value, allow_close):
     """The non-validation boundary, pinned so a later "tighten everything" pass
     reddens here instead of silently rejecting answers in the field. `resolution`
     and `answered_at` are unvalidated because no reader consumes them; `intent` and
     `bundle_name` are unvalidated for keep-open because only the BUILD lane reads
     them, and refusing a keep-open answer un-suppresses its bundle.
     Ablation: validate `intent`/`bundle_name` for every effect (or add `resolution`
-    to the screened fields) and the matching row reddens."""
-    assert sweep_mod.unusable_answer_reason(value) is None
+    to the screened fields) and the matching row reddens.
+
+    Store-independent by construction (DW-147): none of these is a `close`, so the
+    store gate must not reach any of them."""
+    assert sweep_mod.unusable_answer_reason(value, allow_close=allow_close) is None
+
+
+# DW-147: the ONE shape whose verdict depends on the store, so it cannot sit in
+# either shared table above — both of which now run over both stores.
+_CLOSE_ANSWER = {"key": "1", "label": "W", "effect": "close"}
+
+
+def test_close_is_usable_from_the_run_store():
+    """The in-run interactive writer records `effect: "close"` for a decision
+    answered `close` this run, so the run-local reader has to consume it — refusing
+    would re-ask, inside one run, a question the human already answered.
+    Ablation: make the gate unconditional (refuse `close` for both stores) and this
+    reddens."""
+    assert sweep_mod.unusable_answer_reason(_CLOSE_ANSWER, allow_close=True) is None
+
+
+def test_close_is_refused_from_the_project_store():
+    """DW-147. `apply_pre_answer` sends a `close` to the LEDGER and skips
+    `record_pre_answer`, so no legitimate producer puts one in the project store —
+    while `_materialize_bundles` needs `build` or `keep-open`, so a hand-seeded
+    `close` there was counted answered by every reader and acted on by no lane.
+    The reason names the EFFECT only: its caller appends the `({store})` suffix.
+    Ablation: drop the `allow_close` gate and this reddens."""
+    assert (
+        sweep_mod.unusable_answer_reason(_CLOSE_ANSWER, allow_close=False)
+        == "effect close not accepted from this store"
+    )
+
+
+@pytest.mark.parametrize(
+    "allow_close,reason",
+    [
+        pytest.param(True, "key not a string: int", id="run-store"),
+        pytest.param(False, "effect close not accepted from this store", id="project-store"),
+    ],
+)
+def test_a_close_carrying_a_second_defect_reports_by_store(allow_close, reason):
+    """Where the gate sits relative to the string-field loop, pinned — the one
+    input whose reason DIVERGES by store, which neither shared table can hold
+    (both now run over both stores, so every row in them must report identically).
+    The gate is placed after the `effect` membership check and BEFORE the field
+    loop, so the project store refuses this value on its effect and never reaches
+    `key`, while the run store, which accepts the effect, reports the `key` defect
+    exactly as it did before DW-147. Reason strings are contract: they are the
+    `malformed` rows' wording.
+    Ablation: move the gate after the field loop and the project-store row reddens
+    with `key not a string: int`."""
+    value = {"key": 1, "label": "W", "effect": "close"}
+    assert sweep_mod.unusable_answer_reason(value, allow_close=allow_close) == reason
 
 
 @pytest.mark.parametrize("value,reason", _UNUSABLE_SHAPES)
@@ -7120,6 +7177,55 @@ def test_close_effect_stays_a_usable_stored_answer(project):
     assert answers == {"DW-1": stored}
     assert _records(engine, "sweep-decisions-reload-failed") == []
     assert _records(engine, "decision-skipped-unattended") == []
+
+
+def test_close_in_the_project_store_is_refused_and_the_decision_re_offered(project):
+    """DW-147, end to end and per-VALUE. A `close` in `.bmad-loop/decisions.json`
+    is hand-seeded or corrupt — `apply_pre_answer` applies a close to the ledger
+    and skips `record_pre_answer` — and every lane of `_materialize_bundles` needs
+    `build` or `keep-open`, so the id used to be seeded into `answers`, counted
+    answered by both readers, matched by no lane, kept open by `prune_pre_answers`
+    and therefore never built, never closed and never re-offered. Refused at the
+    read site it goes back down the pending/skip path, which is where it was
+    before anyone seeded it.
+
+    DW-2 (a well-shaped build answer in the SAME store) is seeded normally, so the
+    refusal costs no sibling its answer; its seeding also drives the write-back,
+    which must not repair the project store or launder the refused value into the
+    run store.
+    Ablation: pass `allow_close=True` at the pre-answer loop (or delete the gate)
+    and this reddens — DW-1 is answered, journals nothing and is not skipped."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    good = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
+    seeded_store = {"DW-1": {"key": "1", "label": "W", "effect": "close"}, "DW-2": good}
+    store = decisions_store.store_path(project.project)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(json.dumps(seeded_store), encoding="utf-8")
+    store_bytes = store.read_bytes()
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}),
+        decisions=(_decision_for("DW-1"), _decision_for("DW-2")),
+    )
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    answers, closed = engine._decisions_phase(plan)
+
+    assert answers == {"DW-2": good} and closed == 0
+    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
+    # the reason names the EFFECT; the store comes from the row's existing suffix
+    assert reload_failed["errors"] == [
+        "DW-1: effect close not accepted from this store (project .bmad-loop/decisions.json)"
+    ]
+    assert [r["dw_id"] for r in _records(engine, "decision-skipped-unattended")] == ["DW-1"]
+    assert [r["dw_id"] for r in _records(engine, "decision-preanswered")] == ["DW-2"]
+    # in-memory degrade: the project store still holds the refused value verbatim
+    assert store.read_bytes() == store_bytes
+    # and the write-back the sibling's seeding triggers does not carry it across
+    run_store = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
+    assert run_store == {"DW-2": good}
 
 
 def test_keep_open_answer_with_a_corrupt_build_only_field_still_suppresses_its_bundle(project):

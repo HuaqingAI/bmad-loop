@@ -187,8 +187,19 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
     # out was an id no reader ever surfaced: a missing or unrecognized `effect` and
     # a non-string `key`/`label`/`intent`/`bundle_name` are unusable here for
     # exactly the reason they are unusable there.
+    #
+    # The STORE, not the reader, selects the predicate's configuration (DW-147):
+    # both readers of THIS store — here and `_decisions_phase`'s pre-answer
+    # seeding loop — pass the identical `allow_close=False`, which is what keeps
+    # DW-142's same-store agreement intact while the run-local store, whose
+    # interactive writer legitimately records a `close`, passes True. A `close`
+    # here is hand-seeded or corrupt (`apply_pre_answer` sends a close to the
+    # ledger and never records one), and it matches no bundling lane, so it must
+    # be re-offered rather than counted answered.
     answered = {
-        k for k, v in load_pre_answers(project).items() if unusable_answer_reason(v) is None
+        k
+        for k, v in load_pre_answers(project).items()
+        if unusable_answer_reason(v, allow_close=False) is None
     }
 
     # (run-id, cycle) descending == most recent first; run ids sort chronologically

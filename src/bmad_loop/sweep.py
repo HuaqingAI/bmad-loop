@@ -86,7 +86,7 @@ _ANSWER_STR_FIELDS = ("key", "label")
 _BUILD_ANSWER_STR_FIELDS = ("intent", "bundle_name")
 
 
-def unusable_answer_reason(value: Any) -> str | None:
+def unusable_answer_reason(value: Any, *, allow_close: bool) -> str | None:
     """Why `value` is not a usable persisted decision answer, or None when it is.
 
     ONE schema for the two readers of a stored answer — `SweepEngine._decisions_phase`'s
@@ -112,10 +112,19 @@ def unusable_answer_reason(value: Any) -> str | None:
     a keep-open answer is inert prose no reader touches. Fields no reader consumes
     (`resolution`, `answered_at`) are not validated for any effect.
 
-    `close` is usable even though `record_pre_answer` never stores it: the
-    interactive writer in `_decisions_phase` records `effect: "close"` for a
-    decision answered `close` this run, so rejecting it would re-ask a decision the
-    human already answered inside the same run.
+    `close` is usable for the RUN store (`allow_close=True`) even though
+    `record_pre_answer` never stores it: the interactive writer in
+    `_decisions_phase` records `effect: "close"` for a decision answered `close`
+    this run, so rejecting it would re-ask a decision the human already answered
+    inside the same run. That justification does NOT transfer to the project store
+    (DW-147): `apply_pre_answer` applies a `close` to the LEDGER and deliberately
+    skips `record_pre_answer`, so no legitimate producer writes one there — a
+    `close` in `.bmad-loop/decisions.json` is hand-seeded or corrupt, and it used
+    to be counted answered by every reader while matching NO `_materialize_bundles`
+    lane (which needs `build` or `keep-open`), leaving the id never built, never
+    closed and never re-offered. Hence the store, not the reader, selects the gate:
+    `allow_close` is keyword-only and has no default, so a future reader has to
+    state which store it is reading rather than inherit the wrong answer silently.
 
     Rejecting is never a repair — the caller keeps the value and re-publishes it
     unchanged; see `_decisions_phase`'s `unusable` map and `load_pre_answers`."""
@@ -126,6 +135,8 @@ def unusable_answer_reason(value: Any) -> str | None:
     effect = value["effect"]
     if not isinstance(effect, str) or effect not in DECISION_EFFECTS:
         return "effect not recognized"
+    if effect == "close" and not allow_close:
+        return "effect close not accepted from this store"
     fields = _ANSWER_STR_FIELDS
     if effect == "build":
         fields += _BUILD_ANSWER_STR_FIELDS
@@ -1944,7 +1955,12 @@ class SweepEngine(Engine):
                         # SAME schema `decisions.pending_missed_decisions` screens
                         # by (DW-142), so an id this loop refuses to answer is one
                         # that command re-offers instead of counting answered.
-                        reason = unusable_answer_reason(value)
+                        # The predicate is shared but store-PARAMETERIZED (DW-147):
+                        # this is the run-local store, whose interactive writer
+                        # legitimately records `effect: "close"`, so it alone
+                        # passes `allow_close=True`. The pre-answer loop below
+                        # reads a different file and passes False.
+                        reason = unusable_answer_reason(value, allow_close=True)
                         if reason is None:
                             answers[key] = value
                         else:
@@ -1966,14 +1982,19 @@ class SweepEngine(Engine):
             if decision.id in answers or decision.id not in pre:
                 continue
             pre_answer = pre[decision.id]
-            pre_reason = unusable_answer_reason(pre_answer)
+            pre_reason = unusable_answer_reason(pre_answer, allow_close=False)
             if pre_reason is not None:
                 # `load_pre_answers` validates only the TOP level (decisions.py),
                 # so a value here can be any JSON at all. Same degrade as the
-                # run-local store above — same predicate, too — and journaled in
-                # the same record, which is why each entry names the store it came
-                # from: the two files are different, and only one of them is the
-                # one to hand-fix. Nothing is written back to the project store:
+                # run-local store above — same predicate, too, but configured for
+                # THIS store: `allow_close=False`, because `apply_pre_answer`
+                # applies a close to the ledger and never records one here, so a
+                # `close` in this file is hand-seeded or corrupt and matches no
+                # bundling lane (DW-147). Journaled in the same record, which is
+                # why each entry names the store it came from: the two files are
+                # different, only one of them is the one to hand-fix, and the
+                # reason names the effect alone so the suffix is not duplicated.
+                # Nothing is written back to the project store:
                 # this phase never repairs either file, and re-answering the
                 # decision out of band is what overwrites the unusable value.
                 malformed.append(f"{decision.id}: {pre_reason} (project .bmad-loop/decisions.json)")

@@ -1045,8 +1045,12 @@ JOURNAL_KINDS = frozenset(
         "sweep-decisions-only",
         # `<run>/decisions.json` (or a project pre-answer inside it) would not
         # read or is not shaped `{id: {...}}`: the answer map degrades instead of
-        # aborting the sweep. `errors` carries exception text, type names and the
-        # DW ids whose answers were dropped — already a benign field
+        # aborting the sweep. `errors` carries exception text, type names, the
+        # DW ids whose answers were dropped and — since DW-147, which refuses a
+        # `close` read from the PROJECT store — the offending effect, a closed
+        # `DECISION_EFFECTS` value (build/close/keep-open) taken from the answer
+        # rather than authored text, the same bound `answer_effect` and
+        # `option_effect` above are blessed under. Already a benign field
         # (`JOURNAL_BENIGN_FIELDS`), and no answer prose goes near it, so the
         # record needs no `diagnostics` routing row.
         "sweep-decisions-reload-failed",

@@ -249,11 +249,15 @@ def test_pending_missed_decisions_re_offers_an_id_whose_stored_value_is_unusable
 def test_pending_missed_decisions_re_offers_ids_whose_stored_shape_is_unusable(project, unusable):
     """DW-142. DW-134 widened `answered` from key presence to "the value is a
     dict", which still counted every shape a sweep now refuses: no `effect`, an
-    `effect` outside `DECISION_EFFECTS`, or a scalar the bundle lanes read as a
-    string that is not one. Each is an id `_materialize_bundles` silently ignores
-    while this command called it answered — so no reader ever surfaced it. Both
-    readers share `sweep.unusable_answer_reason`, so the two sets agree by
-    construction. DW-2 (well-shaped) still counts as answered, so the exclusion is
+    `effect` this store's reader will not consume — one outside `DECISION_EFFECTS`,
+    or `close`, which is inside that set but refused HERE since DW-147 — or a
+    scalar the bundle lanes read as a string that is not one. Each is an id
+    `_materialize_bundles` silently ignores while this command called it answered —
+    so no reader ever surfaced it. Both readers of THIS store share
+    `sweep.unusable_answer_reason` at one identical configuration
+    (`allow_close=False`), so the two sets agree by construction per store; the
+    run-local store's reader legitimately differs on `close` alone.
+    DW-2 (well-shaped) still counts as answered, so the exclusion is
     per-value rather than "the store has a bad entry, offer everything".
     Ablation: restore `if isinstance(v, dict)` in `pending_missed_decisions` and
     every parametrization but the non-dict cases reddens — DW-1 drops out."""
@@ -279,20 +283,37 @@ def test_pending_missed_decisions_re_offers_ids_whose_stored_shape_is_unusable(p
     assert [d.id for d in decisions.pending_missed_decisions(project.project)] == ["DW-1"]
 
 
-def test_pending_missed_decisions_keeps_a_close_answer_answered(project):
-    """`close` never reaches the PROJECT store (`apply_pre_answer` applies it to
-    the ledger instead), but `unusable_answer_reason` accepts it for the run-local
-    store's sake — so this command must not start re-offering an id a hand-seeded
-    `close` covers. Ablation: drop "close" from `DECISION_EFFECTS` and this
-    reddens with DW-1 offered."""
+def test_pending_missed_decisions_re_offers_a_close_answer_in_the_project_store(project):
+    """DW-147, the `bmad-loop decisions` half of the defect. `close` never reaches
+    the PROJECT store legitimately — `apply_pre_answer` applies it to the ledger
+    and skips `record_pre_answer` — so a `close` here is hand-seeded or corrupt.
+    The predicate accepted it anyway (it is a `DECISION_EFFECTS` member), which
+    counted the id answered while no `_materialize_bundles` lane acts on a `close`:
+    never built, never closed, never re-offered. Store-aware now, so the id comes
+    back down this path, which is the repair — re-answering overwrites the value.
+    DW-2 (well-shaped) stays answered, so the exclusion is per-value.
+    Ablation: pass `allow_close=True` here (or delete the gate) and this reddens
+    with DW-1 absent."""
     install_bmad_config(project)
-    write_ledger(project, {"DW-1": "open"})
-    _make_run(project, "20260101-000000-aaaa", _triage(["DW-1"], [_decision("DW-1")]))
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    _make_run(
+        project,
+        "20260101-000000-aaaa",
+        _triage(["DW-1", "DW-2"], [_decision("DW-1"), _decision("DW-2")]),
+    )
     store = decisions.store_path(project.project)
     store.parent.mkdir(parents=True, exist_ok=True)
-    store.write_text(json.dumps({"DW-1": {"key": "3", "effect": "close"}}), encoding="utf-8")
+    store.write_text(
+        json.dumps(
+            {
+                "DW-1": {"key": "3", "effect": "close"},
+                "DW-2": {"key": "2", "label": "Keep as is", "effect": "keep-open"},
+            }
+        ),
+        encoding="utf-8",
+    )
 
-    assert decisions.pending_missed_decisions(project.project) == []
+    assert [d.id for d in decisions.pending_missed_decisions(project.project)] == ["DW-1"]
 
 
 def test_pending_missed_decisions_skips_an_undecodable_triage_cache(project):
