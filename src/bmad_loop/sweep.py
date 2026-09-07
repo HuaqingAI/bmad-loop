@@ -934,8 +934,23 @@ class SweepEngine(Engine):
             # and the graceful-stop notice. Degrading an unreadable ledger to the
             # empty text would report "0 remaining" for a file nobody could read,
             # the same fabricated answer `cli._sweep_dry_run` refuses to print.
+            #
+            # And the READ's fault is JOURNALED before the `None`, not merely
+            # checked: the observation arm's rule is "degrade, and journal the
+            # fault where a journal is in hand" — one is in hand here, and an
+            # unreadable ledger is by far the likeliest way this hint goes away.
+            # Scoped to the read leg, deliberately. The outer guard still answers
+            # `None` silently for anything raised AFTER it (`open_ids`, the append
+            # below), so `remaining: null` is not in general self-explaining; what
+            # the row buys is that the one fault class the arm hands back as a
+            # value gets attributed instead of collapsing into that same silence.
             text, fault = deferredwork.read_for_observation(ledger)
             if fault is not None:
+                self.journal.append(
+                    "sweep-remaining-estimate-unreadable",
+                    ledger=str(ledger),
+                    error=fault,
+                )
                 return None
             selection = select_entries(
                 deferredwork.parse_ledger(text),

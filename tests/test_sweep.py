@@ -124,13 +124,28 @@ def test_remaining_estimate_is_none_for_an_undecodable_ledger(project):
     being reported as `0 remaining` for a ledger nobody could read — the fabricated
     answer `cli._sweep_dry_run` refuses to print. The fault is checked, not
     discarded.
-    Ablation: drop the `if fault is not None: return None` arm and this reddens
-    with `0`, because the degraded empty text has no open ids."""
+    The READ's fault is also JOURNALED, not merely checked. The observation arm
+    journals its fault wherever a journal is in hand, and one is in hand here. Note
+    the scope: `run-stop` publishes `remaining: null` either way, and the outer
+    guard still answers `None` silently for anything raised AFTER the read, so the
+    row does not make every null self-explaining — what it buys is that the one
+    fault class the arm hands back as a VALUE gets attributed instead of collapsing
+    into that same silence.
+    Ablation: drop the `if fault is not None:` arm and this reddens twice — with `0`
+    for the estimate, because the degraded empty text has no open ids, and with no
+    `sweep-remaining-estimate-unreadable` row."""
     install_bmad_config(project)
     engine, _ = make_sweep(project, [])
     project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
 
     assert engine._remaining_estimate() is None
+
+    faults = [
+        e for e in engine.journal.entries() if e["kind"] == "sweep-remaining-estimate-unreadable"
+    ]
+    assert len(faults) == 1
+    assert faults[0]["ledger"] == str(project.deferred_work)
+    assert faults[0]["error"].startswith("UnicodeDecodeError: ")
 
 
 def resume_sweep(project, engine, script, answers=(), prompting=False, **kwargs):

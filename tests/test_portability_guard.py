@@ -1057,6 +1057,7 @@ JOURNAL_KINDS = frozenset(
         "sweep-migrated",
         "sweep-migration-restore-diverged",
         "sweep-nothing-open",
+        "sweep-remaining-estimate-unreadable",
         "sweep-repeat-done",
         "sweep-resolved-closed",
         "sweep-return-no-client",
@@ -2071,19 +2072,36 @@ def _scan_source(src: str, rel: str):
     }
     git_heads, git_commands = _git_name_bindings(tree)
 
-    # Calls inside the value of a `probe = ...` assignment — `deferredwork.py`'s
-    # ADVISORY pre-lock probes (#736), which are neither arm of the DW-146 contract
-    # and keep their bare read on purpose: they decide nothing, and the locked read
-    # below each one is the repair/write site that does. Matched on the ASSIGNED
-    # NAME rather than on the enclosing function, deliberately — allowlisting
-    # `_mark_done_many` wholesale would re-sanction the very locked read the
-    # contract exists to route, since the two live in the same function. The walk
-    # of `assign.value` covers the `probe = ... if path.is_file() else ""` spelling,
-    # where the call is nested inside an IfExp rather than being the value itself.
+    # Calls inside the value of a `probe = ...` assignment that sits inside the
+    # `try` of a bare `except Exception` — `deferredwork.py`'s ADVISORY pre-lock
+    # probes (#736), which are neither arm of the DW-146 contract and keep their
+    # bare read on purpose: they decide nothing, and the locked read below each one
+    # is the repair/write site that does. The walk of `assign.value` covers the
+    # `probe = ... if path.is_file() else ""` spelling, where the call is nested
+    # inside an IfExp rather than being the value itself.
+    #
+    # BOTH halves are required, and neither alone would do. The assigned NAME rather
+    # than the enclosing function, because allowlisting `_mark_done_many` wholesale
+    # would re-sanction the very locked read the contract exists to route — the two
+    # live in the same function. And the swallowing `try` on top of the name, because
+    # the name alone exempted any read a future edit chose to call `probe`: a
+    # write-bearing read spelled `probe = ledger.read_text(...)` — the shape whose
+    # fault a repair/write site must escalate — would have inherited the advisory
+    # sites' pass. What makes a probe advisory is that a fault in it decides nothing,
+    # and `except Exception` around it is precisely that property written down.
+    swallowing_try_bodies = {
+        id(stmt)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Try)
+        and any(isinstance(h.type, ast.Name) and h.type.id == "Exception" for h in node.handlers)
+        for body_stmt in node.body
+        for stmt in ast.walk(body_stmt)
+    }
     advisory_probe_calls = {
         id(call)
         for assign in ast.walk(tree)
         if isinstance(assign, ast.Assign)
+        and id(assign) in swallowing_try_bodies
         and any(isinstance(t, ast.Name) and t.id == "probe" for t in assign.targets)
         for call in ast.walk(assign.value)
         if isinstance(call, ast.Call)
@@ -2399,9 +2417,13 @@ def _scan_source(src: str, rel: str):
         # receiver names the ledger — `ledger`/`ledger_path`/`deferred_work` anywhere,
         # plus `path`/`archive_path` inside the owning module — carries a
         # `sanctioned` bit so the guard can separate "names its arm" from "bare".
-        # An attribute receiver (`paths.deferred_work`, `self.workspace.paths.deferred_work`)
-        # is matched on the trailing attribute, which is how every call site in the
-        # tree spells it.
+        # An attribute receiver (`paths.deferred_work`, `self.workspace.paths.deferred_work`,
+        # `self.ledger`) is matched on the trailing attribute against `names` — the SAME
+        # set the local branch uses, owner-module widening included. Anything narrower
+        # splits the two branches apart: `self.ledger` would read as generic while the
+        # bare `ledger` beside it is flagged, and inside `deferredwork.py` `self.path`
+        # would be exempt while `path` is not. The ledger travels under these spellings
+        # as readily on an attribute as in a local.
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -2412,7 +2434,7 @@ def _scan_source(src: str, rel: str):
                 LEDGER_OWNER_RECEIVER_NAMES if rel == LEDGER_OWNER else set()
             )
             is_ledger = (isinstance(recv, ast.Name) and recv.id in names) or (
-                isinstance(recv, ast.Attribute) and recv.attr == "deferred_work"
+                isinstance(recv, ast.Attribute) and recv.attr in names
             )
             if is_ledger:
                 fn_name = enclosing_names.get(id(node))
@@ -2888,14 +2910,56 @@ LEDGER_READ_SCOPE_CASES = [
     # ...and stays generic everywhere else, or the guard would flag every spec,
     # manifest and config read in the tree.
     ("foreign-path", "engine.py", 'text = path.read_text(encoding="utf-8")\n', False),
-    # The advisory probes keep their bare read, matched on the ASSIGNED NAME so the
-    # exemption cannot spread to the locked read in the same function.
-    ("owner-probe", "deferredwork.py", 'probe = path.read_text(encoding="utf-8")\n', False),
+    # The advisory probes keep their bare read, matched on the ASSIGNED NAME *inside a
+    # swallowing `try`* so the exemption cannot spread to the locked read in the same
+    # function...
+    (
+        "owner-probe",
+        "deferredwork.py",
+        'try:\n    probe = path.read_text(encoding="utf-8")\nexcept Exception:\n    pass\n',
+        False,
+    ),
     (
         "owner-probe-ifexp",
         "deferredwork.py",
-        'probe = path.read_text(encoding="utf-8") if path.is_file() else ""\n',
+        'try:\n    probe = path.read_text(encoding="utf-8") if path.is_file() else ""\n'
+        "except Exception:\n    pass\n",
         False,
+    ),
+    # ...and cannot be claimed by a write-bearing read that merely borrows the name:
+    # what makes a probe advisory is that a fault in it decides nothing, which is what
+    # the `except Exception` says. Without it, `probe` is just a variable.
+    (
+        "owner-probe-unguarded",
+        "deferredwork.py",
+        'probe = path.read_text(encoding="utf-8")\n',
+        True,
+    ),
+    (
+        "owner-probe-guarded-narrowly",
+        "deferredwork.py",
+        'try:\n    probe = path.read_text(encoding="utf-8")\nexcept OSError:\n    raise\n',
+        True,
+    ),
+    # Attribute receivers carry the ledger under the same three names a local does.
+    (
+        "bare-self-ledger",
+        "sweep.py",
+        'text = self.ledger.read_text(encoding="utf-8")\n',
+        True,
+    ),
+    (
+        "bare-self-ledger-path",
+        "tui/data.py",
+        'def other(p):\n    return self.ledger_path.read_text(encoding="utf-8")\n',
+        True,
+    ),
+    # ...owner-module widening included, so the two branches cannot drift apart on it.
+    (
+        "owner-attribute-path",
+        "deferredwork.py",
+        'text = self.path.read_text(encoding="utf-8")\n',
+        True,
     ),
     # An allowlisted FUNCTION keeps its inline read...
     (

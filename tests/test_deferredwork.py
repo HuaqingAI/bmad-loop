@@ -4710,6 +4710,52 @@ def test_read_for_observation_degrades_on_oserror(tmp_path, monkeypatch):
     assert fault is not None and fault.startswith("PermissionError: ")
 
 
+def test_read_for_observation_degrades_on_a_metadata_fault(tmp_path, monkeypatch):
+    """Attribute exceptions raised by the probe, as EACCES does on Python 3.11–3.13.
+    Inject at the probe seam to exercise the guard on every runtime; this does not
+    claim Python 3.14's real probe raises OS errors, which it suppresses instead.
+    Ablation: hoist `if not path.is_file(): return "", None` back above the `try` and
+    this reddens with `PermissionError` escaping a helper that never raises."""
+    path = write_ledger(tmp_path)
+    real = Path.is_file
+
+    def fake(self, *a, **kw):
+        if self == path:
+            raise PermissionError(13, "Permission denied")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "is_file", fake)
+
+    text, fault = deferredwork.read_for_observation(path)
+
+    assert text == ""
+    assert fault is not None and fault.startswith("PermissionError: ")
+
+
+@pytest.mark.parametrize("shape", ["enotdir-parent", "symlink-loop"])
+def test_read_for_observation_reads_the_ignored_errnos_as_absence(tmp_path, shape):
+    """The OTHER side of the boundary the row above asserts, observed rather than
+    only described. Errors suppressed by `is_file()` retain the absence meaning, so these
+    stay ABSENCE — `("", None)` — even though each is an `OSError` underneath: a
+    ledger path whose parent is a regular file (`ENOTDIR`), and one that is a symlink
+    loop (`ELOOP`). The suppressed set depends on the Python version; this row pins
+    these two preserved shapes rather than claiming all metadata faults escape.
+    Ablation: widen the helper to probe with `path.stat()` (or `os.stat`) instead of
+    `is_file()` and these redden as faults, because a raw stat ignores no errno."""
+    if shape == "enotdir-parent":
+        (tmp_path / "not-a-dir").write_text("x", encoding="utf-8")
+        path = tmp_path / "not-a-dir" / "deferred-work.md"
+    else:
+        path, other = tmp_path / "loop-a", tmp_path / "loop-b"
+        try:
+            path.symlink_to(other)
+            other.symlink_to(path)
+        except OSError as e:
+            pytest.skip(f"symlinks unavailable: {e}")
+
+    assert deferredwork.read_for_observation(path) == ("", None)
+
+
 def test_mark_done_many_raises_on_an_undecodable_ledger_and_writes_nothing(tmp_path):
     """The REPAIR/WRITE row of the DW-146 matrix at a real mutator. The pre-lock
     advisory probe swallows the codec error by design (it decides nothing), so the

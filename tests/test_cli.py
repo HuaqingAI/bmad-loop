@@ -835,6 +835,53 @@ def test_decisions_names_the_decision_a_bad_date_failed(project, capsys, monkeyp
     assert decisions.load_pre_answers(project.project) == {}  # nothing recorded
 
 
+def test_decisions_names_the_decision_an_undecodable_ledger_failed(project, capsys, monkeypatch):
+    """The third reachable member of the same tuple, and the one DW-146 created.
+
+    `record_decision`'s locked read is a REPAIR/WRITE site, so an undecodable ledger
+    raises `deferredwork.LedgerReadError` instead of writing a ledger rebuilt from
+    `""`. That fault used to reach this handler as a `ValueError` (a
+    `UnicodeDecodeError` is one); retyping it to a plain `Exception` — deliberately,
+    so no `except OSError` can swallow it — dropped it out of the tuple, and with it
+    the `DW-1` attribution this arm exists for.
+
+    Reproduced the way the broken-config row is, by corrupting the file from inside
+    `ask` rather than by patching `apply_pre_answer` to raise: `prompter.ask` blocks
+    on the human, so the ledger really can go bad after this command's own read
+    succeeded, and the live locked read is what fails.
+
+    Ablation: drop `deferredwork.LedgerReadError` from the tuple and this reddens on
+    the `could not record DW-1` prefix — `main`'s bare tail still exits 1 and still
+    prints the codec text, just with nothing saying which decision did not land.
+    Byte-preservation ablation: rewrite the heading before raising LedgerReadError;
+    the exact-byte assertion fails even though the status line remains open."""
+    from conftest import write_ledger
+
+    from bmad_loop import decisions
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_decision(project)
+    corrupted = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
+
+    class _StubPrompter:
+        def ask(self, decision):
+            # the ledger went bad while this prompt was blocking on the human
+            project.deferred_work.write_bytes(corrupted)
+            return decision.option("1")
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 1
+
+    captured = capsys.readouterr()
+    assert "could not record DW-1" in captured.err
+    assert "not valid UTF-8" in captured.err
+    assert decisions.load_pre_answers(project.project) == {}  # nothing recorded
+    # ...and nothing was written to the ledger nobody could read.
+    assert project.deferred_work.read_bytes() == corrupted
+
+
 def test_decisions_names_the_decision_a_broken_config_failed(project, capsys, monkeypatch):
     """The reachable half of the same handler, and the reason `BmadConfigError`
     belongs in its tuple beside the unreachable `ValueError`.
@@ -883,6 +930,56 @@ def test_status_surfaces_missed_decision_count(project, capsys):
     # status needs a run to report; the decision run dir doubles as one
     assert cli.main(["status", "--project", str(project.project)]) == 0
     assert "decisions awaiting an answer: 1" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("fault", ["undecodable", "metadata"])
+def test_status_drops_the_decision_line_for_an_unreadable_ledger(
+    project, capsys, monkeypatch, fault
+):
+    """The sibling above's negative, and the surface where the OBSERVATION arm's
+    silence lands. `cmd_status` wraps `pending_missed_decisions` in `except
+    BmadConfigError` alone, so every other fault the helper degrades reaches it as an
+    empty list: the decision line simply does not print, and status still exits 0
+    with the rest of its report intact. That is the intended shape — a ledger this
+    command was not asked to repair must not take the whole status report down — but
+    nothing pinned it in either direction.
+
+    Both legs of the guard are graded. `undecodable` was already degraded by DW-146's
+    `read_for_observation` conversion. `metadata` is the leg moving `is_file()` inside
+    that helper's try created: an `EACCES`-class fault on the probe used to escape the
+    helper entirely and reach `main`'s backstop as exit 1, so this row is the only
+    thing that would notice it silently becoming exit 0.
+
+    Ablation: hoisting `read_for_observation`'s `is_file()` back above its `try`
+    reddens the `metadata` row alone, on the exit code (1, from `main`'s backstop) —
+    the leg isolated to this build. Reverting
+    `decisions.pending_missed_decisions`' read to
+    `ledger.read_text(encoding="utf-8") if ledger.is_file() else ""` reddens BOTH
+    rows, since that bare read re-exposes the codec error and the bare `is_file()`
+    beside it re-exposes the metadata fault; verified in both directions."""
+    from conftest import write_ledger, write_sprint
+
+    install_bmad_config(project)
+    write_sprint(project, {})
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_decision(project, run_id="20260102-000000-bbbb")
+    if fault == "undecodable":
+        project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+    else:
+        ledger, real = project.deferred_work, Path.is_file
+
+        def boom(self, *a, **kw):
+            if self == ledger:
+                raise PermissionError(13, "Permission denied")
+            return real(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "is_file", boom)
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert "decisions awaiting an answer" not in out
+    assert "sprint backlog remaining" in out  # the rest of the report still landed
 
 
 def _make_run_with_tokens(project, tasks, *, weight, run_id="20260101-000000-aaaa"):

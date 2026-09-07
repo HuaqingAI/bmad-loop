@@ -65,6 +65,27 @@ the classification recorded at the site:
   decide nothing. Neither arm: the locked read below each one is the repair/write
   site, and a fault in a probe simply falls through to it.
 
+THE DISCRIMINATOR, for a read that is not obviously one or the other: the arm is
+decided by whose text THIS site edits and publishes — never by whether a write
+happens downstream of it. A read whose bytes this site mutates and writes back
+(or hands to a session as an artifact) is REPAIR/WRITE. A read that only
+classifies, reports, or NARROWS a later write performed by a locked mutator that
+re-reads the ledger for itself is OBSERVATION. That is the only property a site
+can be held to locally: a data-flow rule ("a write follows, therefore
+repair/write") would reclassify every read that feeds any mutator, including the
+reads the mutator's own locked :func:`read_for_write` already covers, and would
+leave no read anywhere in the tree on the observation arm.
+
+The worked example, because it is the one that looks like a counterexample:
+``Engine._close_declared_deferred`` reads the ledger, runs :func:`classify` over
+it, and arms the commit's rollback set from the result — and it is OBSERVATION.
+It never edits or publishes that text. The close itself is
+:func:`mark_done_many_reopenable`, whose own locked :func:`read_for_write` is the
+repair/write read for it, and which deliberately never re-uses the caller's
+snapshot. So a degraded read there journals ``deferred-close-ledger-unavailable``,
+writes nothing, and leaves the entries ``open`` — it must NOT raise
+:class:`LedgerReadError`, because nothing at that site was about to be published.
+
 Only the undecodable-bytes case is retyped, and deliberately so.
 ``UnicodeDecodeError`` is a ``ValueError``, so a handler spelled ``except
 OSError`` never caught it. Two sites were spelled that way — ``verify``'s
@@ -131,10 +152,18 @@ def read_for_observation(path: Path) -> tuple[str, str | None]:
     ``OSError`` and ``UnicodeDecodeError`` degrade to ``("", "<Class>: <msg>")``
     — attributed, so a caller holding a journal can record WHICH fault it
     degraded on rather than reporting an empty ledger. Never raises.
+
+    The ``is_file()`` probe is INSIDE the guard, unlike the repair/write arm's.
+    Metadata errors that escape ``is_file()`` are attributed here too. On Python
+    3.11–3.13, that includes ``EACCES``; Python 3.14 suppresses all OS errors in
+    ``is_file()``. Both readers preserve the runtime's existing false-probe
+    meaning as absence, including directories and ignored metadata errors. This
+    guard attributes exceptions the probe raises; it cannot recover errors the
+    probe suppresses. See Python's pathlib "Querying file type and status" docs.
     """
-    if not path.is_file():
-        return "", None
     try:
+        if not path.is_file():
+            return "", None
         return path.read_text(encoding="utf-8"), None
     except (OSError, UnicodeDecodeError) as e:
         return "", f"{e.__class__.__name__}: {e}"
@@ -2095,7 +2124,12 @@ def archive_closed(
         # REPAIR/WRITE (DW-146): the archive sidecar is republished with these
         # entries appended, so undecodable bytes here must escalate rather than
         # publish an archive rebuilt from "" — the same class as the ledger read
-        # above, applied to the other file this mutator writes.
+        # above, applied to the other file this mutator writes. The contract is
+        # otherwise ledger-only; this sidecar is IN scope by name because it is the
+        # second half of ONE locked repair/write cycle over ledger contents (the
+        # entries appended here are the entries the read above found), so leaving it
+        # bare would park an unattributed `UnicodeDecodeError` inside a converted
+        # region. Nothing else outside the ledger is in scope.
         existing = read_for_write(archive_path) or ""
         # Append an `archived:` line after each entry's status line. The status
         # span is body-relative, so the insertion works within the body slice —

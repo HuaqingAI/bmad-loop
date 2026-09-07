@@ -4555,6 +4555,18 @@ class Engine:
         # and fault, and this site has to split them — a MISSING ledger classifies
         # every id unmatched, while a dangling symlink is an outage that must be
         # journaled and written nothing from. Either way this site writes nothing.
+        #
+        # OBSERVATION *by the discriminator*, not as an exception to it, because
+        # this is the site that looks most like a counterexample: the text below is
+        # classified and the result arms `_ArmedClose`, and a write does follow. But
+        # the arm is decided by whose text THIS site edits and publishes, never by
+        # whether a write happens downstream — and this site publishes nothing. The
+        # close is `deferredwork.mark_done_many_reopenable`, whose own locked
+        # `read_for_write` is the repair/write read for it and which never re-uses
+        # the snapshot taken here. So the documented "Advisory by contract" stands:
+        # a degraded read journals `deferred-close-ledger-unavailable`, writes
+        # nothing, and leaves the entries `open`. It must NOT raise
+        # `LedgerReadError` — nothing here was about to be published.
         try:
             text = ledger.read_text(encoding="utf-8")
         except FileNotFoundError:

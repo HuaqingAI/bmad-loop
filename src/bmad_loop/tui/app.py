@@ -24,7 +24,17 @@ from textual.app import App, SuspendNotSupported
 from textual.binding import Binding
 from tomlkit.exceptions import ParseError
 
-from .. import bmadconfig, decisions, devcontract, policy, resolve, runs, stories, verify
+from .. import (
+    bmadconfig,
+    decisions,
+    deferredwork,
+    devcontract,
+    policy,
+    resolve,
+    runs,
+    stories,
+    verify,
+)
 from ..adapters.multiplexer import MultiplexerError, mux_usable
 from ..journal import load_state, state_lock
 from ..model import (
@@ -398,9 +408,22 @@ class BmadLoopApp(App[None]):
                 option,  # pyright: ignore[reportArgumentType]
                 date=time.strftime("%Y-%m-%d"),
             )
-        except (OSError, bmadconfig.BmadConfigError, ValueError, runs.StateRootError) as e:
+        except (
+            OSError,
+            bmadconfig.BmadConfigError,
+            ValueError,
+            runs.StateRootError,
+            deferredwork.LedgerReadError,
+        ) as e:
             # ValueError is the ledger writers' date precondition; it cannot fire
-            # from the strftime above. StateRootError is reachable: the ledger
+            # from the strftime above. LedgerReadError is the one that IS reachable
+            # from the ledger read itself (DW-146): the modal blocks on the human,
+            # so a ledger that goes undecodable while it is open raises out of
+            # `record_decision`'s locked `read_for_write`. That fault used to arrive
+            # as a `ValueError` (a `UnicodeDecodeError` is one) and was caught here;
+            # retyping it to a plain `Exception` — deliberately, so no `except
+            # OSError` can swallow it — dropped it out of this tuple, and naming it
+            # puts it back. StateRootError is reachable too: the ledger
             # write now takes a cross-process lock whose sidecar lives under the
             # state root (#286/#469), and an environment that names no usable root
             # raises it — it is NOT an OSError, so the tuple has to say so.

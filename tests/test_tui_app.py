@@ -7107,6 +7107,58 @@ async def test_decision_modal_survives_lock_and_state_root_failures(project, mon
         assert app.is_running
 
 
+async def test_decision_modal_survives_a_ledger_corrupted_while_it_is_open(project):
+    """The same degradation for the ledger-read fault DW-146 retyped, reproduced
+    without patching anything: the modal blocks on the human, so the ledger can go
+    undecodable *between* the read that found this decision pending and the write
+    that records the answer.
+
+    That fault used to arrive as a `ValueError` — a `UnicodeDecodeError` is one —
+    and `_record_decision`'s tuple caught it. DW-146 retyped it to
+    `deferredwork.LedgerReadError`, a plain `Exception` deliberately, which dropped
+    it out of every `except OSError`/`except ValueError` in the tree including this
+    one. Here that is not cosmetic: an uncaught raise in this callback escapes into
+    the Textual event loop and takes the dashboard down mid-walk.
+
+    Ablation: drop `deferredwork.LedgerReadError` from `_record_decision`'s catch
+    tuple and this reddens, with the exception coming out of `run_test` instead of
+    arriving as a notification.
+    Byte-preservation ablation: rewrite the heading before raising LedgerReadError;
+    the exact-byte assertion fails even though the status line remains open.
+    """
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: first thing\n\norigin: t\nlocation: a.py:1\nreason: t.\nstatus: open\n\n"
+        "### DW-2: second thing\n\norigin: t\nlocation: b.py:1\nreason: t.\nstatus: open\n",
+        encoding="utf-8",
+    )
+    _write_two_triage_decisions(make_run(project.project, "20260101-000000-aaaa", run_type="sweep"))
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("d")
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        # The human is looking at the modal; the ledger goes bad underneath them.
+        corrupted = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
+        project.deferred_work.write_bytes(corrupted)
+        await pilot.click(await ready(pilot, "#opt-1"))
+
+        await until(pilot, lambda: any("failed to record DW-1" in m for m in notifications(app)))
+        toasts = [n for n in app._notifications if "failed to record" in n.message]
+        assert toasts and toasts[0].severity == "error"
+        assert "not valid UTF-8" in toasts[0].message
+        # The walk carried on rather than ending on the failure...
+        await until(
+            pilot,
+            lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
+        )
+        # ...and nothing was written to the ledger it could not read.
+        assert project.deferred_work.read_bytes() == corrupted
+        assert app.is_running
+
+
 async def test_gate_unreadable_spec_refuses_approve_and_resume(project, monkeypatch):
     """The GATE arm of the same refusal — its sibling row grades plan-checkpoint only.
 
