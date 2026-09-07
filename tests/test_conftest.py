@@ -1011,13 +1011,23 @@ def _declares_loadgroup(addopts: object) -> bool:
     return chosen == "loadgroup"
 
 
-# Per-module floors. Not one suite-wide number: at an actual 6 + 30 a `>= 35` floor
-# leaves a single test of slack, so deleting two gated tests would trip the floor and blame
-# the detector for a change the author made on purpose.
-# The stories count is 15 real-tmux test defs plus 15 local-process identity harness
-# defs. They share the module gate, so leaving the old floor would let helpers mask the
-# deletion of E2Es. Raise this floor with any new test def added to that module.
-_EXPECTED_E2E_FLOORS = {"test_generic_tmux.py": 6, "test_stories_e2e.py": 30}
+# Per-module floors, each pinned AT its module's actual gated-def count. Not one
+# suite-wide number: a shared floor couples the modules, so a deletion in one blames the
+# detector for a change the author made in the other. And not a slack bound either — a
+# floor set below the real count is dead weight over exactly that many deletions, which
+# is what these numbers had silently become (DW-159 found stories at an actual 44 against
+# a floor of 30: fourteen E2Es could have been deleted with every row still green).
+# The stories count is 16 `test_e2e_*` real-tmux defs plus 3 `test_reap_e2e_*` rows plus
+# 28 local-process identity harness defs. They share the module gate, so a floor that
+# trails the count lets the helpers mask the deletion of E2Es.
+#
+# These numbers only bite DOWNWARD: the assertion below is `seen >= floor`, so ADDING a
+# def never fails the guard — the floor just starts trailing again, re-accumulating the
+# very slack this pin paid down. Keeping each number at its module's actual count is
+# therefore a MANUAL discipline the guard cannot enforce: re-pin when you add a def, not
+# only when you deliberately remove one. The `>=` shape is shared with
+# test_generic_tmux.py and is deliberately left alone here.
+_EXPECTED_E2E_FLOORS = {"test_generic_tmux.py": 6, "test_stories_e2e.py": 47}
 
 
 def test_every_real_tmux_e2e_joins_the_serialized_xdist_group():

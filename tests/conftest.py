@@ -93,11 +93,13 @@ REAL_MUX_XDIST_GROUP = "real_mux_e2e"
 # tests/test_conftest.py asserts that declaration alongside the marks.
 real_mux_e2e = pytest.mark.xdist_group(REAL_MUX_XDIST_GROUP)
 
-# Hang ceiling for a real-tmux wait. Three consumer classes ride it: the hook-completion
+# Hang ceiling for a real-tmux wait. Four consumer classes ride it: the hook-completion
 # waits; the window-death wait in `test_tmux_crash_detected`, which reaches its verdict
-# through a dead window rather than a hook event; and the descendant-reap poll deadlines
+# through a dead window rather than a hook event; the descendant-reap poll deadlines
 # in `tests/test_stories_e2e.py` (DW-108), which wait on a killed child disappearing
-# rather than on any session event.
+# rather than on any session event; and the detached-fake readiness gate (DW-159) that
+# both `setsid` fakes in that module splice between `child=$!` and publication, which
+# waits inside bash on the child's own setsid(2) transition completing.
 #
 # This is a HANG DETECTOR, not a performance budget: it answers "is this session
 # wedged?" and nothing else. It is deliberately NOT tuned to observed runtimes — never
@@ -110,10 +112,15 @@ real_mux_e2e = pytest.mark.xdist_group(REAL_MUX_XDIST_GROUP)
 # Ceiling: `--dist loadgroup` now serializes every one of these onto ONE worker, so a
 # SYSTEMIC regression pays the wait once per test rather than in parallel, and the
 # Linux test job is capped at `timeout-minutes: 15` — 900s (.github/workflows/ci.yml).
-# Nine collected uses (five hook-completion cases, one crash case, and the three stories
-# reap polls) can consume up to 810s for these waits alone. The stories subprocess
-# budgets (`_run(..., timeout=90/120)`) and other overhead sit OUTSIDE this constant and
-# are additional, so this ceiling does not guarantee the whole job fits within its cap.
+# Eleven sites (five hook-completion cases, one crash case, the three stories reap polls,
+# and the readiness gate in each of the two detached fakes) nominally total 990s for
+# these waits alone — sites, not collected instances: several sit in parametrized rows.
+# The two gate sites cannot actually add their 180s on top: each is bounded from OUTSIDE
+# by the `_run(..., timeout=120)` wall its row runs under. The gate usually fires first;
+# the outer wall wins only when earlier work has used enough of that shared budget. The
+# stories subprocess budgets (`_run(..., timeout=90/120)`) and other overhead sit
+# OUTSIDE this constant and are additional, so this ceiling does not guarantee the whole
+# job fits within its cap.
 REAL_MUX_HANG_CEILING_S = 90.0
 
 
