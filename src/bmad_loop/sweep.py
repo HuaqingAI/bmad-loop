@@ -1156,6 +1156,52 @@ class SweepEngine(Engine):
             self.journal.append("decision-preanswers-pruned", dw_ids=dropped)
             self._commit_ledger("chore(sweep): drop consumed deferred-work pre-answers")
 
+    def _prune_dropped_pre_answer(self, dw_id: str, drop_cause: str) -> None:
+        """Retire the PROJECT-level pre-answer a just-dropped stale answer came
+        from (DW-143). Part of the drop itself, not a later cleanup.
+
+        Why it exists: DW-124's quarantine is RUN-scoped by design, so it bounds
+        the drop to one announcement per run and a NEW run re-evaluates from
+        scratch. But the answer that feeds a stale drop lives in the project store,
+        `pending_missed_decisions` filters out any id already usably answered
+        there, and `_prune_pre_answers` retires an entry only once a later cycle
+        bundles the id and closes it. While triage keeps re-asking the id as a
+        DECISION instead, that never happens: every new run re-read the same stale
+        answer, re-dropped it and re-notified, and no surface re-offered the id.
+        Removing the entry at the drop breaks that loop from both ends — the next
+        run reads no stale answer, and `bmad-loop decisions` offers the id again.
+
+        Keep-open-only, deliberately. A dropped `build` answer (`no-intent`,
+        `name-collision`) leaves its entry open to be re-asked with the stored
+        answer still meaningful, where a dropped keep-open answer has no payload
+        left beyond the option it named — there is nothing to preserve.
+
+        Called AFTER `_quarantine`, which is the announce-then-persist order that
+        method's docstring promises: the residual crash window (announced,
+        quarantined, store not yet pruned) resumes into the DW-124 skip and the
+        entry is pruned by the next run that re-drops it. The reverse order would
+        leave a window in which a human's answer is already gone while the run has
+        no record of having dropped it.
+
+        Reaches the project store ONLY. `<run>/decisions.json` keeps the answer
+        (the run-local audit trail is untouched by design) and so does the ledger
+        `decision:` line `_apply_decision_effect` wrote. The journal row carries the
+        id and the drop cause alone — no answer prose, no store path."""
+        from . import decisions as decisions_store  # lazy: decisions imports sweep
+
+        # `_project_of_run_dir`, never `self.workspace.root`: under the `repo_root`
+        # override the two diverge and only the run dir stays anchored to the
+        # project that owns the store (see `_decisions_phase` and
+        # `_prune_pre_answers`, which resolve it the same way).
+        if not decisions_store.drop_pre_answer(_project_of_run_dir(self.run_dir), dw_id):
+            return  # run-local-only answer: no store entry, so no write and no row
+        self.journal.append(
+            "sweep-decision-preanswer-pruned", decision=dw_id, drop_cause=drop_cause
+        )
+        # Committed like `_prune_pre_answers`': `_materialize_bundles` runs ahead of
+        # this cycle's bundles, and bundles need a clean baseline.
+        self._commit_ledger("chore(sweep): drop stale deferred-work pre-answer")
+
     def _drive_story(self, task: StoryTask) -> None:
         # no spec-approval gate for bundles: the bundle intent came from the
         # validated triage plan (and, for decision bundles, from the human).
@@ -2375,8 +2421,10 @@ class SweepEngine(Engine):
             # RUN-LOCAL record is what survives — the answer stays auditable in
             # `<run>/decisions.json` and the ledger line `_apply_decision_effect`
             # wrote is unchanged — while an out-of-band pre-answer in the PROJECT
-            # store is pruned by `_prune_pre_answers` once that later bundle closes
-            # the entry, the same way a built or closed decision's is.
+            # store is pruned by the drop itself, below (DW-143): waiting for
+            # `_prune_pre_answers` to retire it once a later bundle closed the entry
+            # never came due while triage kept re-asking the id as a decision, so
+            # every new run re-read the same stale answer and re-dropped it.
             self.journal.append(
                 "sweep-decision-answer-dropped",
                 decision=dw_id,
@@ -2398,6 +2446,14 @@ class SweepEngine(Engine):
                 f"protection is discarded and {dw_id} is eligible for bundling again",
             )
             self._quarantine(self.state.sweep_dropped_decisions, dw_id)
+            # After the row, the notify and the quarantine — announce-then-persist,
+            # so a crash mid-drop resumes into the DW-124 skip rather than into a
+            # silent removal (the helper's docstring has the full argument). Keep-
+            # open only: the build lanes' `no-intent`/`name-collision` drops leave
+            # their stored answer alone, since it still carries a payload to re-ask
+            # against. `<run>/decisions.json` and the ledger are untouched either
+            # way — only the PROJECT store entry goes.
+            self._prune_dropped_pre_answer(dw_id, "stale-option")
             answer_dropped = True
         kept = []
         for b in bundles:

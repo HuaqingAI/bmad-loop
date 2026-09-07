@@ -127,6 +127,27 @@ def prune_pre_answers(project: Path, open_ids: set[str]) -> list[str]:
     return dropped
 
 
+def drop_pre_answer(project: Path, dw_id: str) -> bool:
+    """Remove ONE id's entry, returning whether an entry was actually there. The
+    single-id sibling of `prune_pre_answers` above, and public for the same reason
+    that one is: a sweep that has just dropped a stored answer as stale (DW-143)
+    must be able to retire the entry that fed it without reaching into
+    `_write_store`, which is this module's private writer.
+
+    Same read-modify-write shape, same no-op-when-nothing-changes discipline: an
+    absent id writes nothing at all, so a drop whose answer only ever lived in
+    `<run>/decisions.json` leaves the project store's bytes (and mtime) untouched.
+    A removal goes through `_write_store`, so an operator-locked store still raises
+    `PermissionError` rather than silently skipping — deleting a human-authored
+    answer is a store write, never a repair."""
+    data = load_pre_answers(project)
+    if dw_id not in data:
+        return False
+    del data[dw_id]
+    _write_store(project, data)
+    return True
+
+
 # ------------------------------------------------------- discovery + apply
 
 

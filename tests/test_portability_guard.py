@@ -450,6 +450,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # both of its failures — a renumbered option and a vanished one — because
         # only the first can also write a `sweep-decision-option-mismatch`, so the
         # cause cannot be named for the mismatch alone.
+        # Second producer: `sweep-decision-preanswer-pruned` (DW-143), which carries
+        # the cause of the drop it belongs to — the same enum, though only the
+        # keep-open lane prunes, so in practice only `stale-option` reaches it.
         # A closed enum deliberately — `reason` and `error`, the natural spellings
         # for "why was it dropped", are in `diagnostics._JOURNAL_DROP_FIELDS` and
         # would ship as a presence marker instead of the distinction the record
@@ -985,6 +988,12 @@ JOURNAL_KINDS = frozenset(
         "sweep-cycle",
         "sweep-decision-answer-dropped",
         "sweep-decision-option-mismatch",
+        # DW-143. The keep-open lane's `stale-option` drop retired the PROJECT-level
+        # pre-answer that fed it, so the next run reads no stale answer to re-drop
+        # and `bmad-loop decisions` re-offers the id. `decision` + `drop_cause`
+        # only — both already benign — since deleting a human-authored answer has
+        # to stay auditable without the answer's prose entering the journal.
+        "sweep-decision-preanswer-pruned",
         "sweep-decisions-only",
         # `<run>/decisions.json` (or a project pre-answer inside it) would not
         # read or is not shaped `{id: {...}}`: the answer map degrades instead of

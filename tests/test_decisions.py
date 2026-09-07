@@ -63,6 +63,46 @@ def test_store_round_trip_and_prune(project):
     assert decisions.load_pre_answers(project.project) == {}
 
 
+def test_drop_pre_answer_removes_one_entry_and_leaves_the_rest(project):
+    """DW-143's store primitive at its own layer. `prune_pre_answers` above is
+    covered directly; its single-id sibling was reachable only through
+    `SweepEngine._materialize_bundles`, which cannot see the returned bool at all
+    and pins the no-op branch only indirectly.
+
+    Three claims: the bool reports whether an entry was actually there (both
+    branches), an absent id writes NOTHING — the file's bytes are untouched, so the
+    keep-open drop of an answer that only ever lived in `<run>/decisions.json`
+    cannot re-serialize a store it has no business rewriting — and a real removal
+    carries every sibling through, the unusable one included, since
+    `load_pre_answers` validates only the top level and an unrelated write must not
+    delete a human's corrupt entry.
+
+    Ablation: drop the `if dw_id not in data: return False` early return and the
+    bool and the byte-equality both redden; write `_write_store(project, {})` and
+    the siblings redden."""
+    opt = DecisionOption(key="1", label="Build it", effect="build", intent="do it")
+    decisions.record_pre_answer(project.project, "DW-7", opt, date="2026-06-13")
+    decisions.record_pre_answer(project.project, "DW-8", opt, date="2026-06-13")
+    store = decisions.store_path(project.project)
+    # planted past the writer, the way a hand edit would: unusable, and not ours to repair
+    data = json.loads(store.read_text(encoding="utf-8"))
+    data["DW-9"] = ["not a decision answer at all"]
+    store.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    before = store.read_bytes()
+
+    # an id the store never held: False, and not one byte written
+    assert decisions.drop_pre_answer(project.project, "DW-404") is False
+    assert store.read_bytes() == before
+
+    assert decisions.drop_pre_answer(project.project, "DW-7") is True
+    remaining = decisions.load_pre_answers(project.project)
+    assert set(remaining) == {"DW-8", "DW-9"}
+    assert remaining["DW-8"]["intent"] == "do it"
+    assert remaining["DW-9"] == ["not a decision answer at all"]
+    # and removing the same id twice is False the second time
+    assert decisions.drop_pre_answer(project.project, "DW-7") is False
+
+
 def test_load_pre_answers_tolerates_garbage(project):
     decisions.store_path(project.project).parent.mkdir(parents=True, exist_ok=True)
     decisions.store_path(project.project).write_text("not json", encoding="utf-8")

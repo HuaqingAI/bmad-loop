@@ -4,6 +4,7 @@ import contextlib
 import json
 import re
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from conftest import (
     fault_read_text,
     git,
     ignore_before_commit,
+    install_bmad_config,
     install_build_auto_skill,
     migrate_effect,
     passes_once,
@@ -6328,6 +6330,377 @@ def test_a_new_run_re_evaluates_a_dropped_keep_open_answer(project):
     assert attention.count("recorded keep-open decision discarded") == 1
     # run 1's own records are untouched — one drop each, not two in either
     assert len(_records(engine, "sweep-decision-answer-dropped")) == 1
+
+
+# ------------------------ DW-143: the stale drop retires its PROJECT pre-answer
+
+
+def _seed_project_keep_open_answer(project, others=None):
+    """Plant DW-1's keep-open answer in the PROJECT store — the durable carrier
+    `bmad-loop decisions` writes and `_decisions_phase` seeds runs from, as opposed
+    to the run-local `<run>/decisions.json` the rows above hand-write. Committed,
+    so the only pending edit at prune time is the prune's own.
+
+    `others` seeds the SIBLING entries a single-id removal has to leave alone."""
+    from bmad_loop import decisions as decisions_store
+
+    store = decisions_store.store_path(project.project)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(
+        json.dumps({"DW-1": _STALE_KEEP_OPEN_ANSWER, **(others or {})}), encoding="utf-8"
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "out-of-band pre-answer")
+    return store
+
+
+def _cache_keep_open_triage(engine):
+    """`_stale_keep_open_plan()` in the persisted form a real cycle caches as
+    `<run>/triage.json` — what `decisions.pending_missed_decisions` reconstructs
+    the decision from when it re-offers an unanswered id."""
+    (engine.run_dir / "triage.json").write_text(
+        json.dumps(
+            triage_result(
+                ["DW-1"],
+                decisions=[
+                    {
+                        "id": "DW-1",
+                        "question": "q",
+                        "context": "",
+                        "options": [
+                            {"key": "1", "label": "Build", "effect": "build", "intent": "x"},
+                            {"key": "2", "label": "Close as decayed", "effect": "close"},
+                        ],
+                        "recommendation": "1",
+                    }
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("option_vanished", [False, True], ids=["re-authored", "vanished"])
+def test_the_keep_open_stale_drop_prunes_the_project_pre_answer_that_fed_it(
+    project, option_vanished
+):
+    """DW-143. The drop's own surfaces are RUN-scoped (DW-124's quarantine bounds
+    them to one per id per run, deliberately), but the answer that feeds it lives in
+    the PROJECT store, so the drop now retires that entry as part of itself.
+
+    The whole first half of this row is the byte-identical claim: the journal row,
+    the ATTENTION text, the quarantine and the returned `answer_dropped` are exactly
+    what they were before the prune existed — the prune is additive.
+
+    The store is seeded with two SIBLINGS as well, because a removal is a whole-file
+    read-modify-write and the entries it must carry through are as much of the
+    contract as the one it deletes: a usable `build` answer for another id, and a
+    value `sweep.unusable_answer_reason` rejects — `load_pre_answers`' docstring is
+    explicit that an unrelated write must not silently delete a human's corrupt
+    entry, which is the file repair this codebase refuses.
+
+    Ablation: delete the `_prune_dropped_pre_answer(...)` call from the keep-open
+    lane and this reddens — the store still holds DW-1 and no prune row is written.
+    Ablation: write `_write_store(project, {})` in `drop_pre_answer` and this reddens
+    on the siblings, which no other row would notice.
+    Follow-up ablations: guard the prune on the answered key still existing and
+    the vanished-key case fails; corrupt the sandbox ledger in the prune helper
+    and both cases fail the preserved-history assertion.
+    """
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open"})
+    assert deferredwork.record_decision(
+        project.deferred_work, "DW-1", "2026-09-06", "Keep", "Preserve this decision history"
+    )
+    ledger_before = project.deferred_work.read_bytes()
+    siblings = {
+        "DW-2": {"key": "1", "label": "Widen", "effect": "build", "intent": "x"},
+        "DW-3": ["not a decision answer at all"],  # unusable, and NOT ours to repair
+    }
+    store = _seed_project_keep_open_answer(project, siblings)
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    plan = _stale_keep_open_plan()
+    if option_vanished:
+        decision = plan.decisions[0]
+        plan = replace(
+            plan,
+            decisions=(
+                replace(
+                    decision, options=(decision.options[0], replace(decision.options[1], key="3"))
+                ),
+            ),
+        )
+
+    answers, _closed = engine._decisions_phase(plan)
+    # PRECONDITION: the answer reached this run through the PROJECT store, not a
+    # hand-written run-local file — the carrier every earlier row bypasses
+    assert answers == {"DW-1": _STALE_KEEP_OPEN_ANSWER}
+    assert [r["dw_id"] for r in _records(engine, "decision-preanswered")] == ["DW-1"]
+
+    _, dropped = engine._materialize_bundles(plan, answers)
+
+    assert dropped is True
+    [drop] = _records(engine, "sweep-decision-answer-dropped")
+    assert {k: v for k, v in drop.items() if k != "ts"} == {
+        "kind": "sweep-decision-answer-dropped",
+        "decision": "DW-1",
+        "drop_cause": "stale-option",
+    }
+    assert engine.state.sweep_dropped_decisions == ["DW-1"]
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    fate = "is gone from this cycle's triage" if option_vanished else "has been re-authored since"
+    assert re.sub(r"^\[[^\]]+\] ", "", attention) == (
+        "decision DW-1: recorded keep-open decision discarded: "
+        f"the option it answered (2) {fate}, so the keep-open "
+        "protection is discarded and DW-1 is eligible for bundling again\n"
+    )
+    assert len(_mismatches(engine)) == (0 if option_vanished else 1)
+    assert project.deferred_work.read_bytes() == ledger_before
+    # and the entry that fed it is gone from the project store — but ONLY it: both
+    # siblings ride through the read-modify-write unchanged, the unusable one included
+    assert json.loads(store.read_text(encoding="utf-8")) == siblings
+    assert decisions_store.load_pre_answers(project.project) == siblings
+    [pruned] = _records(engine, "sweep-decision-preanswer-pruned")
+    assert pruned["decision"] == "DW-1" and pruned["drop_cause"] == "stale-option"
+    # id and cause ONLY: deleting a human's answer stays auditable without the
+    # answer's prose (or the store's path) entering the journal
+    assert set(pruned) == {"ts", "kind", "decision", "drop_cause"}
+    # committed, because this cycle's bundles run next and need a clean baseline
+    assert worktree_clean(project.project)
+    assert len(_records(engine, "sweep-ledger-commit")) == 1
+    # the RUN-LOCAL record still stands — only the project entry went
+    run_local = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
+    assert run_local == {"DW-1": _STALE_KEEP_OPEN_ANSWER}
+
+
+def test_a_second_run_reads_no_stale_answer_because_the_first_pruned_it(project):
+    """DW-143's actual regression: the notification loop the prune breaks. Before
+    it, run 1 dropped the answer while the project store kept it, and
+    `pending_missed_decisions` counts a usably-answered id as answered — so triage
+    kept re-asking DW-1 as a decision, nothing ever bundled it, `_prune_pre_answers`
+    never came due, and every NEW run re-seeded the same stale answer, re-dropped it
+    and re-notified, with no surface offering the human a way to re-answer.
+
+    Run 2 is a genuinely separate run (its own run_dir, state.json and journal), so
+    DW-124's run-scoped quarantine gives it no cover: silence here is the store
+    being empty, not the quarantine.
+
+    Ablation: delete the `_prune_dropped_pre_answer(...)` call and this reddens on
+    every assertion below — run 2 re-seeds, re-drops, re-notifies, and
+    `pending_missed_decisions` returns [] because the stale entry still counts as
+    answered."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open"})
+    install_bmad_config(project)  # `pending_missed_decisions` resolves paths from it
+    _seed_project_keep_open_answer(project)
+    plan = _stale_keep_open_plan()
+
+    first, _ = make_sweep(project, [])
+    first.run_dir.mkdir(parents=True, exist_ok=True)
+    _cache_keep_open_triage(first)
+    first_answers, _closed = first._decisions_phase(plan)
+    _, dropped_first = first._materialize_bundles(plan, first_answers)
+    assert dropped_first  # PRECONDITION: run 1 really did drop (and so prune)
+
+    second, _ = make_sweep(project, [], run_id="sweep-run-2")
+    second.run_dir.mkdir(parents=True, exist_ok=True)
+    assert second.run_dir != first.run_dir
+    second_answers, _closed = second._decisions_phase(plan)
+    _, dropped_second = second._materialize_bundles(plan, second_answers)
+
+    assert second_answers == {}  # nothing left in the store to seed
+    assert not dropped_second
+    assert _records(second, "sweep-decision-answer-dropped") == []
+    assert _records(second, "sweep-decision-preanswer-pruned") == []
+    assert _mismatches(second) == []
+    attention = (second.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "recorded keep-open decision discarded" not in attention
+    # and the id is re-offered out of band instead of being invisible to everyone
+    assert [d.id for d in decisions_store.pending_missed_decisions(project.project)] == ["DW-1"]
+
+
+def test_prune_dropped_pre_answer_keys_on_the_run_dir_project_not_workspace_root(project, tmp_path):
+    """The fifth member of the workspace-rooted family the two rows above pin (the
+    `_decisions_phase` read, its seeded and interactive writes, and
+    `_prune_pre_answers`), and it fails the same way: under the `repo_root` override
+    `workspace.root` is the separate CODE repo, whose `.bmad-loop/decisions.json`
+    does not exist, so a workspace-rooted removal would find nothing to delete, write
+    nothing, journal nothing — and leave the stale answer in the PROJECT store to be
+    re-seeded and re-dropped by every later run, which is the exact defect DW-143
+    exists to close. `runs._project_of_run_dir` is the stable anchor, the same root
+    the seeding read uses.
+
+    Ablation: point `_prune_dropped_pre_answer` at `self.workspace.root` and this
+    reddens — DW-1 survives in the project store and no prune row lands."""
+    from bmad_loop import decisions as decisions_store
+    from bmad_loop.workspace import Workspace
+
+    write_ledger(project, {"DW-1": "open"})
+    _seed_project_keep_open_answer(project)
+    engine, _ = make_sweep(project, [])
+    elsewhere = tmp_path / "code-repo"
+    elsewhere.mkdir()
+    git(elsewhere, "init")
+    engine.workspace = Workspace(root=elsewhere, paths=engine.workspace.paths)
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    _, dropped = engine._materialize_bundles(
+        _stale_keep_open_plan(), {"DW-1": _STALE_KEEP_OPEN_ANSWER}
+    )
+
+    assert dropped
+    assert decisions_store.load_pre_answers(project.project) == {}
+    [pruned] = _records(engine, "sweep-decision-preanswer-pruned")
+    assert pruned["decision"] == "DW-1"
+    assert list(elsewhere.rglob("decisions*")) == []  # the code repo was never the store
+
+
+def test_a_run_local_only_stale_answer_writes_nothing_to_the_project_store(project):
+    """The prune retires a PROJECT store entry and there is none here — this stale
+    answer only ever lived in `<run>/decisions.json`. A store holding OTHER ids must
+    therefore keep its exact bytes: the removal is a read-modify-write, and an
+    unconditional one would re-serialize (indent + sort) a file this drop has no
+    business rewriting.
+
+    Ablation: delete `drop_pre_answer`'s `if dw_id not in data: return False` and
+    this reddens — the compact bytes below come back re-indented, and the prune row
+    appears for a removal that never happened."""
+    from bmad_loop import decisions as decisions_store
+
+    store = decisions_store.store_path(project.project)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    other = {"DW-2": {"key": "1", "label": "Widen", "effect": "build", "intent": "x"}}
+    store.write_text(json.dumps(other), encoding="utf-8")  # compact, unlike _write_store's
+    before = store.read_bytes()
+
+    engine = _drop_keep_open_answer_and_persist(project)
+
+    assert store.read_bytes() == before
+    assert _records(engine, "sweep-decision-preanswer-pruned") == []
+    assert _records(engine, "sweep-ledger-commit") == []
+    # the drop itself is unaffected by having nothing to prune
+    assert len(_records(engine, "sweep-decision-answer-dropped")) == 1
+
+
+@pytest.mark.parametrize("drop_cause", ["no-intent", "name-collision"])
+def test_a_build_answer_drop_leaves_the_project_pre_answer_in_place(project, drop_cause):
+    """The prune is scoped to the keep-open lane. A dropped BUILD answer leaves its
+    deferred-work entry open to be re-asked with the stored answer still carrying a
+    payload — an intent, a label, a bundle name — so retiring it would delete a
+    usable answer; a dropped keep-open answer has nothing left beyond the option it
+    named, which is why only that lane prunes.
+
+    Ablation: call `_prune_dropped_pre_answer` from either build lane's drop and
+    this reddens with an empty store."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open"})
+    agreeing = Decision(
+        id="DW-1",
+        question="q",
+        context="",
+        options=(DecisionOption(key="1", label="Widen", effect="build", intent="x"),),
+        recommendation="1",
+    )
+    answer = {"key": "1", "label": "Widen", "effect": "build"}
+    if drop_cause == "no-intent":
+        dropping_plan = TriagePlan(
+            open_ids=frozenset({"DW-1"}),
+            decisions=(
+                Decision(
+                    id="DW-1",
+                    question="q",
+                    context="",
+                    options=(DecisionOption(key="1", label="Close", effect="close"),),
+                    recommendation="1",
+                ),
+            ),
+        )
+    else:
+        answer["intent"] = "x"
+        occupied = ["decision-dw-1"] + [f"decision-dw-1-{n}" for n in range(2, 10)]
+        dropping_plan = TriagePlan(
+            open_ids=frozenset({"DW-1"}),
+            bundles=tuple(
+                Bundle(name, (f"DW-{n + 2}",), "occupied") for n, name in enumerate(occupied)
+            ),
+            decisions=(agreeing,),
+        )
+
+    store = decisions_store.store_path(project.project)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(json.dumps({"DW-1": answer}), encoding="utf-8")
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    _, dropped = engine._materialize_bundles(dropping_plan, {"DW-1": answer})
+
+    assert dropped
+    [drop] = _records(engine, "sweep-decision-answer-dropped")
+    assert drop["drop_cause"] == drop_cause
+    assert decisions_store.load_pre_answers(project.project) == {"DW-1": answer}
+    assert _records(engine, "sweep-decision-preanswer-pruned") == []
+
+
+def test_the_stale_drop_refuses_a_readonly_project_store(project):
+    """Retiring a human-authored answer is a store WRITE, never a repair, so it
+    inherits `_write_store`'s `require_writable_target=True` (#597): an operator who
+    marks the store read-only is answered with a `PermissionError` rather than
+    quietly overwritten, and the prune is not special-cased into swallowing it.
+
+    The drop's own announcement is already durable when this raises — the row, the
+    notify and the quarantine all precede the prune — so the run reports what it did
+    before the write failed, and the entry is retired by the next run that re-drops
+    it once the store is writable again.
+
+    chmod is on the per-test copytree copy the `project` fixture makes, and restored
+    in a `finally` because Windows rmtree refuses a READONLY file at cleanup.
+
+    Ablation: wrap `_prune_dropped_pre_answer`'s `drop_pre_answer` call in a
+    `contextlib.suppress(OSError)` and this fails `DID NOT RAISE`."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open"})
+    store = _seed_project_keep_open_answer(project)
+    before = store.read_bytes()
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    store.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            engine._materialize_bundles(_stale_keep_open_plan(), {"DW-1": _STALE_KEEP_OPEN_ANSWER})
+    finally:
+        store.chmod(0o644)
+
+    assert store.read_bytes() == before  # the answer is still there to retire later
+    assert decisions_store.load_pre_answers(project.project) == {"DW-1": _STALE_KEEP_OPEN_ANSWER}
+    # the drop was announced and latched before the write was attempted
+    assert len(_records(engine, "sweep-decision-answer-dropped")) == 1
+    assert engine.state.sweep_dropped_decisions == ["DW-1"]
+    assert _records(engine, "sweep-decision-preanswer-pruned") == []
+
+    # THE RECOVERY the helper's docstring promises, driven rather than asserted in
+    # prose: the surviving answer is not stranded. A NEW run (DW-124's quarantine is
+    # run-scoped, so it gives run 2 no cover) re-seeds it from the store the write
+    # failed on, re-drops it — the loud direction, since it is still suppressing
+    # bundles for DW-1 — and this time the prune lands.
+    fresh, _ = make_sweep(project, [], run_id="sweep-run-2")
+    fresh.run_dir.mkdir(parents=True, exist_ok=True)
+    plan = _stale_keep_open_plan()
+    reseeded, _closed = fresh._decisions_phase(plan)
+    assert reseeded == {"DW-1": _STALE_KEEP_OPEN_ANSWER}  # the locked store still fed it
+
+    _, dropped_again = fresh._materialize_bundles(plan, reseeded)
+
+    assert dropped_again
+    assert len(_records(fresh, "sweep-decision-answer-dropped")) == 1
+    [pruned] = _records(fresh, "sweep-decision-preanswer-pruned")
+    assert pruned["decision"] == "DW-1" and pruned["drop_cause"] == "stale-option"
+    assert decisions_store.load_pre_answers(project.project) == {}
 
 
 # --------------------------------------- DW-134: a malformed stored-answer store
