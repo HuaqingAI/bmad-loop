@@ -749,6 +749,63 @@ def test_decisions_json_survives_an_undecodable_triage_cache(project, capsys):
     assert [d["id"] for d in doc["decisions"]] == ["DW-1"]
 
 
+@pytest.mark.parametrize("non_object", [False, True], ids=["nested-null", "non-object"])
+def test_decisions_json_survives_a_wrong_shape_triage_cache(project, capsys, non_object):
+    """DW-155/DW-158 at the surface a caller actually sees. A cached triage that
+    decodes and parses cleanly could still hold a `null` list member, which
+    `validate_triage` iterated unscreened: `AttributeError` out of
+    `pending_missed_decisions`, past `cmd_decisions` (which catches
+    `BmadConfigError` alone) and into `main`'s broad backstop -- exit 1, NOTHING
+    on stdout, so one malformed member in one run's cache took the whole listing
+    down. `machine_json` parses the WHOLE stream, so it asserts both halves: exit
+    0 and exactly one complete document.
+
+    The good run's DW-1 still lists, so the totality degrades per FILE rather
+    than emptying the document -- the DW-145 shape, one fault class over.
+    Ablation: drop the `_plan_mapping` call in `validate_triage`'s `bundles` loop
+    and the nested-null row reddens with `AttributeError` (exit 1, empty stdout).
+    For the non-object row, remove both the reader's boundary guard and the
+    validator's top-level refusal: it then fails with exit 1 and empty stdout."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    bad = project.project / ".bmad-loop" / "runs" / "20260102-000000-bbbb"
+    bad.mkdir(parents=True, exist_ok=True)
+    (bad / "state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "20260102-000000-bbbb",
+                "project": str(project.project),
+                "started_at": "now",
+                "run_type": "sweep",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (bad / "triage.json").write_text(
+        json.dumps(
+            ["nope"]
+            if non_object
+            else {
+                "workflow": "deferred-sweep-triage",
+                "open_ids": [],
+                "already_resolved": [],
+                "bundles": [None],
+                "blocked": [],
+                "skip": [],
+                "decisions": [],
+                "escalations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    doc = _decisions_json(project, capsys, "--list")
+    assert [d["id"] for d in doc["decisions"]] == ["DW-1"]
+
+
 def test_decisions_json_survives_an_undecodable_ledger(project, capsys):
     """DW-146's observation row at the surface a caller actually sees, mirroring
     DW-145's. `cmd_decisions` catches `BmadConfigError` alone, so the unguarded

@@ -927,6 +927,320 @@ def test_validate_triage_malformed_name_containers_do_not_preempt_early_feedback
     assert expected_error in errors[0]
 
 
+# ------------- malformed triage CONTAINER shapes (DW-155/DW-158)
+#
+# `_plan_str` (DW-148) screened the plan's free-text SCALARS; the containers
+# around them stayed unscreened, so `validate_triage` was not total over
+# parseable JSON. Every row below raised out of the validator -- and so out of
+# `_ensure_triage`'s live-session call site and
+# `decisions.pending_missed_decisions`, neither of which guards it -- until the
+# shape checks landed. The refusal channel is the existing one: `(None, errors)`.
+
+
+@pytest.mark.parametrize(
+    ("document", "type_name"),
+    [
+        pytest.param(["nope"], "list", id="list"),
+        pytest.param("nope", "str", id="str"),
+        pytest.param(5, "int", id="int"),
+        # Falsy, so `rj = rj or {}` DID substitute here and the old code reported
+        # the `workflow` error instead of raising. Refusing it by shape is the
+        # honest message and keeps the guard total rather than truthiness-shaped.
+        pytest.param([], "list", id="empty-list"),
+    ],
+)
+def test_validate_triage_refuses_a_non_object_document(document, type_name):
+    """ABLATION: restore `rj = rj or {}` in place of the `isinstance(rj, dict)`
+    refusal and the first three rows raise `AttributeError: 'list' object has no
+    attribute 'get'` out of the validator -- past `_ensure_triage` and
+    `pending_missed_decisions`, neither of which catches it.
+
+    The message is modelled on `_ensure_triage`'s cache-reload branch, which
+    already had this guard, with a `triage result` prefix naming the document --
+    that branch emits `not a JSON object: {type}` bare, because its own
+    `sweep-triage-reload-failed` record already says which file it read. What the
+    two share is the RULE, not the string: the type NAME only, never the
+    document's own prose."""
+    plan, errors = validate_triage(document, None)
+
+    assert plan is None
+    assert errors == [f"triage result not a JSON object: {type_name}"]
+
+
+def test_validate_triage_keeps_todays_behavior_for_a_none_document():
+    """`None` is not a wrong SHAPE, it is the documented "no result.json" input
+    (`SessionResult.result_json` is `dict | None`), so it keeps substituting `{}`
+    and failing on `workflow` exactly as before. Pins that the new guard did not
+    swallow that path into a shape error."""
+    plan, errors = validate_triage(None, None)
+
+    assert plan is None
+    assert errors == ["workflow must be 'deferred-sweep-triage': got None"]
+
+
+_LIST_SECTIONS = ["already_resolved", "bundles", "blocked", "skip", "decisions"]
+
+# Wrong shapes for a container `_plan_list` screens. `null` is the likeliest an
+# LLM emits, but it is also the ONLY one a weaker `value is not None` check would
+# catch, so a null-only row cannot attribute the refusal to the `isinstance`. A
+# str is ITERABLE -- the case that silently walked the value character by
+# character before this fix rather than failing -- and a dict iterates its keys.
+_NON_LIST_SHAPES = [
+    pytest.param(None, "NoneType", id="null"),
+    pytest.param("nope", "str", id="str"),
+    pytest.param({"a": 1}, "dict", id="dict"),
+]
+
+# The same for a member `_plan_mapping` screens, for the same reason: against
+# `null` alone the guard is indistinguishable from `item is not None`.
+_NON_MAPPING_SHAPES = [
+    pytest.param(None, "NoneType", id="null"),
+    pytest.param("nope", "str", id="str"),
+    pytest.param(5, "int", id="int"),
+]
+
+
+@pytest.mark.parametrize(("value", "type_name"), _NON_LIST_SHAPES)
+@pytest.mark.parametrize("section", _LIST_SECTIONS)
+def test_validate_triage_refuses_a_non_list_section(section, value, type_name):
+    """ABLATION: drop the `_plan_list` call for the section and the null rows
+    raise `TypeError: 'NoneType' object is not iterable`, while the str and dict
+    rows fail worse than that -- they SUCCEED at iterating (a str yields
+    characters, a dict its keys) and then refuse on whatever those turn out to
+    be, reporting a member fault for a container one.
+    SECOND ABLATION: weaken the check to `value is not None` and the str and dict
+    rows redden while the null rows stay green, which is the whole reason they
+    are here. The message carries the field and the type name; a top-level
+    section needs no positional prefix."""
+    rj = triage_result([])
+    rj[section] = value
+
+    plan, errors = validate_triage(rj, set())
+
+    assert plan is None
+    assert errors == [f"{section} not a list: {type_name}"]
+
+
+@pytest.mark.parametrize(("member", "type_name"), _NON_MAPPING_SHAPES)
+@pytest.mark.parametrize("section", _LIST_SECTIONS)
+def test_validate_triage_refuses_a_non_object_section_member(section, member, type_name):
+    """ABLATION: drop the `_plan_mapping` call in the section's loop and every row
+    raises `AttributeError: '<type>' object has no attribute 'get'`.
+    SECOND ABLATION: weaken the check to `item is not None` and the str and int
+    rows redden while the null rows stay green -- the guard has to be
+    `isinstance(item, dict)`, which is exactly what `_normalize_bundle_names`
+    (running first) already carried on these same members; the validator was the
+    half that did not."""
+    rj = triage_result([])
+    rj[section] = [member]
+
+    plan, errors = validate_triage(rj, set())
+
+    assert plan is None
+    assert errors == [f"{section}[0] not an object: {type_name}"]
+
+
+@pytest.mark.parametrize(("value", "type_name"), _NON_LIST_SHAPES)
+@pytest.mark.parametrize("expected_open_ids", [{"DW-1"}, None], ids=["live", "cache"])
+def test_validate_triage_refuses_a_non_list_open_ids_before_the_ledger_check(
+    value, type_name, expected_open_ids
+):
+    """`open_ids` returns EARLY, like the `workflow` and open-set-mismatch
+    refusals it sits between: with no claimed set there is nothing to compare the
+    ledger against, so the mismatch error must not also fire. Live rows use a
+    non-empty `expected_open_ids`; cache rows skip the ledger comparison.
+    ABLATION: revert to `claimed_open = {str(i) for i in rj.get("open_ids", [])}`
+    and the null rows raise `TypeError: 'NoneType' object is not iterable`; keep
+    the check but fall through instead of returning early and the live null row gains
+    `open_ids do not match the ledger's open entries; missing: DW-1`.
+    ABLATION: bypass `_plan_list` at this call site for non-null values and the
+    string/object rows lose the shape diagnostic in both live and cache modes.
+    A weakened helper alone would not test that this particular field uses it."""
+    rj = triage_result([])
+    rj["open_ids"] = value
+
+    plan, errors = validate_triage(rj, expected_open_ids)
+
+    assert plan is None
+    assert errors == [f"open_ids not a list: {type_name}"]
+
+
+@pytest.mark.parametrize(("value", "type_name"), _NON_LIST_SHAPES)
+def test_validate_triage_refuses_non_list_bundle_dw_ids_without_the_emptiness_error(
+    value, type_name
+):
+    """One error per fault: a `null` `dw_ids` is a SHAPE fault and must not also
+    report `has no dw_ids`, which is what a `[]` fallback would have tripped --
+    the same reason `_plan_str` threads `None` rather than "".
+    ABLATION: revert to `[str(i) for i in item.get("dw_ids", [])]` and this raises
+    `TypeError: 'NoneType' object is not iterable`; keep the `_plan_list` call but
+    drop the `raw_dw_ids is not None` guard and it double-reports (the shape error
+    plus `bundle 'fix-it' has no dw_ids`)."""
+    rj = triage_result([], bundles=[{"name": "fix-it", "dw_ids": value, "intent": "harden it"}])
+
+    plan, errors = validate_triage(rj, set())
+
+    assert plan is None
+    assert errors == [f"bundles[0]: dw_ids not a list: {type_name}"]
+
+
+@pytest.mark.parametrize(("value", "type_name"), _NON_LIST_SHAPES)
+def test_validate_triage_refuses_a_non_list_option_container_without_the_arity_error(
+    value, type_name
+):
+    """The decision-side twin: a `null` `options` reports ONE error. Neither the
+    arity check nor the recommendation check may fire on top of it -- both read a
+    `keys`/`options` census that the shape fault emptied, so both would report a
+    fault this plan does not have and send a re-driven triage session after the
+    wrong field.
+    ABLATION: drop the `_plan_list` call and this raises `TypeError: 'NoneType'
+    object is not iterable`; drop the `raw_options is not None` guard on the arity
+    check and it raises `TypeError: object of type 'NoneType' has no len()` (the
+    guard is what makes the suppression total rather than a `[]` fallback that
+    would report the arity error on top); drop `options_well_shaped` from the
+    recommendation check and `recommendation '1' not an option` appears."""
+    rj = triage_result(
+        ["DW-1"],
+        decisions=[
+            {
+                "id": "DW-1",
+                "question": "build it?",
+                "context": "ctx",
+                "options": value,
+                "recommendation": "1",
+            }
+        ],
+    )
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert errors == [f"decision DW-1: options not a list: {type_name}"]
+
+
+def test_validate_triage_refuses_non_object_option_members_without_the_arity_error():
+    """Exactly two errors, one per malformed member, and nothing else: the arity
+    check counts the RAW list (two options were offered), so dropping both
+    members must not manufacture `needs at least 2 options`, and the
+    recommendation names an option this decision really did offer, so the short
+    `keys` set must not manufacture `not an option` either.
+    ABLATION: drop the `_plan_mapping` call and this raises `AttributeError`;
+    count `len(options)` (the surviving list) instead of `len(raw_options)` and
+    the arity error appears; drop `options_well_shaped` from the recommendation
+    check and a third error appears."""
+    rj = triage_result(
+        ["DW-1"],
+        decisions=[
+            {
+                "id": "DW-1",
+                "question": "build it?",
+                "context": "ctx",
+                "options": [None, "nope"],
+                "recommendation": "1",
+            }
+        ],
+    )
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert errors == [
+        "decision DW-1 options[0] not an object: NoneType",
+        # Deliberately a str, not a second null: `isinstance(raw, dict)` is the
+        # check under test, and a null-only row would stay green under a weaker
+        # `raw is not None`.
+        "decision DW-1 options[1] not an object: str",
+    ]
+
+
+def test_validate_triage_keeps_member_positions_when_an_earlier_member_is_dropped():
+    """The whole point of a positional label: `enumerate` runs over the RAW list,
+    so dropping `bundles[0]` leaves the next bundle reporting `bundles[1]` --
+    the document's position, not the surviving list's.
+    ABLATION: filter the malformed members out of the list before enumerating (or
+    enumerate the surviving bundles) and the second error moves to `bundles[0]`,
+    naming a bundle the triage session never wrote there."""
+    rj = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[None, {"name": 5, "dw_ids": ["DW-1", "DW-2"], "intent": "harden it"}],
+    )
+
+    plan, errors = validate_triage(rj, {"DW-1", "DW-2"})
+
+    assert plan is None
+    assert errors == [
+        "bundles[0] not an object: NoneType",
+        "bundles[1]: name not a string: int",
+    ]
+
+
+def test_validate_triage_keeps_a_surviving_options_original_position():
+    """A malformed member must not shift a surviving object's scalar diagnostic.
+    ABLATION: number surviving object options separately from raw members and
+    the scalar error reports options[0], while the member error stays correct.
+    The non-string key selects the positional scalar diagnostic without changing
+    the existing `str(...)` treatment of identifiers."""
+    rj = _clean_option_decision(key=5, intent=["do", "x"])
+    rj["decisions"][0]["options"].insert(0, None)
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert errors == [
+        "decision DW-1 options[0] not an object: NoneType",
+        "decision DW-1 options[1]: intent not a string: list",
+    ]
+
+
+def test_validate_triage_leaves_a_valid_plan_identical():
+    """The control the shape checks are held against: every section populated,
+    every new helper on its accepting path, and the resulting plan compared field
+    by field to the one this release must keep producing. This pins the resulting
+    plan's values; it makes no claim about the input containers' identity."""
+    rj = triage_result(
+        ["DW-1", "DW-2", "DW-3", "DW-4", "DW-5"],
+        already_resolved=[{"id": "DW-1", "evidence": "fixed in abc123"}],
+        bundles=[{"name": "fix-strings", "dw_ids": ["DW-2"], "intent": "harden it"}],
+        blocked=[{"id": "DW-3", "blocker": "story 5-2"}],
+        skip=[{"id": "DW-4", "reason": "wontfix"}],
+        decisions=[
+            {
+                "id": "DW-5",
+                "question": "renegotiate?",
+                "context": "ctx",
+                "options": [
+                    {"key": "1", "label": "build it", "effect": "build", "intent": "do x"},
+                    {"key": "2", "label": "keep", "effect": "keep-open"},
+                ],
+                "recommendation": "1",
+            }
+        ],
+    )
+
+    plan, errors = validate_triage(rj, {"DW-1", "DW-2", "DW-3", "DW-4", "DW-5"})
+
+    assert errors == []
+    assert plan == TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2", "DW-3", "DW-4", "DW-5"}),
+        already_resolved=(ResolvedEntry("DW-1", "fixed in abc123"),),
+        bundles=(Bundle("fix-strings", ("DW-2",), "harden it"),),
+        blocked=(("DW-3", "story 5-2"),),
+        skip=(("DW-4", "wontfix"),),
+        decisions=(
+            Decision(
+                "DW-5",
+                "renegotiate?",
+                "ctx",
+                (
+                    DecisionOption("1", "build it", "build", intent="do x"),
+                    DecisionOption("2", "keep", "keep-open"),
+                ),
+                "1",
+            ),
+        ),
+    )
+
+
 # --------------------------------- line breaks in ledger-bound text (#305)
 #
 # validate_triage deliberately does NOT gate on line breaks. The sanitizer in
@@ -3101,6 +3415,42 @@ def test_triage_validation_failure_retries_with_feedback_then_escalates(project)
     assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
     feedback_path = prompts[1].split("--feedback ", 1)[1]
     assert "not triaged: DW-1" in open(feedback_path).read()
+
+
+def test_triage_returning_a_nested_null_container_refuses_without_crashing_the_run(project):
+    """DW-155/DW-158's live-session surface. `_read_result` already rejects a
+    non-dict TOP level (`adapters/generic.py`), so what a real triage session can
+    still deliver is a wrong-shape NESTED container -- and `_ensure_triage`'s
+    live-session call site has no guard of its own, deliberately: the validator's
+    totality is what closes it, and a second guard here would be unablatable.
+
+    So the run must degrade exactly as any other invalid plan does: refused,
+    journalled on `triage-decision` with `ok=False` and the shape error, retried
+    with that error as feedback, escalated at the attempt cap -- and no exception
+    out of the run loop.
+    ABLATION: drop the `_plan_mapping` call in the `bundles` loop and this test
+    does not merely redden, it raises `AttributeError` out of `engine.run()`."""
+    write_ledger(project, {"DW-1": "open"})
+    bad = triage_result(["DW-1"], bundles=[None])
+    engine, adapter = make_sweep(project, [triage_effect(bad), triage_effect(bad)])
+
+    summary = engine.run()
+
+    assert summary.paused
+    assert engine.state.tasks["sweep-triage"].phase == Phase.ESCALATED
+    decisions_journalled = _records(engine, "triage-decision")
+    assert [r["ok"] for r in decisions_journalled] == [False, False]
+    # The shape error, plus the unclaimed-id error the dropped bundle leaves
+    # behind: DW-1 was only ever claimed by the member that failed the check.
+    assert decisions_journalled[0]["errors"] == [
+        "bundles[0] not an object: NoneType",
+        "open entries not triaged: DW-1",
+    ]
+    prompts = [s.prompt for s in adapter.sessions]
+    assert len(prompts) == 2
+    assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
+    feedback_path = prompts[1].split("--feedback ", 1)[1]
+    assert "bundles[0] not an object: NoneType" in open(feedback_path).read()
 
 
 def test_overlong_bundle_name_is_normalized_without_triage_retry(project):
@@ -8548,14 +8898,20 @@ def test_sweep_bundle_damped_re_review_capped_notifies_not_refiles(project):
 
 
 def _lose_triage(run_dir, corruption="missing"):
-    """Make the cached triage plan unusable the three ways a real run can: the
-    file vanished, it was truncated mid-write, or it holds something that is not
-    a triage result."""
+    """Make the cached triage plan unusable the four ways a real run can: the
+    file vanished, it was truncated mid-write, it holds something that is not a
+    triage result, or -- the DW-155/DW-158 shape -- it IS a triage result whose
+    containers are the wrong shape. The last one is the only mode that reaches
+    the validator's body at all: `{}` fails on `workflow` and never gets there."""
     path = run_dir / "triage.json"
     if corruption == "missing":
         path.unlink()
     elif corruption == "invalid-json":
         path.write_text("{{{", encoding="utf-8")
+    elif corruption == "nested-null":
+        # No open_ids, so the reload's only complaint is the shape fault itself
+        # (the reload passes expected_open_ids=None, so an empty set is legal).
+        path.write_text(json.dumps(triage_result([], bundles=[None])), encoding="utf-8")
     else:
         path.write_text("{}", encoding="utf-8")
 
@@ -8645,6 +9001,62 @@ def test_fresh_triage_different_bundle_name_no_double_drive(project, corruption)
     if corruption != "missing":
         # a truncated / wrong-shape cache degrades to a fresh triage, never a crash
         assert "sweep-triage-reload-failed" in journal_text(resumed)
+
+
+def test_triage_cache_holding_a_nested_null_container_redrives_triage(project):
+    """DW-155/DW-158 at `_ensure_triage`'s CACHE-RELOAD call site -- the surface
+    the other rows do not reach. That branch guards the top level
+    (`isinstance(cached, dict)`) but hands anything object-shaped straight to
+    `validate_triage`, and its `except` covers only the READ, so a cached plan
+    whose `bundles` held a `null` member raised `AttributeError` from inside the
+    `else` arm. A resuming run therefore died on its own cache instead of
+    degrading to a fresh triage, which is exactly what that `try` was written to
+    guarantee.
+
+    `_lose_triage`'s other three modes cannot pin this: `{}` is refused on
+    `workflow` and never enters the validator's body at all.
+
+    ABLATION: drop the `_plan_mapping` call in `validate_triage`'s `bundles` loop
+    and the fault does NOT surface to the caller -- the engine's backstop catches
+    it and journals `run-crash`, so `run()` still returns an unpaused summary and
+    the sweep simply stops: no triage session (`roles == ["dev", "review"]`), no
+    `sweep-triage-reload-failed` record, DW-2 left open and no bundle for it.
+    That silence is why `run-crash` is asserted absent here rather than left to
+    the unpaused summary to imply."""
+    engine = _run_two_bundle_dev_escalation(project)
+    runs.rearm_escalation(
+        engine.run_dir, "dw-fix", isolated_redrive=False, resolution_recorded=True
+    )
+    _lose_triage(engine.run_dir, "nested-null")
+
+    fresh = triage_result(
+        ["DW-2"], bundles=[{"name": "renamed-fix", "dw_ids": ["DW-2"], "intent": "resolve DW-2"}]
+    )
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [
+            *_redrive_script(project),
+            triage_effect(fresh),
+            bundle_dev_effect(project, "renamed-fix", ["DW-2"]),
+            bundle_review_effect(project, "renamed-fix"),
+        ],
+    )
+
+    summary = resumed.run()
+
+    assert not summary.paused
+    # The engine's backstop turns an escaping fault into a `run-crash` record and
+    # an unpaused summary, so "did not crash" has to be asserted directly.
+    assert _records(resumed, "run-crash") == []
+    # The refusal is journalled, and it carries the SHAPE error -- not a generic
+    # "unreadable", which is what the sibling `except` arm reports.
+    reload_failed = _records(resumed, "sweep-triage-reload-failed")
+    assert len(reload_failed) == 1
+    assert reload_failed[0]["errors"] == ["bundles[0] not an object: NoneType"]
+    # ...and the run degraded to a FRESH triage rather than dying on the cache.
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "triage", "dev", "review"]
+    assert resumed.state.tasks["dw-renamed-fix"].phase == Phase.DONE
 
 
 def test_restore_patch_latch_honored_when_triage_json_lost(project, monkeypatch):

@@ -384,6 +384,48 @@ def test_pending_missed_decisions_skips_an_unreadable_triage_cache(project, monk
     assert [d.id for d in decisions.pending_missed_decisions(project.project)] == ["DW-1"]
 
 
+def test_pending_missed_decisions_skips_a_triage_with_a_nested_null_container(project):
+    """DW-155/DW-158 at this reader. A cached triage that decodes and parses
+    cleanly could still take the whole listing down: `validate_triage` iterated
+    `bundles`/`decisions` and their members unscreened, so a `null` member raised
+    `AttributeError` -- a fault no arm of the `except` above catches, past
+    `cmd_decisions` and `cmd_status` (which catch `BmadConfigError` alone) and
+    past the TUI (which catches `(BmadConfigError, OSError)`). Degradation is per
+    FILE, like DW-145's: the newest run is skipped and the older run's DW-1 still
+    surfaces.
+    ABLATION TARGET IS THE VALIDATOR: drop the `_plan_mapping` call in
+    `validate_triage`'s `bundles` loop and this raises `AttributeError` rather
+    than returning ["DW-1"]. The `isinstance(rj, dict)` boundary guard added here
+    does not cover this row -- a nested fault is inside an object document."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run(project, "20260101-000000-aaaa", _triage(["DW-1"], [_decision("DW-1")]))
+    bad = _triage([], [])
+    bad["bundles"] = [None]
+    _make_run(project, "20260102-000000-bbbb", bad)
+
+    assert [d.id for d in decisions.pending_missed_decisions(project.project)] == ["DW-1"]
+
+
+def test_pending_missed_decisions_skips_a_non_object_triage_document(project):
+    """The document-level twin: a cached `triage*.json` whose top level is not an
+    object at all. `json.loads` returns `Any`, and `validate_triage`'s parameter
+    is `dict[str, Any] | None`, so this call site was handing an unchecked shape
+    across a typed boundary -- and `rj = rj or {}` substituted only on a FALSY
+    document, so a non-empty list reached `.get` and raised `AttributeError`.
+    Two independent checks now stand between that and this reader, and BOTH have
+    to be removed to reproduce the traceback: the validator's `isinstance(rj,
+    dict)` refusal and this loop's boundary `continue`, which matches the parity
+    `load_pre_answers` and `_ensure_triage`'s cache-reload branch already have."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run(project, "20260101-000000-aaaa", _triage(["DW-1"], [_decision("DW-1")]))
+    bad = _make_run(project, "20260102-000000-bbbb", _triage([], []))
+    (bad / "triage.json").write_text(json.dumps(["nope"]), encoding="utf-8")
+
+    assert [d.id for d in decisions.pending_missed_decisions(project.project)] == ["DW-1"]
+
+
 def test_pending_missed_decisions_skips_a_triage_the_stricter_validation_refuses(project):
     """The DW-148 blast radius on THIS reader, pinned rather than discovered. A
     cached triage that decodes and parses cleanly can still fail the new

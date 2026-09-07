@@ -128,6 +128,45 @@ def test_pending_missed_decisions_survives_an_undecodable_triage(project):
     assert [d.id for d in data.pending_missed_decisions(project.project)] == ["DW-1"]
 
 
+def test_pending_missed_decisions_survives_a_nested_null_triage(project):
+    """DW-155/DW-158 at the same uncaught surface, one fault class over. A cached
+    triage can decode and parse cleanly and still hold a `null` where a list
+    member belongs; `validate_triage` called `.get` on it unscreened, so an
+    `AttributeError` -- not an `OSError`, so this reader's
+    `(BmadConfigError, OSError)` catch does not see it either -- escaped
+    `decisions.pending_missed_decisions` and reached the dashboard's render, the
+    same path DW-145's `UnicodeDecodeError` took. The validator is total over
+    shapes now, so the bad cache is refused and skipped and the good run's DW-1
+    still lists: degradation is per FILE, not a blanked panel.
+    Ablation: drop the `_plan_mapping` call in `validate_triage`'s `bundles` loop
+    and this reddens with `AttributeError` rather than returning ["DW-1"]."""
+    import json
+
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _write_triage_decision(make_run(project.project, "20260101-000000-aaaa"))
+    bad = make_run(project.project, "20260102-000000-bbbb")
+    (bad / "triage.json").write_text(
+        json.dumps(
+            {
+                "workflow": "deferred-sweep-triage",
+                "open_ids": [],
+                "already_resolved": [],
+                "bundles": [None],
+                "blocked": [],
+                "skip": [],
+                "decisions": [],
+                "escalations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert [d.id for d in data.pending_missed_decisions(project.project)] == ["DW-1"]
+
+
 def test_pending_missed_decisions_empty_for_uninitialized(tmp_path):
     assert data.pending_missed_decisions(tmp_path) == []
 

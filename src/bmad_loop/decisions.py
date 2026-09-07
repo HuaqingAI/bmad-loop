@@ -226,6 +226,17 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
         # (`_ensure_triage`, `_decisions_phase`).
         except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             continue
+        # Boundary guard (DW-155/DW-158): `json.loads` returns `Any`, and the
+        # parameter below is `dict[str, Any] | None`, so this call was handing an
+        # unchecked shape across a typed boundary — a non-object document made
+        # `validate_triage` raise `AttributeError` past every caller listed in the
+        # comment above. `validate_triage` is total over shapes now, so removing
+        # this alone reproduces nothing; it stands as the parity these two
+        # siblings already have — `load_pre_answers` (`isinstance(data, dict)`)
+        # and `_ensure_triage`'s cache-reload branch — keeping this reader's
+        # per-file degradation independent of the validator's internals.
+        if not isinstance(rj, dict):
+            continue
         plan, _errors = validate_triage(rj, None)
         if plan is None:
             continue

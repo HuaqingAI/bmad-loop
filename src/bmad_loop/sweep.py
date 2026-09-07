@@ -347,6 +347,58 @@ def _plan_str(container: dict[str, Any], field: str, where: str, errors: list[st
     return None
 
 
+def _plan_list(
+    container: dict[str, Any], field: str, where: str, errors: list[str]
+) -> list[Any] | None:
+    """One list-shaped container off a triage plan, or None when it is not a
+    list — the container twin of :func:`_plan_str` (DW-155/DW-158).
+
+    Every one of these sites used to iterate `container.get(field, [])`
+    unscreened, so a JSON `null` (the likeliest wrong shape an LLM emits) raised
+    `TypeError: 'NoneType' object is not iterable` straight out of
+    `validate_triage` — past `_ensure_triage`'s live-session call site, which has
+    no guard of its own, and past `decisions.pending_missed_decisions`, whose
+    read loop catches only decode faults. A malformed plan is REFUSED through the
+    `errors` channel that already exists; there is no repair path, and the caller
+    never sees a `[]` fallback it could mistake for an empty section.
+
+    `None` (not `[]`) is threaded for the reason `_plan_str` threads it rather
+    than "": `[]` would re-enter the field's own emptiness/arity branch and
+    double-report one fault (`bundle ... has no dw_ids`, `decision ... needs at
+    least 2 options`). One error per fault is the convention here.
+
+    The message names the POSITION (or the decision id) and the type name only,
+    never the offending value's prose — these strings reach a journal. `where` is
+    "" for a top-level section, whose field name already locates it.
+    """
+    value = container.get(field, [])
+    if isinstance(value, list):
+        return value
+    prefix = f"{where}: " if where else ""
+    errors.append(f"{prefix}{field} not a list: {type(value).__name__}")
+    return None
+
+
+def _plan_mapping(item: Any, where: str, errors: list[str]) -> dict[str, Any] | None:
+    """One object-shaped member of a triage plan's list section, or None when it
+    is not an object (DW-155/DW-158).
+
+    Each member loop called `.get` on whatever the list held, so a `null` or a
+    bare string member raised `AttributeError` out of `validate_triage` and every
+    caller of it. `_normalize_bundle_names`, which runs first, already carries
+    exactly this guard on the same members — this is the check the validator was
+    missing, not a new policy.
+
+    Callers `continue` past a `None` while enumerating the RAW list, so a dropped
+    member does not renumber the positions its siblings report. As with
+    :func:`_plan_str` the message carries the position and the type name only.
+    """
+    if isinstance(item, dict):
+        return item
+    errors.append(f"{where} not an object: {type(item).__name__}")
+    return None
+
+
 def validate_triage(
     rj: dict[str, Any] | None, expected_open_ids: set[str] | None
 ) -> tuple[TriagePlan | None, list[str]]:
@@ -354,12 +406,25 @@ def validate_triage(
     (plan, []) or (None, errors). expected_open_ids=None skips the ledger
     equality check (used when reloading a previously validated plan)."""
     errors: list[str] = []
-    rj = rj or {}
+    if rj is None:
+        rj = {}
+    if not isinstance(rj, dict):
+        # `rj = rj or {}` substituted only on a FALSY document, so every other
+        # wrong-shape top level -- a list, a string, a number -- reached `.get`
+        # and raised `AttributeError` out of every caller (DW-155). Refused
+        # through the same channel as any other malformed plan, and BEFORE
+        # `_normalize_bundle_names`, which also assumes a mapping.
+        return None, [f"triage result not a JSON object: {type(rj).__name__}"]
     _normalize_bundle_names(rj)
     if rj.get("workflow") != TRIAGE_WORKFLOW:
         return None, [f"workflow must be {TRIAGE_WORKFLOW!r}: got {rj.get('workflow')!r}"]
 
-    claimed_open = {str(i) for i in rj.get("open_ids", [])}
+    raw_open_ids = _plan_list(rj, "open_ids", "", errors)
+    if raw_open_ids is None:
+        # Early return, like the `workflow` and open-set-mismatch refusals around
+        # it: the ledger-equality check below has nothing left to compare.
+        return None, errors
+    claimed_open = {str(i) for i in raw_open_ids}
     if expected_open_ids is not None and claimed_open != expected_open_ids:
         missed = sorted(expected_open_ids - claimed_open)
         invented = sorted(claimed_open - expected_open_ids)
@@ -381,7 +446,12 @@ def validate_triage(
             seen[dw_id] = category
 
     resolved = []
-    for item in rj.get("already_resolved", []):
+    for resolved_index, raw_resolved in enumerate(
+        _plan_list(rj, "already_resolved", "", errors) or []
+    ):
+        item = _plan_mapping(raw_resolved, f"already_resolved[{resolved_index}]", errors)
+        if item is None:
+            continue
         dw_id = str(item.get("id", ""))
         evidence = str(item.get("evidence", "")).strip()
         claim(dw_id, "already_resolved")
@@ -391,11 +461,16 @@ def validate_triage(
 
     bundles = []
     names: set[str] = set()
-    for bundle_index, item in enumerate(rj.get("bundles", [])):
+    for bundle_index, raw_bundle in enumerate(_plan_list(rj, "bundles", "", errors) or []):
         # Positional, not by name: the name itself may be the non-string field,
         # so it cannot be the thing that identifies the bundle in an error. Same
-        # label shape as `_normalize_bundle_names`, which ran above.
+        # label shape as `_normalize_bundle_names`, which ran above. Enumerating
+        # the RAW list is what keeps a dropped member from renumbering its
+        # siblings' positions.
         where = f"bundles[{bundle_index}]"
+        item = _plan_mapping(raw_bundle, where, errors)
+        if item is None:
+            continue
         name = _plan_str(item, "name", where, errors)
         # `repr(name)` for every message that already named the bundle by name;
         # the position stands in when there is no name to print.
@@ -422,8 +497,12 @@ def validate_triage(
             # non-empty `errors` returns `(None, errors)` before any duplicate could
             # matter.
             names.add(name)
-        dw_ids = [str(i) for i in item.get("dw_ids", [])]
-        if not dw_ids:
+        raw_dw_ids = _plan_list(item, "dw_ids", where, errors)
+        # MEMBERS keep their `str(...)` treatment (DW-148 drew that line); only
+        # the container is shape-checked. Guarded on the check having passed so a
+        # `null` list does not also report "has no dw_ids".
+        dw_ids = [str(i) for i in raw_dw_ids or []]
+        if raw_dw_ids is not None and not dw_ids:
             errors.append(f"bundle {label} has no dw_ids")
         for dw_id in dw_ids:
             claim(dw_id, f"bundle {label}")
@@ -435,7 +514,10 @@ def validate_triage(
         bundles.append(Bundle(name or "", tuple(dw_ids), intent or ""))
 
     blocked = []
-    for item in rj.get("blocked", []):
+    for blocked_index, raw_blocked in enumerate(_plan_list(rj, "blocked", "", errors) or []):
+        item = _plan_mapping(raw_blocked, f"blocked[{blocked_index}]", errors)
+        if item is None:
+            continue
         dw_id = str(item.get("id", ""))
         blocker = str(item.get("blocker", "")).strip()
         claim(dw_id, "blocked")
@@ -444,7 +526,10 @@ def validate_triage(
         blocked.append((dw_id, blocker))
 
     skip = []
-    for item in rj.get("skip", []):
+    for skip_index, raw_skip in enumerate(_plan_list(rj, "skip", "", errors) or []):
+        item = _plan_mapping(raw_skip, f"skip[{skip_index}]", errors)
+        if item is None:
+            continue
         dw_id = str(item.get("id", ""))
         reason = str(item.get("reason", "")).strip()
         claim(dw_id, "skip")
@@ -453,7 +538,10 @@ def validate_triage(
         skip.append((dw_id, reason))
 
     decisions = []
-    for item in rj.get("decisions", []):
+    for decision_index, raw_decision in enumerate(_plan_list(rj, "decisions", "", errors) or []):
+        item = _plan_mapping(raw_decision, f"decisions[{decision_index}]", errors)
+        if item is None:
+            continue
         dw_id = str(item.get("id", ""))
         claim(dw_id, "decisions")
         question = str(item.get("question", "")).strip()
@@ -462,7 +550,22 @@ def validate_triage(
         options = []
         keys: set[str] = set()
         decision_bundle_names: set[str] = set()
-        for option_index, raw in enumerate(item.get("options", [])):
+        raw_options = _plan_list(item, "options", f"decision {dw_id}", errors)
+        # Whether `keys` below is a faithful census of the options this decision
+        # OFFERED. Only an object contributes a key, so a `null` container or a
+        # dropped member leaves `keys` short and a perfectly good
+        # `recommendation` would report `not an option` on top of the shape
+        # error it is merely downstream of -- one fault, two errors, and a
+        # re-driven triage session told to fix a field that was never wrong.
+        # This is the `bundles`/`names` gap documented above, but not its
+        # frequency: that one needs a second bundle to collide, while this one
+        # fires on every shape-failed option a recommendation names.
+        options_well_shaped = raw_options is not None
+        for option_index, raw_option in enumerate(raw_options or []):
+            raw = _plan_mapping(raw_option, f"decision {dw_id} options[{option_index}]", errors)
+            if raw is None:
+                options_well_shaped = False
+                continue
             raw_key = raw.get("key", "")
             key = str(raw_key)
             # Positional until the key is known to be a string, for the reason the
@@ -528,10 +631,16 @@ def validate_triage(
                 )
             )
         names.update(decision_bundle_names)
-        if len(options) < 2:
+        # The RAW length, not the surviving one: a dropped member already
+        # reported its own fault and must not also trip the arity error.
+        if raw_options is not None and len(raw_options) < 2:
             errors.append(f"decision {dw_id} needs at least 2 options")
         recommendation = _plan_str(item, "recommendation", f"decision {dw_id}", errors)
-        if recommendation is not None and recommendation not in keys:
+        # Guarded on the option shapes for the reason stated at the loop above:
+        # against a short `keys` this check reports a fault the plan does not
+        # have. A recommendation that really is bogus is still refused on the
+        # next pass, once the options are objects.
+        if recommendation is not None and options_well_shaped and recommendation not in keys:
             errors.append(f"decision {dw_id}: recommendation {recommendation!r} not an option")
         context = _plan_str(item, "context", f"decision {dw_id}", errors)
         decisions.append(
