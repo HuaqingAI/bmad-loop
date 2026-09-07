@@ -13,7 +13,9 @@ from conftest import (
     attach_profile,
     git,
     install_build_auto_skill,
+    nested_repo_root_paths,
     write_gated_ledger,
+    write_ledger,
     write_spec,
 )
 
@@ -1086,6 +1088,92 @@ def test_accepted_plan_halt_journal_excludes_engine_written(project, monkeypatch
     assert outcome.ok
     (record,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
     assert record["zero_diff"] is True
+
+
+def test_accepted_plan_halt_observation_excludes_the_nested_ledger_under_the_monorepo_shape(
+    project,
+):
+    """Grade the real producer's stories plan-halt join (DW-153).
+
+    ``StoriesEngine._verify_dev_artifacts`` passes ``_harvest_gate_exclude`` into
+    ``verify_dev_stories`` as ``engine_written`` for ``observe_skipped_proof``.
+    The nested shape makes a project-rooted spelling name a REAL outer ledger,
+    so it cannot agree with the correct root through a pathspec matching nothing.
+
+    Seed the absolute outer stories folder, whose path the engine keeps verbatim:
+    stories exclusions stay unprefixed while the ledger exclusion needs ``app/``.
+    Commit every seeded file, including the draft story, before the attempt. This
+    prevents decoy residue and forces git's exclude-pathspec branch for the append.
+    Leave the decoy alone: touching it would make even the correct root see residue.
+
+    Assert the observation before the spelling pin so the ablation fails on
+    behavior. The stand-down control proves the append is countable; an additional
+    verifier exclusion hiding it would fail that control. Check the journal first
+    because the second verification deduplicates the same attempt/generation.
+
+    Ablation, measured: set ``root = paths.project`` in ``_harvest_gate_exclude``
+    and this fails with ``plan_halt_zero_diff is False``. The unprefixed spelling
+    excludes the untouched outer decoy and counts the engine's nested append.
+    """
+    paths = nested_repo_root_paths(project)
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+
+    decoy = paths.repo_root / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
+    decoy.parent.mkdir(parents=True, exist_ok=True)
+    assert not decoy.exists(), "the test must create its own outer decoy ledger"
+    decoy_bytes = b"# outer ledger\n"
+    decoy.write_bytes(decoy_bytes)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+
+    outer_spec_folder = paths.repo_root / SPEC_FOLDER
+    sp = outer_spec_folder / "stories" / "1-slug.md"
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "draft", rev_parse_head(paths.repo_root))
+    setup_stories(paths, [entry("1", spec_checkpoint=True)], spec_folder=str(outer_spec_folder))
+    # setup_stories stages repo-wide even from app/: pin every tracked seed.
+    git(
+        paths.repo_root,
+        "ls-files",
+        "--error-unmatch",
+        decoy.as_posix(),
+        paths.deferred_work.as_posix(),
+        sp.as_posix(),
+        (outer_spec_folder / "SPEC.md").as_posix(),
+        (outer_spec_folder / "stories.yaml").as_posix(),
+    )
+
+    engine, _adapter = make_engine(paths, [], spec_folder=str(outer_spec_folder))
+    assert Path(engine._spec_folder_rel).is_absolute()
+    assert engine._stories_folder() == outer_spec_folder
+    baseline = rev_parse_head(paths.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline)
+    task.harvest_wrote_ledger = True
+
+    # The entire attempt: update the tracked plan and append the nested ledger.
+    write_spec(sp, "ready-for-dev", baseline)
+    with paths.deferred_work.open("a", encoding="utf-8") as fh:
+        fh.write("\n### DW-2: harvested from the spec\n\nstatus: open\n")
+    result_json = {"workflow": "auto-dev", "plan_halt": True}
+    outcome = engine._verify_dev_artifacts(task, result_json)
+
+    assert outcome.ok
+    assert outcome.plan_halt_zero_diff is True
+    (record,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    assert record["zero_diff"] is True
+
+    task.ledger_changed_before_harvest = True
+    control = engine._verify_dev_artifacts(task, result_json)
+    assert control.ok
+    assert control.plan_halt_zero_diff is False
+    assert engine._harvest_gate_exclude(task) == ()
+    task.ledger_changed_before_harvest = False
+    assert _kinds(engine.journal, "plan-halt-proof-of-work-skipped") == [record]
+
+    assert engine._harvest_gate_exclude(task) == (
+        "app/_bmad-output/implementation-artifacts/deferred-work.md",
+    )
+    assert decoy.is_file() and decoy.read_bytes() == decoy_bytes
 
 
 def test_replayed_plan_halt_does_not_duplicate_proof_waiver(project):

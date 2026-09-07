@@ -5400,6 +5400,11 @@ class Engine:
         override the ledger sits outside the code tree — where it cannot satisfy
         proof-of-work, so ``()`` is the right answer rather than a pathspec git
         would silently match nothing against.
+
+        Graded by
+        ``tests/test_engine.py::test_harvest_gate_exclude_gates_the_nested_ledger_under_the_monorepo_shape``,
+        ``tests/test_engine.py::test_accepted_park_observation_excludes_the_nested_ledger_under_the_monorepo_shape``,
+        and ``tests/test_stories_engine.py::test_accepted_plan_halt_observation_excludes_the_nested_ledger_under_the_monorepo_shape``.
         """
         if not task.harvest_wrote_ledger or task.ledger_changed_before_harvest:
             return ()
