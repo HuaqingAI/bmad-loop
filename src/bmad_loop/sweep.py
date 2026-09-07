@@ -331,15 +331,35 @@ def _plan_str(container: dict[str, Any], field: str, where: str, errors: list[st
     plan is REFUSED and re-driven instead, through the `errors` channel that
     already exists; there is no repair path and no new drop cause.
 
-    The message names the decision id or the bundle's POSITION, the field and
-    the type name only, never the offending value's prose — the same rule, and
-    the same wording, as `unusable_answer_reason`.
+    The message names a POSITION, or the decision id when that id is itself a
+    string, plus the field and the type name only — never the offending value's
+    prose, the same rule and the same wording as `unusable_answer_reason`. Since
+    DW-157 a decision-level message can name the decision's own position too,
+    when its `id` is not a string.
 
     Callers thread the `None` through rather than falling back to "": "" would
     re-enter the field's own empty/invalid-value branch and double-report, and
     one error per fault is the convention here (see
     `test_validate_triage_reports_one_error_when_a_name_fails_both_gates`). The
-    dataclasses are constructed with `value or ""` at the end."""
+    dataclasses are constructed with `value or ""` at the end.
+
+    The fields screened here: bundle `name` and `intent`; option `key` (DW-156),
+    `effect`, `intent`, `label`, `resolution` and `bundle_name`; decision
+    `question` (DW-156), `recommendation` and `context`. Everything else off a
+    triage plan — the decision, section and `dw_ids` identifiers,
+    `already_resolved.evidence`, `blocked.blocker`, `skip.reason` — keeps its
+    `str(...)` treatment deliberately.
+
+    `key` and `question` joined the screened set under DW-156 for their LIVE
+    unscreened sinks, including operator-facing and journaled consumers:
+    `question` is printed by `DecisionPrompter.ask`, announced by `gates.notify`,
+    written to the `decision-pending` journal record and listed
+    by `bmad-loop decisions --list`; `key` is printed among the options there,
+    persisted into the answer store and written to `decision-answered`. Both also
+    reach `Bundle.decision_note` and so `intent.md`. That path already screened
+    `key`: `_materialize_bundles` takes the option key only when `_agreeing_option`
+    matched it against the answer-store-screened `answer_key`. The agreement
+    check does not screen `question`, whose type check here closes that path."""
     value = container.get(field, "")
     if isinstance(value, str):
         return value
@@ -367,9 +387,11 @@ def _plan_list(
     double-report one fault (`bundle ... has no dw_ids`, `decision ... needs at
     least 2 options`). One error per fault is the convention here.
 
-    The message names the POSITION (or the decision id) and the type name only,
-    never the offending value's prose — these strings reach a journal. `where` is
-    "" for a top-level section, whose field name already locates it.
+    The message names a POSITION (or the decision id, when that id is itself a
+    string — since DW-157 a decision-level message can name the decision's own
+    position instead) and the type name only, never the offending value's prose —
+    these strings reach a journal. `where` is "" for a top-level section, whose
+    field name already locates it.
     """
     value = container.get(field, [])
     if isinstance(value, list):
@@ -437,11 +459,17 @@ def validate_triage(
 
     seen: dict[str, str] = {}  # id -> category that claimed it
 
-    def claim(dw_id: str, category: str) -> None:
+    def claim(dw_id: str, category: str, subject: str | None = None) -> None:
+        """`dw_id` is the plan's identity and keys `seen`; `subject` is what the
+        error PRINTS. They differ only in the decisions loop, where an
+        object-valued `id` is named by its position instead of by its own
+        stringified contents (DW-157). Everywhere else the subject defaults to
+        the id, so the wording is byte-identical to before."""
+        shown = dw_id if subject is None else subject
         if dw_id not in universe:
-            errors.append(f"{category} references unknown/closed id {dw_id}")
+            errors.append(f"{category} references unknown/closed id {shown}")
         elif dw_id in seen:
-            errors.append(f"{dw_id} appears in both {seen[dw_id]} and {category}")
+            errors.append(f"{shown} appears in both {seen[dw_id]} and {category}")
         else:
             seen[dw_id] = category
 
@@ -542,15 +570,42 @@ def validate_triage(
         item = _plan_mapping(raw_decision, f"decisions[{decision_index}]", errors)
         if item is None:
             continue
-        dw_id = str(item.get("id", ""))
-        claim(dw_id, "decisions")
-        question = str(item.get("question", "")).strip()
-        if not question:
-            errors.append(f"decision {dw_id} has no question")
+        raw_id = item.get("id", "")
+        # Still the plan's identity, and still NOT type-checked: it keys `seen`
+        # and becomes `Decision.id` (the DW-145/148 Never clause stands). What is
+        # screened is what gets PRINTED. An object-valued `id` would otherwise
+        # interpolate its own stringified contents into every message this loop
+        # emits, and this module promises they carry type names only — these
+        # reach a journal. So the two display shapes are derived ONCE, from the
+        # raw value: a string id (the empty string included) keeps today's
+        # wording byte for byte, a non-string one is named by its position.
+        # `id_shown` is the bare subject `claim` interpolates; `decision_label`
+        # is the prefix every other message in the loop carries (DW-157).
+        dw_id = str(raw_id)
+        if isinstance(raw_id, str):
+            id_shown = dw_id
+            decision_label = f"decision {dw_id}"
+        else:
+            id_shown = f"decisions[{decision_index}] (id not a string: {type(raw_id).__name__})"
+            decision_label = id_shown
+        claim(dw_id, "decisions", id_shown)
+        # Type-checked rather than `str(...)`-ed (DW-156) for its live unscreened
+        # sinks, all of them operator-facing or journaled: `DecisionPrompter.ask`
+        # prints it, `gates.notify` announces it, the `decision-pending` journal
+        # record carries it and `bmad-loop decisions --list` lists it. It reaches
+        # `Bundle.decision_note` and `intent.md` too: `_agreeing_option` checks
+        # option semantics, not the question, so this check closes that path.
+        # Guarded on `is not None` so a non-string never also trips the emptiness
+        # error — one error per fault.
+        question = _plan_str(item, "question", decision_label, errors)
+        if question is not None:
+            question = question.strip()
+            if not question:
+                errors.append(f"{decision_label} has no question")
         options = []
         keys: set[str] = set()
         decision_bundle_names: set[str] = set()
-        raw_options = _plan_list(item, "options", f"decision {dw_id}", errors)
+        raw_options = _plan_list(item, "options", decision_label, errors)
         # Whether `keys` below is a faithful census of the options this decision
         # OFFERED. Only an object contributes a key, so a `null` container or a
         # dropped member leaves `keys` short and a perfectly good
@@ -562,23 +617,32 @@ def validate_triage(
         # fires on every shape-failed option a recommendation names.
         options_well_shaped = raw_options is not None
         for option_index, raw_option in enumerate(raw_options or []):
-            raw = _plan_mapping(raw_option, f"decision {dw_id} options[{option_index}]", errors)
+            raw = _plan_mapping(raw_option, f"{decision_label} options[{option_index}]", errors)
             if raw is None:
                 options_well_shaped = False
                 continue
             raw_key = raw.get("key", "")
-            key = str(raw_key)
-            # Positional until the key is known to be a string, for the reason the
-            # `bundles` loop is positional: `key` is NOT type-checked here (it stays
-            # `str(...)`, see the note above), so an object key would otherwise print
-            # its own prose into a message this file promises carries type names only
-            # -- and these reach a journal. A string key keeps today's wording byte
-            # for byte, empty ones included.
+            # Positional unless the key is a string, for the reason the `bundles`
+            # loop is positional. `key` IS type-checked now (DW-156 — it is printed
+            # among the options by `DecisionPrompter.ask` and `decisions --list`,
+            # persisted into the answer store and written to the
+            # `decision-answered` journal record), but the label still has to be
+            # derived from the RAW value BEFORE that check runs: a failed check
+            # leaves nothing to name the option with, and interpolating the raw
+            # value would print an object key's own prose into a message this file
+            # promises carries type names only — and these reach a journal. A
+            # string key keeps today's wording byte for byte, empty ones included.
             where = (
-                f"decision {dw_id} option {key}"
+                f"{decision_label} option {raw_key}"
                 if isinstance(raw_key, str)
-                else f"decision {dw_id} options[{option_index}]"
+                else f"{decision_label} options[{option_index}]"
             )
+            key = _plan_str(raw, "key", where, errors)
+            if key is None:
+                # `keys` is now short by one, exactly as a dropped member leaves
+                # it short: a sound `recommendation` must not report `not an
+                # option` on top of the fault it is merely downstream of.
+                options_well_shaped = False
             # Every free-text scalar this option contributes downstream, screened
             # before any of them is read. A field that failed the type check is
             # None from here on, and each value check below is guarded on that --
@@ -595,9 +659,15 @@ def validate_triage(
             if resolution is not None:
                 resolution = resolution.strip()
             bundle_name = _plan_str(raw, "bundle_name", where, errors)
-            if not key or key in keys:
-                errors.append(f"decision {dw_id}: missing/duplicate option key {key!r}")
-            keys.add(key)
+            if key is not None:
+                # The one site in this loop that still interpolates an identifier's
+                # VALUE rather than a positional label. It is leak-free only because
+                # `key` is `_plan_str`-screened above and so is known to be a string
+                # here — not because the label is positional (DW-156 carries DW-157
+                # at this site).
+                if not key or key in keys:
+                    errors.append(f"{decision_label}: missing/duplicate option key {key!r}")
+                keys.add(key)
             if effect is not None and effect not in DECISION_EFFECTS:
                 errors.append(f"{where}: bad effect {effect!r}")
             if effect == "build" and intent is not None and not intent:
@@ -622,8 +692,8 @@ def validate_triage(
                     decision_bundle_names.add(bundle_name)
             options.append(
                 DecisionOption(
-                    key=key,
-                    label=option_label or key,
+                    key=key or "",
+                    label=option_label or key or "",
                     effect=effect or "",
                     intent=intent or "",
                     resolution=resolution or "",
@@ -634,19 +704,19 @@ def validate_triage(
         # The RAW length, not the surviving one: a dropped member already
         # reported its own fault and must not also trip the arity error.
         if raw_options is not None and len(raw_options) < 2:
-            errors.append(f"decision {dw_id} needs at least 2 options")
-        recommendation = _plan_str(item, "recommendation", f"decision {dw_id}", errors)
+            errors.append(f"{decision_label} needs at least 2 options")
+        recommendation = _plan_str(item, "recommendation", decision_label, errors)
         # Guarded on the option shapes for the reason stated at the loop above:
         # against a short `keys` this check reports a fault the plan does not
         # have. A recommendation that really is bogus is still refused on the
         # next pass, once the options are objects.
         if recommendation is not None and options_well_shaped and recommendation not in keys:
-            errors.append(f"decision {dw_id}: recommendation {recommendation!r} not an option")
-        context = _plan_str(item, "context", f"decision {dw_id}", errors)
+            errors.append(f"{decision_label}: recommendation {recommendation!r} not an option")
+        context = _plan_str(item, "context", decision_label, errors)
         decisions.append(
             Decision(
                 dw_id,
-                question,
+                question or "",
                 (context or "").strip(),
                 tuple(options),
                 recommendation or "",

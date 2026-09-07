@@ -507,7 +507,7 @@ def test_validate_triage_accepts_ordinary_option_bundle_names(bundle_name):
     assert plan.decisions[0].option("1").bundle_name == bundle_name
 
 
-# ---------------------- non-string LLM-authored plan scalars (DW-148)
+# ---------------------- non-string LLM-authored plan scalars (DW-148, DW-156/157)
 #
 # The DW-141 harm on the plan-INPUT surface. `validate_triage` used to
 # `str(...)` every free-text scalar, so a list `intent` became the truthy repr
@@ -517,6 +517,18 @@ def test_validate_triage_accepts_ordinary_option_bundle_names(bundle_name):
 # the message names the id or the bundle position, the field and the TYPE name
 # only -- never the offending value's prose -- mirroring
 # `unusable_answer_reason`.
+#
+# DW-156 widened that screened set by exactly two fields — decision `question`
+# and option `key` — because `_materialize_bundles` interpolates both into
+# `Bundle.decision_note` and `_write_intent` writes that under `## Human
+# decision` in `intent.md`: the same harm chain, two fields over. The rest of
+# the DW-145/148 boundary (decision/section ids, `evidence`, `blocker`,
+# `reason`, `dw_ids` members) still stands — see the section-scalar rows below.
+#
+# DW-157 is a DIAGNOSTIC change with no acceptance effect: the decision `id` is
+# still not type-checked, but a non-string one is now NAMED by its position in
+# every message the loop emits instead of printing its own stringified
+# contents. A string id keeps today's wording byte for byte.
 
 
 def _clean_option_decision(**option_overrides):
@@ -592,27 +604,31 @@ def test_validate_triage_reports_one_error_per_non_string_option_scalar(field, v
 
 
 def test_validate_triage_names_an_option_positionally_when_its_key_is_not_a_string():
-    """`key` is deliberately NOT type-checked (it keeps `str(...)`), so it cannot
-    be trusted to name the option in an error -- the same reason the `bundles` loop
-    is positional. Interpolating it would print the offending value's own prose
-    into a message that carries type names only, and these reach a journal.
-    ABLATION: build `where` as `f"decision {dw_id} option {key}"` unconditionally
-    and this reddens with the dict's contents in the message."""
+    """`key` IS type-checked now (DW-156), but the label is still computed from the
+    RAW value BEFORE that check runs — a failed check leaves nothing to name the
+    option with, and interpolating the raw value would print the offending value's
+    own prose into a message that carries type names only, and these reach a
+    journal. So the option's OTHER faults are still reported positionally.
+    ABLATION: build `where` as `f"{decision_label} option {raw_key}"`
+    unconditionally and this reddens with the dict's contents in the messages."""
     rj = _clean_option_decision(key={"leaky": "secret prose"}, intent=["do", "x"])
     rj["decisions"][0]["recommendation"] = "{'leaky': 'secret prose'}"
 
     plan, errors = validate_triage(rj, {"DW-1"})
 
     assert plan is None
-    assert errors == ["decision DW-1 options[0]: intent not a string: list"]
+    assert errors == [
+        "decision DW-1 options[0]: key not a string: dict",
+        "decision DW-1 options[0]: intent not a string: list",
+    ]
     assert not any("secret prose" in e for e in errors)
 
 
 def test_validate_triage_keeps_todays_wording_for_an_empty_option_key():
-    """The other side of that switch: an empty key is still a STRING key, so the
-    existing wording stays byte-identical (`option ` with nothing after it) rather
-    than silently moving to the positional form. Pins that the positional fallback
-    is keyed on the TYPE, not on truthiness."""
+    """The other side of that switch: an empty key is still a STRING key, so it
+    passes the type check and the existing wording stays byte-identical (`option `
+    with nothing after it) rather than silently moving to the positional form.
+    Pins that the positional fallback is keyed on the TYPE, not on truthiness."""
     rj = _clean_option_decision(key="", effect="frobnicate")
 
     plan, errors = validate_triage(rj, {"DW-1"})
@@ -687,34 +703,251 @@ def test_validate_triage_names_the_right_bundle_position():
     assert errors == ["bundles[1]: intent not a string: int"]
 
 
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        pytest.param(
-            lambda rj: rj["decisions"][0]["options"][0].__setitem__("key", 1), id="option-key"
-        ),
-        pytest.param(lambda rj: rj["decisions"][0].__setitem__("question", 5), id="question"),
-    ],
-)
-def test_validate_triage_leaves_out_of_scope_decision_scalars_stringified(mutate):
-    """The scope boundary, asserted rather than assumed -- and it is a SCOPE
-    boundary, not a safety argument. `key` and `question` do reach an intent file:
-    `_materialize_bundles` interpolates both into `Bundle.decision_note`, which
-    `_write_intent` writes under `## Human decision` in
-    `run_dir/bundles/<name>/intent.md`, so a list `question` is accepted today and
-    lands there as `['a', 'b']`. They keep `str(...)` only because the bundle
-    intent enumerates the fields to type-check and these are not among them.
-    Widening the check to them would start refusing plans this release accepts, so
-    that is a separate decision with its own evidence -- this row exists to make
-    the current boundary explicit and to fail loudly if it moves by accident."""
+@pytest.mark.parametrize("value", [["a", "b"], None], ids=["list", "null"])
+def test_validate_triage_refuses_a_non_string_decision_question(value):
+    """The headline DW-156 case, and the field with the longest reach: a list
+    `question` used to validate with `errors == []` and ride into
+    `Bundle.decision_note` -> `intent.md` -> a dev session as the repr
+    `"['a', 'b']"`.
+    ABLATION: restore `question = str(item.get("question", "")).strip()` and this
+    reddens — the plan is ACCEPTED with `plan.decisions[0].question` holding that
+    repr, which is exactly the pre-DW-156 behavior this replaces."""
     rj = _clean_option_decision()
-    mutate(rj)
+    rj["decisions"][0]["question"] = value
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    # Exactly one: the `is not None` guard keeps it out of `has no question`.
+    assert errors == [f"decision DW-1: question not a string: {type(value).__name__}"]
+    assert not any("['a', 'b']" in e for e in errors)
+
+
+def test_validate_triage_still_strips_a_whitespace_only_question():
+    """`question` was `str(...).strip()`-ed before DW-156 and must still be
+    stripped after it: preserving each field's existing `.strip()` behavior is
+    what keeps the widening a TYPE change and nothing more. A whitespace-only
+    question is still empty, still refused, and still reported in today's
+    wording — exactly one error, since the type check passed.
+    ABLATION: drop the `.strip()` after `_plan_str` and this reddens — "   " is
+    truthy, so the plan is accepted with a blank question bound for
+    `Bundle.decision_note`."""
+    rj = _clean_option_decision()
+    rj["decisions"][0]["question"] = "   "
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert errors == ["decision DW-1 has no question"]
+
+
+@pytest.mark.parametrize("value", [1, None], ids=["int", "null"])
+def test_validate_triage_refuses_a_non_string_option_key(value):
+    """`key` reaches `Bundle.decision_note` beside `question` (DW-156).
+    ABLATION: restore `key = str(raw_key)` and this reddens — the plan is
+    ACCEPTED, the int silently renamed to the string "1" that the recommendation
+    then matches, so a key no human authored becomes the option's identity.
+    The COUNT is the second half: dropping the `key is not None` guard on the
+    missing/duplicate check re-reports the same fault as
+    `missing/duplicate option key`, and dropping the `options_well_shaped = False`
+    adds `recommendation '1' not an option` on top of it."""
+    rj = _clean_option_decision(key=value)
+    rj["decisions"][0]["recommendation"] = str(value)
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert errors == [f"decision DW-1 options[0]: key not a string: {type(value).__name__}"]
+
+
+def test_validate_triage_never_prints_an_object_option_keys_contents_even_duplicated():
+    """Two options carrying the SAME object key: the duplicate branch is the one
+    place a `key` was interpolated with `!r`, so it is the one that would leak the
+    value's prose. Both fail the type check, neither reaches `keys`, and the
+    duplicate error is therefore never reached.
+    ABLATION: drop the `key is not None` guard on the missing/duplicate check and
+    this reddens — but NOT with a leak: that branch interpolates the `_plan_str`
+    result, never `raw_key`, so it appends `missing/duplicate option key None`
+    once per option. The key type check closes this leak; positional `where`
+    protects the other diagnostics. This row pins that the duplicate branch
+    is not reached at all."""
+    rj = _clean_option_decision(key={"leaky": "secret prose"})
+    rj["decisions"][0]["options"][1]["key"] = {"leaky": "secret prose"}
     rj["decisions"][0]["recommendation"] = "1"
 
     plan, errors = validate_triage(rj, {"DW-1"})
 
+    assert plan is None
+    assert not any("secret prose" in e for e in errors)
+    assert errors == [
+        "decision DW-1 options[0]: key not a string: dict",
+        "decision DW-1 options[1]: key not a string: dict",
+    ]
+
+
+def test_validate_triage_names_a_decision_positionally_when_its_id_is_not_a_string():
+    """DW-157. `id` stays `str(...)`-ed — it is the plan's identity, not free
+    text — but it must not be what PRINTS: an object id interpolated into
+    `decision {dw_id}: ...` writes its own contents into a message this module
+    promises carries type names only, and these reach a journal.
+    ABLATION: restore `decision_label = f"decision {dw_id}"` unconditionally and
+    this reddens with the dict's contents in every message."""
+    rj = _clean_option_decision()
+    rj["decisions"][0]["id"] = {"leaky": "secret prose"}
+    del rj["decisions"][0]["question"]
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert not any("secret prose" in e for e in errors)
+    label = "decisions[0] (id not a string: dict)"
+    assert f"{label} has no question" in errors
+    # `claim` prints the same sanitized subject, as the bare id it interpolates.
+    assert f"decisions references unknown/closed id {label}" in errors
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        ({"question": None}, [": question not a string: NoneType"]),
+        ({"options": None}, [": options not a list: NoneType"]),
+        (
+            {"options": [None, {"key": "2", "effect": "keep-open"}]},
+            [" options[0] not an object: NoneType"],
+        ),
+        (
+            {"options": [{"key": "1", "effect": None}, {"key": "2", "effect": "keep-open"}]},
+            [" option 1: effect not a string: NoneType"],
+        ),
+        (
+            {
+                "options": [
+                    {"key": None, "effect": "keep-open"},
+                    {"key": "2", "effect": "keep-open"},
+                ]
+            },
+            [" options[0]: key not a string: NoneType"],
+        ),
+        (
+            {"options": [{"key": "1", "effect": "keep-open"}, {"key": "1", "effect": "keep-open"}]},
+            [": missing/duplicate option key '1'"],
+        ),
+        ({"options": [{"key": "1", "effect": "keep-open"}]}, [" needs at least 2 options"]),
+        ({"recommendation": None}, [": recommendation not a string: NoneType"]),
+        ({"recommendation": "missing"}, [": recommendation 'missing' not an option"]),
+        ({"context": None}, [": context not a string: NoneType"]),
+    ],
+    ids=[
+        "question",
+        "container",
+        "member",
+        "string-key",
+        "object-key",
+        "duplicate-key",
+        "arity",
+        "recommendation-type",
+        "recommendation-value",
+        "context",
+    ],
+)
+def test_validate_triage_sanitizes_each_decision_diagnostic(fields, expected):
+    """Each changed diagnostic must retain the positional decision label.
+
+    Ablation: replace each corresponding decision_label use with the stringified
+    dw_id, one at a time; its row fails with the object's prose in the error.
+    A valid first decision pins the raw position of the malformed second one.
+    """
+    rj = _clean_option_decision()
+    malformed = _clean_option_decision()["decisions"][0]
+    leaky = {"leaky": "secret prose"}
+    malformed.update(fields, id=leaky)
+    rj["open_ids"].append(leaky)
+    rj["decisions"].append(malformed)
+
+    plan, errors = validate_triage(rj, None)
+
+    assert plan is None
+    label = "decisions[1] (id not a string: dict)"
+    assert errors == [label + suffix for suffix in expected]
+    assert not any("secret prose" in error for error in errors)
+
+
+def test_validate_triage_keeps_todays_wording_for_a_string_decision_id():
+    """The other side of the DW-157 switch: a STRING id — the empty string
+    included — keeps every message byte-identical, in BOTH shapes the split
+    produces. `id_shown` is the bare subject `claim` interpolates (first half);
+    `decision_label` is the prefix every other message carries (second half).
+    Pins that the positional fallback is keyed on the TYPE, not on truthiness —
+    an empty id is still a string id and still prints as one, with the two
+    spaces today's wording leaves behind."""
+    rj = _clean_option_decision()
+    rj["decisions"][0]["id"] = "DW-9"
+
+    plan, errors = validate_triage(rj, {"DW-1"})
+
+    assert plan is None
+    assert errors == [
+        "decisions references unknown/closed id DW-9",
+        "open entries not triaged: DW-1",
+    ]
+
+    empty = triage_result(
+        [""], decisions=[{"id": "", "question": "", "options": [], "recommendation": ""}]
+    )
+    _, empty_errors = validate_triage(empty, {""})
+    assert empty_errors == [
+        "decision  has no question",
+        "decision  needs at least 2 options",
+        "decision : recommendation '' not an option",
+    ]
+
+
+def test_validate_triage_names_a_decision_positionally_in_a_duplicate_claim():
+    """`claim`'s OTHER branch, and the only path on which a non-string `id` is
+    observable at all: with `expected_open_ids=None` — the cached-triage reader's
+    call — `universe` is built from `open_ids` itself, so `str(raw_id)` IS in the
+    universe and the id is claimed rather than refused as unknown. Claiming it
+    twice is what reaches `appears in both`, the one message where `claim` prints
+    the id as a BARE subject rather than behind a `decision ...` prefix — which is
+    why `id_shown` and `decision_label` have to be separate values.
+    ABLATION: revert `claim` to `f"{dw_id} appears in both ..."` and this reddens
+    with the dict's contents in the message; the whole suite is otherwise green
+    without this row.
+
+    The second half is DW-157's acceptance clause at the same call: drop the
+    duplicate claim and the identical plan is ACCEPTED, `Decision.id` still
+    holding the stringified object exactly as it did before DW-157. Diagnostics
+    moved; what validates did not."""
+    leaky = {"leaky": "secret prose"}
+    rj = triage_result(
+        [leaky],
+        skip=[{"id": leaky, "reason": "later"}],
+        decisions=[
+            {
+                "id": leaky,
+                "question": "build it?",
+                "context": "ctx",
+                "options": [
+                    {"key": "1", "label": "build", "effect": "keep-open"},
+                    {"key": "2", "label": "keep", "effect": "keep-open"},
+                ],
+                "recommendation": "1",
+            }
+        ],
+    )
+
+    plan, errors = validate_triage(rj, None)
+
+    assert plan is None
+    assert errors == ["decisions[0] (id not a string: dict) appears in both skip and decisions"]
+    assert not any("secret prose" in e for e in errors)
+
+    rj["skip"] = []
+    plan, errors = validate_triage(rj, None)
+
     assert errors == []
     assert plan is not None
+    assert plan.decisions[0].id == "{'leaky': 'secret prose'}"
 
 
 @pytest.mark.parametrize(
@@ -1178,8 +1411,8 @@ def test_validate_triage_keeps_a_surviving_options_original_position():
     """A malformed member must not shift a surviving object's scalar diagnostic.
     ABLATION: number surviving object options separately from raw members and
     the scalar error reports options[0], while the member error stays correct.
-    The non-string key selects the positional scalar diagnostic without changing
-    the existing `str(...)` treatment of identifiers."""
+    The non-string key selects the positional scalar diagnostic; since DW-156 it
+    also reports its own type error, which is numbered from the RAW list too."""
     rj = _clean_option_decision(key=5, intent=["do", "x"])
     rj["decisions"][0]["options"].insert(0, None)
 
@@ -1188,6 +1421,7 @@ def test_validate_triage_keeps_a_surviving_options_original_position():
     assert plan is None
     assert errors == [
         "decision DW-1 options[0] not an object: NoneType",
+        "decision DW-1 options[1]: key not a string: int",
         "decision DW-1 options[1]: intent not a string: list",
     ]
 

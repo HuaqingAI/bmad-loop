@@ -456,6 +456,37 @@ def test_pending_missed_decisions_skips_a_triage_the_stricter_validation_refuses
     assert [d.id for d in decisions.pending_missed_decisions(project.project)] == ["DW-1"]
 
 
+@pytest.mark.parametrize("field", ["question", "key"])
+def test_pending_missed_decisions_skips_a_triage_with_a_scalar_predating_dw_156(project, field):
+    """DW-156 refuses old caches with a non-string question or option key.
+    Degradation is per file: even valid DW-3 in that cache disappears, while
+    DW-2 in an older valid file still lists. All ledger entries stay open.
+
+    Ablation: restore str(...) coercion for the selected field in validate_triage;
+    this fails with DW-1 and DW-3 also present. Restoring the string value in the
+    same cache is a positive control for the whole-file refusal.
+    """
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
+    _make_run(project, "20260101-000000-aaaa", _triage(["DW-2"], [_decision("DW-2")]))
+    stale = _decision("DW-1")
+    target = stale if field == "question" else stale["options"][0]
+    value = ["a", "b"] if field == "question" else 1
+    target[field] = value
+    cached = _triage(["DW-1", "DW-3"], [stale, _decision("DW-3")])
+    run = _make_run(project, "20260102-000000-bbbb", cached)
+
+    assert [d.id for d in decisions.pending_missed_decisions(project.project)] == ["DW-2"]
+
+    target[field] = str(value)
+    (run / "triage.json").write_text(json.dumps(cached), encoding="utf-8")
+    assert {d.id for d in decisions.pending_missed_decisions(project.project)} == {
+        "DW-1",
+        "DW-2",
+        "DW-3",
+    }
+
+
 def test_pending_missed_decisions_empty_when_nothing_open(project):
     install_bmad_config(project)
     write_ledger(project, {"DW-1": "done 2026-06-01"})
