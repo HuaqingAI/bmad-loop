@@ -5328,7 +5328,7 @@ def test_path_ignored_raises_on_git_failure(project):
 
 def test_worktree_clean_ignores_stderr_chatter_on_success(project, monkeypatch):
     """A pristine tree must not read DIRTY because git wrote to stderr while
-    exiting 0. Seven callers gate on this and `cli.py`'s three refuse the command
+    exiting 0. Six callers gate on this and `cli.py`'s three refuse the command
     outright, so the merged-stream read made a noisy git config unable to start a
     run — with no file named in the message."""
     real = verify._run_git
@@ -5343,6 +5343,66 @@ def test_worktree_clean_ignores_stderr_chatter_on_success(project, monkeypatch):
     assert verify.worktree_clean(project.project)
     (project.project / "stray.txt").write_text("real change\n")
     assert not verify.worktree_clean(project.project)  # a genuine change still shows
+
+
+def test_path_clean_reports_untracked_files_when_git_hides_them(project):
+    """A publication check must see a new file regardless of display preferences.
+
+    Ablation: remove --untracked-files=all and the dirty assertion fails.
+    """
+    repo = project.project
+    git(repo, "config", "status.showUntrackedFiles", "no")
+    target = repo / "new-ledger.md"
+    target.write_text("published\n", encoding="utf-8")
+    assert git(repo, "status", "--porcelain", "--", target.name) == ""
+    assert not verify.path_clean(repo, target.name)
+
+
+def test_path_clean_treats_a_glob_basename_literally(project):
+    """A dirty neighbor cannot make a clean published file require staging.
+
+    Ablation: remove literal pathspec escaping and the clean assertion fails.
+    """
+    repo = project.project
+    target = repo / "ledger[1].md"
+    neighbor = repo / "ledger1.md"
+    target.write_text("published\n", encoding="utf-8")
+    neighbor.write_text("before\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "seed ledger names")
+    neighbor.write_text("operator edit\n", encoding="utf-8")
+    assert git(repo, "status", "--porcelain", "--", target.name)
+    assert verify.path_clean(repo, target.name)
+
+
+def test_path_clean_ignores_stderr_chatter_on_success(project):
+    """`path_clean`'s narrow sibling of the row above, and it inherits the hazard for
+    the same reason: `status --porcelain` exits 0 while warning on stderr, so against
+    a merged stream an UNCHANGED pathspec reads non-empty and the function answers
+    DIRTY about a file that matches HEAD.
+
+    That direction is not benign. `sweep._commit_ledger` takes this as the decision
+    to publish, so on a host whose git config warns, every already-clean publish
+    would stage and re-interrogate a file it had nothing to say about — reaching git
+    and the index for a non-event, on the ordinary idempotent-replay path (a resumed
+    cycle re-closing ids already `done`).
+
+    REAL-GIT axis (#442), like the `commit_paths` no-op row below: `make_git_noisy`
+    sets an unknown VALUE for a known KEY, which is a warning at rc 0 and the normal
+    shape on a host the orchestrator does not control — not a synthetic stderr.
+
+    The second assertion is the other half: a read that always answered True would
+    satisfy the first alone.
+
+    Ablation target: return `(proc.stdout + proc.stderr).strip() == ""` and this
+    fails alone, answering DIRTY for the unchanged pathspec."""
+    repo = project.project
+    make_git_noisy(repo)
+
+    assert verify.path_clean(repo, "src.txt")  # unchanged, despite the warning
+
+    (repo / "src.txt").write_text("real change\n", encoding="utf-8")
+    assert not verify.path_clean(repo, "src.txt")  # ...and a genuine change still shows
 
 
 # ------------------------------------------ probes that return git's text (#442)

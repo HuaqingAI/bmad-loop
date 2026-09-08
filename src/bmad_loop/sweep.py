@@ -1333,18 +1333,22 @@ class SweepEngine(Engine):
         ledger = self.workspace.paths.deferred_work
         cycle = max(1, self.state.sweep_cycle)
         if self._finish_inflight_bundles():
-            # a recovered bundle's ledger restore can leave the tree dirty, and
-            # triage plus the first bundle baseline need a clean one. Guarded on
-            # a non-empty pass so a fresh sweep never commits the user's dirt.
-            # The ledger's OWN directory (`_commit_ledger`): this publisher wrote
-            # the ledger, so it names the tree that holds it. Spelled off
-            # `self.workspace.paths` rather than a `ledger` local, at every one of
-            # the five publishers: `self.paths.deferred_work` is a DIFFERENT file
-            # under worktree isolation, and only the workspace's copy is the one a
-            # publisher just wrote.
+            # a recovered bundle's ledger restore can leave the LEDGER dirty, and
+            # triage plus the first bundle baseline read it, so it is published
+            # here. Only it: unrelated dirt in the same repository is left for
+            # whoever owns it, so this no longer ends on a clean TREE and nothing
+            # downstream may assume one. Guarded on a non-empty recovery pass, so
+            # a fresh sweep spawns no git at all (see `_close_resolved` for the
+            # guard inventory across all seven sites).
+            # The LEDGER FILE (`_commit_ledger`): this publisher wrote the ledger,
+            # so it names the file it published and the commit is narrowed to it.
+            # Spelled off `self.workspace.paths` rather than a `ledger` local, at
+            # every one of the five publishers: `self.paths.deferred_work` is a
+            # DIFFERENT file under worktree isolation, and only the workspace's
+            # copy is the one a publisher just wrote.
             self._commit_ledger(
                 "chore(sweep): commit ledger after recovering in-flight bundles",
-                root=self.workspace.paths.deferred_work.parent,
+                path=self.workspace.paths.deferred_work,
             )
         while True:
             # First statement of the loop body: covers the boundary right after
@@ -1422,12 +1426,18 @@ class SweepEngine(Engine):
             if cycle >= self.max_cycles:
                 self.journal.append("sweep-repeat-done", cycles=cycle, reason="max-cycles")
                 return
-            # a deferred bundle's ledger restore can leave the tree dirty; the
-            # next cycle's triage and bundle baselines need a clean tree
-            # the ledger's own directory, as above
+            # a deferred bundle's ledger restore can leave the LEDGER dirty, and
+            # the next cycle's triage and bundle baselines read it, so it is
+            # published here. Only it — unrelated dirt stays with its owner and the
+            # next cycle does not start on a clean TREE.
+            # This site carries NO non-empty-write guard: `progressed` can be true
+            # from a dropped answer that wrote no ledger at all (DW-135), so
+            # `path_clean` inside `_commit_ledger` is what makes such a cycle a
+            # no-op. See `_close_resolved` for the full inventory.
+            # the ledger file, as above
             self._commit_ledger(
                 "chore(sweep): commit ledger before next sweep cycle",
-                root=self.workspace.paths.deferred_work.parent,
+                path=self.workspace.paths.deferred_work,
             )
             cycle += 1
 
@@ -1584,15 +1594,19 @@ class SweepEngine(Engine):
         dropped = decisions_store.prune_pre_answers(project, deferredwork.open_ids(text))
         if dropped:
             self.journal.append("decision-preanswers-pruned", dw_ids=dropped)
-            # Committed in the STORE's root, not the workspace's: the same
-            # divergence that made the prune miss its file made the commit miss
-            # its tree (DW-160). Owner of the file, the rule `_commit_ledger`
-            # states — this prune writes the pre-answer store and nothing else,
-            # and the store is a bare join off the project root that no config
-            # knob can move. The ledger PUBLISHERS name the ledger's own
-            # directory for the same rule and a different answer.
+            # The STORE FILE, not the workspace root: the same divergence that
+            # made the prune miss its file made the commit miss its tree (DW-160).
+            # Name the file you published, the rule `_commit_ledger` states — this
+            # prune writes the pre-answer store and nothing else, and the store is
+            # a bare join off the project root that no config knob can move. So
+            # the commit carries that one file, and the ledger this cycle's
+            # decision phase may have withheld is not published by it (DW-187).
+            # The ledger PUBLISHERS name the ledger for the same rule and a
+            # different answer. Guarded on `dropped` above: a prune that consumed
+            # nothing wrote nothing and spawns no git.
             self._commit_ledger(
-                "chore(sweep): drop consumed deferred-work pre-answers", root=project
+                "chore(sweep): drop consumed deferred-work pre-answers",
+                path=decisions_store.store_path(project),
             )
 
     def _prune_dropped_pre_answer(self, dw_id: str, drop_cause: str) -> None:
@@ -1641,13 +1655,19 @@ class SweepEngine(Engine):
             "sweep-decision-preanswer-pruned", decision=dw_id, drop_cause=drop_cause
         )
         # Committed like `_prune_pre_answers`': `_materialize_bundles` runs ahead of
-        # this cycle's bundles, and bundles need a clean baseline. In the STORE's
-        # root for the same reason the removal used it — owner of the file
+        # this cycle's bundles, and bundles need a clean baseline. The STORE FILE for
+        # the same reason the removal used it — name the file you published
         # (`_commit_ledger`), and the store is a bare join off the project root.
         # Where `repo_root` names a DISJOINT tree, `workspace.root` is a separate
         # repo and a clean check there says nothing about the tree this write
-        # dirtied (DW-160).
-        self._commit_ledger("chore(sweep): drop stale deferred-work pre-answer", root=project)
+        # dirtied (DW-160). Narrowed to the store, this site is also the one DW-187
+        # is about: it runs LATER in the same cycle as the decision phase, so a wide
+        # commit here republished the very ledger bytes that phase withheld.
+        # Guarded on `drop_pre_answer` above: no store entry, no write, no git.
+        self._commit_ledger(
+            "chore(sweep): drop stale deferred-work pre-answer",
+            path=decisions_store.store_path(project),
+        )
 
     def _drive_story(self, task: StoryTask) -> None:
         # no spec-approval gate for bundles: the bundle intent came from the
@@ -2159,10 +2179,10 @@ class SweepEngine(Engine):
                 (self.run_dir / "migrate-result.json").write_text(
                     json.dumps(result.result_json, indent=2), encoding="utf-8"
                 )
-                # the ledger's own directory: the migration rewrote the ledger
+                # the ledger file: the migration rewrote the ledger
                 self._commit_ledger(
                     "chore(sweep): migrate legacy deferred-work entries to DW format",
-                    root=self.workspace.paths.deferred_work.parent,
+                    path=self.workspace.paths.deferred_work,
                 )
                 post = deferredwork.parse_ledger(new_text)
                 self.journal.append(
@@ -2439,11 +2459,32 @@ class SweepEngine(Engine):
             return 0
         if closed:
             self.journal.append("sweep-resolved-closed", dw_ids=closed)
-        # the ledger's own directory: `mark_done_many` above wrote the ledger
-        self._commit_ledger(
-            "chore(sweep): close resolved deferred-work entries",
-            root=self.workspace.paths.deferred_work.parent,
-        )
+            # ...and the commit rides the SAME guard: a NON-EMPTY pass. With zero
+            # ids flipped `mark_done_many` wrote nothing, so there is nothing to
+            # publish and no git is spawned at all (DW-183/DW-185).
+            #
+            # The guard inventory across all seven `_commit_ledger` sites, since
+            # it is not uniform and reading it as uniform is the trap:
+            #   * FOUR gate on a write result or a normally returned effect:
+            #     both prunes (`dropped`, and `drop_pre_answer` answering True),
+            #     this site (`closed`), and `_decisions_phase` (`any_effect_landed`).
+            #   * THREE gate on something that does NOT prove a write: `_loop`'s
+            #     post-recovery publisher counts recovered tasks (which may defer
+            #     without editing the ledger), `_loop`'s
+            #     cycle-boundary publisher gates on `progressed`, which a dropped
+            #     answer can set without touching the ledger, and
+            #     `_ensure_migration` gates on `if not errors:`, a verdict on the
+            #     rewrite session rather than on bytes changing.
+            # Beneath all seven, `_commit_ledger`'s `path_clean` is the uniform
+            # floor: it makes any of them a no-op when the published file already
+            # matches HEAD. The per-site guards are the early-outs that keep a
+            # phase which wrote nothing from reaching git at all.
+            #
+            # the ledger file: `mark_done_many` above wrote the ledger
+            self._commit_ledger(
+                "chore(sweep): close resolved deferred-work entries",
+                path=self.workspace.paths.deferred_work,
+            )
         self._emit("post_close_resolved")
         return len(closed)
 
@@ -2584,17 +2625,24 @@ class SweepEngine(Engine):
             )
         pending = [d for d in plan.decisions if d.id not in answers]
         answered_interactively = False
-        # TWO flags, because the commit and the hand-back ask different questions.
-        # `ledger_in_doubt` is the LAST attempt's verdict — set by the degrade
-        # below, cleared by the next effect that succeeds — so it means "the bytes
-        # now on disk are the ones an effect could not read". `any_effect_faulted`
-        # is sticky and only shapes what the human is told. A sticky flag on the
-        # commit would be wrong: a walk where DW-1 faults and DW-2 then lands a
-        # human-authorized `decision:` line would leave that line uncommitted
-        # immediately ahead of this cycle's bundles. Both start False, so a walk
-        # that runs no effects at all commits exactly as it did before.
+        # THREE flags, because the commit and the hand-back ask different
+        # questions. `ledger_in_doubt` is the LAST attempt's verdict — set by the
+        # degrade below, cleared by the next effect that succeeds — so it means
+        # "the bytes now on disk are the ones an effect could not read".
+        # `any_effect_faulted` is sticky and only shapes what the human is told. A
+        # sticky flag on the commit would be wrong: a walk where DW-1 faults and
+        # DW-2 then lands a human-authorized `decision:` line would leave that line
+        # uncommitted immediately ahead of this cycle's bundles.
+        # `any_effect_landed` is the NON-EMPTY PASS the commit needs beside the
+        # withhold: `_apply_decision_effect` is this walk's only ledger write, so a
+        # walk that ran none of them — every decision already answered, skipped
+        # unattended, or dropped — published nothing and must spawn no git at all
+        # (DW-183/DW-185). It is sticky in the other direction, and deliberately:
+        # once an effect has written the ledger, a LATER fault is the withhold's
+        # business, not this flag's.
         ledger_in_doubt = False
         any_effect_faulted = False
+        any_effect_landed = False
         if not self.prompting:
             pending = [d for d in pending if d.id not in self.state.sweep_skipped_decisions]
             for decision in pending:
@@ -2696,10 +2744,12 @@ class SweepEngine(Engine):
                     # recording who authorized it. Both are recoverable; crashing
                     # the sweep mid-walk is not, which is the trade this arm makes.
                     #
-                    # `ledger_in_doubt` withholds this phase's commit below.
-                    # `commit_story` stages the WHOLE enclosing repository, so a
-                    # commit taken while the ledger on disk is the text an effect
-                    # could not read publishes exactly those bytes. It is the LAST
+                    # `ledger_in_doubt` withholds this phase's commit below. The
+                    # commit's pathspec IS the ledger, so a commit taken while the
+                    # ledger on disk is the text an effect could not read publishes
+                    # exactly those bytes — narrowing the scope bounds what else
+                    # rides along, it does not make the ledger itself safe to
+                    # publish, so the withhold is unchanged. It is the LAST
                     # attempt's verdict, not the walk's: a later effect that
                     # succeeds proves the ledger reads again and clears it, and
                     # that commit then carries the earlier decisions' lines too.
@@ -2711,19 +2761,31 @@ class SweepEngine(Engine):
                     any_effect_faulted = True
                     continue
                 # the ledger read and wrote, so the doubt the last fault raised is
-                # settled — whatever it left on disk is now committable
+                # settled — whatever it left on disk is now committable, and this
+                # walk now HAS something to publish
                 ledger_in_doubt = False
+                any_effect_landed = True
                 self._emit("post_decision", story_key=decision.id, decision_action=option.effect)
                 if option.effect == "close":
                     closed += 1
-        if not ledger_in_doubt:
-            # The LEDGER's own directory, not the project and not
-            # `self.workspace.root`: this phase's write went to the ledger, and
-            # `implementation_artifacts` is configurable to any absolute path
-            # (see `_commit_ledger`).
+        if any_effect_landed and not ledger_in_doubt:
+            # TWO conditions, and they are different questions. `ledger_in_doubt`
+            # is the withhold: the last effect faulted, so whatever is on disk is
+            # bytes nobody could read. `any_effect_landed` is the non-empty pass:
+            # `_apply_decision_effect` is this walk's only ledger write, so a walk
+            # that answered nothing (every decision pre-answered, skipped
+            # unattended, or dropped) wrote nothing, and no git is spawned
+            # (DW-183/DW-185). This is one of the FOUR sites gating on a write
+            # result or returned effect; three gate on something weaker, and `path_clean`
+            # is the uniform floor beneath all seven — the inventory is spelled out
+            # at `_close_resolved`.
+            #
+            # The LEDGER FILE, not the project and not `self.workspace.root`: this
+            # phase's write went to the ledger, and `implementation_artifacts` is
+            # configurable to any absolute path (see `_commit_ledger`).
             self._commit_ledger(
                 "chore(sweep): record deferred-work decisions",
-                root=self.workspace.paths.deferred_work.parent,
+                path=self.workspace.paths.deferred_work,
             )
         if answered_interactively:
             self._return_after_decisions(every_effect_landed=not any_effect_faulted)
@@ -2804,44 +2866,31 @@ class SweepEngine(Engine):
             ledger, decision.id, self._today(), option.label, detail, close_note=close_note
         )
 
-    def _commit_ledger(self, message: str, *, root: Path | None = None) -> None:
-        """Commit pending orchestrator ledger edits; bundles need a clean
-        baseline. No-op when the tree is already clean.
+    def _commit_ledger(self, message: str, *, path: Path) -> None:
+        """Publish the orchestrator bookkeeping FILE a phase just wrote: that one
+        file reaches HEAD, and everything else the enclosing repository is
+        carrying is left dirty for whoever owns it. No-op when the file already
+        matches HEAD.
 
-        `root` is the directory both git calls run in, and every caller passes it.
-        The two do NOT see the same scope, which matters now that it can be a
-        subdirectory rather than a repository root: `verify.worktree_clean`
-        pathspecs `-- .`, so it reports only what is dirty inside `root`'s own
-        subtree, while `verify.commit_story` runs `git add -A`, which stages the
-        WHOLE enclosing repository. So this method asks "is the ledger's directory
-        clean?" and, if not, commits everything the repository holding it is
-        carrying. A corollary: `worktree_clean`'s `:(exclude)<policy.toml>` is
-        relative to `root` too, so at the five publisher sites it names a path
-        under the artifacts directory and no longer reaches the real
-        `.bmad-loop/policy.toml` — an operator's uncommitted policy edit is
-        invisible to the check here and is then swept into the commit by `add -A`.
-        That is not new to the exclusion's own purpose (it exists so a policy edit
-        cannot BLOCK a run) and it is bounded by the same best-effort framing the
-        `GitError` degrade rests on, but it is the reason a caller must not read
-        this as a whole-repository clean check.
+        The rule is NAME THE FILE YOU PUBLISHED. `path` is the file the caller
+        just wrote, and everything else follows from it: it is resolved, both git
+        calls run in the resolved parent, and both are pathspec'd to the resolved
+        basename. Nothing is derived from a role ("the project owns sweep
+        bookkeeping") — the two families name different files because they write
+        different files:
 
-        The rule for choosing `root` is OWNER OF THE FILE: a caller names the
-        directory holding the file it just published, and git resolves that
-        directory to whichever repository encloses it. Nothing here is derived
-        from a role ("the project owns sweep bookkeeping") — the two families
-        spell different roots because they write different files:
-
-        * the five ledger PUBLISHERS pass the ledger's own directory
-          (`ledger.parent`, i.e. `paths.implementation_artifacts`). The ledger
-          hangs off `implementation_artifacts`, which `bmadconfig._resolve`
-          accepts as any absolute path and `ProjectPaths.rebased` leaves unmoved
-          when it sits outside the project — so it may be under the project, or
-          inside a disjoint `repo_root`, or in no repository at all. Naming the
-          directory is the only spelling correct in all three.
-        * the two pre-answer PRUNES pass `_project_of_run_dir(self.run_dir)`.
-          The pre-answer store is a bare join off the project root
-          (`decisions.STORE_REL`) that no config knob can move, and the run dir
-          is the anchor no workspace swap relocates.
+        * the five ledger PUBLISHERS pass `self.workspace.paths.deferred_work`.
+          The ledger hangs off `implementation_artifacts`, which
+          `bmadconfig._resolve` accepts as any absolute path and
+          `ProjectPaths.rebased` leaves unmoved when it sits outside the project
+          — so it may be under the project, inside a disjoint `repo_root`, or in
+          no repository at all, and git resolves the enclosing repository in all
+          three. The WORKSPACE's copy, never `self.paths.deferred_work`, which is
+          a different file in a different tree under worktree isolation.
+        * the two pre-answer PRUNES pass `decisions.store_path(project)`. The
+          pre-answer store is a bare join off the project root
+          (`decisions.STORE_REL`) that no config knob can move, and the run dir is
+          the anchor no workspace swap relocates.
 
         `self.workspace.root` is refused at every site. Where `repo_root` names a
         tree DISJOINT from the project it is the separate CODE repo, so a
@@ -2851,44 +2900,105 @@ class SweepEngine(Engine):
         dirty ahead of this cycle's bundles. A hardcoded project root fails the
         mirror-image way for the publishers, which is why they do not use one.
 
-        A `verify.GitError` degrades to a journal row naming the tree and the
-        error instead of propagating, and under this rule the degrade is REQUIRED
-        rather than a kindness. `cli`'s sweep precondition only requires
-        `paths.repo_root` to be a git repository, so neither the project nor a
-        freestanding artifacts directory need be one, and `git status` there
-        answers `fatal: not a git repository`. Under the old workspace-rooted
-        default that call ran against a real repo and the edit simply stayed
-        uncommitted; letting the raise through after re-rooting would abort the
-        whole sweep over bookkeeping that was always best effort — strictly worse
-        than the missed commit it replaces. `decisions.apply_pre_answer` already
-        degrades on `GitError` for this very file ("best effort, so a non-git or
-        dirty tree never blocks the on-disk record") and this keeps them agreeing.
+        RESOLVED, following symlinks — and that rationale belongs to the LEDGER
+        publishers alone (DW-188). Their writer is `platform_util
+        .atomic_write_text`, whose default `follow_symlinks=True` resolves the
+        target, so a ledger symlinked into the project has its TARGET rewritten.
+        Against the lexical parent the two disagreed: the clean check interrogated
+        the link's own directory while the bytes landed in the target's
+        repository, which then received no commit at all. Resolving here is what
+        makes the check, the commit and that write name one file, so
+        `follow_symlinks=False` semantics would be exactly wrong for them —
+        agreement with the writer is the property, not link-hardening.
 
-        The `root is None` arm has no in-tree caller left and STAYS anyway: the
-        default and its raise are this method's published contract, so a new
-        caller that forgets to say which tree it dirtied fails loud rather than
-        inheriting whichever root happened to be convenient, and it is never
-        quietly journalled the way a rooted failure is."""
-        target = self.workspace.root if root is None else root
+        The two PRUNES are a different case and the resolve is not doing that job
+        for them. Their writer is `decisions._write_store` via
+        `atomic_write_text_confined`, which takes the OPPOSITE symlink policy:
+        `follow_symlinks=False` refuses to write through a link planted at the
+        store's own name, and a lexical parent walk refuses a redirected directory
+        above it. So a store reached through a link is a shape that writer REFUSES
+        rather than one it follows, and the resolve here can only ever agree with
+        the plain path it did write. It stays uniform because a per-family
+        spelling would claim a distinction the callers cannot act on — not because
+        the two writers agree about links. Nothing here should be read as a
+        promise that a symlinked pre-answer store works; its own writer says it
+        does not.
+
+        Both git calls see ONE scope: `verify.path_clean` checks the resolved
+        basename and `verify.commit_paths` commits that same single path. That is
+        what bounds the blast radius to the published file (DW-183/DW-185) — an
+        operator's unrelated in-flight edits in the enclosing repository stay
+        dirty rather than riding into a `chore(sweep):` commit — and what
+        quarantines a withheld ledger from a LATER commit in the same cycle
+        (DW-187): a prune commits the pre-answer store alone, so the undecodable
+        bytes the decision phase refused to publish are still unpublished.
+        `worktree_clean`'s `:(exclude)policy.toml` wart is gone with it: a single
+        pathspec naming one published file cannot reach `policy.toml`.
+
+        `commit_paths` rather than a narrow twin of `commit_story`: it already
+        commits an exact path list, and it is stronger than a hand-rolled pair —
+        it forces `:(literal)` pathspecs (an `implementation_artifacts` carrying a
+        `[`, `*` or `?` reaches here verbatim from the operator's config, where a
+        bare operand is a wildmatch glob), keeps a missing-but-TRACKED path as a
+        deletion to stage, wraps its own root resolve in `GitError`, and answers
+        `None` for "these paths held no change". `_commit_ledger` already knows
+        that from `path_clean`, so a `None` here means the pathspec went clean
+        between the two calls and there is nothing to announce.
+
+        `path_clean` still runs FIRST, and is load-bearing rather than an
+        optimization: `commit_paths` opens with `git add`, so without the check an
+        already-clean publish would stage and re-interrogate a file it had nothing
+        to say about — reaching git, and the index, for a non-event. Idempotent
+        replays make that the ordinary case, not the rare one: a resumed cycle
+        re-closing ids already `done` reproduces the committed bytes exactly.
+
+        A `verify.GitError` degrades to a journal row naming the resolved
+        directory and the error instead of propagating, and under this rule the
+        degrade is REQUIRED rather than a kindness. `cli`'s sweep precondition only
+        requires `paths.repo_root` to be a git repository, so neither the project
+        nor a freestanding artifacts directory need be one, and `git status` there
+        answers `fatal: not a git repository`. Letting the raise through would
+        abort the whole sweep over bookkeeping that was always best effort —
+        strictly worse than the missed commit it replaces.
+        `decisions.apply_pre_answer` already degrades on `GitError` for this very
+        file ("best effort, so a non-git or dirty tree never blocks the on-disk
+        record") and this keeps them agreeing. The RESOLVE degrades to the same row
+        for the same reason: `path.resolve()` can raise `OSError` (a broken link
+        chain, a permission-denied component) or `RuntimeError` (a symlink loop),
+        and outside the `try` either would propagate out of a method this docstring
+        calls strictly best effort. `verify.commit_paths` and
+        `verify.last_commit_for` guard their own resolves against the same pair.
+
+        `path` is a REQUIRED keyword argument with no default, replacing the old
+        `root=None` arm and its runtime raise. That is strictly louder, not
+        laxer: a caller that forgets to name the file it dirtied now fails at call
+        time and under pyright, before any run, instead of on whichever branch
+        first reached the raise."""
+        # `root` is bound inside the `try` because the resolve that derives it can
+        # itself fail; until it succeeds the only directory known is the LEXICAL
+        # parent, which is what the degrade row then names.
+        root = path.parent
         try:
-            if verify.worktree_clean(target):
+            target = path.resolve()
+            root = target.parent
+            if verify.path_clean(root, target.name):
                 return
-            sha = verify.commit_story(target, message)
-        except verify.GitError as e:
-            if root is None:
-                # No in-tree caller reaches this (all seven pass a root); the
-                # loud default is preserved deliberately — see the docstring.
-                raise
+            sha = verify.commit_paths(root, message, [target])
+        except (verify.GitError, OSError, RuntimeError) as e:
             # `repo` (not `root`): an absolute host path naming a git tree,
             # already routed out of diagnostics dumps, exactly as
-            # `rearm-baseline-advance-failed` spells the same value.
+            # `rearm-baseline-advance-failed` spells the same value. The RESOLVED
+            # directory, which is the one git was actually asked about — or the
+            # lexical parent when the resolve is what failed.
             self.journal.append(
                 "sweep-ledger-commit-unavailable",
                 message=message,
-                repo=str(target),
+                repo=str(root),
                 error=str(e),
             )
             return
+        if sha is None:
+            return  # the pathspec went clean between the check and the commit
         self.journal.append("sweep-ledger-commit", message=message, commit=sha)
 
     # ---------------------------------------------------------- bundles

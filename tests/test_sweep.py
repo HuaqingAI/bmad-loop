@@ -7788,14 +7788,15 @@ def test_a_prune_in_a_non_git_project_keeps_the_store_write_and_journals(project
     swallowed — `sweep-ledger-commit-unavailable` naming the tree and the error,
     so an operator reading the journal learns the store is uncommitted.
 
-    Scoped to the callers that pass a root, which is all seven of them: the ledger
-    publishers name the LEDGER's own directory under the same owner-of-the-file rule
-    and inherit this degrade, which is required rather than incidental — keeping
-    them loud would turn every ledger commit whose artifacts directory is in no
-    repository into a sweep-ending raise, strictly worse than the missed commit it
-    replaced (`test_a_ledger_commit_in_a_non_git_project_keeps_the_write_and_journals`
-    grades that half). The unused `root=None` default keeps propagating, which
-    `test_a_default_rooted_commit_failure_still_raises` below pins.
+    Total over the callers, which all seven are: the ledger publishers name the
+    LEDGER FILE under the same name-the-file-you-published rule and inherit this
+    degrade, which is required rather than incidental — keeping them loud would turn
+    every ledger commit whose artifacts directory is in no repository into a
+    sweep-ending raise, strictly worse than the missed commit it replaced
+    (`test_a_ledger_commit_in_a_non_git_project_keeps_the_write_and_journals` grades
+    that half). There is no rootless arm left to reach: `path` is a required
+    keyword-only parameter, which `test_commit_ledger_requires_the_published_path`
+    below pins.
 
     Ablation: drop the `except verify.GitError` arm in `_commit_ledger` and this
     reds with the `GitError` escaping `_prune_pre_answers`."""
@@ -7824,40 +7825,105 @@ def test_a_prune_in_a_non_git_project_keeps_the_store_write_and_journals(project
     assert set(decisions_store.load_pre_answers(project.project)) == {"DW-2"}  # write survived
     assert _records(engine, "sweep-ledger-commit") == []  # nothing could be committed
     [failed] = _records(engine, "sweep-ledger-commit-unavailable")
-    assert failed["repo"] == str(project.project)
+    # the RESOLVED directory holding the file the prune published — the store lives
+    # at `<project>/.bmad-loop/decisions.json`, so its parent is that subdirectory
+    # and not the project root itself
+    assert failed["repo"] == str((project.project / ".bmad-loop").resolve())
     assert "not a git repository" in failed["error"]
 
 
-def test_a_default_rooted_commit_failure_still_raises(project, monkeypatch):
-    """The other half of the degrade: it is scoped to callers that passed a root.
+def test_commit_ledger_requires_the_published_path():
+    """`path` is a REQUIRED keyword-only parameter, which is what replaced the old
+    `root=None` default and its runtime raise.
 
-    Every in-tree caller passes one — `test_every_sweep_ledger_commit_names_its_own_tree`
-    is total over that — so this grades the PRESERVED DEFAULT and nothing else; it is
-    called here directly because no call site reaches the arm. It is kept
-    deliberately: the `root=None` arm and its raise are `_commit_ledger`'s published
-    contract, so a future caller that forgets to name the tree holding the file it
-    just wrote fails loud instead of inheriting whichever root happened to be
-    convenient — and is never quietly journalled the way a rooted failure is. Without
-    this row the degrade could widen to the default too and no test would notice.
+    That default existed so a caller which forgot to say which tree it dirtied
+    failed loud instead of inheriting whichever root happened to be convenient. A
+    required keyword argument keeps the property and strengthens it: the failure now
+    lands at call time and under pyright, before any run, rather than on whichever
+    branch first reached the raise — and it is checked HERE rather than left to
+    pyright alone, because a `= None` default reintroduced with the runtime raise
+    deleted would typecheck cleanly while restoring the exact silent-inheritance the
+    argument exists to prevent.
 
-    Ablation: drop the `if root is None: raise` line in `_commit_ledger`'s handler
-    and this reds `DID NOT RAISE`, with a journal row in place of the failure."""
+    Graded through the signature rather than by calling it, because the claim is
+    about the parameter and not about any one caller's behavior; the AST guard below
+    is what holds the seven call sites to the two sanctioned spellings.
+
+    Ablation: give `path` a default (`path: Path | None = None`) and this reds on
+    `default is inspect.Parameter.empty`; make it positional-or-keyword and it reds
+    on the KEYWORD_ONLY kind."""
+    import inspect
+
+    sig = inspect.signature(sweep_mod.SweepEngine._commit_ledger)
+    assert "root" not in sig.parameters  # the old spelling is gone, not aliased
+    path_param = sig.parameters["path"]
+    assert path_param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert path_param.default is inspect.Parameter.empty
+
+
+def test_a_clean_published_path_returns_before_git_add(project, monkeypatch):
+    """An unchanged publication must return before staging, even with unrelated dirt.
+
+    `commit_paths` itself returns None for unchanged paths, but first runs git add.
+    This direct helper test pins the earlier check: phase guards do not all prove
+    a ledger write, so the shared helper still needs its own clean-file early-out.
+
+    Ablation: drop the `if verify.path_clean(...): return` arm in `_commit_ledger`
+    and this fails inside the staging-helper stub."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})  # committed: the file is clean
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
+    # an operator's in-flight work ELSEWHERE in the same repository, which the old
+    # subtree-wide check counted as "dirty" and the old `add -A` then committed
+    (project.project / "unrelated.txt").write_text("wip\n", encoding="utf-8")
+    head = git(project.project, "rev-parse", "HEAD")
+    dirty_before = git(project.project, "status", "--porcelain")
+    assert dirty_before  # premise: something a stray commit could take
+    # premise: the published file itself really is clean, so the check has the
+    # answer this row is about rather than passing for want of a diff to find
+    ledger_rel = str(project.deferred_work.relative_to(project.project)).replace("\\", "/")
+    assert git(project.project, "status", "--porcelain", "--", ledger_rel) == ""
 
-    def boom(_repo):
-        raise verify.GitError("git status failed: contrived")
+    def no_commit(*_args, **_kwargs):
+        raise AssertionError("_commit_ledger reached git for an already-clean pathspec")
 
-    monkeypatch.setattr(verify, "worktree_clean", boom)
+    monkeypatch.setattr(verify, "commit_paths", no_commit)
 
-    with pytest.raises(verify.GitError, match="contrived"):
-        engine._commit_ledger("chore(sweep): a default-rooted commit")
+    engine._commit_ledger(
+        "chore(sweep): a publish with nothing to publish", path=project.deferred_work
+    )
 
-    # nothing was journalled AT ALL — no degrade row, and no commit row either.
-    # Asserted as the file's absence rather than through `_records`, which cannot
-    # read a journal that was never created: the raise is the only thing that
-    # happened, which is the whole claim.
+    assert not (engine.run_dir / "journal.jsonl").exists()  # no commit row AND no degrade row
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert git(project.project, "status", "--porcelain") == dirty_before  # still theirs
+
+
+def test_a_publication_that_becomes_clean_announces_no_commit(project, monkeypatch):
+    """Another writer can restore HEAD bytes between the check and staging.
+
+    Ablation: delete the sha-is-None early-out and the journal assertion fails.
+    """
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    ledger = project.deferred_work
+    original = ledger.read_text(encoding="utf-8")
+    ledger.write_text(original + "\n<!-- temporary edit -->\n", encoding="utf-8")
+    head = git(project.project, "rev-parse", "HEAD")
+    real_commit = verify.commit_paths
+    called = []
+
+    def restore_before_staging(repo, message, paths):
+        called.append(paths)
+        ledger.write_text(original, encoding="utf-8")
+        return real_commit(repo, message, paths)
+
+    monkeypatch.setattr(verify, "commit_paths", restore_before_staging)
+    engine._commit_ledger("chore(sweep): publish", path=ledger)
+
+    assert called == [[ledger.resolve()]]
     assert not (engine.run_dir / "journal.jsonl").exists()
+    assert git(project.project, "rev-parse", "HEAD") == head
 
 
 @pytest.mark.parametrize(
@@ -7885,8 +7951,8 @@ def test_a_divergent_root_prune_is_committed_in_the_project_tree(project, tmp_pa
     committed reds even though `load_pre_answers` would still say the id is gone.
 
     The code repo is asserted to receive NOTHING, which is the other half: a fix
-    that committed in both trees would satisfy the blob assert while sweeping the
-    project's entire `git add -A` into a repository that is not its own.
+    that committed in both trees would satisfy the blob assert while publishing the
+    project's store into a repository that is not its own.
 
     The premise is guarded before the outcome, as every divergent-root row here
     must be (docs/testing.md): the two roots are compared RESOLVED, and asserted
@@ -8211,7 +8277,10 @@ def _artifacts_in_no_repository(project, tmp_path):
         assert on_disk["DW-2"].open
         assert _records(engine, "sweep-ledger-commit") == []  # nothing could be committed
         [failed] = _records(engine, "sweep-ledger-commit-unavailable")
-        assert failed["repo"] == str(paths_.deferred_work.parent)  # the directory it named
+        # the RESOLVED directory holding the file it published (DW-188): the
+        # publisher hands `_commit_ledger` the ledger and the method resolves it,
+        # agreeing with `platform_util.atomic_write_text`'s own resolve
+        assert failed["repo"] == str(paths_.deferred_work.resolve().parent)
         assert "not a git repository" in failed["error"]  # ...and git's own error
         # neither repository receives a commit for a file neither of them holds
         assert git(project.project, "rev-parse", "HEAD") == project_head
@@ -8307,31 +8376,33 @@ def test_a_divergent_root_ledger_commit_lands_in_the_tree_that_owns_the_ledger(
     check(engine, paths, after, done_ids)
 
 
-def test_a_re_rooted_ledger_commit_stages_the_whole_enclosing_repository(project, tmp_path):
-    """What a re-rooted publisher's commit CONTAINS, which every topology row above
-    hides by settling each tree first.
+def test_a_ledger_commit_carries_the_ledger_alone(project, tmp_path):
+    """What a publisher's commit CONTAINS, which every topology row above hides by
+    settling each tree first.
 
-    `_commit_ledger`'s two git calls do not see the same scope, and after re-rooting
-    that gap is visible: `verify.worktree_clean` pathspecs `-- .`, so it asks only
-    about `root`'s own subtree, while `verify.commit_story` runs `git add -A`, which
-    stages the WHOLE repository enclosing it. So the decision to commit is made from
-    the artifacts directory and the commit itself takes everything the code repo is
-    carrying — here an unrelated new file and an edit to a tracked source file that
-    have nothing to do with the sweep.
+    DW-183/DW-185. `_commit_ledger`'s two git calls now see ONE scope: the resolved
+    basename of the file the phase published. So the decision to commit and the
+    commit itself ask about the same thing, and an operator's in-flight work in the
+    enclosing repository — here an untracked new file and an edit to a tracked
+    source file, neither of which the sweep touched — stays dirty instead of riding
+    into a `chore(sweep):` commit. Before this, the check was `worktree_clean`'s
+    `-- .` over the artifacts subtree while the commit was `commit_story`'s
+    `git add -A` over the WHOLE enclosing repository, and the file list carried all
+    three.
 
     Graded rather than asserted in prose because it is the shape a reader is most
-    likely to get wrong from the call site, and because the deferred non-empty-pass
-    guard is about exactly this: the ledger commits are unconditional, so a user's
-    in-flight edits ride along. That guard belongs to all seven sites at once and is
-    deliberately not added here — this row pins the behavior as it stands, so
-    landing the guard later has to change a test rather than pass silently.
+    likely to get wrong from the call site, and because the tree deliberately does
+    NOT go clean afterwards — the inverse of what the predecessor row pinned, and
+    the property a wide commit would silently restore.
 
     Topology B (artifacts INSIDE the disjoint code repo) is the sharp one: the
     enclosing repository is the code checkout, which is exactly where a human's
-    unrelated work lives. Under topology A the same `add -A` sweeps the project.
+    unrelated work lives. Under topology A the same `add -A` swept the project.
 
-    Ablation: narrow `commit_story` to the ledger path alone and the file list reds,
-    carrying the ledger by itself."""
+    Ablation: restore `verify.commit_story` in `_commit_ledger` (with
+    `verify.worktree_clean` for the check) and both halves red — the file list gains
+    `src.txt` and `unrelated.txt`, and the two dirt assertions red with a clean
+    tree."""
     code_root = _copy_code_repo(project, tmp_path / "code-repo")
     artifacts = code_root / "_bmad-output" / "implementation-artifacts"
     artifacts.mkdir(parents=True, exist_ok=True)
@@ -8344,9 +8415,16 @@ def test_a_re_rooted_ledger_commit_stages_the_whole_enclosing_repository(project
     # clean before the unrelated work below lands
     assert code_root.resolve() in artifacts.resolve().parents
     assert git(code_root, "status", "--porcelain") == ""
-    # a human's in-flight work in the code checkout, untouched by the sweep
+    # a human's in-flight work in the code checkout, untouched by the sweep: one
+    # UNTRACKED file and one edit to a TRACKED file, since `add -A` swept both and a
+    # pathspec'd `add` must refuse both
     (code_root / "unrelated.txt").write_text("wip\n", encoding="utf-8")
+    assert (code_root / "src.txt").is_file()  # premise: tracked, so the edit is a diff
     (code_root / "src.txt").write_text("edited\n", encoding="utf-8")
+    staged = code_root / "staged.txt"
+    staged.write_text("staged version\n", encoding="utf-8")
+    git(code_root, "add", "--", "staged.txt")
+    staged.write_text("working version\n", encoding="utf-8")
 
     assert (
         engine._close_resolved(
@@ -8360,60 +8438,326 @@ def test_a_re_rooted_ledger_commit_stages_the_whole_enclosing_repository(project
 
     ledger_rel = str(paths.deferred_work.relative_to(code_root)).replace("\\", "/")
     files = sorted(git(code_root, "show", "--name-only", "--pretty=format:", "HEAD").split())
-    assert files == sorted([ledger_rel, "src.txt", "unrelated.txt"])
-    assert git(code_root, "status", "--porcelain") == ""  # ...and the tree goes clean
+    assert files == [ledger_rel]  # the published file ALONE
+    # ...and the operator's work is still theirs to commit: the tracked edit is still
+    # an UNSTAGED working-tree diff and the new file is still UNTRACKED. Read through
+    # plumbing rather than `status --porcelain`, whose two-column prefix `conftest.git`
+    # strips off the first line.
+    assert git(code_root, "diff", "--name-only").splitlines() == ["src.txt", "staged.txt"]
+    assert git(code_root, "diff", "--cached", "--name-only") == "staged.txt"
+    assert git(code_root, "show", ":staged.txt") == "staged version"
+    assert staged.read_text(encoding="utf-8") == "working version\n"
+    assert git(code_root, "ls-files", "--others", "--exclude-standard") == "unrelated.txt"
 
 
-# The sanctioned `root=` spellings, by family. Compared as `ast.unparse` text,
+def test_a_prune_does_not_publish_a_ledger_the_decision_phase_withheld(project, monkeypatch):
+    """DW-187. The decision phase's withhold has to survive the REST of its cycle,
+    not just its own `return`.
+
+    `_materialize_bundles` reaches `_prune_dropped_pre_answer` after the decision
+    phase and inside the same cycle, so the withhold used to be undone a few
+    statements later: that prune's commit was `commit_story`'s `git add -A` over the
+    whole enclosing repository, which swept up the very ledger bytes an effect could
+    not read and published them under a `chore(sweep): drop stale deferred-work
+    pre-answer` message. Narrowed to the store's own pathspec, the prune commits the
+    file it wrote and nothing else, and the quarantined ledger stays unpublished.
+
+    The two sites are driven in order on one engine because that IS the claim — a
+    later commit in the same cycle — and composing them directly keeps the row about
+    the commit scope rather than about `_materialize_bundles`' triage machinery.
+
+    The ledger is graded by its BLOB SHA at HEAD, not its text: the withheld bytes
+    are deliberately not UTF-8, so any text comparison would have to decode the thing
+    the fault is about. The store is graded by content, since the claim there is that
+    its edit really did land — a row that only asserted the ledger unchanged would
+    pass on a prune that committed nothing at all.
+
+    Ablation: restore `verify.commit_story` in `_commit_ledger` and the ledger blob
+    assertion reds, with HEAD carrying the undecodable bytes."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    # a stale keep-open answer for the OTHER id, which is what the prune retires.
+    # Not DW-1's: a stored answer for the decided id would pre-answer it and the
+    # walk would never prompt, so no effect could fault.
+    decisions_store.record_pre_answer(
+        project.project,
+        "DW-2",
+        DecisionOption(key="2", label="Keep", effect="keep-open"),
+        date="2026-06-12",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "store")
+    ledger_rel = str(project.deferred_work.relative_to(project.project)).replace("\\", "/")
+    store_rel = ".bmad-loop/decisions.json"
+    ledger_blob_before = git(project.project, "rev-parse", f"HEAD:{ledger_rel}")
+    assert "DW-2" in git(project.project, "show", f"HEAD:{store_rel}")  # premise: tracked
+
+    engine, _ = make_sweep(project, [])
+    engine.prompting = True
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+
+    def answer(_prompt):
+        # the ledger goes undecodable WHILE the prompt is open — the reachable
+        # window `_decisions_phase`'s degrade exists for
+        project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
+        return "1"
+
+    engine.prompter = DecisionPrompter(input_fn=answer, print_fn=lambda _line: None)
+
+    engine._decisions_phase(
+        TriagePlan(
+            open_ids=frozenset({"DW-1", "DW-2"}),
+            decisions=(_close_or_keep_decision("DW-1"),),
+        )
+    )
+
+    # premise before outcome: the phase really did fault and really did withhold,
+    # leaving the unreadable bytes on disk for the prune below to be tempted by
+    assert len(_records(engine, "sweep-decision-effect-unavailable")) == 1
+    assert _records(engine, "sweep-ledger-commit") == []
+    assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER
+
+    engine._prune_dropped_pre_answer("DW-2", "stale-option")
+
+    # the prune's own write IS published...
+    [commit] = _records(engine, "sweep-ledger-commit")
+    assert commit["commit"] == git(project.project, "rev-parse", "HEAD")
+    assert "DW-2" not in git(project.project, "show", f"HEAD:{store_rel}")
+    # ...and the quarantined ledger is byte-identical at HEAD, still unpublished
+    assert git(project.project, "rev-parse", f"HEAD:{ledger_rel}") == ledger_blob_before
+    assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER  # and still on disk
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    [
+        "deferred-work.md",
+        pytest.param(
+            ":(literal)ledger.md",
+            marks=pytest.mark.skipif(
+                sys.platform == "win32", reason="colon is not a Windows filename"
+            ),
+        ),
+    ],
+)
+def test_a_symlinked_ledger_commits_in_the_repository_that_holds_its_target(
+    project, tmp_path, target_name
+):
+    """DW-188. The publishers resolve the ledger, so the commit lands where the WRITE
+    landed.
+
+    `platform_util.atomic_write_text` — the writer behind every ledger publish —
+    follows symlinks (`path.resolve()`), so a ledger symlinked out of the project has
+    its TARGET rewritten. `_commit_ledger` used to take the LEXICAL parent, so the
+    two disagreed about which file was even in play: the clean check interrogated the
+    link's own directory in the project repo (where the link itself is unchanged, so
+    it reads clean) while the bytes landed in the target's repository, which received
+    no commit at all and stayed dirty. Resolving here is what makes the check, the
+    commit and the write name one file.
+
+    Three claims, and the second and third are what stop a "fix" that merely widened
+    the scope: the target repo's HEAD carries the close, the link is still a LINK
+    aimed at the same target (a publisher that replaced the name would satisfy the
+    first claim while destroying the operator's indirection), and the project repo —
+    which holds only the link — receives nothing.
+
+    The premise is guarded before the outcome (docs/testing.md): the entry really is
+    a symlink, the two repositories are compared RESOLVED and asserted DISJOINT
+    rather than merely unequal, and both trees start clean.
+
+    Ablation: drop the `.resolve()` in `_commit_ledger` and this reds on the target
+    repo's HEAD — `path_clean` answers clean for an unchanged link and nothing is
+    committed anywhere. Restore a bare status pathspec in `path_clean` and the
+    magic-basename case fails at the target HEAD assertion."""
+    ledger_repo = _copy_code_repo(project, tmp_path / "ledger-repo")
+    target = ledger_repo / target_name
+    link = project.deferred_work
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    try:
+        link.symlink_to(target)
+    except OSError as exc:  # pragma: no cover - win32 without developer mode
+        pytest.skip(f"symlinks unavailable on this host: {exc}")
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"}, commit=False)  # writes THROUGH
+    _settle(project.project, ledger_repo)
+
+    # premise before outcome
+    assert link.is_symlink() and link.readlink() == target  # the indirection is real
+    assert target.is_file() and not target.is_symlink()  # ...and the write went through it
+    project_resolved, ledger_resolved = project.project.resolve(), ledger_repo.resolve()
+    assert project_resolved != ledger_resolved
+    assert project_resolved not in ledger_resolved.parents  # DISJOINT, not merely unequal
+    assert ledger_resolved not in project_resolved.parents
+    assert git(project.project, "status", "--porcelain") == ""
+    assert git(ledger_repo, "status", "--porcelain") == ""
+    project_head = git(project.project, "rev-parse", "HEAD")
+
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    assert (
+        engine._close_resolved(
+            TriagePlan(
+                open_ids=frozenset({"DW-1", "DW-2"}),
+                already_resolved=(ResolvedEntry("DW-1", "fixed by a1b2c3d"),),
+            )
+        )
+        == 1
+    )
+
+    # the TARGET repository's HEAD carries the close
+    committed = {
+        e.id: e for e in deferredwork.parse_ledger(git(ledger_repo, "show", f"HEAD:{target_name}"))
+    }
+    assert not committed["DW-1"].open and committed["DW-2"].open
+    [commit] = _records(engine, "sweep-ledger-commit")
+    assert commit["commit"] == git(ledger_repo, "rev-parse", "HEAD")
+    assert git(ledger_repo, "status", "--porcelain") == ""
+    # the link survives AS a link, still aimed at the same file
+    assert link.is_symlink() and link.readlink() == target
+    # ...and the project repo, which holds only the link, receives nothing
+    assert git(project.project, "rev-parse", "HEAD") == project_head
+
+
+def _close_resolved_with_nothing_resolved(engine):
+    """`_close_resolved` over a plan whose `already_resolved` is empty: the phase
+    runs, `mark_done_many` flips nothing, and `closed` comes back empty."""
+    assert engine._close_resolved(TriagePlan(open_ids=frozenset({"DW-1", "DW-2"}))) == 0
+
+
+def _decisions_phase_with_no_effect_landing(engine):
+    """`_decisions_phase` unattended: the decision is announced and quarantined, no
+    prompt is taken, and `_apply_decision_effect` — the walk's only ledger write — is
+    never reached, so no effect lands."""
+    engine.prompting = False
+    answers, closed = engine._decisions_phase(
+        TriagePlan(
+            open_ids=frozenset({"DW-1", "DW-2"}),
+            decisions=(_close_or_keep_decision("DW-1"),),
+        )
+    )
+    assert answers == {} and closed == 0
+    assert [r["dw_id"] for r in _records(engine, "decision-skipped-unattended")] == ["DW-1"]
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [_close_resolved_with_nothing_resolved, _decisions_phase_with_no_effect_landing],
+    ids=["close-resolved", "decisions-phase"],
+)
+def test_a_phase_that_wrote_nothing_spawns_no_git(project, monkeypatch, phase):
+    """DW-183/DW-185's other half: the two sites that used to commit whether or not
+    they had written anything now guard on a NON-EMPTY PASS, the shape the other
+    three sites already spelled.
+
+    `_close_resolved` commits only when `mark_done_many` actually flipped ids;
+    `_decisions_phase` only when an effect actually landed. Without those guards a
+    phase that did nothing still reached for git over whatever the enclosing
+    repository happened to be carrying — an operator's hand-edit of the ledger
+    included, which is the dirt this row plants precisely because `_commit_ledger`'s
+    pathspec backstop would otherwise absorb the ablation and hide the missing guard.
+
+    Graded at the git seam rather than by the absence of a journal row: `verify
+    .path_clean` is the first thing `_commit_ledger` does, so pinning it to a raise
+    grades "no git spawned at all" — the matrix's actual claim — instead of an
+    absence that a clean pathspec would also produce.
+
+    Ablation: drop the `if closed:` guard in `_close_resolved`, or `any_effect_landed`
+    from `_decisions_phase`'s condition, and the matching row reds inside the stub —
+    and with the stub removed, the operator's ledger edit is committed under a
+    `chore(sweep):` message by a phase that wrote none of it."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    # an operator's in-flight work, INCLUDING a hand-edit of the ledger itself — so
+    # the pathspec check could not no-op even if it were reached
+    (project.project / "unrelated.txt").write_text("wip\n", encoding="utf-8")
+    project.deferred_work.write_text(
+        project.deferred_work.read_text(encoding="utf-8") + "\n<!-- operator note -->\n",
+        encoding="utf-8",
+    )
+    head = git(project.project, "rev-parse", "HEAD")
+    dirty_before = git(project.project, "status", "--porcelain")
+    assert dirty_before  # premise: there is something a stray commit could take
+
+    def no_git(*_args, **_kwargs):
+        raise AssertionError("_commit_ledger reached git for a phase that wrote nothing")
+
+    monkeypatch.setattr(verify, "path_clean", no_git)
+    monkeypatch.setattr(verify, "commit_paths", no_git)
+
+    phase(engine)
+
+    # A phase that wrote nothing may not have journalled AT ALL (the close-resolved
+    # row does not), and an absent journal is the stronger form of the same claim —
+    # `_records` cannot read a file that was never created.
+    if (engine.run_dir / "journal.jsonl").exists():
+        assert _records(engine, "sweep-ledger-commit") == []
+        assert _records(engine, "sweep-ledger-commit-unavailable") == []
+    assert git(project.project, "rev-parse", "HEAD") == head  # nothing was published
+    assert git(project.project, "status", "--porcelain") == dirty_before  # ...and it stays theirs
+
+
+# The sanctioned `path=` spellings, by family. Compared as `ast.unparse` text,
 # which is exact for these and stable across formatting. The ledger family is ONE
-# fully-qualified spelling on purpose: a bare `ledger.parent` is name-scoped, and
+# fully-qualified spelling on purpose: a bare `ledger` is name-scoped, and
 # `sweep.py` also binds `ledger = self.paths.deferred_work` — the UN-rebased file,
 # a different path in a different tree under worktree isolation — so a publisher
-# added in that scope would have satisfied a text match while naming the wrong tree.
-_LEDGER_ROOTED = frozenset({"self.workspace.paths.deferred_work.parent"})
-_PROJECT_ROOTED = frozenset({"project", "_project_of_run_dir(self.run_dir)"})
+# added in that scope would have satisfied a text match while naming the wrong file.
+_LEDGER_PUBLISHED = frozenset({"self.workspace.paths.deferred_work"})
+_STORE_PUBLISHED = frozenset({"decisions_store.store_path(project)"})
 
 
 def test_every_sweep_ledger_commit_names_its_own_tree():
-    """Every `_commit_ledger` call in `sweep.py` names the tree that owns the file
-    the caller just wrote — checked by the argument's VALUE, not its presence.
+    """Every `_commit_ledger` call in `sweep.py` names the FILE the caller just
+    published — checked by the argument's VALUE, not its presence.
 
     The behavioral rows above drive four of the seven callers; this one is TOTAL,
     and it is what holds the fifth publisher (the post-migration commit, which
     cannot be driven at that layer) plus any caller added later. Presence alone is
-    not enough: `root=None` and `root=self.workspace.root` are both explicit
-    arguments, and either would reinstate a bug the suite would stay green through
-    — the first by inheriting the default, the second by interrogating the code repo
-    under a disjoint `repo_root`. So each call's root must be one of exactly two
-    sanctioned spellings, and the two families must be the right SIZE:
+    not enough: `path=self.workspace.root` is an explicit argument that would
+    reinstate a bug the suite would stay green through — a directory is not a
+    published file, its `.resolve().parent` is the workspace's own parent, and the
+    pathspec would name the workspace directory itself. So each call's path must be
+    one of exactly two sanctioned spellings, and the two families must be the right
+    SIZE:
 
-    * five LEDGER-rooted publishers, all spelling
-      `self.workspace.paths.deferred_work.parent`. `implementation_artifacts` is
-      configurable to any absolute path, so only the ledger's own directory is
-      correct in all three topologies — and only the WORKSPACE's copy of it, since
-      `self.paths.deferred_work` is a different file under worktree isolation.
-    * two PROJECT-rooted prunes (`_project_of_run_dir(self.run_dir)`, or the
-      `project` local each site binds to exactly that). The pre-answer store is a
-      bare join off the project root that no config knob can move.
+    * five LEDGER publishers, all spelling `self.workspace.paths.deferred_work`.
+      `implementation_artifacts` is configurable to any absolute path, so only the
+      ledger's own file is correct in all three topologies — and only the
+      WORKSPACE's copy of it, since `self.paths.deferred_work` is a different file
+      under worktree isolation.
+    * two pre-answer STORE prunes, spelling `decisions_store.store_path(project)`.
+      The store is a bare join off the project root that no config knob can move,
+      and each site binds `project` from `_project_of_run_dir(self.run_dir)` two
+      lines above its call.
+
+    Naming the FILE rather than a root is what narrows both git calls to one
+    pathspec (DW-183/DW-185/DW-187) and what makes the resolve agree with the
+    writer's (DW-188) — so a site that hands over a directory does not merely
+    mis-root the commit, it defeats the whole family's scope discipline.
 
     Source-level rather than behavioral on purpose, the same shape
     `test_portability_guard.py` uses for the `_run_git` and tmux-argv chokepoints:
     "every call site spells the right argument" is a property no single run can
-    observe. The `root=None` DEFAULT itself stays — it is `_commit_ledger`'s
-    published contract and `test_a_default_rooted_commit_failure_still_raises`
-    grades it — this guard only forbids in-tree callers from relying on it.
+    observe. That `path` is required at all is
+    `test_commit_ledger_requires_the_published_path`'s claim; this guard only holds
+    what the seven in-tree callers put in it.
 
-    Known limit: one bare name is still accepted — `project`, on the prune side.
-    A site that bound that name to something else would pass, though both prune
-    sites assign it from `_project_of_run_dir(self.run_dir)` two lines above their
-    call, and tightening this to the inline call would force them to spell the
-    helper twice. The LEDGER side has no such gap left: its single sanctioned
-    spelling resolves through `self.workspace`, which no local can shadow.
+    Known limit: the store spelling embeds one bare name — `project` — so a site
+    that bound that name to something else would pass, though both prune sites
+    assign it from `_project_of_run_dir(self.run_dir)` two lines above their call,
+    and inlining the helper would force them to spell it twice. The LEDGER side has
+    no such gap: its single sanctioned spelling resolves through `self.workspace`,
+    which no local can shadow.
 
-    Ablation: respell any publisher's `root=` as `_project_of_run_dir(self.run_dir)`
-    and the family counts red (4 ledger-rooted, 3 project-rooted); respell it
-    `self.workspace.root` or drop the argument and the per-call check reds naming
-    that line."""
+    Ablation: respell any publisher's `path=` as `decisions_store.store_path(project)`
+    and the family counts red (4 ledger, 3 store); respell it `self.workspace.root`,
+    revert one to `self.workspace.paths.deferred_work.parent`, or drop the argument
+    and the per-call check reds naming that line."""
     import ast
 
     source = (Path(sweep_mod.__file__)).read_text(encoding="utf-8")
@@ -8428,25 +8772,27 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     # premise: the scan actually finds the calls it is grading, so an AST shape
     # change cannot turn this into a guard over an empty set
     assert len(calls) == 7, f"expected 7 _commit_ledger callers, found {len(calls)}"
-    roots = {}
+    published = {}
     for node in calls:
-        root = next((kw.value for kw in node.keywords if kw.arg == "root"), None)
-        assert root is not None, f"sweep.py:{node.lineno} calls _commit_ledger with no root="
-        roots[node.lineno] = ast.unparse(root)
+        path = next((kw.value for kw in node.keywords if kw.arg == "path"), None)
+        assert path is not None, f"sweep.py:{node.lineno} calls _commit_ledger with no path="
+        published[node.lineno] = ast.unparse(path)
     # named explicitly, ahead of the whitelist, because these two are the regressions
-    # the whitelist exists to stop and a reader should see them refused by name
-    assert [line for line, spelling in roots.items() if spelling == "None"] == []
-    assert [line for line, spelling in roots.items() if spelling == "self.workspace.root"] == []
+    # the whitelist exists to stop and a reader should see them refused by name: a
+    # workspace root is not a published file, and `.parent` is the pre-DW-183
+    # directory spelling the whole change replaced
+    assert [line for line, spelling in published.items() if spelling == "self.workspace.root"] == []
+    assert [line for line, spelling in published.items() if spelling.endswith(".parent")] == []
     unsanctioned = {
         line: spelling
-        for line, spelling in roots.items()
-        if spelling not in _LEDGER_ROOTED | _PROJECT_ROOTED
+        for line, spelling in published.items()
+        if spelling not in _LEDGER_PUBLISHED | _STORE_PUBLISHED
     }
-    assert unsanctioned == {}, f"unsanctioned _commit_ledger roots: {unsanctioned}"
-    ledger_rooted = sorted(line for line, s in roots.items() if s in _LEDGER_ROOTED)
-    project_rooted = sorted(line for line, s in roots.items() if s in _PROJECT_ROOTED)
-    assert len(ledger_rooted) == 5, f"expected 5 ledger-rooted publishers: {ledger_rooted}"
-    assert len(project_rooted) == 2, f"expected 2 project-rooted prunes: {project_rooted}"
+    assert unsanctioned == {}, f"unsanctioned _commit_ledger paths: {unsanctioned}"
+    ledger_published = sorted(line for line, s in published.items() if s in _LEDGER_PUBLISHED)
+    store_published = sorted(line for line, s in published.items() if s in _STORE_PUBLISHED)
+    assert len(ledger_published) == 5, f"expected 5 ledger publishers: {ledger_published}"
+    assert len(store_published) == 2, f"expected 2 store prunes: {store_published}"
 
 
 _UNDECODABLE_LEDGER = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"

@@ -649,7 +649,7 @@ def worktree_clean(repo: Path) -> bool:
     `core.fsmonitor` hook that cannot exec, an unknown `core.fsyncMethod`, a stale
     index advisory), and against the merged stream that chatter is indistinguishable
     from a porcelain record — a pristine tree answers DIRTY. That direction is not
-    benign here: seven callers gate on it, and `cli.py`'s three refuse the command
+    benign here: six callers gate on it, and `cli.py`'s three refuse the command
     outright, so a host with a noisy git config could never start a run and the
     message would name no file. The error path keeps the merge, where stderr is the
     only informative half."""
@@ -663,6 +663,51 @@ def worktree_clean(repo: Path) -> bool:
             "--",
             ".",
             f":(exclude){POLICY_FILE_REL}",
+        ],
+        repo,
+    )
+    if proc.returncode != 0:
+        merged = (proc.stdout + proc.stderr).strip()
+        raise GitError(f"git status failed in {repo}: {merged}")
+    return proc.stdout.strip() == ""
+
+
+def path_clean(repo: Path, rel: str) -> bool:
+    """True when nothing under the single pathspec `rel` (relative to `repo`)
+    differs from HEAD — the NARROW sibling of :func:`worktree_clean`.
+
+    It exists because :func:`worktree_clean` answers about a whole subtree while its
+    caller acts on ONE file: `sweep._commit_ledger` asks "is the file I just
+    published dirty?" and commits that file alone via :func:`commit_paths`
+    (DW-183/DW-185/DW-187). The write half needs no narrow sibling — `commit_paths`
+    already commits an exact path list — but the DECISION to write does, and taking
+    it here is what keeps an already-clean publish from reaching `git add` at all.
+
+    No `:(exclude)<policy.toml>` here, unlike the wide sibling. That exclusion is
+    about a whole-tree scan sweeping in an operator's config edit; a single
+    pathspec naming one published file cannot reach `policy.toml` at all, so the
+    exclusion would be inert and only obscure what is being asked.
+
+    Reads `stdout` ALONE for the reason :func:`worktree_clean` spells out: `status`
+    exits 0 while still writing to stderr (a `core.fsmonitor` hook that cannot
+    exec, an unknown `core.fsyncMethod`, a stale index advisory), and against a
+    merged stream that chatter is indistinguishable from a porcelain record — a
+    clean path would answer DIRTY on a noisy host, and every already-clean publish
+    would then stage and re-interrogate a file it had nothing to say about. The
+    error path keeps the merge, where stderr is the informative half."""
+    # A resolved symlink target may have any basename, including pathspec magic.
+    # Match commit_paths' literal scope and include new publications even when
+    # the operator hides untracked files in their interactive status display.
+    proc = _run_git(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            *_literal_specs([rel]),
         ],
         repo,
     )
