@@ -191,8 +191,18 @@ class _BundleNameRepair:
 
 
 def _normalize_bundle_names(rj: dict[str, Any] | None) -> tuple[_BundleNameRepair, ...]:
-    """Truncate overlong bundle-name fields only when their shape is already safe."""
-    if rj is None:
+    """Truncate overlong bundle-name fields only when their shape is already safe.
+
+    Total on any input (DW-181): a non-mapping document answers `()` with no
+    repairs rather than raising out of `.get`. Same totality as the
+    `escalation._escalation_list` twin and for the same reason -- callers'
+    totality over parseable JSON, NOT a live crash fix, since `engine.py:6003`
+    dereferences `result.result_json.get(...)` behind an `is not None` check
+    alone and raises before any sweep lane reaches here. The triage lane calls
+    this one line ahead of `validate_triage`, which names the wrong shape on
+    the existing `errors` channel.
+    """
+    if not isinstance(rj, dict):
         return ()
 
     repairs: list[_BundleNameRepair] = []
@@ -964,10 +974,12 @@ def validate_migration(
         # function's own callers, NOT a live crash fix, and symmetry with the
         # DW-155 site is the whole argument: `_ensure_migration`, the only
         # production caller, cannot deliver a non-dict here, because
-        # `critical_escalations(result.result_json)` runs first and
-        # `_escalation_list` calls `.get` behind a falsiness check alone -- a
-        # truthy non-dict raises THERE, before this guard is reached. Refused
-        # through the existing `errors` channel; never raised, never repaired.
+        # `engine.py:6003` dereferences `result.result_json.get(...)` behind an
+        # `is not None` check alone -- a truthy non-dict raises THERE, inside
+        # `_run_session`, before this guard is reached. (DW-181 made the later
+        # `_escalation_list` helper total; the earlier engine dereference is
+        # unchanged.) Refused through the existing
+        # `errors` channel; never raised, never repaired.
         return [f"migration result not a JSON object: {type(rj).__name__}"]
     if rj.get("workflow") != MIGRATE_WORKFLOW:
         return [f"workflow must be {MIGRATE_WORKFLOW!r}: got {_shown_value(rj.get('workflow'))}"]

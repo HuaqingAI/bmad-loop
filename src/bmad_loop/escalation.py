@@ -49,7 +49,26 @@ class Decision:
 
 
 def _escalation_list(result_json: dict[str, Any] | None) -> list[Any]:
-    if not result_json:
+    """The `escalations` list a result document contributes, or `[]`.
+
+    Total on any input (DW-181): a non-mapping document -- a list, a string, a
+    number -- answers `[]` instead of raising `AttributeError` out of `.get`.
+    Like the DW-155/DW-170 guards in `sweep.validate_triage` /
+    `validate_migration`, what that buys is totality over parseable JSON for
+    this predicate's callers, NOT a live crash fix: `engine.py:6003`
+    dereferences `result.result_json.get(...)` behind an `is not None` check
+    alone, so a truthy non-mapping raises THERE, upstream of every caller here.
+    Refused through the existing return channel -- no escalation contributes,
+    no new raise or escalation path.
+
+    Kept as the single shared predicate so `critical_escalations` and
+    `preference_escalations` cannot drift on what a non-list `escalations`
+    VALUE contributes -- the question `resolve.py:273-284` relies on this
+    owning.
+    """
+    if not isinstance(result_json, dict):
+        # Subsumes the old `if not result_json`: `None` refuses here, and `{}`
+        # falls through to `.get`, which returns `[]`.
         return []
     escalations = result_json.get("escalations", [])
     return escalations if isinstance(escalations, list) else []

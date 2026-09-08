@@ -1018,6 +1018,29 @@ def test_validate_triage_truncates_overlong_decision_bundle_name():
     assert rj["decisions"][0]["options"][0]["bundle_name"] == _NORMALIZED_BUNDLE_NAME
 
 
+def test_normalize_bundle_names_absorbs_a_non_mapping_document():
+    """Direct calls with non-dict JSON documents return no repairs (DW-181).
+
+    This tests the helper boundary; the earlier engine dereference still
+    prevents malformed session documents from reaching the triage lane.
+
+    ABLATION: restore `if rj is None` and the non-dict rows raise
+    `AttributeError` instead of returning `()`. The mapping row is the control --
+    an empty tuple alone would pass even if the guard swallowed every document,
+    so it pins that a real document still reaches the truncation.
+    """
+    for document in (None, {}, [], "", 0, False, ["nope"], "bundles", 7):
+        assert sweep_mod._normalize_bundle_names(document) == ()
+
+    rj = {"bundles": [{"name": _OVERLONG_BUNDLE_NAME}]}
+    repairs = sweep_mod._normalize_bundle_names(rj)
+
+    assert [(r.field, r.original, r.normalized) for r in repairs] == [
+        ("bundles[0].name", _OVERLONG_BUNDLE_NAME, _NORMALIZED_BUNDLE_NAME)
+    ]
+    assert rj["bundles"][0]["name"] == _NORMALIZED_BUNDLE_NAME
+
+
 def test_validate_triage_rejects_post_truncation_bundle_name_collision():
     """ABLATION A1: delete direct normalization and the duplicate error disappears."""
     shared_prefix = "a" * 40

@@ -49,6 +49,29 @@ def test_escalation_selectors_reject_every_non_list_shape():
         assert preference_escalations(result) == []
 
 
+def test_escalation_selectors_absorb_a_non_mapping_document():
+    """The row above varies the `escalations` VALUE; this one varies the whole
+    document through direct helper calls (DW-181). The sweep lanes call the
+    critical selector before their validators, but the earlier engine
+    dereference prevents malformed session documents from reaching them.
+
+    ABLATION: restore `if not result_json` in `_escalation_list` and every
+    truthy row here raises `AttributeError` instead of returning `[]` -- the
+    empty list alone would pass for any reason a value could be absent, so the
+    mapping control below pins that the widened guard still lets a real
+    document through to its partition."""
+    for document in (None, {}, [], "", 0, False, ["nope"], "escalations", 7):
+        assert critical_escalations(document) == []
+        assert preference_escalations(document) == []
+
+    critical = {"severity": "CRITICAL", "detail": "stop"}
+    preference = {"severity": "PREFERENCE", "detail": "note"}
+    control = {"escalations": [critical, preference]}
+
+    assert critical_escalations(control) == [critical]
+    assert preference_escalations(control) == [preference]
+
+
 @pytest.mark.parametrize("role", ["dev", "review", "fix", "migration", "triage"])
 def test_every_critical_session_role_uses_the_shared_lossless_formatter(role):
     detail = "begin\n" + "x" * 2500 + "TAIL"
