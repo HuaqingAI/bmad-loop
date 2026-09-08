@@ -28,7 +28,7 @@ from .platform_util import (
     neutralize_surrogates,
     safe_segment,
 )
-from .runs import _project_of_run_dir
+from .runs import StateRootError, _project_of_run_dir
 from .statemachine import advance
 
 
@@ -1256,7 +1256,10 @@ class SweepEngine(Engine):
             # a recovered bundle's ledger restore can leave the tree dirty, and
             # triage plus the first bundle baseline need a clean one. Guarded on
             # a non-empty pass so a fresh sweep never commits the user's dirt.
-            self._commit_ledger("chore(sweep): commit ledger after recovering in-flight bundles")
+            self._commit_ledger(
+                "chore(sweep): commit ledger after recovering in-flight bundles",
+                root=_project_of_run_dir(self.run_dir),
+            )
         while True:
             # First statement of the loop body: covers the boundary right after
             # _finish_inflight_bundles on resume and between repeat cycles. A
@@ -1335,7 +1338,10 @@ class SweepEngine(Engine):
                 return
             # a deferred bundle's ledger restore can leave the tree dirty; the
             # next cycle's triage and bundle baselines need a clean tree
-            self._commit_ledger("chore(sweep): commit ledger before next sweep cycle")
+            self._commit_ledger(
+                "chore(sweep): commit ledger before next sweep cycle",
+                root=_project_of_run_dir(self.run_dir),
+            )
             cycle += 1
 
     def _finish_inflight_bundles(self) -> int:
@@ -1460,7 +1466,22 @@ class SweepEngine(Engine):
         ledger = self.workspace.paths.deferred_work
         # REPAIR/WRITE (DW-146): the open set derived here decides a store write,
         # and pruning from bytes nobody could read would drop live answers.
-        text = deferredwork.read_for_write(ledger) or ""
+        text = deferredwork.read_for_write(ledger)
+        # ABSENCE is refused, not collapsed to `""` (DW-176). The `or ""` spelling
+        # every observation-shaped caller uses is exact for them because
+        # `open_ids("")` and `open_ids(<absent>)` say the same thing about a ledger
+        # nobody is writing — but here the open set is the KEEP list for a store
+        # write, so an empty one means "nothing is open, drop every answer" and a
+        # ledger that vanished mid-cycle would wipe the human's whole pre-answer
+        # store and (since DW-160) commit the wipe. An absent ledger is unknown
+        # open work, not zero of it. The test is `is None`, never falsiness: an
+        # empty-but-PRESENT ledger genuinely has zero open ids and must keep
+        # pruning exactly as it does today.
+        if text is None:
+            self.journal.append(
+                "sweep-preanswer-prune-refused", ledger=str(ledger), reason="ledger-absent"
+            )
+            return
         # The store lives under the project that owns `run_dir`, never
         # `self.workspace.root`: where `repo_root` names a tree DISJOINT from the
         # project the two diverge and a workspace-rooted prune trimmed a store
@@ -2050,7 +2071,8 @@ class SweepEngine(Engine):
                     json.dumps(result.result_json, indent=2), encoding="utf-8"
                 )
                 self._commit_ledger(
-                    "chore(sweep): migrate legacy deferred-work entries to DW format"
+                    "chore(sweep): migrate legacy deferred-work entries to DW format",
+                    root=_project_of_run_dir(self.run_dir),
                 )
                 post = deferredwork.parse_ledger(new_text)
                 self.journal.append(
@@ -2299,16 +2321,38 @@ class SweepEngine(Engine):
         # half landed and the journal claimed all of them. `notes=` carries the
         # per-entry evidence the loop passed positionally, so the resulting ledger
         # text and the returned ids (order preserved, skips dropped) are unchanged.
-        closed = deferredwork.mark_done_many(
-            ledger,
-            [entry.id for entry in plan.already_resolved],
-            self._today(),
-            "already resolved",
-            notes=[f"already resolved: {entry.evidence}" for entry in plan.already_resolved],
-        )
+        ids = [entry.id for entry in plan.already_resolved]
+        # The write DEGRADES rather than propagating (DW-166). `mark_done_many`'s
+        # locked `read_for_write` raises `LedgerReadError` on undecodable bytes,
+        # and the lock itself can fail on `OSError` or `StateRootError`; bare, any
+        # of them ended the whole sweep as crashed out of a bookkeeping phase that
+        # runs before a single bundle. Entries staying `open` is the conservative
+        # outcome — the next cycle re-triages them and closes them then — where a
+        # crash loses the cycle. `ValueError` is the writers' `date` precondition,
+        # unreachable from `_today()` and named for the same reason the DW-146
+        # sibling handlers name it. `LedgerReadError` is a plain `Exception` and
+        # `StateRootError` is not an `OSError`, so both must be spelled out.
+        try:
+            closed = deferredwork.mark_done_many(
+                ledger,
+                ids,
+                self._today(),
+                "already resolved",
+                notes=[f"already resolved: {entry.evidence}" for entry in plan.already_resolved],
+            )
+        except (deferredwork.LedgerReadError, OSError, ValueError, StateRootError) as e:
+            self.journal.append("sweep-resolved-close-unavailable", dw_ids=ids, error=str(e))
+            # `post_close_resolved` still fires and 0 is still returned: the phase
+            # RAN, it just closed nothing, and a plugin watching the phase boundary
+            # must not silently lose its pairing with `pre_close_resolved`.
+            self._emit("post_close_resolved")
+            return 0
         if closed:
             self.journal.append("sweep-resolved-closed", dw_ids=closed)
-        self._commit_ledger("chore(sweep): close resolved deferred-work entries")
+        self._commit_ledger(
+            "chore(sweep): close resolved deferred-work entries",
+            root=_project_of_run_dir(self.run_dir),
+        )
         self._emit("post_close_resolved")
         return len(closed)
 
@@ -2483,6 +2527,10 @@ class SweepEngine(Engine):
                 )
                 self._emit("pre_decision", story_key=decision.id)
                 option = self.prompter.ask(decision)
+                # True from the moment the human answers, which is what the flag
+                # means: `_return_after_decisions` owes them a hand-back whether or
+                # not the effect below lands.
+                answered_interactively = True
                 answers[decision.id] = {
                     "key": option.key,
                     "label": option.label,
@@ -2500,12 +2548,56 @@ class SweepEngine(Engine):
                     key=option.key,
                     effect=option.effect,
                 )
-                self._apply_decision_effect(decision, option)
+                # The effect DEGRADES per decision and the walk carries on
+                # (DW-166), the same shape `cli.cmd_decisions` and
+                # `tui.app._record_decision` took in the DW-146 pass — and the
+                # handler sits here rather than inside `_apply_decision_effect`
+                # so the row can name the decision it lost, exactly as those two
+                # wrap `apply_pre_answer` at the loop.
+                #
+                # This is the reachable shape, not a theoretical one: `prompter.ask`
+                # above blocks on the human, so a ledger that goes undecodable
+                # while the prompt is open raises out of `record_decision`'s locked
+                # `read_for_write`. And by then the answer is already persisted to
+                # `<run>/decisions.json` and journalled as `decision-answered` — so
+                # bare, the run recorded an answer whose ledger line never landed
+                # and then crashed. (That ordering is deliberate and stays: the
+                # human's answer must survive a crash. It is the reason this
+                # degrade matters, not a thing to fix by reordering.)
+                try:
+                    self._apply_decision_effect(decision, option)
+                except (
+                    deferredwork.LedgerReadError,
+                    OSError,
+                    ValueError,
+                    StateRootError,
+                ) as e:
+                    self.journal.append(
+                        "sweep-decision-effect-unavailable",
+                        dw_id=decision.id,
+                        effect=option.effect,
+                        error=str(e),
+                    )
+                    # What is skipped is everything that would claim the effect
+                    # landed: no `post_decision` emit, and no `closed` increment,
+                    # so the cycle's progress signal does not count a closure the
+                    # ledger never received.
+                    #
+                    # What the human is left with differs by effect, and neither
+                    # is repaired THIS RUN — the answer is already in
+                    # `<run>/decisions.json`, so the next cycle reloads it into
+                    # `answers` and `pending` filters the id out. Only a NEW run
+                    # re-offers it. For `close`, the entry simply stays open and a
+                    # later run's triage can re-close it. For `build`, the bundle
+                    # still materializes and runs off the stored answer — the work
+                    # happens, but the entry carries no `decision:` audit line
+                    # recording who authorized it. Both are recoverable; crashing
+                    # the sweep mid-walk is not, which is the trade this arm makes.
+                    continue
                 self._emit("post_decision", story_key=decision.id, decision_action=option.effect)
-                answered_interactively = True
                 if option.effect == "close":
                     closed += 1
-        self._commit_ledger("chore(sweep): record deferred-work decisions")
+        self._commit_ledger("chore(sweep): record deferred-work decisions", root=project_root)
         if answered_interactively:
             self._return_after_decisions()
         return answers, closed
@@ -2571,37 +2663,44 @@ class SweepEngine(Engine):
         """Commit pending orchestrator ledger edits; bundles need a clean
         baseline. No-op when the tree is already clean.
 
-        `root` is the tree the clean check and the commit both run against,
-        defaulting to `self.workspace.root`. The two pre-answer prunes pass it
-        explicitly because the file they just wrote is the pre-answer STORE,
-        which lives under `_project_of_run_dir(self.run_dir)`: where `repo_root`
-        names a tree DISJOINT from the project, committing the store's edit
-        against the code repo checked a tree the write never touched (DW-160) —
-        the clean check passed, nothing was committed, and the project worktree
-        stayed dirty ahead of this cycle's bundles.
+        `root` is the tree the clean check and the commit both run against.
+        EVERY caller now passes it, and each names the tree its own write
+        dirtied. Both spellings resolve to `_project_of_run_dir(self.run_dir)`
+        today, but for two separate reasons and neither is an alias for the
+        other: the two pre-answer prunes wrote the pre-answer STORE, which lives
+        under the project that owns the run dir; the five ledger publishers
+        wrote the deferred-work ledger, which hangs off `implementation_artifacts`
+        and so stays project-rooted under the `repo_root` override. What they
+        share is that `self.workspace.root` is the wrong answer for both: where
+        `repo_root` names a tree DISJOINT from the project, committing against
+        the code repo interrogated a tree the write never touched (DW-160 for the
+        prunes, DW-175 for the publishers) — the clean check passed, nothing was
+        committed, and the project worktree stayed dirty ahead of this cycle's
+        bundles. Neither claim generalizes to "the project owns everything a
+        sweep edits": `implementation_artifacts` may be configured outside the
+        project tree entirely (see `ProjectPaths.rebased`), so a future caller
+        writing some third file must work out its own root rather than copy one.
 
-        ⚠️ The five default-root callers are KNOWN WRONG in that same shape and
-        are left that way deliberately, not vouched for here. They publish the
-        deferred-work ledger, which hangs off `implementation_artifacts` and so
-        stays project-rooted under the override, while this default hands
-        `workspace.root` — so a disjoint code root checks and commits the wrong
-        tree for them exactly as it did for the prunes. Fixing them is out of
-        scope for DW-160, which is bounded to the two prune sites; they keep
-        today's root until that is picked up.
+        A `verify.GitError` degrades to a journal row naming the tree and the
+        error instead of propagating. Passing a root makes `worktree_clean`
+        reachable on a project that is not a git repo at all — the `cli` sweep
+        precondition only requires `paths.repo_root` to be one — where it raises
+        `git status failed ...: fatal: not a git repository`. Under the old
+        default that call ran against the code repo and the edit simply stayed
+        uncommitted; letting the raise through would abort the whole sweep over
+        bookkeeping that was always best effort. That reasoning was DW-160's for
+        the prunes and it carries to the publishers unchanged — re-rooting them
+        without it would have made a non-git project strictly WORSE than before,
+        turning every ledger commit there into a sweep-ending raise.
+        `decisions.apply_pre_answer` already degrades on `GitError` for this very
+        file ("best effort, so a non-git or dirty tree never blocks the on-disk
+        record") and this keeps them agreeing.
 
-        A `verify.GitError` from an EXPLICITLY-rooted call degrades to a journal
-        row naming the tree and the error instead of propagating. Passing a root
-        newly makes `worktree_clean` reachable on a project that is not a git
-        repo at all — the `cli` sweep precondition only requires `paths.repo_root`
-        to be one — where it raises `git status failed ...: fatal: not a git
-        repository`. Before the root argument that call ran against the code repo
-        and the store write simply stayed uncommitted; letting the raise through
-        would abort the whole sweep out of a prune whose on-disk write already
-        succeeded. `decisions.apply_pre_answer` already degrades on `GitError`
-        for this very file ("best effort, so a non-git or dirty tree never blocks
-        the on-disk record") and this keeps the two agreeing. The default-root
-        callers keep failing loud: their raise is the pre-existing contract, and
-        nothing here should quiet a commit failure nobody asked to re-root."""
+        The `root is None` arm has no in-tree caller left and STAYS anyway: the
+        default and its raise are this method's published contract, so a new
+        caller that forgets to say which tree it dirtied fails loud rather than
+        inheriting whichever root happened to be convenient, and it is never
+        quietly journalled the way a rooted failure is."""
         target = self.workspace.root if root is None else root
         try:
             if verify.worktree_clean(target):
@@ -2609,7 +2708,9 @@ class SweepEngine(Engine):
             sha = verify.commit_story(target, message)
         except verify.GitError as e:
             if root is None:
-                raise  # the five default-root callers keep failing loud
+                # No in-tree caller reaches this (all seven pass a root); the
+                # loud default is preserved deliberately — see the docstring.
+                raise
             # `repo` (not `root`): an absolute host path naming a git tree,
             # already routed out of diagnostics dumps, exactly as
             # `rearm-baseline-advance-failed` spells the same value.

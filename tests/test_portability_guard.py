@@ -1156,6 +1156,16 @@ JOURNAL_KINDS = frozenset(
         "sweep-bundles-truncated",
         "sweep-cycle",
         "sweep-decision-answer-dropped",
+        # DW-166. An attended decision the human answered whose ledger effect did
+        # not land: `prompter.ask` blocks, so a ledger that goes undecodable (or a
+        # ledger lock that fails) while the prompt is open raises out of
+        # `record_decision` AFTER the answer was persisted and journalled. The
+        # sweep degrades per decision and walks on; this row is what says the
+        # `decision-answered` above it has no ledger line behind it. `dw_id` and
+        # `effect` are already benign (`effect` is a closed `DECISION_EFFECTS`
+        # value, not authored text) and `error` is already in
+        # `diagnostics._JOURNAL_DROP_FIELDS`, so no new field routing is needed.
+        "sweep-decision-effect-unavailable",
         "sweep-decision-option-mismatch",
         # DW-143. The keep-open lane's `stale-option` drop retired the PROJECT-level
         # pre-answer that fed it, so the next run reads no stale answer to re-drop
@@ -1190,9 +1200,26 @@ JOURNAL_KINDS = frozenset(
         "sweep-migrated",
         "sweep-migration-restore-diverged",
         "sweep-nothing-open",
+        # DW-176. `_prune_pre_answers` refusing to prune because the deferred-work
+        # ledger is ABSENT. The open set is the keep list for a store write, so
+        # collapsing absence to an empty ledger would read as "nothing is open"
+        # and drop every pre-answer the human recorded — and since DW-160 commit
+        # the wipe. Refusal is announced rather than silent so an operator can see
+        # why consumed answers are still in the store. `ledger` is already benign
+        # and `reason` is already in `diagnostics._JOURNAL_DROP_FIELDS`; the
+        # reason is the fixed token `ledger-absent`, never free text.
+        "sweep-preanswer-prune-refused",
         "sweep-remaining-estimate-unreadable",
         "sweep-repeat-done",
         "sweep-resolved-closed",
+        # DW-166. The degrade arm of the row above: `_close_resolved`'s batched
+        # `mark_done_many` could not write — undecodable ledger bytes, or the
+        # cross-process ledger lock failing — so nothing was closed and the
+        # entries stay `open` for the next cycle to re-triage, instead of the bare
+        # call ending the whole sweep as crashed. `dw_ids` carries the ids that
+        # were TO BE closed and is routed by name in
+        # `diagnostics._JOURNAL_KEYLIST_FIELDS`; `error` is already a drop field.
+        "sweep-resolved-close-unavailable",
         "sweep-return-no-client",
         "sweep-returned-after-decisions",
         "sweep-selection-empty",

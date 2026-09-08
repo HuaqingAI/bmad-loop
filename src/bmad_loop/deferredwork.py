@@ -775,19 +775,22 @@ def _one_line(value: str) -> str:
     observable is the line structure.
 
     Sanitizes; never raises, and nothing upstream rejects on a break either. The
-    close paths call these writers bare (`sweep._close_resolved`,
-    `decisions.apply_pre_answer`), so a `ValueError` would end the sweep as
-    crashed; refusing the same text back at `validate_triage` only moved the
-    stoppage to a pause. Collapsing is lossless enough — the ledger wants one
-    line anyway — so this is the fix, and the skill docs are guidance that
-    reduces occurrences without gating on them.
+    close paths do not want a `ValueError` out of these writers: it used to end
+    the sweep as crashed from `sweep._close_resolved`, which since DW-166 catches
+    it and degrades instead — losing the batch's closures for the cycle, which is
+    better than the crash but still a lost cycle of bookkeeping, and
+    `decisions.apply_pre_answer` still calls them bare (its `cli` and TUI callers
+    hold the handler). Refusing the same text back at `validate_triage` only
+    moved the stoppage to a pause. Collapsing is lossless enough — the ledger
+    wants one line anyway — so this is the fix, and the skill docs are guidance
+    that reduces occurrences without gating on them.
 
     That contract covers one hazard more than the break collapse alone, which is
     what the `neutralize_surrogates` pass in front of it buys (#329). A lone
     surrogate is not a line break, so it sailed through untouched — but it has
     no UTF-8 encoding, and `atomic_write_text`'s strict encode raises
     `UnicodeEncodeError` (a `ValueError` subclass) on it, from inside those same
-    bare close-path calls. It arrives the way the break did: a triage
+    close-path calls. It arrives the way the break did: a triage
     `result.json` is cached with `json.dumps`, whose `ensure_ascii` keeps the
     code point a harmless `\\ud800` escape, and the reload's `json.loads` revives
     the real thing into `ResolvedEntry.evidence` and on into the `mark_done`
