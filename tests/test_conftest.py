@@ -983,6 +983,264 @@ def test_reap_deadline_detector_cannot_pass_by_scanning_nothing():
     assert "inspected 0" in inventory[0]
 
 
+# DW-174: the stories detached-writer fake pins its bash-side detach acknowledgement
+# budget by SPLICING the shared ceiling into a module-level f-string. That module asserts
+# the fragment's presence and order in the RENDERED text, which cannot tell the splice
+# apart from a hardcoded `90` — the two render byte-identically, so a bare literal would
+# restore exactly the load-sensitive budget DW-95/DW-108 paid down with every row still
+# green. This third scanner grades that module's own AST for the EXPRESSION instead.
+#
+# A third focused scanner rather than a widening of the two above: `_scan_session_walls`
+# grades `SessionSpec(...)` constructor keywords and `_scan_reap_deadlines` grades
+# `time.monotonic() + <expr>` inside a test def. Neither reaches a module-level string
+# concatenation, and folding a third expression kind into either would mean threading a
+# shape switch through both.
+#
+# MODULE-LEVEL assignments only, which is what keeps `_run_detach_gate` out of scope for
+# free: that helper deliberately VARIES `detach_ack_ceiling_s={ceiling_s}` per row to
+# drive the direct-harness gate, and it lives inside a def.
+_DETACH_CEILING_FRAGMENT = "detach_ack_ceiling_s="
+
+_EXPECTED_DETACH_CEILING_SITES = {"DETACHED_WRITER_FAKE_CLI": 1}
+
+
+def _ceiling_excerpt(text: str) -> str:
+    """The one line of ``text`` carrying the fragment, so an offender names the spelling."""
+    return next(
+        (line for line in text.splitlines() if _DETACH_CEILING_FRAGMENT in line),
+        text,
+    )
+
+
+def _scan_detach_ceiling_splices(src: str, rel: str) -> tuple[dict[str, int], list[str]]:
+    """Inspect module-level ``detach_ack_ceiling_s=`` splices in a real-tmux module.
+
+    Sites are keyed by the assignment's FIRST `Name` target, since the property belongs to
+    the fake-CLI constant rather than to a test def — so a chained `OTHER =
+    DETACHED_WRITER_FAKE_CLI = ...` keys the site under `OTHER` and makes the inventory
+    fire on a file that is in fact correct. The derived `PUBLICATION_FAULT_FAKE_CLI`
+    inherits the gate through a `str.replace` and holds no fragment of its own, so it is
+    deliberately not a site here; the rendered-text asserts in `tests/test_stories_e2e.py`
+    are what cover that inheritance.
+
+    Accepts exactly ``int(<conftest alias of REAL_MUX_HANG_CEILING_S>)`` immediately after
+    the fragment, under either import form via `_conftest_aliases` — the `int()` is load
+    bearing, because bash arithmetic cannot take the `90.0` float. Everything else offends,
+    including a plain (non-f-string) constant that carries the fragment: that is the
+    hardcoded-90 case this guard exists for, and it counts as a site AND an offender.
+
+    Like `_scan_reap_deadlines` this does not flag an assignment holding zero sites — most
+    module constants have no ceiling at all. `_detach_ceiling_inventory_offenders` is what
+    keeps a scan that found nothing from passing vacuously.
+
+    KNOWN BLIND SPOTS, deliberately not closed — the shape above is matched literally, so
+    every one of these scans CLEAN and would carry a hardcoded budget past the guard:
+
+    * a name-built spelling (`f"{key}={int(...)}"`), the fragment never being a literal;
+    * a ceiling assembled outside a module-level assignment — a helper call, or a dict
+      entry consumed later;
+    * `tree.body` is iterated directly, so an assignment nested in a module-level `if`,
+      `try` or `with` is never reached;
+    * an `AugAssign` append (`FAKE += "detach_ack_ceiling_s=90\\n"`) is not an `Assign`
+      and so is not inspected;
+    * a SECOND fragment occurring EARLIER in the same f-string part — only the part's
+      tail is graded, and the site still counts 1, so the earlier one is invisible;
+    * a `conversion` or `format_spec` on the formatted value is accepted, since only the
+      wrapped expression is graded (`{int(CEILING)!r}` and `{int(CEILING):d}` both pass);
+    * a module-level REBINDING of the imported ceiling name is unseen — `_conftest_aliases`
+      resolves the import, not the current binding. `_scan_reap_deadlines` shares this
+      limit exactly, and diverging here would split the two scanners' alias doctrine;
+    * scope is `tests/test_stories_e2e.py` alone, so the same fragment hardcoded in any
+      other module is out of scope entirely.
+
+    KNOWN FALSE POSITIVE, accepted for the same reason: the fragment must END an f-string
+    part IMMEDIATELY before a `FormattedValue`, so a legitimate quoted spelling
+    (`f'detach_ack_ceiling_s="{int(REAL_MUX_HANG_CEILING_S)}"'`) is reported as an offender
+    even though it splices the shared ceiling correctly. Write the bare shape and the
+    guard sees it.
+
+    Closing any of the above means resolving arbitrary dataflow or widening past the shape
+    the spec fixes; the narrow shape is the point, and probe rows below pin the limits that
+    matter so they stay recorded limits rather than surprises.
+    """
+    tree = ast.parse(src, filename=rel)
+    ceilings = _conftest_aliases(tree, frozenset({"REAL_MUX_HANG_CEILING_S"}))
+    sites: dict[str, int] = {}
+    offenders: list[str] = []
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            targets, value = stmt.targets, stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            targets, value = [stmt.target], stmt.value
+        else:
+            continue
+        names = [t.id for t in targets if isinstance(t, ast.Name)]
+        name = names[0] if names else ast.unparse(targets[0])
+
+        def offend(lineno: int, found: str, name: str = name) -> None:
+            offenders.append(
+                f"{rel}::{name}:{lineno}: expected "
+                f"`{_DETACH_CEILING_FRAGMENT}{{int(REAL_MUX_HANG_CEILING_S)}}`, got {found}"
+            )
+
+        spliced: set[int] = set()
+        for node in ast.walk(value):
+            if not isinstance(node, ast.JoinedStr):
+                continue
+            for i, part in enumerate(node.values):
+                if not (isinstance(part, ast.Constant) and isinstance(part.value, str)):
+                    continue
+                spliced.add(id(part))
+                if _DETACH_CEILING_FRAGMENT not in part.value:
+                    continue
+                sites[name] = sites.get(name, 0) + 1
+                after = node.values[i + 1] if i + 1 < len(node.values) else None
+                if not part.value.endswith(_DETACH_CEILING_FRAGMENT) or not isinstance(
+                    after, ast.FormattedValue
+                ):
+                    offend(node.lineno, repr(_ceiling_excerpt(part.value)))
+                    continue
+                inner = after.value
+                valid = (
+                    isinstance(inner, ast.Call)
+                    and _dotted(inner.func) == "int"
+                    and len(inner.args) == 1
+                    and not inner.keywords
+                    and _dotted(inner.args[0]) in ceilings
+                )
+                if not valid:
+                    offend(node.lineno, ast.unparse(inner))
+        for node in ast.walk(value):
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and id(node) not in spliced
+                and _DETACH_CEILING_FRAGMENT in node.value
+            ):
+                sites[name] = sites.get(name, 0) + 1
+                offend(node.lineno, f"plain literal {_ceiling_excerpt(node.value)!r}")
+    return sites, offenders
+
+
+def _detach_ceiling_inventory_offenders(sites: dict[str, int], rel: str) -> list[str]:
+    """Mismatches between a detach-ceiling scan and the named expected-site inventory."""
+    return [
+        f"{rel}::{name}: expected {expected} detach-ceiling splice site, inspected "
+        f"{sites.get(name, 0)}; update the inventory for intentional changes"
+        for name, expected in _EXPECTED_DETACH_CEILING_SITES.items()
+        if sites.get(name) != expected
+    ]
+
+
+def test_stories_e2e_detach_ceiling_splices_the_shared_ceiling():
+    path = _TESTS_DIR / "test_stories_e2e.py"
+    sites, offenders = _scan_detach_ceiling_splices(path.read_text(encoding="utf-8"), path.name)
+    assert not offenders, "\n".join(offenders)
+    inventory = _detach_ceiling_inventory_offenders(sites, path.name)
+    assert not inventory, "\n".join(inventory)
+
+
+_DETACH_PROBE_TARGET = "DETACHED_WRITER_FAKE_CLI"
+_DETACH_PROBE_HEADERS = {
+    "from": "from conftest import REAL_MUX_HANG_CEILING_S\n",
+    "dotted": "import conftest\n",
+    "none": "",
+}
+
+
+@pytest.mark.parametrize(
+    ("value", "imports", "reported"),
+    [
+        ('f"detach_ack_ceiling_s={int(REAL_MUX_HANG_CEILING_S)}\\n"', "from", None),
+        ('f"detach_ack_ceiling_s={int(conftest.REAL_MUX_HANG_CEILING_S)}\\n"', "dotted", None),
+        # The hardcoded literals this guard exists for: both render as text the stories
+        # module's own `count(...)` assert accepts (90) or rejects only by luck (10).
+        ('"detach_ack_ceiling_s=90\\n"', "from", "'detach_ack_ceiling_s=90'"),
+        ('"detach_ack_ceiling_s=10\\n"', "from", "'detach_ack_ceiling_s=10'"),
+        # A same-spelled local that was never imported from conftest is not the ceiling.
+        (
+            'f"detach_ack_ceiling_s={int(REAL_MUX_HANG_CEILING_S)}\\n"',
+            "none",
+            "got int(REAL_MUX_HANG_CEILING_S)",
+        ),
+        ('f"detach_ack_ceiling_s={int(SOME_LOCAL)}\\n"', "from", "int(SOME_LOCAL)"),
+        # The float would reach bash arithmetic as `90.0`; the `int()` is load bearing.
+        (
+            'f"detach_ack_ceiling_s={REAL_MUX_HANG_CEILING_S}\\n"',
+            "from",
+            "got REAL_MUX_HANG_CEILING_S",
+        ),
+        # Fragment present but nothing formatted after it inside the f-string.
+        ('f"detach_ack_ceiling_s=90\\n{tail}"', "from", "'detach_ack_ceiling_s=90'"),
+    ],
+)
+def test_detach_ceiling_detector_grades_the_module_level_splice(value, imports, reported):
+    source = _DETACH_PROBE_HEADERS[imports] + f"{_DETACH_PROBE_TARGET} = {value}\n"
+    sites, offenders = _scan_detach_ceiling_splices(source, "test_probe.py")
+    assert sites == {_DETACH_PROBE_TARGET: 1}
+    if reported is None:
+        assert offenders == []
+    else:
+        assert len(offenders) == 1
+        assert f"test_probe.py::{_DETACH_PROBE_TARGET}:" in offenders[0]
+        assert reported in offenders[0]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # `_run_detach_gate` deliberately varies the budget per row; it lives in a def, so
+        # module-level-only scanning excludes it without an exception list.
+        'def _run_detach_gate(ceiling_s):\n    return f"detach_ack_ceiling_s={ceiling_s}\\n"\n',
+        # The bash READ of the variable (`AWAIT_DETACHED_SESSION_SH`) is not a splice.
+        'AWAIT = "detach_deadline=$(( SECONDS + detach_ack_ceiling_s ))\\n"\n',
+        # The derived fake inherits the gate through a replace and holds no fragment.
+        "PUBLICATION_FAULT_FAKE_CLI = DETACHED_WRITER_FAKE_CLI.replace(A, B, 1)\n",
+    ],
+)
+def test_detach_ceiling_detector_leaves_lookalikes_alone(body):
+    source = _DETACH_PROBE_HEADERS["from"] + body
+    sites, offenders = _scan_detach_ceiling_splices(source, "test_probe.py")
+    assert sites == {}
+    assert offenders == []
+
+
+def test_detach_ceiling_detector_cannot_pass_by_scanning_nothing():
+    source = _DETACH_PROBE_HEADERS["from"] + f'{_DETACH_PROBE_TARGET} = "no fragment here\\n"\n'
+    sites, offenders = _scan_detach_ceiling_splices(source, "test_probe.py")
+    assert sites == {}
+    assert offenders == []  # the scan alone is silent — the inventory is what bites
+    inventory = _detach_ceiling_inventory_offenders(sites, "test_probe.py")
+    assert len(inventory) == len(_EXPECTED_DETACH_CEILING_SITES)
+    assert f"test_probe.py::{_DETACH_PROBE_TARGET}" in inventory[0]
+    assert "inspected 0" in inventory[0]
+
+
+def test_detach_ceiling_inventory_bites_an_over_count_too():
+    """Equality, not a floor: a SECOND splice site fails as loudly as a missing one.
+
+    Driven directly, because the scan over the real module can only ever hand this helper
+    the count that module actually holds.
+    """
+    expected = _EXPECTED_DETACH_CEILING_SITES[_DETACH_PROBE_TARGET]
+    over = {_DETACH_PROBE_TARGET: expected + 1}
+    inventory = _detach_ceiling_inventory_offenders(over, "test_probe.py")
+    assert len(inventory) == 1
+    assert f"test_probe.py::{_DETACH_PROBE_TARGET}" in inventory[0]
+    assert f"expected {expected} detach-ceiling splice site" in inventory[0]
+    assert f"inspected {expected + 1}" in inventory[0]
+    assert "update the inventory for intentional changes" in inventory[0]
+
+
+def test_detach_ceiling_detector_reads_an_annotated_assignment():
+    """The `ast.AnnAssign` branch: every parametrized row above is a bare `NAME = value`."""
+    splice = 'f"detach_ack_ceiling_s={int(REAL_MUX_HANG_CEILING_S)}\\n"'
+    source = _DETACH_PROBE_HEADERS["from"] + f"{_DETACH_PROBE_TARGET}: str = {splice}\n"
+    sites, offenders = _scan_detach_ceiling_splices(source, "test_probe.py")
+    assert sites == {_DETACH_PROBE_TARGET: 1}
+    assert offenders == []
+
+
 def _scan_tests() -> list[tuple[str, str, bool]]:
     found: list[tuple[str, str, bool]] = []
     for path in sorted(_TESTS_DIR.glob("test_*.py")):
@@ -1011,29 +1269,53 @@ def _declares_loadgroup(addopts: object) -> bool:
     return chosen == "loadgroup"
 
 
-# Per-module floors, each pinned AT its module's actual gated-def count. Not one
-# suite-wide number: a shared floor couples the modules, so a deletion in one blames the
-# detector for a change the author made in the other. And not a slack bound either — a
-# floor set below the real count is dead weight over exactly that many deletions, which
-# is what these numbers had silently become (DW-159 found stories at an actual 44 against
-# a floor of 30: fourteen E2Es could have been deleted with every row still green).
-# The stories count is 16 `test_e2e_*` real-tmux defs plus 3 `test_reap_e2e_*` rows plus
-# 28 local-process identity harness defs. They share the module gate, so a floor that
-# trails the count lets the helpers mask the deletion of E2Es.
+# EXACT per-module gated-def counts (DW-173), the same inventory contract
+# `_EXPECTED_SESSION_WALL_SITES` and `_EXPECTED_REAP_DEADLINE_SITES` already carry: the
+# assertion below is equality, so it bites in BOTH directions — adding a tmux-gated def
+# fails it just as deleting one does, and either way the fix is to re-pin the number for
+# the intentional change. A floor could only bite downward, which is how these numbers
+# silently went stale before (DW-159 found stories at an actual 44 against a floor of 30:
+# fourteen E2Es could have been deleted with every row still green).
 #
-# These numbers only bite DOWNWARD: the assertion below is `seen >= floor`, so ADDING a
-# def never fails the guard — the floor just starts trailing again, re-accumulating the
-# very slack this pin paid down. Keeping each number at its module's actual count is
-# therefore a MANUAL discipline the guard cannot enforce: re-pin when you add a def, not
-# only when you deliberately remove one. The `>=` shape is shared with
-# test_generic_tmux.py and is deliberately left alone here.
-_EXPECTED_E2E_FLOORS = {"test_generic_tmux.py": 6, "test_stories_e2e.py": 47}
+# Per-module rather than one suite-wide number: a shared count couples the modules, so a
+# deletion in one blames the detector for a change the author made in the other. Both
+# modules are carried here for the same reason — a half-pinned inventory leaves the
+# unpinned module free to drift.
+#
+# The stories count is 16 `test_e2e_*` real-tmux defs plus 3 `test_reap_e2e_*` rows plus
+# 28 local-process identity harness defs. They share the module gate, so a count that
+# trails lets the helpers mask the deletion of E2Es.
+_EXPECTED_E2E_DEF_COUNTS = {"test_generic_tmux.py": 6, "test_stories_e2e.py": 47}
+
+
+def _e2e_def_count_offenders(found: list[tuple[str, str, bool]]) -> list[str]:
+    """Mismatches between a gated-def scan and the named expected-count inventory.
+
+    Split out of the live test the way `_reap_inventory_offenders` is, and for the same
+    reason: the live guard reads the real `tests/` tree through `_scan_tests()`, so the
+    mismatch path this inventory exists to enforce cannot be driven there — only a
+    synthetic `found` list can exercise it, in either direction.
+    """
+    offenders: list[str] = []
+    for rel, expected in _EXPECTED_E2E_DEF_COUNTS.items():
+        seen = sum(1 for found_rel, _name, _grouped in found if found_rel == rel)
+        if seen != expected:
+            offenders.append(
+                f"{rel}: expected {expected} tmux-gated test defs, inspected {seen}; "
+                "update the inventory for intentional changes"
+            )
+    return offenders
+
+
+def _synthetic_found(counts: dict[str, int]) -> list[tuple[str, str, bool]]:
+    """A `_scan_tests()`-shaped list holding the named per-module gated-def counts."""
+    return [(rel, f"test_row_{i}", True) for rel, n in counts.items() for i in range(n)]
 
 
 def test_every_real_tmux_e2e_joins_the_serialized_xdist_group():
     """The live scan: no real-tmux E2E may run outside the shared group (DW-95).
 
-    The floors are not decoration — without them a glob that stopped matching, or a
+    The counts are not decoration — without them a glob that stopped matching, or a
     discriminator that stopped discriminating, reports zero offenders and passes while
     enforcing nothing."""
     found = _scan_tests()
@@ -1043,17 +1325,36 @@ def test_every_real_tmux_e2e_joins_the_serialized_xdist_group():
         f"`{REAL_MUX_MARK_ALIAS}` from conftest and apply it (and remove any other "
         f"`xdist_group` mark, which xdist would merge into a different group): {offenders}"
     )
-    assert set(_EXPECTED_E2E_FLOORS) == {rel for rel, _name, _grouped in found}, (
+    assert set(_EXPECTED_E2E_DEF_COUNTS) == {rel for rel, _name, _grouped in found}, (
         "the set of modules holding real-tmux E2Es changed. If a new module legitimately "
         "drives real tmux, confirm it applies `real_mux_e2e` and then add it to "
-        f"_EXPECTED_E2E_FLOORS with its own floor; found {sorted({r for r, _n, _g in found})}"
+        f"_EXPECTED_E2E_DEF_COUNTS with its own count; "
+        f"found {sorted({r for r, _n, _g in found})}"
     )
-    for rel, floor in _EXPECTED_E2E_FLOORS.items():
-        seen = sum(1 for found_rel, _name, _grouped in found if found_rel == rel)
-        assert seen >= floor, (
-            f"the scan found only {seen} tmux-gated tests in {rel} (expected >= {floor}). "
-            "If E2Es were deliberately removed, lower the floor; otherwise the detector broke"
-        )
+    counts = _e2e_def_count_offenders(found)
+    assert not counts, "\n".join(counts)
+
+
+@pytest.mark.parametrize(("delta", "direction"), [(1, "def added"), (-1, "def removed")])
+def test_e2e_def_count_inventory_bites_in_both_directions(delta, direction):
+    """Equality, not a floor: an ADDED gated def fails as loudly as a removed one.
+
+    Driven synthetically because the live guard above scans the real `tests/` tree — the
+    only mismatch it can ever see is one an author has already committed.
+    """
+    for rel, expected in _EXPECTED_E2E_DEF_COUNTS.items():
+        counts = dict(_EXPECTED_E2E_DEF_COUNTS)
+        counts[rel] = expected + delta
+        offenders = _e2e_def_count_offenders(_synthetic_found(counts))
+        assert len(offenders) == 1, f"{direction} in {rel}: {offenders}"
+        assert offenders[0].startswith(f"{rel}: ")
+        assert f"expected {expected} tmux-gated test defs" in offenders[0]
+        assert f"inspected {expected + delta}" in offenders[0]
+        assert "update the inventory for intentional changes" in offenders[0]
+
+
+def test_e2e_def_count_inventory_stays_silent_on_an_exact_match():
+    assert _e2e_def_count_offenders(_synthetic_found(dict(_EXPECTED_E2E_DEF_COUNTS))) == []
 
 
 def test_the_shared_mark_really_carries_the_shared_group_name():

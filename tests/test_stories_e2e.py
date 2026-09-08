@@ -412,12 +412,17 @@ assert PUBLICATION_FAULT_FAKE_CLI.count(RECORD_CHILD_IDENTITY_SH) == 2
 # property, not presence: a gate spliced AFTER the recorder would publish the identity
 # first and re-establish exactly the race DW-159 closes, so pin the index too. The
 # ceiling assignment is respelled rather than shared, so swapping the splice for a bare
-# literal fails here — neither conftest scanner reaches a module-level f-string (one
-# grades `SessionSpec(...)` keywords, the other `time.monotonic() + <expr>` inside a test
-# def). KNOWN BLIND SPOT, deliberately not closed: this compares rendered TEXT, so a bare
-# literal that happens to equal the ceiling's current value reads as identical and passes.
-# It catches the drift that matters — a short load-sensitive budget, the DW-95/DW-108
-# failure mode — and closing the rest means grading this module's own AST.
+# SHORT literal fails here.
+#
+# These asserts compare rendered TEXT, which on its own cannot tell the splice apart from
+# a hardcoded `90` — the two render byte-identically. That is graded elsewhere (DW-174):
+# `_scan_detach_ceiling_splices` in `tests/test_conftest.py` reads THIS module's own AST
+# and requires the module-level `detach_ack_ceiling_s=` fragment to be followed by
+# `int(<conftest REAL_MUX_HANG_CEILING_S>)`, under either import form, against a named
+# expected-site inventory. Keep both halves: that scan observes only the EXPRESSION, while
+# the splice ORDER pinned below and the derived `PUBLICATION_FAULT_FAKE_CLI` inheritance
+# (a `str.replace` result, which holds no fragment of its own) are text properties no AST
+# scan of this module sees.
 for _fake in (DETACHED_WRITER_FAKE_CLI, PUBLICATION_FAULT_FAKE_CLI):
     assert _fake.count(AWAIT_DETACHED_SESSION_SH) == 1
     assert _fake.count(f"detach_ack_ceiling_s={int(REAL_MUX_HANG_CEILING_S)}\n") == 1
