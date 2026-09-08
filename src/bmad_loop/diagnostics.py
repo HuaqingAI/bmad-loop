@@ -1386,6 +1386,7 @@ def render_markdown(
             in {
                 "sweep-ledger-commit",
                 "sweep-ledger-commit-clean",
+                "sweep-ledger-commit-refused",
                 "sweep-ledger-commit-unavailable",
                 "sweep-repeat-done",
             }

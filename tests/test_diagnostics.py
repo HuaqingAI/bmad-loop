@@ -1299,6 +1299,7 @@ def test_remaining_journal_sanitization_contract_reaches_both_public_renders(pro
 
 
 @pytest.mark.parametrize("render_format", ["markdown", "json"])
+@pytest.mark.parametrize("refuse_cause", ["target-absent", "target-unreadable"])
 @pytest.mark.parametrize(
     "stop_cause",
     [
@@ -1311,14 +1312,23 @@ def test_remaining_journal_sanitization_contract_reaches_both_public_renders(pro
     ],
 )
 def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
-    project, render_format, stop_cause
+    project, render_format, stop_cause, refuse_cause
 ):
-    """Each public render independently retains all three publication identities,
+    """Each public render independently retains all FOUR publication identities,
     the six stop slugs, and the dropped fields' presence booleans.
 
-    Ablation: remove Markdown's sweep-entry emission, or add file/stop_cause to
-    _JOURNAL_DROP_FIELDS, and the corresponding positive assertions fail. Remove
-    message/error/repo/reason from that set and the presence assertions fail.
+    The refusal row (DW-199/203/205) carries two surviving fields, not one: `file`
+    says WHICH of the two published files went unpublished and `refuse_cause` says
+    WHY, and the two are separate claims — the causes are a closed pair
+    (`target-absent` | `target-unreadable`) whose natural spelling, `reason`, is
+    dropped, so without the minted field a scrubbed dump could not tell a ledger
+    that vanished from one nobody could decode.
+
+    Ablation: remove Markdown's sweep-entry emission, drop
+    `sweep-ledger-commit-refused` from the collected kind set, or add
+    file/stop_cause/refuse_cause to _JOURNAL_DROP_FIELDS, and the corresponding
+    positive assertions fail. Remove message/error/repo/reason from that set and
+    the presence assertions fail.
     """
     run_dir = _seed_run(project.project)
     repo_value = f"{HOME_PATH}/_bmad-output/implementation-artifacts"
@@ -1333,6 +1343,13 @@ def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
         file="deferred-work.md",
     )
     journal.append("sweep-ledger-commit-clean", message=message_value, file="decisions.json")
+    journal.append(
+        "sweep-ledger-commit-refused",
+        message=message_value,
+        file="deferred-work.md",
+        refuse_cause=refuse_cause,
+        **({"error": error_value} if refuse_cause == "target-unreadable" else {}),
+    )
     journal.append(
         "sweep-ledger-commit", message=message_value, commit="a" * 40, file="deferred-work.md"
     )
@@ -1352,6 +1369,7 @@ def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
 
     failed = next(e for e in entries if e["kind"] == "sweep-ledger-commit-unavailable")
     clean = next(e for e in entries if e["kind"] == "sweep-ledger-commit-clean")
+    refused = next(e for e in entries if e["kind"] == "sweep-ledger-commit-refused")
     published = next(e for e in entries if e["kind"] == "sweep-ledger-commit")
     stopped = next(e for e in entries if e["kind"] == "sweep-repeat-done")
 
@@ -1359,6 +1377,8 @@ def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
     assert failed["file"] == "deferred-work.md"
     assert clean["file"] == "decisions.json"
     assert published["file"] == "deferred-work.md"
+    assert refused["file"] == "deferred-work.md"
+    assert refused["refuse_cause"] == refuse_cause
     assert stopped["stop_cause"] == stop_cause
     # ...while every field they were minted to replace still collapses
     assert failed["repo_present"] is True and "repo" not in failed
@@ -1366,6 +1386,12 @@ def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
     assert failed["message_present"] is True and "message" not in failed
     assert clean["message_present"] is True and "message" not in clean
     assert published["message_present"] is True and "message" not in published
+    assert refused["message_present"] is True and "message" not in refused
+    assert "error" not in refused
+    if refuse_cause == "target-unreadable":
+        assert refused["error_present"] is True
+    else:
+        assert "error_present" not in refused
     assert published["commit"].startswith("commit-")  # aliased, not shipped
     assert stopped["reason_present"] is True and "reason" not in stopped
     assert stopped["cycles"] == 2  # the unrelated field is untouched

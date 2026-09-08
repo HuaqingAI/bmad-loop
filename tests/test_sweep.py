@@ -7894,8 +7894,9 @@ def test_a_prune_in_a_non_git_project_keeps_the_store_write_and_journals(project
 
 
 def test_commit_ledger_requires_the_published_path():
-    """`path` is a REQUIRED keyword-only parameter, which is what replaced the old
-    `root=None` default and its runtime raise.
+    """`path` and `family` are REQUIRED keyword-only parameters. `path` is what
+    replaced the old `root=None` default and its runtime raise; `family` is the
+    target validation's declaration (DW-199/203/205), required for the same reason.
 
     That default existed so a caller which forgot to say which tree it dirtied
     failed loud instead of inheriting whichever root happened to be convenient. A
@@ -7910,16 +7911,25 @@ def test_commit_ledger_requires_the_published_path():
     about the parameter and not about any one caller's behavior; the AST guard below
     is what holds the seven call sites to the two sanctioned spellings.
 
-    Ablation: give `path` a default (`path: Path | None = None`) and this reds on
-    `default is inspect.Parameter.empty`; make it positional-or-keyword and it reds
-    on the KEYWORD_ONLY kind."""
+    `family` is graded here rather than left to pyright for the reason `path` is,
+    and it is the stronger claim of the two: a default (`family: ... = "ledger"`)
+    would typecheck at every call site while silently handing a NEW publisher a
+    validation it may not want — the ledger's decodability check applied to a file
+    that is not the ledger. Declared, never derived: `_commit_ledger`'s own rule
+    refuses anything chosen by role, so `path == self.workspace.paths.deferred_work`
+    would be exactly the wrong test.
+
+    Ablation: give `path` or `family` a default and this reds on
+    `default is inspect.Parameter.empty`; make either positional-or-keyword and it
+    reds on the KEYWORD_ONLY kind."""
     import inspect
 
     sig = inspect.signature(sweep_mod.SweepEngine._commit_ledger)
     assert "root" not in sig.parameters  # the old spelling is gone, not aliased
-    path_param = sig.parameters["path"]
-    assert path_param.kind is inspect.Parameter.KEYWORD_ONLY
-    assert path_param.default is inspect.Parameter.empty
+    for name in ("path", "family"):
+        param = sig.parameters[name]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY, name
+        assert param.default is inspect.Parameter.empty, name
 
 
 def test_a_clean_published_path_returns_before_git_add(project, monkeypatch):
@@ -7958,7 +7968,9 @@ def test_a_clean_published_path_returns_before_git_add(project, monkeypatch):
     monkeypatch.setattr(verify, "commit_paths", no_commit)
 
     engine._commit_ledger(
-        "chore(sweep): a publish with nothing to publish", path=project.deferred_work
+        "chore(sweep): a publish with nothing to publish",
+        path=project.deferred_work,
+        family="ledger",
     )
 
     assert _records(engine, "sweep-ledger-commit") == []  # no commit row...
@@ -7995,7 +8007,7 @@ def test_a_publication_that_becomes_clean_announces_no_commit(project, monkeypat
         return real_commit(repo, message, paths)
 
     monkeypatch.setattr(verify, "commit_paths", restore_before_staging)
-    engine._commit_ledger("chore(sweep): publish", path=ledger)
+    engine._commit_ledger("chore(sweep): publish", path=ledger, family="ledger")
 
     assert called == [[ledger.resolve()]]
     assert _records(engine, "sweep-ledger-commit") == []
@@ -8888,10 +8900,18 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     no such gap: its single sanctioned spelling resolves through `self.workspace`,
     which no local can shadow.
 
+    Since DW-199/203/205 each call ALSO declares which validation it wants, and
+    this guard holds the declaration against the family the `path=` spelling puts
+    the call in. That pairing is the claim: the two validations differ (the ledger's
+    reads for decodability, the store's checks existence), so a publisher declaring
+    the wrong one is a silently weaker guard rather than a type error.
+
     Ablation: respell any publisher's `path=` as `decisions_store.store_path(project)`
     and the family counts red (4 ledger, 3 store); respell it `self.workspace.root`,
     revert one to `self.workspace.paths.deferred_work.parent`, or drop the argument
-    and the per-call check reds naming that line."""
+    and the per-call check reds naming that line. Flip any one call's `family=` to
+    the other token, or compute it, and the declaration checks red naming that
+    line."""
     import ast
 
     source = (Path(sweep_mod.__file__)).read_text(encoding="utf-8")
@@ -8907,10 +8927,19 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     # change cannot turn this into a guard over an empty set
     assert len(calls) == 7, f"expected 7 _commit_ledger callers, found {len(calls)}"
     published = {}
+    declared = {}
     for node in calls:
         path = next((kw.value for kw in node.keywords if kw.arg == "path"), None)
         assert path is not None, f"sweep.py:{node.lineno} calls _commit_ledger with no path="
         published[node.lineno] = ast.unparse(path)
+        family = next((kw.value for kw in node.keywords if kw.arg == "family"), None)
+        assert family is not None, f"sweep.py:{node.lineno} calls _commit_ledger with no family="
+        # a LITERAL, not an expression: the whole point of declaring the family is
+        # that a reader of the call site can see which validation it asked for
+        assert isinstance(
+            family, ast.Constant
+        ), f"sweep.py:{node.lineno} declares a computed family: {ast.unparse(family)}"
+        declared[node.lineno] = family.value
     # named explicitly, ahead of the whitelist, because these two are the regressions
     # the whitelist exists to stop and a reader should see them refused by name: a
     # workspace root is not a published file, and `.parent` is the pre-DW-183
@@ -8927,6 +8956,18 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     store_published = sorted(line for line, s in published.items() if s in _STORE_PUBLISHED)
     assert len(ledger_published) == 5, f"expected 5 ledger publishers: {ledger_published}"
     assert len(store_published) == 2, f"expected 2 store prunes: {store_published}"
+    # ...and each family's calls declare THAT family (DW-199/203/205). The two
+    # validations are not interchangeable: `family="store"` on a ledger publisher
+    # buys existence only, so undecodable bytes still reach HEAD, and
+    # `family="ledger"` on a store prune would run the ledger's UTF-8 contract over
+    # `decisions.json`. This is also the check that holds the post-migration
+    # publisher, which no behavioral row in this file can drive.
+    mismatched = {
+        line: (published[line], declared[line])
+        for line in published
+        if declared[line] != ("ledger" if published[line] in _LEDGER_PUBLISHED else "store")
+    }
+    assert mismatched == {}, f"_commit_ledger calls declaring the wrong family: {mismatched}"
 
 
 _UNDECODABLE_LEDGER = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
@@ -9546,7 +9587,7 @@ def test_a_disappearing_untracked_publication_announces_the_clean_skip(project, 
         return result
 
     monkeypatch.setattr(verify, "commit_paths", remove_before_staging)
-    engine._commit_ledger("chore(sweep): disappeared", path=ledger)
+    engine._commit_ledger("chore(sweep): disappeared", path=ledger, family="ledger")
 
     assert results == [None]  # the real helper, not a stubbed return
     [clean] = _records(engine, "sweep-ledger-commit-clean")
@@ -9556,18 +9597,27 @@ def test_a_disappearing_untracked_publication_announces_the_clean_skip(project, 
     assert git(project.project, "rev-parse", "HEAD") == head
 
 
-@pytest.mark.parametrize("outcome", ["clean", "commit", "unavailable"])
+@pytest.mark.parametrize("outcome", ["clean", "commit", "unavailable", "refused"])
 def test_publication_journal_write_errors_propagate_without_retry(project, monkeypatch, outcome):
     """Best effort applies to Git and resolution, never journal persistence.
 
+    The `refused` arm (DW-199/203/205) joins the other three unchanged: its append
+    sits outside the guarded Git block exactly as they do, so a journal fault during
+    a refusal propagates rather than being retried or reported as a publication
+    failure — which matters most there, since a refusal is the one arm whose whole
+    output IS the row.
+
     Ablation: move the clean append inside the Git try and this fails because
-    an unavailable append is attempted after the first write fault.
+    an unavailable append is attempted after the first write fault. Move the refusal
+    append inside it and the `refused` case fails the same way.
     """
     write_ledger(project, {"DW-1": "open"}, commit=outcome == "clean")
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
     if outcome == "unavailable":
         shutil.rmtree(project.project / ".git")
+    if outcome == "refused":
+        project.deferred_work.unlink()
     attempted = []
     failure = OSError("journal disk full")
 
@@ -9577,7 +9627,7 @@ def test_publication_journal_write_errors_propagate_without_retry(project, monke
 
     monkeypatch.setattr(engine.journal, "append", fail_append)
     with pytest.raises(OSError, match="journal disk full") as caught:
-        engine._commit_ledger("chore(sweep): publish", path=project.deferred_work)
+        engine._commit_ledger("chore(sweep): publish", path=project.deferred_work, family="ledger")
 
     assert caught.value is failure
     expected = "sweep-ledger-commit" + ("" if outcome == "commit" else f"-{outcome}")
@@ -9606,7 +9656,7 @@ def test_the_ledger_commit_rows_name_the_file_they_are_about(project):
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
 
-    engine._commit_ledger("chore(sweep): published", path=project.deferred_work)
+    engine._commit_ledger("chore(sweep): published", path=project.deferred_work, family="ledger")
 
     [commit] = _records(engine, "sweep-ledger-commit")
     assert commit["file"] == "deferred-work.md"
@@ -9618,7 +9668,7 @@ def test_the_ledger_commit_rows_name_the_file_they_are_about(project):
         project.deferred_work.read_text(encoding="utf-8") + "\n<!-- more -->\n", encoding="utf-8"
     )
     shutil.rmtree(project.project / ".git")
-    engine._commit_ledger("chore(sweep): degraded", path=project.deferred_work)
+    engine._commit_ledger("chore(sweep): degraded", path=project.deferred_work, family="ledger")
 
     [failed] = _records(engine, "sweep-ledger-commit-unavailable")
     assert failed["file"] == "deferred-work.md"
@@ -9657,7 +9707,9 @@ def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, m
 
     monkeypatch.setattr(Path, "resolve", exploding_resolve)
 
-    engine._commit_ledger("chore(sweep): unresolvable", path=ledger)  # must not raise
+    engine._commit_ledger(
+        "chore(sweep): unresolvable", path=ledger, family="ledger"
+    )  # must not raise
 
     [failed] = _records(engine, "sweep-ledger-commit-unavailable")
     assert failed["file"] == "deferred-work.md"  # bound before the try, so still here
@@ -9723,7 +9775,9 @@ def test_the_journalled_file_is_the_lexical_tail_not_the_symlink_target(project,
 
     # ...and again over the now-published (so CLEAN) symlinked ledger, which is the
     # arm the default gitignored shape takes every time
-    engine._commit_ledger("chore(sweep): nothing left to publish", path=project.deferred_work)
+    engine._commit_ledger(
+        "chore(sweep): nothing left to publish", path=project.deferred_work, family="ledger"
+    )
 
     [clean] = _records(engine, "sweep-ledger-commit-clean")
     assert clean["file"] == "deferred-work.md"
@@ -9731,7 +9785,7 @@ def test_the_journalled_file_is_the_lexical_tail_not_the_symlink_target(project,
 
     shutil.rmtree(ledger_repo / ".git")
     assert link.resolve() == target  # resolution succeeds; Git publication fails
-    engine._commit_ledger("chore(sweep): unavailable", path=link)
+    engine._commit_ledger("chore(sweep): unavailable", path=link, family="ledger")
     [failed] = _records(engine, "sweep-ledger-commit-unavailable")
     assert failed["file"] == "deferred-work.md"
     assert failed["repo"] == str(target.parent.resolve())
@@ -10298,8 +10352,14 @@ def test_an_absent_ledger_prune_refusal_still_lets_the_next_cycle_run(project, m
     """DW-176 is deliberately NOT carried. An absent ledger already ends the next
     cycle cleanly — `read_for_write` returns None, `or ""` makes it empty, no ids
     are open and `_loop` stops on `no-open` — so ending the run early would replace
-    a correct report with a worse one, and publishing a DELETED ledger at the
-    boundary is a separate pre-existing finding this change does not touch.
+    a correct report with a worse one.
+
+    The boundary commit is still REACHED (that is what the call count below pins),
+    and since DW-203 it is refused rather than taken: `_commit_ledger`'s target
+    validation finds the ledger gone and journals `target-absent` instead of letting
+    `commit_paths` stage the absence as a deletion. The DW-176 arm above and the
+    DW-182 carry are untouched by that — this row asserts both, so the refusal
+    cannot be mistaken for a second stop signal.
 
     Ablation: set `_prune_ledger_unreadable` in the `text is None` arm too and this
     reddens on `reason` — the run would stop on `ledger-unreadable` at the boundary
@@ -10311,9 +10371,9 @@ def test_an_absent_ledger_prune_refusal_still_lets_the_next_cycle_run(project, m
     commits = []
     commit_ledger = engine._commit_ledger
 
-    def record_commit(message, *, path):
+    def record_commit(message, *, path, family):
         commits.append((message, path))
-        return commit_ledger(message, path=path)
+        return commit_ledger(message, path=path, family=family)
 
     monkeypatch.setattr(engine, "_commit_ledger", record_commit)
 
@@ -10333,6 +10393,378 @@ def test_an_absent_ledger_prune_refusal_still_lets_the_next_cycle_run(project, m
         )
         == 1
     )
+
+
+def _sweep_with_a_ledger_fault_between_two_decisions(project, fault, **kwargs):
+    """DW-199's exact state, which no existing fixture builds: the decision walk
+    lands its FIRST effect, the ledger is then removed out of band, and the second
+    decision's `record_decision` answers False — taking the `if not recorded:` arm,
+    which deliberately leaves `ledger_in_doubt` ALONE. So the walk arrives at its
+    commit gate with `any_effect_landed` True and `ledger_in_doubt` False, over a
+    ledger that is gone.
+
+    Same window as `_sweep_with_ledger_fault_at_the_decision_prompt` above and for
+    the same reason — `prompter.ask` is where an out-of-band fault can land
+    mid-walk — with two differences that are what make this row DW-199's and not
+    DW-203's: the fault rides the SECOND prompt (so an effect has already landed),
+    and nothing is already-resolved, so `_close_resolved` publishes nothing and the
+    decision gate is the only publisher in the cycle that reaches git at all."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        decisions=[
+            _decision(
+                dw_id,
+                [
+                    {"key": "1", "label": "Close", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+            for dw_id in ("DW-1", "DW-2")
+        ],
+    )
+    engine, adapter = make_sweep(project, [triage_effect(plan)], prompting=True, **kwargs)
+    asked = []
+
+    def fault_before_the_second_answer(_prompt):
+        asked.append(None)
+        if len(asked) == 2:
+            fault(project.deferred_work)
+        return "1"
+
+    engine.prompter = DecisionPrompter(
+        input_fn=fault_before_the_second_answer, print_fn=lambda _line: None
+    )
+    return engine, adapter, asked
+
+
+def test_a_vanished_ledger_is_refused_at_the_decision_phase_gate(project):
+    """DW-199. `_decisions_phase`'s gate fires on `any_effect_landed and not
+    ledger_in_doubt`, and both stay true when a LATER decision's write finds the
+    ledger gone — the `if not recorded:` arm journals the miss and continues without
+    touching either flag. The gate then published a file that no longer exists, and
+    `verify.commit_paths` keeps a missing-but-TRACKED path as a DELETION to stage:
+    the sweep committed the human's whole ledger away under a `chore(sweep):`
+    message, taking every `decision:` line this walk had just written with it.
+
+    The claim is what does NOT happen: no commit, and HEAD still carries the blob.
+    The refusal row is what makes that legible rather than silent.
+
+    Ablation: delete the `refusal = self._unpublishable(...)` call from
+    `_commit_ledger` (or make it always answer None) and this reds on every
+    assertion below — `sweep-ledger-commit` gains the deletion commit, HEAD's blob
+    lookup raises because the path is gone at HEAD, and no refusal row exists."""
+    engine, _adapter, asked = _sweep_with_a_ledger_fault_between_two_decisions(
+        project, lambda ledger: ledger.unlink()
+    )
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    head = git(project.project, "rev-parse", "HEAD")
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    # premises: both decisions were asked (so an effect landed before the fault),
+    # and the window really opened
+    assert len(asked) == 2
+    assert not project.deferred_work.exists()
+    # ...and the second write really took the arm that leaves `ledger_in_doubt`
+    # alone, which is the whole reason the gate fires over a vanished ledger
+    [missed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert missed["dw_id"] == "DW-2"
+    assert "the ledger file is gone" in missed["error"]
+
+    # THE claim: nothing was published, and HEAD still holds the ledger
+    assert _records(engine, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert "DW-1" in git(project.project, "show", f"HEAD:{rel}")
+    [refused] = _records(engine, "sweep-ledger-commit-refused")
+    assert refused["message"] == "chore(sweep): record deferred-work decisions"
+    assert refused["refuse_cause"] == "target-absent"
+    assert refused["file"] == "deferred-work.md"  # the LEXICAL basename, as the siblings spell it
+    assert "error" not in refused  # an absent target has no fault text to attribute
+
+
+def test_a_vanished_ledger_is_refused_at_the_repeat_boundary(project):
+    """DW-203, reached the other way: `_prune_pre_answers` takes its DW-176
+    `ledger-absent` arm, which — unlike the DW-182 `ledger-unreadable` arm beside
+    it — sets no carry, so `_loop` falls straight through to the repeat-boundary
+    commit whose pathspec IS the ledger. That published the deletion.
+
+    The DW-176 decision not to carry stays right: an absent ledger ends the next
+    cycle cleanly on `no-open`, which is a better report than an early stop. What
+    changes is only that the boundary no longer commits the absence on the way
+    there — so cycle 2 still runs, still stops on `no-open`, and HEAD is untouched.
+
+    Ablation: delete the target validation from `_commit_ledger` and
+    `sweep-ledger-commit` goes to 2 (cycle 1's close, plus the boundary deletion),
+    the HEAD blob lookup raises, and the refusal row disappears."""
+    engine, adapter = _sweep_with_ledger_fault_at_the_decision_prompt(
+        project, lambda ledger: ledger.unlink(), policy=repeat_policy()
+    )
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert not project.deferred_work.exists()  # the window really opened
+    # premise: the DW-176 arm is what routed us here, and it still carries nothing
+    [prune_refused] = _records(engine, "sweep-preanswer-prune-refused")
+    assert prune_refused["reason"] == "ledger-absent"
+    assert not engine._prune_ledger_unreadable
+
+    # THE claim: the boundary publish was refused, not taken
+    [refused] = _records(engine, "sweep-ledger-commit-refused")
+    assert refused["message"] == "chore(sweep): commit ledger before next sweep cycle"
+    assert refused["refuse_cause"] == "target-absent"
+    assert refused["file"] == "deferred-work.md"
+    # cycle 1's own close DID publish, before the fault — so the count pins that the
+    # boundary added nothing, rather than that no publisher ever ran
+    [published] = _records(engine, "sweep-ledger-commit")
+    assert published["message"] == "chore(sweep): close resolved deferred-work entries"
+    assert "DW-1" in git(project.project, "show", f"HEAD:{rel}")  # HEAD still has it
+    # ...and the cycle after the refusal is unchanged
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == "no-open"
+    assert [spec.role for spec in adapter.sessions] == ["triage"]
+
+
+def test_an_undecodable_ledger_is_refused_at_the_post_recovery_commit(project):
+    """DW-205. `_loop`'s post-recovery commit sits ABOVE the loop's own
+    `read_for_write`, so a resume whose recovery left the ledger holding bytes
+    nobody can decode PUBLISHED them and only then raised on them — the crash was
+    loud, but the corrupt bytes were already at HEAD by the time it fired.
+
+    The crash itself is pre-existing and deliberately untouched: `_loop`'s bare read
+    still raises `LedgerReadError` on the same bytes right after the refusal, and
+    this row asserts that it does. What is gone is the publish that preceded it, so
+    the bytes stay dirty for a human to repair against a HEAD that still holds the
+    last good ledger.
+
+    The recovery is stubbed for the reason `_recover_inflight_in_a_divergent_project`
+    stubs it: a real in-flight recovery drives a dev+review pair and would grade the
+    bundle machinery rather than the commit above it.
+
+    Ablation: delete the target validation from `_commit_ledger` and this reds on
+    the HEAD assertions — the undecodable bytes reach HEAD (and `sweep-ledger-commit`
+    appears) before the raise this test still expects."""
+    write_ledger(project, {"DW-1": "open"})
+    head = git(project.project, "rev-parse", "HEAD")
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    def corrupt_and_report():
+        project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
+        return 1
+
+    engine._finish_inflight_bundles = corrupt_and_report
+    # the commit under grade sits above `_cycle`, which never runs here anyway
+    engine._cycle = lambda *_a, **_k: False
+
+    with pytest.raises(deferredwork.LedgerReadError):
+        engine._loop()  # the PRE-EXISTING crash, unchanged
+
+    [refused] = _records(engine, "sweep-ledger-commit-refused")
+    assert refused["message"] == "chore(sweep): commit ledger after recovering in-flight bundles"
+    assert refused["refuse_cause"] == "target-unreadable"
+    assert refused["file"] == "deferred-work.md"
+    assert "not valid UTF-8" in refused["error"]  # the decode fault is attributed
+    assert _records(engine, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head  # the bytes never reached HEAD
+    assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER  # ...and stay for repair
+    assert _ledger_differs_from_head(project)
+
+
+@pytest.mark.parametrize("via_symlink", [False, True])
+@pytest.mark.parametrize(
+    "family,fault,cause,fragment",
+    [
+        ("ledger", "absent", "target-absent", None),
+        ("ledger", "undecodable", "target-unreadable", "not valid UTF-8"),
+        ("ledger", "unreadable", "target-unreadable", "Permission denied"),
+        ("store", "absent", "target-absent", None),
+    ],
+)
+def test_commit_ledger_refuses_an_unpublishable_target_without_reaching_git(
+    project, monkeypatch, family, fault, cause, fragment, via_symlink
+):
+    """Both families and both causes, graded directly on the helper — including the
+    two arms no behavioral row above can reach: the store family's absence, and the
+    ledger read raising `OSError` rather than answering.
+
+    The `OSError` arm is the one that needs saying out loud. `read_for_write`'s
+    contract lets `OSError` PROPAGATE, and here it deliberately does not: this is
+    best-effort bookkeeping whose whole degrade discipline exists so a publication
+    fault never aborts a sweep, so an unreadable target joins the undecodable cause
+    instead of escaping into a caller that has no handler for it.
+
+    "Never reaches git" is graded by making both git helpers raise: a stub that
+    merely records would let a regression pass whenever the recorded call happened
+    to be harmless, where a raise cannot be ignored by any arm.
+
+    Ablation: delete the `refusal = self._unpublishable(...)` call and every case
+    reds through the `AssertionError` those stubs raise (the store case reaches
+    `path_clean` too, since a missing operand is only discovered inside git).
+    Replace the lexical `path.name` with `target.name` in the publisher and the
+    symlink rows fail their `file` assertion."""
+    write_ledger(project, {"DW-1": "open"})
+    from bmad_loop import decisions as decisions_store
+
+    store = decisions_store.store_path(project.project)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text("{}", encoding="utf-8")
+    published_path = project.deferred_work if family == "ledger" else store
+    target = published_path.resolve()
+    if via_symlink:
+        target = published_path.with_name("operator-chosen-target")
+        published_path.rename(target)
+        try:
+            published_path.symlink_to(target)
+        except OSError as exc:  # pragma: no cover - win32 without developer mode
+            pytest.skip(f"symlinks unavailable on this host: {exc}")
+    if fault == "absent":
+        target.unlink()
+    elif fault == "undecodable":
+        target.write_bytes(_UNDECODABLE_LEDGER)
+    else:
+        fault_read_text(monkeypatch, target)
+
+    def never(*_a, **_k):
+        raise AssertionError("a refused publication reached git")
+
+    monkeypatch.setattr(verify, "path_clean", never)
+    monkeypatch.setattr(verify, "commit_paths", never)
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    engine._commit_ledger("chore(sweep): publish", path=published_path, family=family)
+
+    [refused] = _records(engine, "sweep-ledger-commit-refused")
+    assert refused["refuse_cause"] == cause
+    assert refused["message"] == "chore(sweep): publish"
+    assert refused["file"] == published_path.name
+    if fragment is None:
+        assert "error" not in refused
+    else:
+        assert fragment in refused["error"]
+    assert _records(engine, "sweep-ledger-commit") == []
+    assert _records(engine, "sweep-ledger-commit-clean") == []
+    assert _records(engine, "sweep-ledger-commit-unavailable") == []
+
+
+def test_a_dangling_store_link_is_an_absence_because_the_probes_see_the_resolved_path(
+    project, monkeypatch
+):
+    """The store family's `exists() or is_symlink()` probes run on the RESOLVED
+    argument, and that is what decides what the disjunct buys — not the spelling.
+
+    A DANGLING link does not survive the resolve as a link: non-strict
+    `Path.resolve` collapses it to the plain non-existent path it points at, so both
+    probes answer False and the publish is refused `target-absent`. That is the
+    right answer — `atomic_write_text_confined` REFUSES to write through a link at
+    the store's own name, so a dangling one holds no write of ours to publish — but
+    it is the opposite of what "keeps a dangling link publishable" would mean, and
+    a comment is the only thing that could have said otherwise. This row pins the
+    behavior so the claim cannot drift back.
+
+    On Python 3.13+, the disjunct keeps a symlink LOOP publishable: it resolves
+    to the link ITSELF (`exists()` False, `is_symlink()` True). Python 3.11–3.12
+    raise during resolve instead, taking the publisher's existing degrade arm.
+
+    Ablation: on Python 3.13+, drop `or target.is_symlink()` and the loop starts
+    refusing too. Reverse the arm to `if target.exists():` and the dangling case
+    stops being refused on every version. On Python 3.11–3.12, remove RuntimeError
+    from the publisher's handler and its loop publication raises."""
+    from bmad_loop import decisions as decisions_store
+
+    store = decisions_store.store_path(project.project)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        store.symlink_to(store.parent / "gone.json")
+    except OSError as exc:  # pragma: no cover - win32 without developer mode
+        pytest.skip(f"symlinks unavailable on this host: {exc}")
+    # premise: the link is real, and the RESOLVE is what erases it — the lexical
+    # path is still a symlink, the resolved one is a plain absent path
+    assert store.is_symlink()
+    resolved = store.resolve()
+    assert not resolved.exists() and not resolved.is_symlink()
+
+    def never(*_a, **_k):
+        raise AssertionError("a refused publication reached git")
+
+    monkeypatch.setattr(verify, "path_clean", never)
+    monkeypatch.setattr(verify, "commit_paths", never)
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    engine._commit_ledger("chore(sweep): dangling store", path=store, family="store")
+
+    [refused] = _records(engine, "sweep-ledger-commit-refused")
+    assert refused["refuse_cause"] == "target-absent"
+    assert refused["file"] == "decisions.json"
+    assert _records(engine, "sweep-ledger-commit") == []
+
+    # Path.resolve changed its non-strict loop behavior in Python 3.13.
+    loop = store.parent / "loop.json"
+    loop.symlink_to("loop.json")
+    if sys.version_info < (3, 13):
+        with pytest.raises(RuntimeError):
+            loop.resolve()
+        engine._commit_ledger("chore(sweep): loop store", path=loop, family="store")
+        [unavailable] = _records(engine, "sweep-ledger-commit-unavailable")
+        assert unavailable["message"] == "chore(sweep): loop store"
+        assert unavailable["file"] == "loop.json"
+    else:
+        resolved_loop = loop.resolve()
+        assert not resolved_loop.exists() and resolved_loop.is_symlink()
+        assert engine._unpublishable(resolved_loop, "store") is None
+
+
+def test_an_empty_present_ledger_is_published(project):
+    """An empty ledger is present, readable bookkeeping and remains publishable.
+
+    Ablation: change the ledger validator's `is None` to a falsiness check and
+    this fails on the missing commit row: empty text would be refused as absent.
+    """
+    write_ledger(project, {"DW-1": "open"})
+    project.deferred_work.write_text("", encoding="utf-8")
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    engine._commit_ledger(
+        "chore(sweep): publish empty ledger", path=project.deferred_work, family="ledger"
+    )
+
+    [published] = _records(engine, "sweep-ledger-commit")
+    assert published["commit"] == git(project.project, "rev-parse", "HEAD")
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    assert git(project.project, "show", f"HEAD:{rel}") == ""
+    assert _records(engine, "sweep-ledger-commit-refused") == []
+
+
+def test_a_present_store_publishes_even_though_it_is_not_decodable_as_a_ledger(project):
+    """The store family checks EXISTENCE only, and that boundary is the point of
+    declaring the family rather than deriving it. The writer emits valid UTF-8
+    JSON; invalid bytes here represent a replacement after that write. Publication
+    deliberately preserves its existence-only policy for the store family.
+
+    Ablation: make `_unpublishable` apply the ledger validator to the store family
+    and this reds — the publish is refused with `target-unreadable` and no commit
+    row appears. Prune call-site family declarations are held separately by
+    `test_every_sweep_ledger_commit_names_its_own_tree`."""
+    from bmad_loop import decisions as decisions_store
+
+    store = decisions_store.store_path(project.project)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_bytes(b'{"DW-1": "\xff"}')  # present, and not UTF-8
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    engine._commit_ledger("chore(sweep): publish the store", path=store, family="store")
+
+    assert _records(engine, "sweep-ledger-commit-refused") == []
+    [published] = _records(engine, "sweep-ledger-commit")
+    assert published["file"] == "decisions.json"
+    assert published["commit"] == git(project.project, "rev-parse", "HEAD")
 
 
 def test_a_run_local_only_stale_answer_writes_nothing_to_the_project_store(project):

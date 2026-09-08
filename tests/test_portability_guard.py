@@ -614,6 +614,16 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "ref",
         "refiled",
         "refs",
+        # `sweep-ledger-commit-refused` (DW-199/203/205): WHY `_commit_ledger`
+        # declined to publish its target, as a closed TWO-value enum
+        # (`target-absent` | `target-unreadable`), both literals in `sweep.py`.
+        # Minted for the reason `stop_cause`, `drop_cause` and `regen_cause` below
+        # were — the natural spelling is `reason`, which sits in
+        # `diagnostics._JOURNAL_DROP_FIELDS` and ships as a presence boolean, which
+        # would collapse the two causes into one indistinguishable row. Names no
+        # path, identifier or prose; the decode/OS fault rides in `error` beside it,
+        # which is dropped.
+        "refuse_cause",
         "refused",
         # `sweep-intent-regenerated` (DW-164): which of `missing` /
         # `dw-ids-mismatch` / `unreadable` made `_ensure_bundle_intent` rebuild a
@@ -1234,6 +1244,18 @@ JOURNAL_KINDS = frozenset(
         # already dropped; `file` is the new benign field that names which of the
         # two published files this is about.
         "sweep-ledger-commit-clean",
+        # DW-199/203/205. The REFUSAL arm of the same producer: `_commit_ledger`
+        # asked whether its declared family's target was still publishable BEFORE
+        # reaching git, and it was not. Minted because `verify.commit_paths` keeps
+        # a missing-but-TRACKED path as a deletion to stage, so a ledger removed
+        # after the phase wrote it was published as a DELETION under a
+        # `chore(sweep):` message, and a resume whose ledger held undecodable bytes
+        # published them and only then raised on them. `refuse_cause` is the new
+        # benign field naming which of TWO fixed tokens fired (`target-absent` |
+        # `target-unreadable`); `file` is the same already-benign lexical basename
+        # the sibling rows carry, and `message` plus the optional `error` are
+        # already in `diagnostics._JOURNAL_DROP_FIELDS`.
+        "sweep-ledger-commit-refused",
         # The degrade arm of the same producer: an EXPLICITLY-rooted
         # `_commit_ledger` whose `verify.GitError` is journalled instead of
         # propagating, leaving the write on disk rather than aborting the sweep.

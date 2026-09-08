@@ -16,7 +16,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Literal, assert_never
 
 from . import deferredwork, gates, verify
 from .engine import Engine, RunPaused, _ArmedClose, _LedgerAnchor
@@ -1374,6 +1374,7 @@ class SweepEngine(Engine):
             self._commit_ledger(
                 "chore(sweep): commit ledger after recovering in-flight bundles",
                 path=self.workspace.paths.deferred_work,
+                family="ledger",
             )
         while True:
             # First statement of the loop body: covers the boundary right after
@@ -1534,6 +1535,7 @@ class SweepEngine(Engine):
             self._commit_ledger(
                 "chore(sweep): commit ledger before next sweep cycle",
                 path=self.workspace.paths.deferred_work,
+                family="ledger",
             )
             cycle += 1
 
@@ -1757,6 +1759,7 @@ class SweepEngine(Engine):
             self._commit_ledger(
                 "chore(sweep): drop consumed deferred-work pre-answers",
                 path=decisions_store.store_path(project),
+                family="store",
             )
 
     def _prune_dropped_pre_answer(self, dw_id: str, drop_cause: str) -> None:
@@ -1819,6 +1822,7 @@ class SweepEngine(Engine):
         self._commit_ledger(
             "chore(sweep): drop stale deferred-work pre-answer",
             path=decisions_store.store_path(project),
+            family="store",
         )
 
     def _drive_story(self, task: StoryTask) -> None:
@@ -2335,6 +2339,7 @@ class SweepEngine(Engine):
                 self._commit_ledger(
                     "chore(sweep): migrate legacy deferred-work entries to DW format",
                     path=self.workspace.paths.deferred_work,
+                    family="ledger",
                 )
                 post = deferredwork.parse_ledger(new_text)
                 self.journal.append(
@@ -2627,15 +2632,24 @@ class SweepEngine(Engine):
             #     answer can set without touching the ledger, and
             #     `_ensure_migration` gates on `if not errors:`, a verdict on the
             #     rewrite session rather than on bytes changing.
-            # Beneath all seven, `_commit_ledger`'s `path_clean` is the uniform
-            # floor: it makes any of them a no-op when the published file already
-            # matches HEAD. The per-site guards are the early-outs that keep a
-            # phase which wrote nothing from reaching git at all.
+            # Beneath all seven are TWO uniform floors, in this order:
+            #   * the TARGET VALIDATION (DW-199/203/205), which asks whether the
+            #     declared `family`'s file is still there and still readable before
+            #     any git runs. It is what the per-site guards above cannot cover:
+            #     each of them grades the phase's own WRITE, and the ledger can
+            #     vanish or go undecodable AFTER that write — at which point
+            #     `commit_paths` would have staged the absence as a DELETION.
+            #     Every site declares its family; none derives one.
+            #   * `_commit_ledger`'s `path_clean`, which makes any of them a no-op
+            #     when the published file already matches HEAD.
+            # The per-site guards are the early-outs that keep a phase which wrote
+            # nothing from reaching git at all.
             #
             # the ledger file: `mark_done_many` above wrote the ledger
             self._commit_ledger(
                 "chore(sweep): close resolved deferred-work entries",
                 path=self.workspace.paths.deferred_work,
+                family="ledger",
             )
         self._emit("post_close_resolved")
         return len(closed)
@@ -2980,6 +2994,7 @@ class SweepEngine(Engine):
             self._commit_ledger(
                 "chore(sweep): record deferred-work decisions",
                 path=self.workspace.paths.deferred_work,
+                family="ledger",
             )
         if answered_interactively:
             self._return_after_decisions(every_effect_landed=not any_effect_faulted)
@@ -3076,7 +3091,9 @@ class SweepEngine(Engine):
             ledger, decision.id, self._today(), option.label, detail, close_note=close_note
         )
 
-    def _commit_ledger(self, message: str, *, path: Path) -> None:
+    def _commit_ledger(
+        self, message: str, *, path: Path, family: Literal["ledger", "store"]
+    ) -> None:
         """Publish the orchestrator bookkeeping FILE a phase just wrote: that one
         file reaches HEAD, and everything else the enclosing repository is
         carrying is left dirty for whoever owns it. No-op when the file already
@@ -3191,6 +3208,49 @@ class SweepEngine(Engine):
         time and under pyright, before any run, instead of on whichever branch
         first reached the raise.
 
+        `family` is REQUIRED and keyword-only for exactly that reason, and it is
+        DECLARED rather than derived (DW-199/203/205). Before it, this method
+        published whatever `path` named without ever asking whether that file was
+        still there or still readable, and `verify.commit_paths` deliberately keeps
+        a missing-but-TRACKED path as a DELETION to stage — so a ledger removed
+        after the phase wrote it was committed as a deletion under a
+        `chore(sweep):` message, and a resume whose ledger held undecodable bytes
+        published them and only then raised on them. `_unpublishable` below is the
+        guard, and it runs between the resolve and `path_clean`: after, because git
+        is asked about the RESOLVED target (DW-188) and those are the bytes that
+        would be published; before, because a refused publish must spawn no git at
+        all — the same property the per-site guards buy. The two families need
+        different validation (the five ledger publishers read through
+        `deferredwork.read_for_write`, the two prunes check existence only), and
+        the family is a caller's declaration because deriving it from the path
+        would be precisely the "chosen by role" test the rule above refuses; a
+        required keyword-only argument also makes a NEW call site fail under
+        pyright rather than silently inherit a validation it does not want.
+
+        A refusal journals `sweep-ledger-commit-refused` and returns, exactly as
+        the other two no-op arms do — never a raise, because the read this guard
+        takes is bookkeeping and not the sweep's own read. `refuse_cause` is one of
+        TWO fixed tokens (`target-absent`, `target-unreadable`) and is minted for
+        the reason `stop_cause` (DW-201), `drop_cause` and `regen_cause` were: the
+        natural spelling is `reason`, which sits in
+        `diagnostics._JOURNAL_DROP_FIELDS` and renders as a presence boolean, so a
+        scrubbed dump could not tell the two causes apart. The decode or OS fault
+        rides in `error` beside it, which is dropped, and `file` carries the same
+        lexical basename the sibling rows do. What this guard does NOT do is
+        rescue the run: `_loop`'s own `read_for_write` still raises on the same
+        undecodable bytes right after the refusal, which is pre-existing behavior.
+        What is gone is the publish that used to precede it.
+
+        The guard NARROWS a window it does not close, and the residual is worth
+        naming the way `_prune_dropped_pre_answer` names its own: a TRACKED target
+        removed between `_unpublishable`'s probe and `commit_paths`' `git add` is
+        still staged as a deletion. Closing it would mean changing
+        `verify.commit_paths`, whose missing-but-tracked deletion contract other
+        callers rely on, so it stays out of bounds here — and the residual is a
+        genuine race (a file removed inside a few milliseconds by something that is
+        not this sweep), where the shapes this guard exists for are steady states
+        the publisher walked into deliberately.
+
         Both no-op outcomes journal `sweep-ledger-commit-clean` (DW-191).
         `path_clean` also answers True for an ignored path, so a ledger under a
         gitignored `implementation_artifacts` was previously skipped with no row
@@ -3225,12 +3285,22 @@ class SweepEngine(Engine):
         # docstring — it is a code constant at every caller, which is what lets it
         # be a benign (undropped) journal field, and the resolved tail is not.
         name = path.name
+        # Bound ahead of the `try` so neither is possibly-unbound below it: the
+        # refusal short-circuits past the two git calls, and `sha`'s `None` is the
+        # same "nothing was published" the clean arm reads.
+        sha: str | None = None
+        refusal: tuple[str, str | None] | None = None
         try:
             target = path.resolve()
             root = target.parent
-            # Preserve the clean short-circuit without catching journal write faults.
-            clean = verify.path_clean(root, target.name)
-            sha = None if clean else verify.commit_paths(root, message, [target])
+            # THE TARGET VALIDATION (DW-199/203/205), between the resolve and
+            # `path_clean` for two reasons the docstring states: git is asked about
+            # the RESOLVED target, and a refused publish must spawn no git at all.
+            refusal = self._unpublishable(target, family)
+            if refusal is None:
+                # Preserve the clean short-circuit without catching journal write faults.
+                clean = verify.path_clean(root, target.name)
+                sha = None if clean else verify.commit_paths(root, message, [target])
         except (verify.GitError, OSError, RuntimeError) as e:
             # `repo` (not `root`): an absolute host path naming a git tree,
             # already routed out of diagnostics dumps, exactly as
@@ -3246,11 +3316,98 @@ class SweepEngine(Engine):
                 file=name,
             )
             return
+        if refusal is not None:
+            cause, error = refusal
+            # Outside the guarded git block, like every other row here, so a journal
+            # write fault is never misreported as a publication failure. `error`
+            # only where the refusal HAS a fault to attribute — an absent target has
+            # no exception text, and an empty string would read as one.
+            extra = {} if error is None else {"error": error}
+            self.journal.append(
+                "sweep-ledger-commit-refused",
+                message=message,
+                file=name,
+                refuse_cause=cause,
+                **extra,
+            )
+            return
         if sha is None:
-            # Already clean/ignored, raced clean, or absent and never tracked.
+            # Already clean/ignored, or raced clean between the two calls. Absence
+            # reaches here only as that RACE — a target removed after the guard
+            # above read it and left untracked, which is `commit_paths`' `if not
+            # rels:` arm. A plainly-absent target never gets this far; it took the
+            # refusal arm before `path_clean` ran.
             self.journal.append("sweep-ledger-commit-clean", message=message, file=name)
             return
         self.journal.append("sweep-ledger-commit", message=message, commit=sha, file=name)
+
+    def _unpublishable(
+        self, target: Path, family: Literal["ledger", "store"]
+    ) -> tuple[Literal["target-absent", "target-unreadable"], str | None] | None:
+        """Why `target` must not be published, or `None` when it may be. Returns
+        `(refuse_cause, error)` — the two fields the refusal row carries beyond
+        `message` and `file`.
+
+        Split out of `_commit_ledger` only so the two families read as the two
+        different questions they are; it is not a seam anything else may call.
+
+        The FAMILY is declared by the caller, never derived here. `path ==
+        self.workspace.paths.deferred_work` would be exactly the "chosen by role"
+        test `_commit_ledger`'s own rule refuses, and it would answer wrongly for a
+        publisher whose ledger is symlinked (the argument is the RESOLVED target)
+        or for any file a later caller publishes.
+
+        LEDGER: `deferredwork.read_for_write`, because the ledger's own read
+        contract (DW-146) already answers both questions in the two shapes this
+        guard asks them — `None` for absence, `LedgerReadError` for bytes nobody
+        can decode. Its `OSError` normally propagates; here it does not, because
+        `_commit_ledger` is best-effort bookkeeping whose whole degrade discipline
+        exists so a publication fault never aborts a sweep, so it joins the
+        undecodable cause rather than escaping. No lock is taken: this is a read
+        the writer above already took. A later disappearance or replacement can
+        still change what git publishes, as `_commit_ledger` documents above.
+
+        STORE: existence only, preserving the publisher's existing content
+        policy. The writer emits valid UTF-8 JSON, but this guard does not check
+        whether those bytes were replaced after the write. `_prune_pre_answers`'
+        own DW-176 absence refusal is about the LEDGER it reads, not the store.
+
+        Both probes are taken on the RESOLVED argument, which is what decides what
+        the `is_symlink()` disjunct actually buys — and it is not what the spelling
+        suggests. A DANGLING link does not survive the resolve as a link: non-strict
+        `Path.resolve` collapses it to the plain non-existent path it points at, so
+        both probes answer False and the store is refused `target-absent`. That is
+        the right answer for it (the prune's writer,
+        `atomic_write_text_confined`, REFUSES to write through a link at the
+        store's own name, so a dangling one holds no write of ours to publish), but
+        it means the disjunct is doing a different job: on Python 3.13+, a symlink
+        LOOP resolves to the link ITSELF, which `exists()` calls False and
+        `is_symlink()` calls True. The disjunct preserves publication of that link
+        entry. Python 3.11–3.12 instead raise during resolve, taking the existing
+        `sweep-ledger-commit-unavailable` arm before this helper runs.
+
+        Returns the `refuse_cause` token as a `Literal` rather than a bare `str`,
+        which is what makes the closed two-value claim
+        `tests/test_portability_guard.py` declares `refuse_cause` benign on a
+        typechecked property rather than a comment."""
+        if family == "ledger":
+            try:
+                if deferredwork.read_for_write(target) is None:
+                    return ("target-absent", None)
+            except (deferredwork.LedgerReadError, OSError) as e:
+                return ("target-unreadable", str(e))
+            return None
+        if family == "store":
+            if not (target.exists() or target.is_symlink()):
+                return ("target-absent", None)
+            return None
+        # Spelled as an exhaustive dispatch, not `if ledger / else store`: a THIRD
+        # family added to the `Literal` would otherwise typecheck at every call site
+        # and fall silently through to existence-only validation — precisely the
+        # "inherit a validation it does not want" failure the required keyword-only
+        # argument exists to prevent. This reds under pyright the moment the union
+        # grows, before any run.
+        assert_never(family)
 
     # ---------------------------------------------------------- bundles
 
