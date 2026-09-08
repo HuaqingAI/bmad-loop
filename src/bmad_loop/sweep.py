@@ -424,6 +424,53 @@ def _plan_mapping(item: Any, where: str, errors: list[str]) -> dict[str, Any] | 
     return None
 
 
+def _plan_identifier(raw: Any, where: str, label_prefix: str) -> tuple[str, str, str]:
+    """The three shapes one plan identifier takes: `(dw_id, shown, label)` —
+    the IDENTITY, the bare subject a message interpolates, and the same subject
+    behind its section prefix (DW-157/DW-171).
+
+    The identity is `str(raw)` and stays that way: `id` members are deliberately
+    NOT type-checked (the DW-145/148 Never clause), so what validates and what is
+    refused is unchanged by this helper. What is screened is what gets PRINTED. An
+    object-valued `id` would otherwise interpolate its own stringified contents
+    into every message its loop emits, and this module promises those carry a
+    POSITION and the type name only, never the offending value's prose — these
+    strings reach a journal.
+
+    A `str` id (the empty string included, since the fallback is keyed on the TYPE
+    and not on truthiness) keeps today's wording byte for byte: `shown` is the id
+    itself and `label` is `f"{label_prefix} {raw}"`. A non-string one is named by
+    its position in both.
+
+    `shown` and `label` are separate values because the two display shapes are:
+    `claim`'s `appears in both` prints the subject BARE, while the loops'
+    `has no evidence` / `names no blocker` / `gives no reason` / `has no question`
+    messages print it behind a section prefix. For a string id the two collapse to
+    the strings each site emitted before.
+    """
+    if isinstance(raw, str):
+        return raw, raw, f"{label_prefix} {raw}"
+    shown = f"{where} (id not a string: {type(raw).__name__})"
+    return str(raw), shown, shown
+
+
+def _shown_value(value: Any) -> str:
+    """One LLM-authored value as a diagnostic prints it (DW-171).
+
+    `repr` is kept for the flat scalars — `got None` and `got 'wrong'` are pinned
+    wording. What that buys is NOT a length bound: an LLM-authored string is
+    printed verbatim and can be arbitrarily long, which the byte-for-byte rule
+    freezes here deliberately. What it buys is that a flat scalar has no NESTED
+    structure to expose, and nesting is exactly the harm this screens: an object-
+    or list-valued field used to print its whole contents — its keys included —
+    into a message that reaches the journal. So anything non-scalar is named by
+    its type alone.
+    """
+    if value is None or isinstance(value, (str, int, float)):
+        return repr(value)
+    return f"a {type(value).__name__}"
+
+
 def validate_triage(
     rj: dict[str, Any] | None, expected_open_ids: set[str] | None
 ) -> tuple[TriagePlan | None, list[str]]:
@@ -442,17 +489,36 @@ def validate_triage(
         return None, [f"triage result not a JSON object: {type(rj).__name__}"]
     _normalize_bundle_names(rj)
     if rj.get("workflow") != TRIAGE_WORKFLOW:
-        return None, [f"workflow must be {TRIAGE_WORKFLOW!r}: got {rj.get('workflow')!r}"]
+        return None, [
+            f"workflow must be {TRIAGE_WORKFLOW!r}: got {_shown_value(rj.get('workflow'))}"
+        ]
 
     raw_open_ids = _plan_list(rj, "open_ids", "", errors)
     if raw_open_ids is None:
         # Early return, like the `workflow` and open-set-mismatch refusals around
         # it: the ledger-equality check below has nothing left to compare.
         return None, errors
-    claimed_open = {str(i) for i in raw_open_ids}
+    # Identity is `str(i)`, unchanged — the comparison below is byte for byte the
+    # one it always was. What is derived alongside it is the DISPLAY name for each
+    # claimed id, from the RAW member: `invented` is the half of the mismatch that
+    # comes from the PLAN (`missed` comes from the ledger and is strings by
+    # construction), so an object-valued `open_ids` member used to print its own
+    # contents into a journaled message. First occurrence wins, so a duplicate
+    # cannot rename the position its first spelling reported (DW-171).
+    shown_open: dict[str, str] = {}
+    for open_index, raw_open in enumerate(raw_open_ids):
+        claimed_id = str(raw_open)
+        if claimed_id in shown_open:
+            continue
+        shown_open[claimed_id] = (
+            raw_open
+            if isinstance(raw_open, str)
+            else f"open_ids[{open_index}] (not a string: {type(raw_open).__name__})"
+        )
+    claimed_open = set(shown_open)
     if expected_open_ids is not None and claimed_open != expected_open_ids:
         missed = sorted(expected_open_ids - claimed_open)
-        invented = sorted(claimed_open - expected_open_ids)
+        invented = sorted(shown_open[i] for i in claimed_open - expected_open_ids)
         return None, [
             "open_ids do not match the ledger's open entries"
             + (f"; missing: {', '.join(missed)}" if missed else "")
@@ -464,10 +530,15 @@ def validate_triage(
 
     def claim(dw_id: str, category: str, subject: str | None = None) -> None:
         """`dw_id` is the plan's identity and keys `seen`; `subject` is what the
-        error PRINTS. They differ only in the decisions loop, where an
-        object-valued `id` is named by its position instead of by its own
-        stringified contents (DW-157). Everywhere else the subject defaults to
-        the id, so the wording is byte-identical to before."""
+        error PRINTS. The four id-bearing loops pass an explicit subject derived
+        by `_plan_identifier` — `decisions` (DW-157) and `already_resolved`,
+        `blocked`, `skip` (DW-171) — so an object-valued `id` is named by its
+        position instead of by its own stringified contents. `bundles` is the one
+        loop that still defaults: it claims each member of `dw_ids`, and those
+        members keep their `str(...)` treatment (the DW-145/148 Never clause)
+        while the bundle itself is already named positionally by `label`. For a
+        STRING id the subject collapses to the id, so every message here stays
+        byte-identical to before."""
         shown = dw_id if subject is None else subject
         if dw_id not in universe:
             errors.append(f"{category} references unknown/closed id {shown}")
@@ -483,11 +554,13 @@ def validate_triage(
         item = _plan_mapping(raw_resolved, f"already_resolved[{resolved_index}]", errors)
         if item is None:
             continue
-        dw_id = str(item.get("id", ""))
+        dw_id, id_shown, resolved_label = _plan_identifier(
+            item.get("id", ""), f"already_resolved[{resolved_index}]", "already_resolved"
+        )
         evidence = str(item.get("evidence", "")).strip()
-        claim(dw_id, "already_resolved")
+        claim(dw_id, "already_resolved", id_shown)
         if not evidence:
-            errors.append(f"already_resolved {dw_id} has no evidence")
+            errors.append(f"{resolved_label} has no evidence")
         resolved.append(ResolvedEntry(dw_id, evidence))
 
     bundles = []
@@ -549,11 +622,13 @@ def validate_triage(
         item = _plan_mapping(raw_blocked, f"blocked[{blocked_index}]", errors)
         if item is None:
             continue
-        dw_id = str(item.get("id", ""))
+        dw_id, id_shown, blocked_label = _plan_identifier(
+            item.get("id", ""), f"blocked[{blocked_index}]", "blocked"
+        )
         blocker = str(item.get("blocker", "")).strip()
-        claim(dw_id, "blocked")
+        claim(dw_id, "blocked", id_shown)
         if not blocker:
-            errors.append(f"blocked {dw_id} names no blocker")
+            errors.append(f"{blocked_label} names no blocker")
         blocked.append((dw_id, blocker))
 
     skip = []
@@ -561,11 +636,13 @@ def validate_triage(
         item = _plan_mapping(raw_skip, f"skip[{skip_index}]", errors)
         if item is None:
             continue
-        dw_id = str(item.get("id", ""))
+        dw_id, id_shown, skip_label = _plan_identifier(
+            item.get("id", ""), f"skip[{skip_index}]", "skip"
+        )
         reason = str(item.get("reason", "")).strip()
-        claim(dw_id, "skip")
+        claim(dw_id, "skip", id_shown)
         if not reason:
-            errors.append(f"skip {dw_id} gives no reason")
+            errors.append(f"{skip_label} gives no reason")
         skip.append((dw_id, reason))
 
     decisions = []
@@ -583,14 +660,12 @@ def validate_triage(
         # raw value: a string id (the empty string included) keeps today's
         # wording byte for byte, a non-string one is named by its position.
         # `id_shown` is the bare subject `claim` interpolates; `decision_label`
-        # is the prefix every other message in the loop carries (DW-157).
-        dw_id = str(raw_id)
-        if isinstance(raw_id, str):
-            id_shown = dw_id
-            decision_label = f"decision {dw_id}"
-        else:
-            id_shown = f"decisions[{decision_index}] (id not a string: {type(raw_id).__name__})"
-            decision_label = id_shown
+        # is the prefix every other message in the loop carries (DW-157). The
+        # derivation itself lives in `_plan_identifier`, shared with the three
+        # section loops above since DW-171 — one definition of the idiom, not two.
+        dw_id, id_shown, decision_label = _plan_identifier(
+            raw_id, f"decisions[{decision_index}]", "decision"
+        )
         claim(dw_id, "decisions", id_shown)
         # Type-checked rather than `str(...)`-ed (DW-156) for its live unscreened
         # sinks, all of them operator-facing or journaled: `DecisionPrompter.ask`
@@ -827,9 +902,24 @@ def validate_migration(
     pre-existing canonical entry's status and every ``gate:`` token it
     declared, continue DW numbering, and the result.json mapping must cover
     the manifest exactly. Returns errors, empty on success."""
-    rj = rj or {}
+    if rj is None:
+        rj = {}
+    if not isinstance(rj, dict):
+        # The DW-155 guard `validate_triage` carries one function over, which this
+        # twin was left without (DW-170): `rj = rj or {}` substituted only on a
+        # FALSY document, so every other wrong-shape top level -- a list, a string,
+        # a number -- reached `.get` and raised `AttributeError` out of THIS
+        # function. What that buys is totality over parseable JSON for this
+        # function's own callers, NOT a live crash fix, and symmetry with the
+        # DW-155 site is the whole argument: `_ensure_migration`, the only
+        # production caller, cannot deliver a non-dict here, because
+        # `critical_escalations(result.result_json)` runs first and
+        # `_escalation_list` calls `.get` behind a falsiness check alone -- a
+        # truthy non-dict raises THERE, before this guard is reached. Refused
+        # through the existing `errors` channel; never raised, never repaired.
+        return [f"migration result not a JSON object: {type(rj).__name__}"]
     if rj.get("workflow") != MIGRATE_WORKFLOW:
-        return [f"workflow must be {MIGRATE_WORKFLOW!r}: got {rj.get('workflow')!r}"]
+        return [f"workflow must be {MIGRATE_WORKFLOW!r}: got {_shown_value(rj.get('workflow'))}"]
     errors: list[str] = []
 
     leftovers = deferredwork.parse_legacy(new_text)

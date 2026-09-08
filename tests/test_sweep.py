@@ -1163,6 +1163,250 @@ def test_validate_triage_malformed_name_containers_do_not_preempt_early_feedback
     assert expected_error in errors[0]
 
 
+# ------------- identifier / value diagnostics outside the decisions loop (DW-171)
+#
+# DW-157 fixed ONE leak: a non-string decision `id` used to interpolate its own
+# stringified contents into every message that loop emits. The same idiom was
+# owed to the three section loops, to the open-set mismatch and to both
+# `workflow must be` refusals, all of which still printed LLM-authored objects
+# verbatim into strings that reach the journal. Like DW-157 these rows are
+# DIAGNOSTIC only: the identifier fields are still not type-checked (the
+# DW-145/148 Never clause stands), so the same plans validate and the same plans
+# are refused -- the acceptance halves below pin that.
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "complaint"),
+    [
+        pytest.param("already_resolved", "evidence", "has no evidence", id="already_resolved"),
+        pytest.param("blocked", "blocker", "names no blocker", id="blocked"),
+        pytest.param("skip", "reason", "gives no reason", id="skip"),
+    ],
+)
+def test_validate_triage_names_a_section_id_positionally(section, field, complaint):
+    """The DW-157 treatment, three loops over. Both display shapes are exercised
+    in one plan: `claim` prints the subject BARE (`references unknown/closed id
+    ...`) while the section's own complaint prints it behind its section prefix,
+    which is why `_plan_identifier` returns `shown` and `label` separately.
+    ABLATION: restore `dw_id = str(item.get("id", ""))` and `claim(dw_id, ...)` /
+    `f"{section} {dw_id} ..."` in this loop and both assertions redden with
+    `{'leaky': 'secret prose'}` printed into a journaled message; the rest of the
+    suite stays green without this row.
+
+    `expected_open_ids=None` is the cached-triage reader's call, the only one on
+    which a non-string id is observable at all: `universe` is built from
+    `open_ids` itself, so an id absent from `open_ids` reaches `claim`'s
+    unknown/closed branch instead of the open-set mismatch that would short
+    circuit first."""
+    leaky = {"leaky": "secret prose"}
+    rj = triage_result(["DW-1"], **{section: [{"id": leaky, field: ""}]})
+
+    plan, errors = validate_triage(rj, None)
+
+    subject = f"{section}[0] (id not a string: dict)"
+    assert plan is None
+    assert errors == [
+        f"{section} references unknown/closed id {subject}",
+        f"{subject} {complaint}",
+        "open entries not triaged: DW-1",
+    ]
+    assert not any("secret prose" in e or "leaky" in e for e in errors)
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "complaint"),
+    [
+        pytest.param("already_resolved", "evidence", "has no evidence", id="already_resolved"),
+        pytest.param("blocked", "blocker", "names no blocker", id="blocked"),
+        pytest.param("skip", "reason", "gives no reason", id="skip"),
+    ],
+)
+@pytest.mark.parametrize("dw_id", ["DW-9", ""], ids=["named", "empty"])
+def test_validate_triage_keeps_todays_wording_for_a_string_section_id(
+    section, field, complaint, dw_id
+):
+    """The other half: the positional fallback is keyed on the TYPE, not on
+    truthiness, so an EMPTY id is still a string id and still prints as one --
+    with the two spaces today's wording leaves behind. Byte for byte the strings
+    these loops emitted before DW-171."""
+    rj = triage_result(["DW-1"], **{section: [{"id": dw_id, field: ""}]})
+
+    _, errors = validate_triage(rj, None)
+
+    assert errors == [
+        f"{section} references unknown/closed id {dw_id}",
+        f"{section} {dw_id} {complaint}",
+        "open entries not triaged: DW-1",
+    ]
+
+
+def test_validate_triage_names_a_non_string_open_id_positionally():
+    """`invented` is the half of the open-set mismatch that comes from the PLAN
+    (`missed` comes from the ledger and is strings by construction), so it was
+    the leak. ABLATION: sort `claimed_open - expected_open_ids` directly instead
+    of the display names and this reddens with the object's contents.
+
+    The second plan pins first-occurrence-wins: a duplicate must not renumber the
+    position its first spelling reported."""
+    leaky = {"leaky": "secret prose"}
+
+    plan, errors = validate_triage(triage_result([leaky]), {"DW-1"})
+
+    assert plan is None
+    assert errors == [
+        "open_ids do not match the ledger's open entries"
+        "; missing: DW-1; not open in the ledger: open_ids[0] (not a string: dict)"
+    ]
+    assert not any("secret prose" in e or "leaky" in e for e in errors)
+
+    _, dupe_errors = validate_triage(triage_result(["DW-1", leaky, leaky]), {"DW-1"})
+    assert dupe_errors == [
+        "open_ids do not match the ledger's open entries"
+        "; not open in the ledger: open_ids[1] (not a string: dict)"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("first", "first_field", "second", "second_field"),
+    [
+        pytest.param("already_resolved", "evidence", "blocked", "blocker", id="blocked"),
+        pytest.param("blocked", "blocker", "skip", "reason", id="skip"),
+    ],
+)
+def test_validate_triage_names_a_section_id_positionally_in_a_duplicate_claim(
+    first, first_field, second, second_field
+):
+    """`claim`'s OTHER branch for the three section loops, and the reason
+    `_plan_identifier` returns `shown` and `label` as SEPARATE values: `appears in
+    both` prints the subject BARE, where every other message in these loops prints
+    it behind a section prefix. The rows above only ever reach the unknown/closed
+    branch, so without this one the bare-subject half of the helper's contract is
+    unpinned for these loops.
+
+    The claiming ORDER is the loops' own (already_resolved, bundles, blocked,
+    skip), so the SECOND section is the one that prints -- `already_resolved`
+    cannot be the printer because it claims first.
+
+    ABLATION: drop the `id_shown` argument from the second section's
+    `claim(dw_id, ...)` call and this reddens with `{'leaky': 'secret prose'}` as
+    the bare subject; the rest of the suite stays green without this row."""
+    leaky = {"leaky": "secret prose"}
+    rj = triage_result(
+        [leaky],
+        **{
+            first: [{"id": leaky, first_field: "x"}],
+            second: [{"id": leaky, second_field: "x"}],
+        },
+    )
+
+    plan, errors = validate_triage(rj, None)
+
+    assert plan is None
+    assert errors == [f"{second}[0] (id not a string: dict) appears in both {first} and {second}"]
+    assert not any("secret prose" in e or "leaky" in e for e in errors)
+
+
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [
+        pytest.param("already_resolved", "evidence", id="already_resolved"),
+        pytest.param("blocked", "blocker", id="blocked"),
+        pytest.param("skip", "reason", id="skip"),
+    ],
+)
+def test_validate_triage_still_accepts_a_plan_whose_section_ids_are_objects(section, field):
+    """DW-171's acceptance clause, the twin of the second half of
+    `test_validate_triage_names_a_decision_positionally_in_a_duplicate_claim`:
+    the section `id` fields are still NOT type-checked, so a plan that validated
+    before still validates and the stringified object still rides into the
+    dataclasses exactly as it did. Diagnostics moved; what validates did not.
+
+    Parametrized over the same three sections the refusal rows are: type-checking
+    any ONE of them would break this clause, and a `skip`-only row would leave the
+    other two free to acquire a check with the suite green."""
+    leaky = {"leaky": "secret prose"}
+    rj = triage_result([leaky], **{section: [{"id": leaky, field: "later"}]})
+
+    plan, errors = validate_triage(rj, None)
+
+    assert errors == []
+    assert plan is not None
+    stringified = "{'leaky': 'secret prose'}"
+    if section == "already_resolved":
+        assert plan.already_resolved == (ResolvedEntry(stringified, "later"),)
+    else:
+        assert getattr(plan, section) == ((stringified, "later"),)
+
+
+@pytest.mark.parametrize(
+    ("value", "shown"),
+    [
+        pytest.param({"leaky": "secret prose"}, "a dict", id="dict"),
+        pytest.param(["secret prose"], "a list", id="list"),
+    ],
+)
+def test_both_validators_name_a_non_scalar_workflow_by_type(value, shown):
+    """The `workflow` refusal is the FIRST message either validator can emit, and
+    it printed `{rj.get('workflow')!r}` -- the whole nested value -- into the
+    journal. ABLATION: restore `{rj.get('workflow')!r}` in either refusal and its
+    row reddens with the object's contents.
+
+    Both validators, not one: DW-170 exists precisely because the previous pass
+    hardened `validate_triage` and left its twin one function over."""
+    triage_plan, triage_errors = validate_triage({"workflow": value}, None)
+    migration_errors = validate_migration({"workflow": value}, [], {}, "")
+
+    assert triage_plan is None
+    assert triage_errors == [f"workflow must be 'deferred-sweep-triage': got {shown}"]
+    assert migration_errors == [f"workflow must be 'deferred-sweep-migrate': got {shown}"]
+    assert not any("secret prose" in e for e in triage_errors + migration_errors)
+
+
+@pytest.mark.parametrize(
+    ("value", "shown"),
+    [
+        pytest.param("wrong", "'wrong'", id="str"),
+        pytest.param(None, "None", id="none"),
+        pytest.param(5, "5", id="int"),
+        pytest.param(1.5, "1.5", id="float"),
+        # Reaches the `int` arm by SUBCLASSING, so `got True` is wording nothing
+        # else pins: without this row a later `isinstance(value, bool)` guard
+        # could reroute it to `a bool` with the whole suite still green.
+        pytest.param(True, "True", id="bool"),
+    ],
+)
+def test_both_validators_keep_repr_for_a_scalar_workflow(value, shown):
+    """`_shown_value` deliberately keeps `repr` for the flat scalars: `got None`
+    is pinned wording (see the `None`-document rows) and a bounded scalar repr
+    leaks nothing nested -- the harm DW-171 names is the UNBOUNDED nested value."""
+    _, triage_errors = validate_triage({"workflow": value}, None)
+
+    assert triage_errors == [f"workflow must be 'deferred-sweep-triage': got {shown}"]
+    assert validate_migration({"workflow": value}, [], {}, "") == [
+        f"workflow must be 'deferred-sweep-migrate': got {shown}"
+    ]
+
+
+def test_validate_triage_sanitizes_a_decision_id_beside_a_bad_options_container():
+    """Regression pin for the DW-157 site DW-171 refactored into
+    `_plan_identifier`: the decision-level messages `_plan_list` and `_plan_str`
+    emit still carry the POSITIONAL label, and `claim` still prints the bare
+    subject. ABLATION: re-inline the old `id_shown`/`decision_label` derivation
+    incorrectly (e.g. `decision_label = f"decision {dw_id}"` unconditionally) and
+    this reddens with the object's contents."""
+    leaky = {"leaky": "secret prose"}
+    rj = triage_result([leaky], decisions=[{"id": leaky, "options": None}])
+
+    plan, errors = validate_triage(rj, None)
+
+    assert plan is None
+    assert errors == [
+        "decisions[0] (id not a string: dict) has no question",
+        "decisions[0] (id not a string: dict): options not a list: NoneType",
+    ]
+    assert not any("secret prose" in e or "leaky" in e for e in errors)
+
+
 # ------------- malformed triage CONTAINER shapes (DW-155/DW-158)
 #
 # `_plan_str` (DW-148) screened the plan's free-text SCALARS; the containers
@@ -1966,6 +2210,41 @@ def test_validate_migration_allows_dedupe_merge():
 def test_validate_migration_wrong_workflow():
     errors = validate_migration({"workflow": "quick-dev"}, [], {}, "")
     assert errors and "workflow" in errors[0]
+
+
+@pytest.mark.parametrize(
+    ("document", "type_name"),
+    [
+        pytest.param(["nope"], "list", id="list"),
+        pytest.param("nope", "str", id="str"),
+        pytest.param(5, "int", id="int"),
+        # Falsy, so `rj = rj or {}` DID substitute here and the old code reported
+        # the `workflow` error instead of raising. Refused by SHAPE, like the
+        # `validate_triage` twin -- the guard is total, not truthiness-shaped.
+        pytest.param([], "list", id="empty-list"),
+    ],
+)
+def test_validate_migration_refuses_a_non_object_document(document, type_name):
+    """DW-170: the DW-155 guard `validate_triage` got, one function over. ABLATION:
+    restore `rj = rj or {}` in place of the `isinstance(rj, dict)` refusal and the
+    first three rows raise `AttributeError: 'list' object has no attribute 'get'`
+    out of the validator -- past `_ensure_migration`, which calls it with no guard
+    of its own. Same channel, same message shape as the triage refusal it
+    mirrors."""
+    assert validate_migration(document, [], {}, "") == [
+        f"migration result not a JSON object: {type_name}"
+    ]
+
+
+def test_validate_migration_keeps_todays_behavior_for_a_none_document():
+    """`None` is not a wrong SHAPE, it is the documented "no result.json" input
+    (`SessionResult.result_json` is `dict | None`), so it keeps substituting `{}`
+    and failing on `workflow` exactly as before -- the twin of
+    `test_validate_triage_keeps_todays_behavior_for_a_none_document`, and the row
+    that pins `got None` surviving `_shown_value`."""
+    assert validate_migration(None, [], {}, "") == [
+        "workflow must be 'deferred-sweep-migrate': got None"
+    ]
 
 
 def test_validate_migration_rejects_changed_manifest_severity():
