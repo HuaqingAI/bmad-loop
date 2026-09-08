@@ -35,6 +35,7 @@ from conftest import (
     refuse_to_resolve,
     review_effect,
     scripted_verify_runner,
+    seed_outer_decoy_ledger,
     set_sprint,
     spec_path,
     write_gated_ledger,
@@ -2602,14 +2603,7 @@ def test_harvest_gate_exclude_names_the_prefixed_path_under_the_monorepo_shape(p
 
     # the OUTER project's ledger — the file a `project`-rooted pathspec silently
     # names when git resolves it in the code tree
-    decoy = paths.repo_root / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
-    decoy.parent.mkdir(parents=True, exist_ok=True)
-    assert not decoy.exists(), (
-        "this row creates the outer ledger deliberately so the 'silently wrong' "
-        "claim is graded by value; inheriting one from the sandbox template would "
-        "make that premise a setup accident"
-    )
-    decoy.write_text("# outer ledger\n", encoding="utf-8")
+    decoy, _ = seed_outer_decoy_ledger(paths)
 
     engine, _ = make_engine(paths, [])
     task = StoryTask(story_key="1-1-a", epic=1)
@@ -2687,15 +2681,7 @@ def test_harvest_gate_exclude_gates_the_nested_ledger_under_the_monorepo_shape(p
 
     # the OUTER project's ledger: the real file a `project`-rooted pathspec names
     # once git resolves it in the code tree
-    decoy = paths.repo_root / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
-    decoy.parent.mkdir(parents=True, exist_ok=True)
-    assert not decoy.exists(), (
-        "this row creates the outer ledger deliberately so the 'silently wrong' "
-        "claim is graded by value; inheriting one from the sandbox template would "
-        "make that premise a setup accident"
-    )
-    decoy_text = "# outer ledger\n"
-    decoy.write_text(decoy_text, encoding="utf-8")
+    decoy, decoy_bytes = seed_outer_decoy_ledger(paths)
 
     # every file the attempt below touches is seeded as TRACKED content first
     initial_baseline = verify.rev_parse_head(paths.repo_root)
@@ -2745,7 +2731,7 @@ def test_harvest_gate_exclude_gates_the_nested_ledger_under_the_monorepo_shape(p
     # the wrong spelling would have named a REAL file, and the decoy contributed no
     # residue of its own — so the refusal above is about the nested ledger being
     # excluded, not about the outer one being absent
-    assert decoy.is_file() and decoy.read_text(encoding="utf-8") == decoy_text
+    assert decoy.is_file() and decoy.read_bytes() == decoy_bytes
 
     # the same attempt with one real source edit passes, so the refusal is about the
     # missing work and not about the fixture being unusable
@@ -2807,15 +2793,7 @@ def test_accepted_park_observation_excludes_the_nested_ledger_under_the_monorepo
 
     # the OUTER project's ledger: the real file a `project`-rooted pathspec names
     # once git resolves it in the code tree
-    decoy = paths.repo_root / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
-    decoy.parent.mkdir(parents=True, exist_ok=True)
-    assert not decoy.exists(), (
-        "this row creates the outer ledger deliberately so the 'silently wrong' "
-        "claim is graded by value; inheriting one from the sandbox template would "
-        "make that premise a setup accident"
-    )
-    decoy_text = "# outer ledger\n"
-    decoy.write_text(decoy_text, encoding="utf-8")
+    decoy, decoy_bytes = seed_outer_decoy_ledger(paths)
 
     # every file the attempt below touches is seeded as TRACKED content first, at
     # PRE-park values: the flip INTO `awaiting-operator` with `operator_actions` has to
@@ -2886,7 +2864,7 @@ def test_accepted_park_observation_excludes_the_nested_ledger_under_the_monorepo
     # the wrong spelling would have named a REAL file, and the decoy contributed no
     # residue of its own — so the `True` above is about the nested ledger being
     # excluded, not about the outer one being absent
-    assert decoy.is_file() and decoy.read_text(encoding="utf-8") == decoy_text
+    assert decoy.is_file() and decoy.read_bytes() == decoy_bytes
 
 
 # ------------------- `[verify] commands` run where the SESSION ran (#695, DW-3)

@@ -26,6 +26,7 @@ from conftest import (
     migrate_effect,
     nested_repo_root_paths,
     passes_once,
+    seed_outer_decoy_ledger,
     triage_effect,
     write_ledger,
     write_legacy_ledger,
@@ -12745,15 +12746,7 @@ def test_bundle_gate_excludes_the_nested_ledger_under_the_monorepo_shape(project
 
     # the OUTER project's ledger: the real file a `project`-rooted pathspec names
     # once git resolves it in the code tree
-    decoy = paths.repo_root / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
-    decoy.parent.mkdir(parents=True, exist_ok=True)
-    assert not decoy.exists(), (
-        "this row creates the outer ledger deliberately so the 'silently wrong' "
-        "claim is graded by value; inheriting one from the sandbox template would "
-        "make that premise a setup accident"
-    )
-    decoy_bytes = b"# outer ledger\n"
-    decoy.write_bytes(decoy_bytes)
+    decoy, decoy_bytes = seed_outer_decoy_ledger(paths)
 
     # every file the attempt below touches is seeded as TRACKED content first
     initial_baseline = verify.rev_parse_head(paths.repo_root)

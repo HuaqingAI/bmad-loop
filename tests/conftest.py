@@ -998,6 +998,65 @@ def nested_repo_root_paths(paths: ProjectPaths) -> ProjectPaths:
     return load_paths(project)
 
 
+OUTER_DECOY_LEDGER = b"# outer ledger\n"
+
+
+def seed_outer_decoy_ledger(paths: ProjectPaths) -> tuple[Path, bytes]:
+    """Seed the OUTER project's decoy ledger under `nested_repo_root_paths`' shape.
+
+    The companion half of `nested_repo_root_paths`. Under the nested shape the
+    ledger's project-relative tail (``_bmad-output/implementation-artifacts/
+    deferred-work.md``) re-rooted at `repo_root` is *precisely* the real file a
+    `project`-rooted pathspec silently names once git resolves it in the code tree
+    — the "not merely wrong, it is SILENTLY wrong" failure the consumer rows grade.
+    So the decoy is DERIVED from `paths.deferred_work`, never re-spelled: the
+    helper's derivation and `engine._harvest_gate_exclude`'s rule move together if
+    the artifact layout ever changes.
+
+    Returns ``(path, bytes)`` rather than bare bytes because every consumer needs
+    the path too — for `is_file`/`resolve` claims and for its own `git add` seed
+    list — and a bytes-only return would leave each row re-deriving the identity by
+    hand, which is the duplication this helper exists to remove.
+
+    SEEDS ONLY: it writes the file and stops — it never stages, commits, or touches
+    the decoy again. The consumer rows turn on the decoy being left ALONE afterwards,
+    and whether it ends up tracked is each row's own premise to establish and to
+    pin, not something this helper may decide on their behalf.
+
+    The content is fixed and the path always derives from `paths`; neither is an
+    additional helper argument. Consumers share that seed while the decoy's location
+    follows the artifact layout.
+
+    Refuses input it cannot honor, and BOTH refused shapes fail silently rather than
+    loudly — which is why they are asserted rather than left to fall over on their
+    own. On COLLAPSED paths (``project == repo_root``, the plain `project` fixture)
+    the "decoy" would BE `paths.deferred_work`, so the helper would overwrite the
+    very ledger the consumer rows exclude. On DISJOINT paths (`repo_root` not an
+    ancestor of `project`, the sibling shape) nothing raises either: both operands of
+    ``paths.deferred_work.relative_to(paths.project)`` are independent of `repo_root`,
+    so the tail still resolves and the helper would happily seed a file into a tree
+    that has no outer project at all — a decoy no pathspec spelling can name, making
+    the consumer's claim vacuous instead of false. A decoy already on disk is refused
+    rather than overwritten: the consumer rows create it deliberately so the claim is
+    graded by value, and silently absorbing an inherited one would turn that premise
+    into a setup accident. All three guards fail before anything is written.
+    """
+    assert paths.project != paths.repo_root and paths.project.is_relative_to(paths.repo_root), (
+        "seed_outer_decoy_ledger needs the NESTED shape from `nested_repo_root_paths`: "
+        "`repo_root` a strict ancestor of `project`. Collapsed roots would make the "
+        "'decoy' the ledger itself, and disjoint roots have no outer ledger at all."
+    )
+    decoy = paths.repo_root / paths.deferred_work.relative_to(paths.project)
+    decoy.parent.mkdir(parents=True, exist_ok=True)
+    assert not decoy.exists(), (
+        "this row creates the outer ledger deliberately so the 'silently wrong' "
+        "claim is graded by value; inheriting one from the sandbox template would "
+        "make that premise a setup accident"
+    )
+    decoy.write_bytes(OUTER_DECOY_LEDGER)
+    return decoy, OUTER_DECOY_LEDGER
+
+
 UNRESOLVABLE = "stubbed: the provider is registered but not serving"
 
 

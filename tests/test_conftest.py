@@ -274,6 +274,99 @@ def test_nested_repo_root_paths_refuses_a_dangling_nested_symlink(project):
     assert conftest.git(project.project, "status", "--porcelain") == status_before
 
 
+def test_seed_outer_decoy_ledger_names_the_unprefixed_spelling_in_the_code_tree(project):
+    """The decoy IS the file a `project`-rooted pathspec names in the code tree.
+
+    Pins the VALUE under the real artifact layout: the same un-prefixed spelling the
+    consumer rows assert `_harvest_gate_exclude` must NOT produce. That it is derived
+    rather than re-spelled is the row below.
+    """
+    paths = conftest.nested_repo_root_paths(project)
+    head_before = verify.rev_parse_head(paths.repo_root)
+
+    decoy, decoy_bytes = conftest.seed_outer_decoy_ledger(paths)
+
+    assert decoy == paths.repo_root / "_bmad-output/implementation-artifacts/deferred-work.md"
+    assert decoy.resolve() != paths.deferred_work.resolve()
+    assert decoy.read_bytes() == decoy_bytes == conftest.OUTER_DECOY_LEDGER
+    # SEEDS ONLY, pinned so BOTH ways of breaking it redden. A cached-diff check alone
+    # is satisfied by a helper that stages AND commits, which leaves the index clean
+    # again — so pin the decoy UNTRACKED and pin that HEAD never moved across the call.
+    assert conftest.git(paths.repo_root, "diff", "--cached", "--name-only") == ""
+    with pytest.raises(subprocess.CalledProcessError):
+        conftest.git(paths.repo_root, "ls-files", "--error-unmatch", decoy.as_posix())
+    assert verify.rev_parse_head(paths.repo_root) == head_before
+
+
+def test_seed_outer_decoy_ledger_follows_a_relocated_artifact_tail(project):
+    """The decoy is DERIVED from `paths.deferred_work`, not re-spelled from a literal.
+
+    Move the artifact tail somewhere else inside `project` and the decoy has to move
+    with it — that is what keeps the helper locked to
+    `engine._harvest_gate_exclude`'s rule if the layout ever changes.
+
+    Ablation: replace the helper's derivation with the literal
+    ``repo_root / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"``
+    and this row reddens while every other helper and consumer row stays green — it
+    is the only row that separates the derivation from today's layout.
+    """
+    paths = conftest.nested_repo_root_paths(project)
+    relocated = replace(paths, implementation_artifacts=paths.project / "artifacts" / "impl")
+    assert relocated.deferred_work.is_relative_to(relocated.project)
+
+    decoy, decoy_bytes = conftest.seed_outer_decoy_ledger(relocated)
+
+    assert decoy == paths.repo_root / "artifacts" / "impl" / "deferred-work.md"
+    assert decoy.read_bytes() == decoy_bytes
+
+
+def test_seed_outer_decoy_ledger_refuses_collapsed_roots(project):
+    """Collapsed, the "decoy" would BE the ledger the consumer rows exclude.
+
+    Seeded with sentinel bytes first, so the row grades that the real ledger SURVIVES
+    rather than that an absent one stayed absent — a bare `not exists()` would pass
+    for every reason the file could be missing, the sandbox template's shape included.
+    """
+    sentinel = b"# the project's own ledger\n"
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(sentinel)
+
+    with pytest.raises(AssertionError, match="NESTED shape"):
+        conftest.seed_outer_decoy_ledger(project)
+
+    assert project.deferred_work.read_bytes() == sentinel
+
+
+def test_seed_outer_decoy_ledger_refuses_disjoint_roots(project, tmp_path):
+    """The sibling shape has no outer ledger to name.
+
+    Nothing raises on its own: the tail resolves independently of `repo_root`, so an
+    un-guarded helper would seed a decoy into a tree with no outer project at all.
+    `other_root` staying absent is what shows the guard fired before any write.
+    """
+    other_root = tmp_path / "other-root"
+    paths = replace(project, repo_root=other_root)
+
+    with pytest.raises(AssertionError, match="NESTED shape"):
+        conftest.seed_outer_decoy_ledger(paths)
+
+    assert not other_root.exists()
+    assert not project.deferred_work.exists()
+
+
+def test_seed_outer_decoy_ledger_refuses_an_inherited_decoy(project):
+    """An inherited outer ledger would make the "graded by value" premise an accident."""
+    paths = conftest.nested_repo_root_paths(project)
+    decoy = paths.repo_root / paths.deferred_work.relative_to(paths.project)
+    decoy.parent.mkdir(parents=True, exist_ok=True)
+    decoy.write_bytes(b"belongs to the caller\n")
+
+    with pytest.raises(AssertionError, match="graded by value"):
+        conftest.seed_outer_decoy_ledger(paths)
+
+    assert decoy.read_bytes() == b"belongs to the caller\n"
+
+
 def test_template_leaves_no_detached_git_maintenance_writing_into_the_copies(project, tmp_path):
     """No background git process may outlive a commit into the sandbox.
 

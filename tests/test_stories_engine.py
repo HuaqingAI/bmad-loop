@@ -14,6 +14,7 @@ from conftest import (
     git,
     install_build_auto_skill,
     nested_repo_root_paths,
+    seed_outer_decoy_ledger,
     write_gated_ledger,
     write_ledger,
     write_spec,
@@ -1119,11 +1120,7 @@ def test_accepted_plan_halt_observation_excludes_the_nested_ledger_under_the_mon
     assert paths.project != paths.repo_root
     assert paths.project.parent == paths.repo_root
 
-    decoy = paths.repo_root / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
-    decoy.parent.mkdir(parents=True, exist_ok=True)
-    assert not decoy.exists(), "the test must create its own outer decoy ledger"
-    decoy_bytes = b"# outer ledger\n"
-    decoy.write_bytes(decoy_bytes)
+    decoy, decoy_bytes = seed_outer_decoy_ledger(paths)
     write_ledger(paths, {"DW-1": "open"}, commit=False)
 
     outer_spec_folder = paths.repo_root / SPEC_FOLDER
