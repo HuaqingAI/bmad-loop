@@ -1191,11 +1191,15 @@ JOURNAL_KINDS = frozenset(
         "sweep-ledger-commit",
         # The degrade arm of the same producer: an EXPLICITLY-rooted
         # `_commit_ledger` whose `verify.GitError` is journalled instead of
-        # propagating, so a pre-answer prune against a project root that is not a
-        # git repo leaves the store write on disk rather than aborting the sweep
-        # (DW-160). Both its fields are already routed out of diagnostics dumps —
-        # `repo` as an absolute host path naming a git tree, `error` as free text
-        # quoting git's own stderr — so it needs no new field row.
+        # propagating, leaving the write on disk rather than aborting the sweep.
+        # TWO producers reach it. The pre-answer prunes (DW-160) name the project,
+        # so `repo` is a project root that is not a git repo. The five ledger
+        # publishers (DW-175) name the ledger's own directory, so `repo` can be a
+        # freestanding `implementation_artifacts` enclosed by no repository at all,
+        # which is a plain host directory and not a git tree in any sense
+        # (`tests/test_sweep.py` asserts that spelling). Both fields are already
+        # routed out of diagnostics dumps — `repo` as an absolute host path, `error`
+        # as free text quoting git's own stderr — so it needs no new field row.
         "sweep-ledger-commit-unavailable",
         "sweep-migrated",
         "sweep-migration-restore-diverged",

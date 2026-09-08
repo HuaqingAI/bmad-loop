@@ -4374,13 +4374,21 @@ def _stub_return(monkeypatch, outcome):
     return asked
 
 
-def _run_one_decision_sweep(project):
+def _run_one_decision_sweep(project, printed=None):
     engine, _adapter = make_sweep(
         project,
         [triage_effect(_close_decision_plan())],
         answers=["1"],
         prompting=True,
     )
+    if printed is not None:
+        # `make_sweep`'s prompter swallows its output, so the hand-back's own line
+        # is unobservable through it — which is how deleting or inverting that
+        # branch used to stay green.
+        answers = iter(["1"])
+        engine.prompter = DecisionPrompter(
+            input_fn=lambda _p: next(answers), print_fn=printed.append
+        )
     summary = engine.run()
     assert not summary.paused
     return engine
@@ -4389,13 +4397,22 @@ def _run_one_decision_sweep(project):
 def test_interactive_decisions_return_client_goes_unattended(project, monkeypatch):
     """When a client was attached to answer, the sweep hands the terminal back
     after the decisions and goes unattended so later cycles don't block on a
-    detached window."""
+    detached window.
+
+    The printed LINE is asserted here too, and this is the only row that sees it on
+    the success path: every effect landed, so the human is told the decisions were
+    recorded. Without it, deleting that print or inverting its condition stays green
+    while the failure row alone keeps passing.
+
+    Ablation: swap the two hand-back constants and this reds on the line."""
     asked = _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
     write_ledger(project, {"DW-1": "open"})
-    engine = _run_one_decision_sweep(project)
+    printed = []
+    engine = _run_one_decision_sweep(project, printed=printed)
     assert len(asked) == 1  # asked exactly once, after the decisions phase
     assert engine.prompting is False
     assert '"sweep-returned-after-decisions"' in journal_text(engine)
+    assert printed[-1] == "✓ decisions recorded — sweep continues in the background"
 
 
 def test_interactive_decisions_no_attach_stays_attended(project, monkeypatch):
@@ -7504,12 +7521,13 @@ def test_a_prune_in_a_non_git_project_keeps_the_store_write_and_journals(project
     swallowed — `sweep-ledger-commit-unavailable` naming the tree and the error,
     so an operator reading the journal learns the store is uncommitted.
 
-    Scoped to the callers that pass a root, which since DW-175 is all seven of
-    them: the ledger publishers were re-rooted for the same divergence and inherit
-    this degrade, which is required rather than incidental — keeping them loud
-    after re-rooting would turn every ledger commit in a non-git project into a
-    sweep-ending raise, strictly worse than the missed commit it replaced. The
-    unused `root=None` default keeps propagating, which
+    Scoped to the callers that pass a root, which is all seven of them: the ledger
+    publishers name the LEDGER's own directory under the same owner-of-the-file rule
+    and inherit this degrade, which is required rather than incidental — keeping
+    them loud would turn every ledger commit whose artifacts directory is in no
+    repository into a sweep-ending raise, strictly worse than the missed commit it
+    replaced (`test_a_ledger_commit_in_a_non_git_project_keeps_the_write_and_journals`
+    grades that half). The unused `root=None` default keeps propagating, which
     `test_a_default_rooted_commit_failure_still_raises` below pins.
 
     Ablation: drop the `except verify.GitError` arm in `_commit_ledger` and this
@@ -7546,13 +7564,14 @@ def test_a_prune_in_a_non_git_project_keeps_the_store_write_and_journals(project
 def test_a_default_rooted_commit_failure_still_raises(project, monkeypatch):
     """The other half of the degrade: it is scoped to callers that passed a root.
 
-    Since DW-175 every in-tree caller passes one, so this grades the PRESERVED
-    DEFAULT rather than any live call site. It is kept deliberately: the `root=None`
-    arm and its raise are `_commit_ledger`'s published contract, so a future caller
-    that forgets to say which tree its own write dirtied fails loud instead of
-    inheriting whichever root happened to be convenient — and is never quietly
-    journalled the way a rooted failure is. Without this row the degrade could widen
-    to the default too and no test would notice.
+    Every in-tree caller passes one — `test_every_sweep_ledger_commit_names_its_own_tree`
+    is total over that — so this grades the PRESERVED DEFAULT and nothing else; it is
+    called here directly because no call site reaches the arm. It is kept
+    deliberately: the `root=None` arm and its raise are `_commit_ledger`'s published
+    contract, so a future caller that forgets to name the tree holding the file it
+    just wrote fails loud instead of inheriting whichever root happened to be
+    convenient — and is never quietly journalled the way a rooted failure is. Without
+    this row the degrade could widen to the default too and no test would notice.
 
     Ablation: drop the `if root is None: raise` line in `_commit_ledger`'s handler
     and this reds `DID NOT RAISE`, with a journal row in place of the failure."""
@@ -7742,10 +7761,44 @@ def test_a_prune_with_an_empty_but_present_ledger_still_drops_every_answer(proje
     assert _records(engine, "sweep-preanswer-prune-refused") == []  # absence was never claimed
 
 
-def _close_resolved_in_a_divergent_project(project, engine):
+# ---------- divergent-root ledger publishers: one rule, three topologies ------
+#
+# The five ledger publishers name the LEDGER'S OWN directory and let git resolve
+# it to the enclosing repository (`_commit_ledger`'s owner-of-the-file rule).
+# `implementation_artifacts` is configurable to any absolute path
+# (`bmadconfig._resolve`, and `ProjectPaths.rebased` leaves an outside path
+# unmoved), so the ledger can sit in exactly three places relative to the two
+# roots — under the project, inside a disjoint `repo_root`, or in no git
+# repository at all — and each is a topology row below. A hardcoded project root
+# is correct only in the first; `self.workspace.root` only in the second.
+#
+# The setups leave their ledger write UNCOMMITTED and each topology settles every
+# tree it built, so a row starts clean whichever repository owns the file — under
+# the third topology no repository does, and `git commit` refuses an empty commit.
+
+
+def _settle(*repos):
+    """Commit whatever each repo is carrying, so every tree starts clean."""
+    for repo in repos:
+        if git(repo, "status", "--porcelain"):
+            git(repo, "add", "-A")
+            git(repo, "commit", "-q", "-m", "settle")
+
+
+def _copy_code_repo(project, path):
+    """Copy the disposable project fixture for a disjoint checkout with HEAD.
+
+    Inherit the sandbox's Git configuration, including disabled automatic
+    maintenance, without accessing or mutating the session template.
+    """
+    shutil.copytree(project.project, path)
+    return path
+
+
+def _close_resolved_in_a_divergent_project(paths, engine):
     """`_close_resolved`'s divergent-root setup and call: DW-1 is triaged already
     resolved, so the phase flips it to `done` in the ledger and publishes that edit."""
-    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    write_ledger(paths, {"DW-1": "open", "DW-2": "open"}, commit=False)
     plan = TriagePlan(
         open_ids=frozenset({"DW-1", "DW-2"}),
         already_resolved=(ResolvedEntry("DW-1", "fixed by a1b2c3d"),),
@@ -7753,11 +7806,11 @@ def _close_resolved_in_a_divergent_project(project, engine):
     return lambda: engine._close_resolved(plan), {"DW-1"}
 
 
-def _answer_a_decision_in_a_divergent_project(project, engine):
+def _answer_a_decision_in_a_divergent_project(paths, engine):
     """`_decisions_phase`'s divergent-root setup and call: the human closes DW-1 over
     an attached terminal, so `record_decision` writes the decision line and the close
     into the ledger and the phase publishes that edit."""
-    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    write_ledger(paths, {"DW-1": "open", "DW-2": "open"}, commit=False)
     plan = TriagePlan(
         open_ids=frozenset({"DW-1", "DW-2"}),
         decisions=(_close_or_keep_decision("DW-1"),),
@@ -7767,19 +7820,19 @@ def _answer_a_decision_in_a_divergent_project(project, engine):
     return lambda: engine._decisions_phase(plan), {"DW-1"}
 
 
-def _recover_inflight_in_a_divergent_project(project, engine):
+def _recover_inflight_in_a_divergent_project(paths, engine):
     """`_loop`'s post-recovery commit. The recovery ITSELF is stubbed, deliberately:
     a real in-flight bundle recovery drives a dev+review session pair inside
-    `workspace.root`, and this row repoints that root at an empty repo precisely to
+    `workspace.root`, and this row repoints that root at a separate repo precisely to
     create the divergence — so driving the real thing would grade the bundle
     machinery rather than which tree its ledger dirt lands in. The stub reproduces
     exactly what the site's own comment says it is there for ("a recovered bundle's
     ledger restore can leave the tree dirty") and nothing else. `_cycle` is stubbed
     to a no-op for the same reason: the commit under grade sits above it."""
-    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    write_ledger(paths, {"DW-1": "open", "DW-2": "open"}, commit=False)
 
     def restore_and_report():
-        write_ledger(project, {"DW-1": "done 2026-06-01", "DW-2": "open"}, commit=False)
+        write_ledger(paths, {"DW-1": "done 2026-06-01", "DW-2": "open"}, commit=False)
         return 1
 
     engine._finish_inflight_bundles = restore_and_report
@@ -7787,19 +7840,19 @@ def _recover_inflight_in_a_divergent_project(project, engine):
     return lambda: engine._loop(), {"DW-1"}
 
 
-def _between_cycles_in_a_divergent_project(project, engine):
+def _between_cycles_in_a_divergent_project(paths, engine):
     """`_loop`'s between-cycles commit, which publishes the dirt a deferred bundle's
     ledger restore leaves so the NEXT cycle's triage and bundle baselines start
     clean. Same stubbing rationale as the row above — cycle 1 stands in for a cycle
     that progressed and left the ledger dirty, cycle 2 reports no progress so the
     repeat loop stops and exactly one commit is under grade."""
-    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    write_ledger(paths, {"DW-1": "open", "DW-2": "open"}, commit=False)
     cycles = []
 
     def progressed_cycle(*_args, **_kwargs):
         cycles.append(None)
         if len(cycles) == 1:
-            write_ledger(project, {"DW-1": "done 2026-06-01", "DW-2": "open"}, commit=False)
+            write_ledger(paths, {"DW-1": "done 2026-06-01", "DW-2": "open"}, commit=False)
             return True  # progress, so the repeat loop reaches the commit below it
         return False  # ...and stops on the next cycle
 
@@ -7807,6 +7860,97 @@ def _between_cycles_in_a_divergent_project(project, engine):
     engine.repeat = True
     engine.max_cycles = 5
     return lambda: engine._loop(), {"DW-1"}
+
+
+def _assert_ledger_committed_in(repo, paths, engine, after, done_ids):
+    """The `HEAD` blob is the assertion, never `read_text()` of the working file:
+    a publisher that WROTE but never committed passes a working-file check, which
+    is exactly the bug under grade."""
+    ledger_rel = str(paths.deferred_work.relative_to(repo)).replace("\\", "/")
+    blob = git(repo, "show", f"HEAD:{ledger_rel}")
+    # `conftest.git` strips its stdout, so the comparison is against the stripped
+    # working file; the ledger has no leading space and one trailing newline.
+    assert blob == after.strip()  # the blob at HEAD is the edit, byte for byte
+    committed = {e.id: e for e in deferredwork.parse_ledger(blob)}
+    assert {i for i, e in committed.items() if not e.open} == done_ids
+    assert committed["DW-2"].open  # and the untouched sibling is untouched
+    assert git(repo, "status", "--porcelain") == ""  # clean for this cycle's bundles
+    [commit] = _records(engine, "sweep-ledger-commit")
+    assert commit["commit"] == git(repo, "rev-parse", "HEAD")
+
+
+def _artifacts_under_the_project(project, tmp_path):
+    """Topology A: the default shape — artifacts under the project, `repo_root`
+    naming a DISJOINT code repo. The project owns the ledger, so that is the tree
+    the commit must land in and `self.workspace.root` is the wrong answer."""
+    code_root = _copy_code_repo(project, tmp_path / "code-repo")
+    paths = replace(project, repo_root=code_root)
+    # premise: the artifacts directory really is inside the project tree, which is
+    # what makes "the project owns the ledger" the claim this row grades
+    assert project.project.resolve() in paths.implementation_artifacts.resolve().parents
+    code_head = git(code_root, "rev-parse", "HEAD")
+
+    def check(engine, paths_, after, done_ids):
+        _assert_ledger_committed_in(project.project, paths_, engine, after, done_ids)
+        # ...and the code repo, whose tree these writes never touched, gets nothing
+        assert git(code_root, "rev-parse", "HEAD") == code_head
+        assert list(code_root.rglob("deferred-work.md")) == []
+
+    return paths, code_root, check
+
+
+def _artifacts_inside_the_code_repo(project, tmp_path):
+    """Topology B: `implementation_artifacts` configured INSIDE the disjoint code
+    repo — legal, since `_resolve` accepts any absolute path. Here the CODE repo
+    owns the ledger, so a hardcoded project root names a tree the write never
+    touched: the shape the predecessor attempt regressed on."""
+    code_root = _copy_code_repo(project, tmp_path / "code-repo")
+    artifacts = code_root / "_bmad-output" / "implementation-artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    paths = replace(project, implementation_artifacts=artifacts, repo_root=code_root)
+    # premise: the artifacts directory is inside the CODE repo and outside the project
+    assert code_root.resolve() in artifacts.resolve().parents
+    assert project.project.resolve() not in artifacts.resolve().parents
+    project_head = git(project.project, "rev-parse", "HEAD")
+
+    def check(engine, paths_, after, done_ids):
+        _assert_ledger_committed_in(code_root, paths_, engine, after, done_ids)
+        # ...and the PROJECT repo, which owns no part of this write, gets nothing
+        assert git(project.project, "rev-parse", "HEAD") == project_head
+        assert list(project.project.rglob("deferred-work.md")) == []
+
+    return paths, code_root, check
+
+
+def _artifacts_in_no_repository(project, tmp_path):
+    """Topology C: `implementation_artifacts` outside BOTH trees and inside no git
+    repository at all — also legal, and the case the `GitError` degrade exists for.
+    Nothing may raise, the on-disk write must survive, and the miss is announced."""
+    code_root = _copy_code_repo(project, tmp_path / "code-repo")
+    artifacts = tmp_path / "loose-artifacts"
+    artifacts.mkdir()
+    paths = replace(project, implementation_artifacts=artifacts, repo_root=code_root)
+    # premise: no git repository encloses it, so `git -C` there has no tree to answer
+    # for — asserted over every ancestor, since one `.git` anywhere above would make
+    # this row grade a commit rather than the degrade
+    assert not any((p / ".git").exists() for p in (artifacts, *artifacts.parents))
+    project_head = git(project.project, "rev-parse", "HEAD")
+    code_head = git(code_root, "rev-parse", "HEAD")
+
+    def check(engine, paths_, after, done_ids):
+        # the on-disk write SURVIVES — the degrade is about the commit, never the file
+        on_disk = {e.id: e for e in deferredwork.parse_ledger(after)}
+        assert {i for i, e in on_disk.items() if not e.open} == done_ids
+        assert on_disk["DW-2"].open
+        assert _records(engine, "sweep-ledger-commit") == []  # nothing could be committed
+        [failed] = _records(engine, "sweep-ledger-commit-unavailable")
+        assert failed["repo"] == str(paths_.deferred_work.parent)  # the directory it named
+        assert "not a git repository" in failed["error"]  # ...and git's own error
+        # neither repository receives a commit for a file neither of them holds
+        assert git(project.project, "rev-parse", "HEAD") == project_head
+        assert git(code_root, "rev-parse", "HEAD") == code_head
+
+    return paths, code_root, check
 
 
 @pytest.mark.parametrize(
@@ -7818,129 +7962,224 @@ def _between_cycles_in_a_divergent_project(project, engine):
         _between_cycles_in_a_divergent_project,
     ],
 )
-def test_a_divergent_root_ledger_commit_lands_in_the_project_tree(project, tmp_path, setup):
-    """DW-175. The ledger PUBLISHERS had the same wrong root DW-160 fixed for the two
-    pre-answer prunes, and were left that way deliberately then; this is that
-    follow-up.
+@pytest.mark.parametrize(
+    "topology",
+    [_artifacts_under_the_project, _artifacts_inside_the_code_repo, _artifacts_in_no_repository],
+)
+def test_a_divergent_root_ledger_commit_lands_in_the_tree_that_owns_the_ledger(
+    project, tmp_path, topology, setup
+):
+    """DW-175. The ledger PUBLISHERS commit in the tree that OWNS the ledger, which
+    is the rule `_commit_ledger` states and not a root chosen by role.
 
-    The deferred-work ledger hangs off `implementation_artifacts`, which stays
-    project-rooted under the supported `repo_root` override, while `_commit_ledger`'s
-    default handed `self.workspace.root` — the separate CODE repo. So the clean check
-    interrogated a tree these writes never touched, found it clean, returned, and
-    nothing was committed: the ledger edit sat uncommitted in the project worktree
-    immediately ahead of this cycle's bundles, which need a clean baseline.
+    The deferred-work ledger hangs off `implementation_artifacts`, which
+    `bmadconfig._resolve` accepts as any absolute path and `ProjectPaths.rebased`
+    leaves unmoved when it is outside the project. So neither fixed root is right:
+    `self.workspace.root` — the old default — interrogates the separate CODE repo
+    when the artifacts are under the project (the clean check passes, nothing is
+    committed, and the project worktree stays dirty ahead of this cycle's bundles),
+    while a hardcoded project root interrogates the PROJECT when the artifacts are
+    configured inside the code repo, failing the mirror-image way. Naming the
+    ledger's own directory and letting git resolve it is correct in both, and in the
+    third shape — artifacts in no repository at all — it degrades instead of
+    committing, which is what the `GitError` arm is for.
 
-    Four of the five re-rooted sites are driven here: `_close_resolved` and the
-    attended `_decisions_phase` end to end, and `_loop`'s two commits with only the
-    dirt-producer above each stubbed (see those setups for why). The fifth, the
-    post-migration commit in `_ensure_migration`, is NOT driven at this layer: it
-    dispatches a rewrite session and stamps or resets a baseline against
-    `workspace.root`, which this row deliberately points at an empty repo with no
-    `HEAD`, so the setup would grade session and baseline machinery instead of the
-    commit's root. `test_every_sweep_ledger_commit_names_its_own_tree` below is what
-    holds that site, and it is total over all seven callers rather than these four.
+    Four of the five re-rooted sites are driven here, across all three topologies:
+    `_close_resolved` and the attended `_decisions_phase` end to end, and `_loop`'s
+    two commits with only the dirt-producer above each stubbed (see those setups for
+    why). The fifth, the post-migration commit in `_ensure_migration`, is NOT driven
+    at this layer: it dispatches a rewrite session and stamps or resets a baseline
+    against `workspace.root`, which these rows deliberately point at a foreign repo,
+    so the setup would grade session and baseline machinery instead of the commit's
+    root. `test_every_sweep_ledger_commit_names_its_own_tree` below is what holds
+    that site, and it is total over all seven callers rather than these four.
 
     The `HEAD` blob is the assertion, not the working file: a publisher that wrote
     but never committed still passes a `parse_ledger(read_text())` check, which is
-    exactly the bug. The code repo is asserted to receive NOTHING as the other half
-    — a fix that committed in both trees would satisfy the blob assert while
-    sweeping the project's entire `git add -A` into a repository that is not its own.
+    exactly the bug. The tree that owns nothing is asserted to receive NOTHING as
+    the other half — a fix that committed in both would satisfy the blob assert
+    while sweeping a whole `git add -A` into a repository that is not its own.
 
-    The premise is guarded before the outcome (docs/testing.md): the roots are
-    compared RESOLVED and asserted DISJOINT rather than merely unequal. Disjointness
-    is the shape this bites in — in the NESTED/monorepo shape
-    (`conftest.nested_repo_root_paths`) `repo_root` is an ANCESTOR of the project, so
-    `git -C repo_root status` did see the ledger edit and the old code committed it,
-    and an inequality-only guard would keep passing on a fixture that drifted there.
+    Each topology guards its premise before its outcome (docs/testing.md): the two
+    roots are compared RESOLVED and asserted DISJOINT rather than merely unequal,
+    and the artifacts directory is asserted inside (or outside) the tree the row is
+    about. Disjointness is the shape this bites in — in the NESTED/monorepo shape
+    (`conftest.nested_repo_root_paths`) `repo_root` is an ANCESTOR of the project,
+    so `git -C repo_root status` did see the ledger edit and even the old code
+    committed it, and an inequality-only guard would keep passing on a fixture that
+    drifted there.
 
-    Ablation: drop `root=_project_of_run_dir(self.run_dir)` at any of the four call
-    sites (back to the `workspace.root` default) — that row reds with DW-1 still
-    `open` in the `HEAD` blob, the project tree dirty, and no `sweep-ledger-commit`
-    row."""
-    from bmad_loop.workspace import Workspace
-
-    engine, _ = make_sweep(project, [])
-    call, done_ids = setup(project, engine)
-    elsewhere = tmp_path / "code-repo"
-    elsewhere.mkdir()
-    git(elsewhere, "init")
-    engine.workspace = Workspace(root=elsewhere, paths=engine.workspace.paths)
+    Ablation: respell `root=ledger.parent` at any of the four call sites as
+    `root=_project_of_run_dir(self.run_dir)` — topology A stays green while B reds
+    with DW-1 still `open` in the code repo's `HEAD` blob and C reds naming the
+    project instead of the artifacts directory. Drop the `root=` argument entirely
+    (back to the `workspace.root` default) and A and C red as well."""
+    paths, code_root, check = topology(project, tmp_path)
+    engine, _ = make_sweep(paths, [])
+    call, done_ids = setup(paths, engine)
     engine.run_dir.mkdir(parents=True, exist_ok=True)
     # premise before outcome: resolved, and DISJOINT — not merely unequal, since the
     # nested shape commits correctly under the old code and would grade nothing
-    code_root, ledger_root = engine.workspace.root.resolve(), project.project.resolve()
-    assert code_root != ledger_root
-    assert ledger_root not in code_root.parents and code_root not in ledger_root.parents
-    assert git(project.project, "status", "--porcelain") == ""  # only the phase's edit follows
-    before = project.deferred_work.read_text(encoding="utf-8")
+    code_resolved, project_resolved = engine.workspace.root.resolve(), project.project.resolve()
+    assert code_resolved == code_root.resolve()  # the override really took
+    assert code_resolved != project_resolved
+    assert project_resolved not in code_resolved.parents
+    assert code_resolved not in project_resolved.parents
+    _settle(project.project, code_root)  # only the phase's own edit follows
+    assert git(project.project, "status", "--porcelain") == ""
+    assert git(code_root, "status", "--porcelain") == ""
+    before = paths.deferred_work.read_text(encoding="utf-8")
 
     call()
 
     # premise: this site really did edit the ledger, so "it was committed" has
     # something to be about — a setup that silently stopped producing dirt would
     # otherwise satisfy every assertion below by committing nothing.
-    after = project.deferred_work.read_text(encoding="utf-8")
+    after = paths.deferred_work.read_text(encoding="utf-8")
     assert after != before
-    # the ledger edit is COMMITTED in the project tree, not merely written there
-    ledger_rel = str(project.deferred_work.relative_to(project.project)).replace("\\", "/")
-    blob = git(project.project, "show", f"HEAD:{ledger_rel}")
-    # `conftest.git` strips its stdout, so the comparison is against the stripped
-    # working file; the ledger has no leading space and one trailing newline.
-    assert blob == after.strip()  # the blob at HEAD is the edit, byte for byte
-    committed = {e.id: e for e in deferredwork.parse_ledger(blob)}
-    assert {i for i, e in committed.items() if not e.open} == done_ids
-    assert committed["DW-2"].open  # and the untouched sibling is untouched
-    assert git(project.project, "status", "--porcelain") == ""  # clean for this cycle's bundles
-    [commit] = _records(engine, "sweep-ledger-commit")
-    assert commit["commit"] == git(project.project, "rev-parse", "HEAD")
-    # ...and the code repo, whose tree these writes never touched, receives nothing
-    assert git(elsewhere, "rev-list", "--all", "--count") == "0"
-    assert list(elsewhere.rglob("deferred-work.md")) == []
+    check(engine, paths, after, done_ids)
+
+
+def test_a_re_rooted_ledger_commit_stages_the_whole_enclosing_repository(project, tmp_path):
+    """What a re-rooted publisher's commit CONTAINS, which every topology row above
+    hides by settling each tree first.
+
+    `_commit_ledger`'s two git calls do not see the same scope, and after re-rooting
+    that gap is visible: `verify.worktree_clean` pathspecs `-- .`, so it asks only
+    about `root`'s own subtree, while `verify.commit_story` runs `git add -A`, which
+    stages the WHOLE repository enclosing it. So the decision to commit is made from
+    the artifacts directory and the commit itself takes everything the code repo is
+    carrying — here an unrelated new file and an edit to a tracked source file that
+    have nothing to do with the sweep.
+
+    Graded rather than asserted in prose because it is the shape a reader is most
+    likely to get wrong from the call site, and because the deferred non-empty-pass
+    guard is about exactly this: the ledger commits are unconditional, so a user's
+    in-flight edits ride along. That guard belongs to all seven sites at once and is
+    deliberately not added here — this row pins the behavior as it stands, so
+    landing the guard later has to change a test rather than pass silently.
+
+    Topology B (artifacts INSIDE the disjoint code repo) is the sharp one: the
+    enclosing repository is the code checkout, which is exactly where a human's
+    unrelated work lives. Under topology A the same `add -A` sweeps the project.
+
+    Ablation: narrow `commit_story` to the ledger path alone and the file list reds,
+    carrying the ledger by itself."""
+    code_root = _copy_code_repo(project, tmp_path / "code-repo")
+    artifacts = code_root / "_bmad-output" / "implementation-artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    paths = replace(project, implementation_artifacts=artifacts, repo_root=code_root)
+    engine, _ = make_sweep(paths, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    write_ledger(paths, {"DW-1": "open", "DW-2": "open"}, commit=False)
+    _settle(project.project, code_root)
+    # premise: the code repo really is the tree enclosing the artifacts, and it is
+    # clean before the unrelated work below lands
+    assert code_root.resolve() in artifacts.resolve().parents
+    assert git(code_root, "status", "--porcelain") == ""
+    # a human's in-flight work in the code checkout, untouched by the sweep
+    (code_root / "unrelated.txt").write_text("wip\n", encoding="utf-8")
+    (code_root / "src.txt").write_text("edited\n", encoding="utf-8")
+
+    assert (
+        engine._close_resolved(
+            TriagePlan(
+                open_ids=frozenset({"DW-1", "DW-2"}),
+                already_resolved=(ResolvedEntry("DW-1", "fixed by a1b2c3d"),),
+            )
+        )
+        == 1
+    )
+
+    ledger_rel = str(paths.deferred_work.relative_to(code_root)).replace("\\", "/")
+    files = sorted(git(code_root, "show", "--name-only", "--pretty=format:", "HEAD").split())
+    assert files == sorted([ledger_rel, "src.txt", "unrelated.txt"])
+    assert git(code_root, "status", "--porcelain") == ""  # ...and the tree goes clean
+
+
+# The sanctioned `root=` spellings, by family. Compared as `ast.unparse` text,
+# which is exact for these and stable across formatting. The ledger family is ONE
+# fully-qualified spelling on purpose: a bare `ledger.parent` is name-scoped, and
+# `sweep.py` also binds `ledger = self.paths.deferred_work` — the UN-rebased file,
+# a different path in a different tree under worktree isolation — so a publisher
+# added in that scope would have satisfied a text match while naming the wrong tree.
+_LEDGER_ROOTED = frozenset({"self.workspace.paths.deferred_work.parent"})
+_PROJECT_ROOTED = frozenset({"project", "_project_of_run_dir(self.run_dir)"})
 
 
 def test_every_sweep_ledger_commit_names_its_own_tree():
-    """No `_commit_ledger` call in `sweep.py` may take the `root=None` default.
+    """Every `_commit_ledger` call in `sweep.py` names the tree that owns the file
+    the caller just wrote — checked by the argument's VALUE, not its presence.
 
     The behavioral rows above drive four of the seven callers; this one is TOTAL,
     and it is what holds the fifth publisher (the post-migration commit, which
-    cannot be driven at that layer) plus any caller added later. Without it a
-    partial revert — re-rooting some sites and not others, or a new phase that
-    copies the old default-root spelling — leaves the suite green while
-    reinstating exactly the DW-175 bug: under a disjoint `repo_root` the clean
-    check interrogates a code repo the write never touched.
+    cannot be driven at that layer) plus any caller added later. Presence alone is
+    not enough: `root=None` and `root=self.workspace.root` are both explicit
+    arguments, and either would reinstate a bug the suite would stay green through
+    — the first by inheriting the default, the second by interrogating the code repo
+    under a disjoint `repo_root`. So each call's root must be one of exactly two
+    sanctioned spellings, and the two families must be the right SIZE:
+
+    * five LEDGER-rooted publishers, all spelling
+      `self.workspace.paths.deferred_work.parent`. `implementation_artifacts` is
+      configurable to any absolute path, so only the ledger's own directory is
+      correct in all three topologies — and only the WORKSPACE's copy of it, since
+      `self.paths.deferred_work` is a different file under worktree isolation.
+    * two PROJECT-rooted prunes (`_project_of_run_dir(self.run_dir)`, or the
+      `project` local each site binds to exactly that). The pre-answer store is a
+      bare join off the project root that no config knob can move.
 
     Source-level rather than behavioral on purpose, the same shape
     `test_portability_guard.py` uses for the `_run_git` and tmux-argv chokepoints:
-    the property is "every call site spells the argument", which no single run can
+    "every call site spells the right argument" is a property no single run can
     observe. The `root=None` DEFAULT itself stays — it is `_commit_ledger`'s
     published contract and `test_a_default_rooted_commit_failure_still_raises`
     grades it — this guard only forbids in-tree callers from relying on it.
 
-    Ablation: drop `root=` from any one `_commit_ledger` call and this reds naming
+    Known limit: one bare name is still accepted — `project`, on the prune side.
+    A site that bound that name to something else would pass, though both prune
+    sites assign it from `_project_of_run_dir(self.run_dir)` two lines above their
+    call, and tightening this to the inline call would force them to spell the
+    helper twice. The LEDGER side has no such gap left: its single sanctioned
+    spelling resolves through `self.workspace`, which no local can shadow.
+
+    Ablation: respell any publisher's `root=` as `_project_of_run_dir(self.run_dir)`
+    and the family counts red (4 ledger-rooted, 3 project-rooted); respell it
+    `self.workspace.root` or drop the argument and the per-call check reds naming
     that line."""
     import ast
 
     source = (Path(sweep_mod.__file__)).read_text(encoding="utf-8")
     tree = ast.parse(source)
-    bare = [
-        node.lineno
+    calls = [
+        node
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "_commit_ledger"
-        and not any(kw.arg == "root" for kw in node.keywords)
     ]
-    assert bare == [], f"sweep.py:{bare} call _commit_ledger without an explicit root="
     # premise: the scan actually finds the calls it is grading, so an AST shape
     # change cannot turn this into a guard over an empty set
-    rooted = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_commit_ledger"
-    ]
-    assert len(rooted) == 7, f"expected 7 _commit_ledger callers, found {len(rooted)}: {rooted}"
+    assert len(calls) == 7, f"expected 7 _commit_ledger callers, found {len(calls)}"
+    roots = {}
+    for node in calls:
+        root = next((kw.value for kw in node.keywords if kw.arg == "root"), None)
+        assert root is not None, f"sweep.py:{node.lineno} calls _commit_ledger with no root="
+        roots[node.lineno] = ast.unparse(root)
+    # named explicitly, ahead of the whitelist, because these two are the regressions
+    # the whitelist exists to stop and a reader should see them refused by name
+    assert [line for line, spelling in roots.items() if spelling == "None"] == []
+    assert [line for line, spelling in roots.items() if spelling == "self.workspace.root"] == []
+    unsanctioned = {
+        line: spelling
+        for line, spelling in roots.items()
+        if spelling not in _LEDGER_ROOTED | _PROJECT_ROOTED
+    }
+    assert unsanctioned == {}, f"unsanctioned _commit_ledger roots: {unsanctioned}"
+    ledger_rooted = sorted(line for line, s in roots.items() if s in _LEDGER_ROOTED)
+    project_rooted = sorted(line for line, s in roots.items() if s in _PROJECT_ROOTED)
+    assert len(ledger_rooted) == 5, f"expected 5 ledger-rooted publishers: {ledger_rooted}"
+    assert len(project_rooted) == 2, f"expected 2 project-rooted prunes: {project_rooted}"
 
 
 _UNDECODABLE_LEDGER = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
@@ -8012,7 +8251,9 @@ def test_an_undecodable_ledger_in_close_resolved_degrades_and_the_sweep_continue
     assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER  # nothing published
 
 
-def test_an_undecodable_ledger_during_an_attended_decision_degrades_per_decision(project):
+def test_an_undecodable_ledger_during_an_attended_decision_degrades_per_decision(
+    project, monkeypatch
+):
     """DW-166. The reachable shape, and the one with a persistence hazard behind it.
 
     `prompter.ask` BLOCKS on the human, so a ledger that goes undecodable while the
@@ -8037,9 +8278,19 @@ def test_an_undecodable_ledger_during_an_attended_decision_degrades_per_decision
     The human's own answers both survive in `answers` and in `decision-answered` —
     losing those is what the ordering above exists to prevent.
 
+    A sixth, and the reason the commit guard is per-ATTEMPT rather than sticky: the
+    phase still COMMITS. DW-2's effect read and wrote the ledger, which settles the
+    doubt DW-1's fault raised — so the human-authorized `decision:` line DW-2 landed
+    must not be left dirty in the worktree immediately ahead of `_materialize_bundles`
+    and this cycle's bundles, which need a clean baseline. Nothing later would pick it
+    up: without `--repeat` there is no next cycle at all. The hand-back still reports
+    the partial miss, which is the other flag's job.
+
     Ablation: drop the `try`/`except` around `self._apply_decision_effect(...)` and
     this reds with the `LedgerReadError` escaping `_decisions_phase` — with DW-1's
-    `decision-answered` row already on disk, which is the point."""
+    `decision-answered` row already on disk, which is the point. Make the commit
+    guard STICKY (never clear it on a successful effect) and the commit assertions
+    below red with DW-2's line uncommitted and the tree dirty."""
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
     good = project.deferred_work.read_bytes()
     engine, _ = make_sweep(project, [])
@@ -8050,6 +8301,8 @@ def test_an_undecodable_ledger_during_an_attended_decision_degrades_per_decision
         decisions=(_close_or_keep_decision("DW-1"), _close_or_keep_decision("DW-2")),
     )
     prompts = []
+    printed = []
+    asked = _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
 
     def answer(_prompt):
         # the ledger goes undecodable WHILE DW-1's prompt is open, and is repaired
@@ -8058,7 +8311,7 @@ def test_an_undecodable_ledger_during_an_attended_decision_degrades_per_decision
         project.deferred_work.write_bytes(_UNDECODABLE_LEDGER if not prompts[-1] else good)
         return "1"
 
-    engine.prompter = DecisionPrompter(input_fn=answer, print_fn=lambda _line: None)
+    engine.prompter = DecisionPrompter(input_fn=answer, print_fn=printed.append)
     emits = []
     original_emit = engine._emit
 
@@ -8081,6 +8334,26 @@ def test_an_undecodable_ledger_during_an_attended_decision_degrades_per_decision
     entries = ledger_entries(project)
     assert entries["DW-1"].open  # the effect the degrade dropped
     assert entries["DW-2"].status.startswith("done ")  # the walk carried on
+    # ...and DW-2's line is COMMITTED, not merely written: the last effect read and
+    # wrote the ledger, so the fault before it no longer says anything about the
+    # bytes on disk. `HEAD` is the assertion, since a withheld commit still leaves
+    # the working file saying `done`.
+    [commit] = _records(engine, "sweep-ledger-commit")
+    assert commit["commit"] == git(project.project, "rev-parse", "HEAD")
+    assert git(project.project, "status", "--porcelain") == ""
+    ledger_rel = str(project.deferred_work.relative_to(project.project)).replace("\\", "/")
+    committed = {
+        e.id: e
+        for e in deferredwork.parse_ledger(git(project.project, "show", f"HEAD:{ledger_rel}"))
+    }
+    assert committed["DW-2"].status.startswith("done ")
+    assert committed["DW-1"].open
+
+    assert len(asked) == 1
+    assert engine.prompting is False
+    assert not any("decisions recorded" in line for line in printed)
+    [miss] = [line for line in printed if "not every decision reached" in line]
+    assert "sweep-decision-effect-unavailable" in miss
 
 
 def test_close_resolved_degrades_on_lock_and_state_root_failures(project, monkeypatch):
@@ -8173,25 +8446,97 @@ def test_decision_effect_degrades_on_lock_and_state_root_failures(project, monke
     assert all(entry.open for entry in ledger_entries(project).values())
 
 
+@pytest.mark.parametrize(
+    "first_effect_lands", [False, True], ids=["all-fault", "success-then-fault"]
+)
+def test_a_walk_ending_in_a_fault_commits_nothing_and_says_so(
+    project, monkeypatch, first_effect_lands
+):
+    """The last fault withholds this phase's commit and still returns the terminal.
+
+    Cover both total failure and a successful close followed by corruption. The
+    latter counts the earlier close, but the corrupt working bytes must not reach
+    HEAD. The answers survive in the run store even when the ledger write fails.
+
+    Ablation: remove the commit guard; both rows commit the corrupt bytes. Derive
+    the message from whether any effect succeeded; success-then-fault falsely
+    announces success. The inverse order's test separately pins the sticky warning.
+    """
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    good = project.deferred_work.read_text(encoding="utf-8")
+    asked = _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+    engine, _ = make_sweep(project, [])
+    engine.prompting = True
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    printed = []
+    prompts = []
+
+    def answer(_prompt):
+        prompts.append(None)
+        if len(prompts) > 1 or not first_effect_lands:
+            project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
+        return "1"
+
+    engine.prompter = DecisionPrompter(input_fn=answer, print_fn=printed.append)
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}),
+        decisions=(_close_or_keep_decision("DW-1"), _close_or_keep_decision("DW-2")),
+    )
+
+    answers, closed = engine._decisions_phase(plan)  # must not raise
+
+    assert closed == int(first_effect_lands)
+    assert set(answers) == {"DW-1", "DW-2"}  # ...and the human's answers survive
+    failed_ids = ["DW-2"] if first_effect_lands else ["DW-1", "DW-2"]
+    assert [r["dw_id"] for r in _records(engine, "sweep-decision-effect-unavailable")] == failed_ids
+    # NOTHING was committed, and the corrupt bytes are still only in the worktree
+    assert _records(engine, "sweep-ledger-commit") == []
+    assert git(project.project, "status", "--porcelain") != ""  # the ledger is dirty
+    ledger_rel = str(project.deferred_work.relative_to(project.project)).replace("\\", "/")
+    assert git(project.project, "show", f"HEAD:{ledger_rel}") == good.strip()
+    assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER  # ...still on disk
+    # the hand-back RAN anyway: the trigger is the human, not the effects
+    assert len(asked) == 1
+    assert engine.prompting is False
+    assert len(_records(engine, "sweep-returned-after-decisions")) == 1
+    # ...and it told the truth about what did and did not land. `print_fn` also
+    # renders each prompt, so the claim is over EVERY line: no line anywhere may
+    # say the decisions were recorded, and exactly one reports the ledger miss —
+    # naming the journal kind, and not led by the success glyph.
+    assert [line for line in printed if "decisions recorded" in line] == []
+    [miss] = [line for line in printed if "not every decision reached" in line]
+    assert "sweep-decision-effect-unavailable" in miss
+    assert not miss.startswith("✓")
+
+
 def test_a_ledger_commit_in_a_non_git_project_keeps_the_write_and_journals(project):
     """DW-175. Re-rooting the ledger publishers hands them `_commit_ledger`'s
     `GitError` degrade, and that is REQUIRED rather than incidental — this is the row
     that grades the claim.
 
-    Nothing requires the project to be a git repository: `cli`'s sweep precondition
-    checks `paths.repo_root` alone, so a project whose artifacts live under a code
-    root elsewhere need never have been `git init`-ed. Before the re-rooting these
-    publishers committed against `workspace.root` — a real repo — and a non-git
-    project simply left the ledger edit uncommitted. Rooted at the project,
-    `git status` there answers `fatal: not a git repository`. Keeping the publishers
-    loud after re-rooting would therefore have turned every ledger commit in such a
-    project into a sweep-ending raise: STRICTLY WORSE than the missed commit it
-    replaced, which is why the degrade is part of the fix and not a separate
-    kindness.
+    Nothing requires the tree holding the ledger to be a git repository: `cli`'s
+    sweep precondition checks `paths.repo_root` alone, so a project whose artifacts
+    live under a code root elsewhere need never have been `git init`-ed — and a
+    freestanding `implementation_artifacts` need not be inside any repository at
+    all. Before the re-rooting these publishers committed against `workspace.root`
+    — a real repo — and such a project simply left the ledger edit uncommitted.
+    Rooted at the ledger's own directory, `git status` there answers `fatal: not a
+    git repository`. Keeping the publishers loud after re-rooting would therefore
+    have turned every ledger commit in such a project into a sweep-ending raise:
+    STRICTLY WORSE than the missed commit it replaced, which is why the degrade is
+    part of the fix and not a separate kindness.
+
+    The tree named in the journal row is the ARTIFACTS directory, not the project:
+    that is the directory this publisher handed git, and naming what was actually
+    interrogated is what lets an operator find the tree to `git init` (or to
+    reconfigure). The `_artifacts_in_no_repository` topology above grades the same
+    degrade where the artifacts sit outside every repository rather than inside a
+    project that stopped being one.
 
     `test_a_prune_in_a_non_git_project_keeps_the_store_write_and_journals` above
-    pins the same degrade for the pre-answer prune; this pins it for a publisher, so
-    the docstring claim that both inherit it is graded rather than asserted in prose.
+    pins the same degrade for the pre-answer prune, which names the PROJECT because
+    that is the tree the store lives in; this pins it for a publisher, so the
+    owner-of-the-file rule is graded on both families rather than asserted in prose.
 
     Ablation: drop the `except verify.GitError` arm in `_commit_ledger` and this reds
     with the `GitError` escaping `_close_resolved`."""
@@ -8211,7 +8556,8 @@ def test_a_ledger_commit_in_a_non_git_project_keeps_the_write_and_journals(proje
     assert ledger_entries(project)["DW-1"].status.startswith("done ")  # write survived
     assert _records(engine, "sweep-ledger-commit") == []  # nothing could be committed
     [failed] = _records(engine, "sweep-ledger-commit-unavailable")
-    assert failed["repo"] == str(project.project)
+    assert failed["repo"] == str(project.implementation_artifacts)  # the ledger's own tree
+    assert failed["repo"] != str(project.project)  # ...not the project, which owns no part
     assert "not a git repository" in failed["error"]
 
 

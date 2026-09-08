@@ -81,6 +81,22 @@ def increment_decimal_digits(value: str) -> str:
     return "".join(digits)
 
 
+# The two lines `_return_after_decisions` shows a human, as whole named constants
+# joined explicitly. Assembling either at the call site out of adjacent string
+# literals is what this avoids: a reflow can silently re-bind a trailing literal
+# to one arm of a conditional, and these are the only strings that phase prints.
+# The failure line does not lead with the success glyph — a `✓` in front of a
+# miss reads as success at a glance — and it names the journal kind an operator
+# greps for, since the answers really are saved and only the ledger is short.
+_HANDBACK_TAIL = "sweep continues in the background"
+_HANDBACK_RECORDED = " ".join(["✓ decisions recorded —", _HANDBACK_TAIL])
+_HANDBACK_LEDGER_MISS = " ".join(
+    [
+        "! answers saved, but not every decision reached the deferred-work ledger",
+        "(see sweep-decision-effect-unavailable in the journal) —",
+        _HANDBACK_TAIL,
+    ]
+)
 # The scalars a stored answer's consumers read as strings, split by WHO reads them.
 # `_agreeing_option` runs on both `_materialize_bundles` lanes, so `key`/`label` are
 # consumed whatever the effect; `intent`/`bundle_name` are read by the BUILD lane
@@ -1256,9 +1272,15 @@ class SweepEngine(Engine):
             # a recovered bundle's ledger restore can leave the tree dirty, and
             # triage plus the first bundle baseline need a clean one. Guarded on
             # a non-empty pass so a fresh sweep never commits the user's dirt.
+            # The ledger's OWN directory (`_commit_ledger`): this publisher wrote
+            # the ledger, so it names the tree that holds it. Spelled off
+            # `self.workspace.paths` rather than a `ledger` local, at every one of
+            # the five publishers: `self.paths.deferred_work` is a DIFFERENT file
+            # under worktree isolation, and only the workspace's copy is the one a
+            # publisher just wrote.
             self._commit_ledger(
                 "chore(sweep): commit ledger after recovering in-flight bundles",
-                root=_project_of_run_dir(self.run_dir),
+                root=self.workspace.paths.deferred_work.parent,
             )
         while True:
             # First statement of the loop body: covers the boundary right after
@@ -1338,9 +1360,10 @@ class SweepEngine(Engine):
                 return
             # a deferred bundle's ledger restore can leave the tree dirty; the
             # next cycle's triage and bundle baselines need a clean tree
+            # the ledger's own directory, as above
             self._commit_ledger(
                 "chore(sweep): commit ledger before next sweep cycle",
-                root=_project_of_run_dir(self.run_dir),
+                root=self.workspace.paths.deferred_work.parent,
             )
             cycle += 1
 
@@ -1499,11 +1522,11 @@ class SweepEngine(Engine):
             self.journal.append("decision-preanswers-pruned", dw_ids=dropped)
             # Committed in the STORE's root, not the workspace's: the same
             # divergence that made the prune miss its file made the commit miss
-            # its tree (DW-160). The claim is about the STORE alone — that is the
-            # only file this prune writes, and `implementation_artifacts` may be
-            # configured outside the project tree entirely (see
-            # `ProjectPaths.rebased`), so this root is not a general home for
-            # everything a sweep edits.
+            # its tree (DW-160). Owner of the file, the rule `_commit_ledger`
+            # states — this prune writes the pre-answer store and nothing else,
+            # and the store is a bare join off the project root that no config
+            # knob can move. The ledger PUBLISHERS name the ledger's own
+            # directory for the same rule and a different answer.
             self._commit_ledger(
                 "chore(sweep): drop consumed deferred-work pre-answers", root=project
             )
@@ -1555,9 +1578,11 @@ class SweepEngine(Engine):
         )
         # Committed like `_prune_pre_answers`': `_materialize_bundles` runs ahead of
         # this cycle's bundles, and bundles need a clean baseline. In the STORE's
-        # root for the same reason the removal used it — where `repo_root` names a
-        # DISJOINT tree, `workspace.root` is a separate repo and a clean check
-        # there says nothing about the tree this write dirtied (DW-160).
+        # root for the same reason the removal used it — owner of the file
+        # (`_commit_ledger`), and the store is a bare join off the project root.
+        # Where `repo_root` names a DISJOINT tree, `workspace.root` is a separate
+        # repo and a clean check there says nothing about the tree this write
+        # dirtied (DW-160).
         self._commit_ledger("chore(sweep): drop stale deferred-work pre-answer", root=project)
 
     def _drive_story(self, task: StoryTask) -> None:
@@ -2070,9 +2095,10 @@ class SweepEngine(Engine):
                 (self.run_dir / "migrate-result.json").write_text(
                     json.dumps(result.result_json, indent=2), encoding="utf-8"
                 )
+                # the ledger's own directory: the migration rewrote the ledger
                 self._commit_ledger(
                     "chore(sweep): migrate legacy deferred-work entries to DW format",
-                    root=_project_of_run_dir(self.run_dir),
+                    root=self.workspace.paths.deferred_work.parent,
                 )
                 post = deferredwork.parse_ledger(new_text)
                 self.journal.append(
@@ -2349,9 +2375,10 @@ class SweepEngine(Engine):
             return 0
         if closed:
             self.journal.append("sweep-resolved-closed", dw_ids=closed)
+        # the ledger's own directory: `mark_done_many` above wrote the ledger
         self._commit_ledger(
             "chore(sweep): close resolved deferred-work entries",
-            root=_project_of_run_dir(self.run_dir),
+            root=self.workspace.paths.deferred_work.parent,
         )
         self._emit("post_close_resolved")
         return len(closed)
@@ -2493,6 +2520,17 @@ class SweepEngine(Engine):
             )
         pending = [d for d in plan.decisions if d.id not in answers]
         answered_interactively = False
+        # TWO flags, because the commit and the hand-back ask different questions.
+        # `ledger_in_doubt` is the LAST attempt's verdict — set by the degrade
+        # below, cleared by the next effect that succeeds — so it means "the bytes
+        # now on disk are the ones an effect could not read". `any_effect_faulted`
+        # is sticky and only shapes what the human is told. A sticky flag on the
+        # commit would be wrong: a walk where DW-1 faults and DW-2 then lands a
+        # human-authorized `decision:` line would leave that line uncommitted
+        # immediately ahead of this cycle's bundles. Both start False, so a walk
+        # that runs no effects at all commits exactly as it did before.
+        ledger_in_doubt = False
+        any_effect_faulted = False
         if not self.prompting:
             pending = [d for d in pending if d.id not in self.state.sweep_skipped_decisions]
             for decision in pending:
@@ -2593,16 +2631,41 @@ class SweepEngine(Engine):
                     # happens, but the entry carries no `decision:` audit line
                     # recording who authorized it. Both are recoverable; crashing
                     # the sweep mid-walk is not, which is the trade this arm makes.
+                    #
+                    # `ledger_in_doubt` withholds this phase's commit below.
+                    # `commit_story` stages the WHOLE enclosing repository, so a
+                    # commit taken while the ledger on disk is the text an effect
+                    # could not read publishes exactly those bytes. It is the LAST
+                    # attempt's verdict, not the walk's: a later effect that
+                    # succeeds proves the ledger reads again and clears it, and
+                    # that commit then carries the earlier decisions' lines too.
+                    # `_close_resolved` refuses its commit on the same fault by
+                    # returning early, but its question is simpler — one
+                    # all-or-nothing `mark_done_many` batch, so nothing there can
+                    # have landed, where this walk writes one decision at a time.
+                    ledger_in_doubt = True
+                    any_effect_faulted = True
                     continue
+                # the ledger read and wrote, so the doubt the last fault raised is
+                # settled — whatever it left on disk is now committable
+                ledger_in_doubt = False
                 self._emit("post_decision", story_key=decision.id, decision_action=option.effect)
                 if option.effect == "close":
                     closed += 1
-        self._commit_ledger("chore(sweep): record deferred-work decisions", root=project_root)
+        if not ledger_in_doubt:
+            # The LEDGER's own directory, not the project and not
+            # `self.workspace.root`: this phase's write went to the ledger, and
+            # `implementation_artifacts` is configurable to any absolute path
+            # (see `_commit_ledger`).
+            self._commit_ledger(
+                "chore(sweep): record deferred-work decisions",
+                root=self.workspace.paths.deferred_work.parent,
+            )
         if answered_interactively:
-            self._return_after_decisions()
+            self._return_after_decisions(every_effect_landed=not any_effect_faulted)
         return answers, closed
 
-    def _return_after_decisions(self) -> None:
+    def _return_after_decisions(self, *, every_effect_landed: bool) -> None:
         """Once the human has answered this cycle's decisions over an attached
         terminal, hand it back so the sweep runs its bundles in the background —
         detach a plain-shell client, switch a tmux client back to its origin. A
@@ -2628,7 +2691,23 @@ class SweepEngine(Engine):
         name across that widening: it has always meant "no hand-back verified",
         which is what an unvouched switch reports too. Only a real return is
         announced: UNREACHABLE prints nothing, since there may be no one to
-        read it."""
+        read it.
+
+        `every_effect_landed` says only what the printed line may CLAIM, never
+        whether to hand back: the trigger above is unchanged, so a walk in which
+        every effect faulted still detaches and still goes unattended. It is
+        REQUIRED and keyword-only — there is exactly one caller, and a default
+        would make the optimistic claim the thing a new caller inherits by
+        forgetting. Sticky over the whole walk, unlike the flag that gates the
+        phase's commit: a PARTIAL miss is still a miss to the human, and the line
+        says "not every decision" rather than claiming a total one either way. The
+        answers themselves are on disk in `<run>/decisions.json`, which the next
+        cycle reloads, so what is short is the ledger alone. `bmad-loop decisions`
+        reconstructs unanswered questions from triage files and the project-level
+        pre-answer store; it does not read these run-local answers.
+        `sweep-returned-after-decisions` and every other branch are byte-identical
+        either way: the journal records the hand-back, and the
+        misses are already attributed by `sweep-decision-effect-unavailable`."""
         from .tui import launch  # import-light: launch.py has no textual imports
 
         outcome = launch.return_attached_client()
@@ -2637,7 +2716,9 @@ class SweepEngine(Engine):
         self.prompting = False
         if outcome is launch.ReturnOutcome.RETURNED:
             self.journal.append("sweep-returned-after-decisions")
-            self.prompter.print_fn("✓ decisions recorded — sweep continues in the background")
+            self.prompter.print_fn(
+                _HANDBACK_RECORDED if every_effect_landed else _HANDBACK_LEDGER_MISS
+            )
         else:
             self.journal.append("sweep-return-no-client")
 
@@ -2663,38 +2744,61 @@ class SweepEngine(Engine):
         """Commit pending orchestrator ledger edits; bundles need a clean
         baseline. No-op when the tree is already clean.
 
-        `root` is the tree the clean check and the commit both run against.
-        EVERY caller now passes it, and each names the tree its own write
-        dirtied. Both spellings resolve to `_project_of_run_dir(self.run_dir)`
-        today, but for two separate reasons and neither is an alias for the
-        other: the two pre-answer prunes wrote the pre-answer STORE, which lives
-        under the project that owns the run dir; the five ledger publishers
-        wrote the deferred-work ledger, which hangs off `implementation_artifacts`
-        and so stays project-rooted under the `repo_root` override. What they
-        share is that `self.workspace.root` is the wrong answer for both: where
-        `repo_root` names a tree DISJOINT from the project, committing against
-        the code repo interrogated a tree the write never touched (DW-160 for the
-        prunes, DW-175 for the publishers) — the clean check passed, nothing was
-        committed, and the project worktree stayed dirty ahead of this cycle's
-        bundles. Neither claim generalizes to "the project owns everything a
-        sweep edits": `implementation_artifacts` may be configured outside the
-        project tree entirely (see `ProjectPaths.rebased`), so a future caller
-        writing some third file must work out its own root rather than copy one.
+        `root` is the directory both git calls run in, and every caller passes it.
+        The two do NOT see the same scope, which matters now that it can be a
+        subdirectory rather than a repository root: `verify.worktree_clean`
+        pathspecs `-- .`, so it reports only what is dirty inside `root`'s own
+        subtree, while `verify.commit_story` runs `git add -A`, which stages the
+        WHOLE enclosing repository. So this method asks "is the ledger's directory
+        clean?" and, if not, commits everything the repository holding it is
+        carrying. A corollary: `worktree_clean`'s `:(exclude)<policy.toml>` is
+        relative to `root` too, so at the five publisher sites it names a path
+        under the artifacts directory and no longer reaches the real
+        `.bmad-loop/policy.toml` — an operator's uncommitted policy edit is
+        invisible to the check here and is then swept into the commit by `add -A`.
+        That is not new to the exclusion's own purpose (it exists so a policy edit
+        cannot BLOCK a run) and it is bounded by the same best-effort framing the
+        `GitError` degrade rests on, but it is the reason a caller must not read
+        this as a whole-repository clean check.
+
+        The rule for choosing `root` is OWNER OF THE FILE: a caller names the
+        directory holding the file it just published, and git resolves that
+        directory to whichever repository encloses it. Nothing here is derived
+        from a role ("the project owns sweep bookkeeping") — the two families
+        spell different roots because they write different files:
+
+        * the five ledger PUBLISHERS pass the ledger's own directory
+          (`ledger.parent`, i.e. `paths.implementation_artifacts`). The ledger
+          hangs off `implementation_artifacts`, which `bmadconfig._resolve`
+          accepts as any absolute path and `ProjectPaths.rebased` leaves unmoved
+          when it sits outside the project — so it may be under the project, or
+          inside a disjoint `repo_root`, or in no repository at all. Naming the
+          directory is the only spelling correct in all three.
+        * the two pre-answer PRUNES pass `_project_of_run_dir(self.run_dir)`.
+          The pre-answer store is a bare join off the project root
+          (`decisions.STORE_REL`) that no config knob can move, and the run dir
+          is the anchor no workspace swap relocates.
+
+        `self.workspace.root` is refused at every site. Where `repo_root` names a
+        tree DISJOINT from the project it is the separate CODE repo, so a
+        workspace-rooted commit interrogated a tree the write never touched
+        (DW-160 for the prunes, DW-175 for the publishers): the clean check
+        passed, nothing was committed, and the worktree carrying the edit stayed
+        dirty ahead of this cycle's bundles. A hardcoded project root fails the
+        mirror-image way for the publishers, which is why they do not use one.
 
         A `verify.GitError` degrades to a journal row naming the tree and the
-        error instead of propagating. Passing a root makes `worktree_clean`
-        reachable on a project that is not a git repo at all — the `cli` sweep
-        precondition only requires `paths.repo_root` to be one — where it raises
-        `git status failed ...: fatal: not a git repository`. Under the old
-        default that call ran against the code repo and the edit simply stayed
-        uncommitted; letting the raise through would abort the whole sweep over
-        bookkeeping that was always best effort. That reasoning was DW-160's for
-        the prunes and it carries to the publishers unchanged — re-rooting them
-        without it would have made a non-git project strictly WORSE than before,
-        turning every ledger commit there into a sweep-ending raise.
-        `decisions.apply_pre_answer` already degrades on `GitError` for this very
-        file ("best effort, so a non-git or dirty tree never blocks the on-disk
-        record") and this keeps them agreeing.
+        error instead of propagating, and under this rule the degrade is REQUIRED
+        rather than a kindness. `cli`'s sweep precondition only requires
+        `paths.repo_root` to be a git repository, so neither the project nor a
+        freestanding artifacts directory need be one, and `git status` there
+        answers `fatal: not a git repository`. Under the old workspace-rooted
+        default that call ran against a real repo and the edit simply stayed
+        uncommitted; letting the raise through after re-rooting would abort the
+        whole sweep over bookkeeping that was always best effort — strictly worse
+        than the missed commit it replaces. `decisions.apply_pre_answer` already
+        degrades on `GitError` for this very file ("best effort, so a non-git or
+        dirty tree never blocks the on-disk record") and this keeps them agreeing.
 
         The `root is None` arm has no in-tree caller left and STAYS anyway: the
         default and its raise are this method's published contract, so a new
