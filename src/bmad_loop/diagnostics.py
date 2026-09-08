@@ -1376,6 +1376,31 @@ def render_markdown(
             out.append("\n_Per-task event counts:_")
             for alias, counts in sorted(j.per_alias_event_counts.items()):
                 out.append(f"- `{alias}`: {_dict_inline(counts)}")
+        # Use the bounded, already-scrubbed collection, just as JSON does. These
+        # outcomes need their file/stop identity and presence flags in the default
+        # dump too; a kind histogram alone loses those distinctions.
+        sweep_entries = [
+            entry
+            for entry in j.entries
+            if entry.get("kind")
+            in {
+                "sweep-ledger-commit",
+                "sweep-ledger-commit-clean",
+                "sweep-ledger-commit-unavailable",
+                "sweep-repeat-done",
+            }
+        ]
+        if sweep_entries:
+            out.extend(
+                [
+                    "",
+                    "_Sweep publication and repeat stops (collected entries):_",
+                    "",
+                    "```json",
+                    json.dumps(sweep_entries, indent=2, ensure_ascii=False),
+                    "```",
+                ]
+            )
         out.append("")
 
         out.append("### Run-dir files (counts only)")

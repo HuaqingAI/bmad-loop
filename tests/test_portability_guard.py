@@ -515,6 +515,19 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "failed",
         "fallback",
         "field",
+        # `_commit_ledger`'s three rows (DW-192): WHICH of the two published files
+        # the row is about, as a LEXICAL basename (`path.name`). Benign because it
+        # is a code constant at both publisher families — `deferred-work.md` from
+        # `ProjectPaths.deferred_work`, `decisions.json` from `decisions.STORE_REL`
+        # — so no operator text can reach it. Explicitly NOT the RESOLVED tail:
+        # DW-188 follows a ledger symlink to a target the operator named, so
+        # `target.name` is arbitrary text of exactly the identifier shape
+        # `sanitize.scrub_json` ships verbatim, and blessing it here would
+        # pre-approve that text. Minted because the row's other identifiers are
+        # gone from a dump: `repo`, `message` and `error` are all in
+        # `diagnostics._JOURNAL_DROP_FIELDS`, so a scrubbed dump named no file at
+        # all. Not a path — the directory is `repo`, which stays dropped.
+        "file",
         "finished",
         "fired_at",
         "flat_remainder",
@@ -642,6 +655,16 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "stdout_bytes",
         "stdout_captured_bytes",
         "stdout_truncated",
+        # `sweep-repeat-done`'s stop discriminator (DW-201): WHICH of the repeat
+        # loop's five stops fired, as a closed five-value enum (`no-open` |
+        # `no-progress` | `max-cycles` | `legacy-appeared` | `ledger-unreadable`),
+        # every one of them a literal in `sweep.py`. Minted for the reason
+        # `drop_cause` and `regen_cause` above were: the natural spelling is
+        # `reason`, which sits in `diagnostics._JOURNAL_DROP_FIELDS` and ships as a
+        # presence boolean, collapsing all five stops into one indistinguishable
+        # row. `reason` is still written beside it, unchanged, carrying the same
+        # token — this field adds a surviving copy, it does not replace one.
+        "stop_cause",
         "strategy",
         "teardown_s",
         "to",
@@ -1199,6 +1222,18 @@ JOURNAL_KINDS = frozenset(
         "sweep-inflight-stranded",
         "sweep-intent-regenerated",
         "sweep-ledger-commit",
+        # DW-191. The NO-OP arm of the same producer, covering BOTH of
+        # `_commit_ledger`'s silent returns: the `verify.path_clean` early return,
+        # and the `sha is None` return where `verify.commit_paths` found the
+        # pathspec clean between the check and the commit. One kind for both
+        # because the operator-facing fact is identical — nothing was published
+        # because the pathspec held no change. Minted because `path_clean` reports
+        # an IGNORED path as clean, so the default ledger under a gitignored
+        # `implementation_artifacts` was skipped with no row of any kind, which a
+        # dump could not tell apart from a publisher that never ran. `message` is
+        # already dropped; `file` is the new benign field that names which of the
+        # two published files this is about.
+        "sweep-ledger-commit-clean",
         # The degrade arm of the same producer: an EXPLICITLY-rooted
         # `_commit_ledger` whose `verify.GitError` is journalled instead of
         # propagating, leaving the write on disk rather than aborting the sweep.

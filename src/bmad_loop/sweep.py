@@ -1391,8 +1391,18 @@ class SweepEngine(Engine):
                 if cycle > 1:
                     # freeform text appeared mid-run; _ensure_migration assumes
                     # one migration per run, so hand off to a fresh sweep
+                    # `stop_cause` beside `reason`, on all five stop sites (DW-201):
+                    # `diagnostics._JOURNAL_DROP_FIELDS` holds `reason` and renders it
+                    # as a presence boolean, so a scrubbed dump could not tell the five
+                    # stops apart at all. The same closed-slug convention `regen_cause`
+                    # (DW-164) and `drop_cause` use, and for the same reason — the two
+                    # carry the SAME token, so `reason` is unchanged for every reader
+                    # of the raw journal.
                     self.journal.append(
-                        "sweep-repeat-done", cycles=cycle - 1, reason="legacy-appeared"
+                        "sweep-repeat-done",
+                        cycles=cycle - 1,
+                        reason="legacy-appeared",
+                        stop_cause="legacy-appeared",
                     )
                     gates.notify(
                         self.policy,
@@ -1417,7 +1427,12 @@ class SweepEngine(Engine):
                 if cycle == 1:
                     self.journal.append("sweep-nothing-open", ledger=str(ledger))
                 else:
-                    self.journal.append("sweep-repeat-done", cycles=cycle - 1, reason="no-open")
+                    self.journal.append(
+                        "sweep-repeat-done",
+                        cycles=cycle - 1,
+                        reason="no-open",
+                        stop_cause="no-open",
+                    )
                 return
             selected_ids = {entry.id for entry in selection.selected}
             selector = "only" if self.only_ids is not None else f"min-severity:{self.min_severity}"
@@ -1462,7 +1477,12 @@ class SweepEngine(Engine):
                 # and re-running `bmad-loop sweep` is the resume. Deliberately NOT
                 # extended to the DW-176 absence refusal — an absent ledger ends
                 # the next cycle cleanly on `no-open`.
-                self.journal.append("sweep-repeat-done", cycles=cycle, reason="ledger-unreadable")
+                self.journal.append(
+                    "sweep-repeat-done",
+                    cycles=cycle,
+                    reason="ledger-unreadable",
+                    stop_cause="ledger-unreadable",
+                )
                 # The message NAMES the file and the re-run's precondition. Neither
                 # is guessable: `implementation_artifacts` is configurable to any
                 # absolute path and the ledger may be symlinked out of the project,
@@ -1482,10 +1502,20 @@ class SweepEngine(Engine):
                 )
                 return
             if not progressed:
-                self.journal.append("sweep-repeat-done", cycles=cycle, reason="no-progress")
+                self.journal.append(
+                    "sweep-repeat-done",
+                    cycles=cycle,
+                    reason="no-progress",
+                    stop_cause="no-progress",
+                )
                 return
             if cycle >= self.max_cycles:
-                self.journal.append("sweep-repeat-done", cycles=cycle, reason="max-cycles")
+                self.journal.append(
+                    "sweep-repeat-done",
+                    cycles=cycle,
+                    reason="max-cycles",
+                    stop_cause="max-cycles",
+                )
                 return
             # a deferred bundle's ledger restore can leave the LEDGER dirty, and
             # the next cycle's triage and bundle baselines read it, so it is
@@ -3117,8 +3147,13 @@ class SweepEngine(Engine):
         bare operand is a wildmatch glob), keeps a missing-but-TRACKED path as a
         deletion to stage, wraps its own root resolve in `GitError`, and answers
         `None` for "these paths held no change". `_commit_ledger` already knows
-        that from `path_clean`, so a `None` here means the pathspec went clean
-        between the two calls and there is nothing to announce.
+        that from `path_clean`, so a `None` here has TWO causes and not one: the
+        pathspec went clean between the two calls, or the single operand survived
+        neither the working tree nor the index (`commit_paths`' `if not rels:`
+        arm, which drops a path git has never seen so one optional operand cannot
+        hard-fail a whole commit) — a ledger deleted and left untracked after the
+        check reported it dirty. Both mean nothing was published, which is what
+        the row below announces.
 
         `path_clean` still runs FIRST, and is load-bearing rather than an
         optimization: `commit_paths` opens with `git add`, so without the check an
@@ -3140,41 +3175,77 @@ class SweepEngine(Engine):
         record") and this keeps them agreeing. The RESOLVE degrades to the same row
         for the same reason: `path.resolve()` can raise `OSError` (a broken link
         chain, a permission-denied component) or `RuntimeError` (a symlink loop),
-        and outside the `try` either would propagate out of a method this docstring
-        calls strictly best effort. `verify.commit_paths` and
+        so both are caught alongside Git failures. `verify.commit_paths` and
         `verify.last_commit_for` guard their own resolves against the same pair.
+        Best effort applies to Git publication and resolution only: journal I/O
+        failures propagate, as they do for other journal writes.
 
         `path` is a REQUIRED keyword argument with no default, replacing the old
         `root=None` arm and its runtime raise. That is strictly louder, not
         laxer: a caller that forgets to name the file it dirtied now fails at call
         time and under pyright, before any run, instead of on whichever branch
-        first reached the raise."""
+        first reached the raise.
+
+        Both no-op outcomes journal `sweep-ledger-commit-clean` (DW-191).
+        `path_clean` also answers True for an ignored path, so a ledger under a
+        gitignored `implementation_artifacts` was previously skipped with no row
+        at all. The shared row states only that nothing was published; no extra
+        git call distinguishes ignored, unchanged or disappeared operands.
+        Appends stay outside the guarded Git operations so a journal write fault
+        cannot be misreported as a publication failure.
+
+        `file` is the LEXICAL basename (`path.name`), never `target.name`, and
+        that distinction is what makes it declarable (DW-192). The degrade row's
+        other identifying field is `repo`, which — like `message` and `error`
+        beside it — sits in `diagnostics._JOURNAL_DROP_FIELDS`, so a scrubbed dump
+        retained nothing saying WHICH of the two published files went
+        uncommitted. `file` is declared benign in
+        `tests/test_portability_guard.py` and survives the scrub verbatim, and it
+        can only be declared benign because every caller passes a code constant —
+        `deferred-work.md` (`ProjectPaths.deferred_work`) or `decisions.json`
+        (`decisions.STORE_REL`) — so the lexical tail is invariant by
+        construction. The RESOLVED tail is not: the DW-188 resolve above follows
+        a symlink to a target the OPERATOR named, so `target.name` can be
+        arbitrary operator text of exactly the identifier shape `scrub_json`
+        ships verbatim, and a benign row for it would be pre-approving that text.
+        Bound beside `root` and before the `try` for the same reason `root` is,
+        so the degrade row still names the file when the resolve is what failed.
+        `repo` still carries the resolved directory for anyone reading the raw
+        journal."""
         # `root` is bound inside the `try` because the resolve that derives it can
         # itself fail; until it succeeds the only directory known is the LEXICAL
         # parent, which is what the degrade row then names.
         root = path.parent
+        # The LEXICAL tail, bound here rather than off `target` below: see the
+        # docstring — it is a code constant at every caller, which is what lets it
+        # be a benign (undropped) journal field, and the resolved tail is not.
+        name = path.name
         try:
             target = path.resolve()
             root = target.parent
-            if verify.path_clean(root, target.name):
-                return
-            sha = verify.commit_paths(root, message, [target])
+            # Preserve the clean short-circuit without catching journal write faults.
+            clean = verify.path_clean(root, target.name)
+            sha = None if clean else verify.commit_paths(root, message, [target])
         except (verify.GitError, OSError, RuntimeError) as e:
             # `repo` (not `root`): an absolute host path naming a git tree,
             # already routed out of diagnostics dumps, exactly as
             # `rearm-baseline-advance-failed` spells the same value. The RESOLVED
             # directory, which is the one git was actually asked about — or the
-            # lexical parent when the resolve is what failed.
+            # lexical parent when the resolve is what failed. `file` is what
+            # SURVIVES a dump: `repo`, `message` and `error` are all dropped.
             self.journal.append(
                 "sweep-ledger-commit-unavailable",
                 message=message,
                 repo=str(root),
                 error=str(e),
+                file=name,
             )
             return
         if sha is None:
-            return  # the pathspec went clean between the check and the commit
-        self.journal.append("sweep-ledger-commit", message=message, commit=sha)
+            # Already clean/ignored, raced clean, or absent and never tracked.
+            self.journal.append("sweep-ledger-commit-clean", message=message, file=name)
+            return
+        self.journal.append("sweep-ledger-commit", message=message, commit=sha, file=name)
 
     # ---------------------------------------------------------- bundles
 

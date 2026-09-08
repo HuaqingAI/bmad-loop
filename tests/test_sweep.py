@@ -6828,6 +6828,8 @@ def test_repeat_two_cycles_then_no_open(project):
     )
     summary = engine.run()
     assert not summary.paused
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == done["stop_cause"] == "no-open"
     tasks = engine.state.tasks
     assert tasks["sweep-triage"].phase == Phase.DONE
     assert tasks["dw-first-fix"].phase == Phase.DONE
@@ -6863,9 +6865,38 @@ def test_repeat_stops_on_no_progress(project):
     )
     summary = engine.run()
     assert not summary.paused
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == done["stop_cause"] == "no-progress"
     assert len(adapter.sessions) == 4  # the cycle-2 triage confirmed nothing addressable
     assert "no-progress" in journal_text(engine)
     assert ledger_entries(project)["DW-2"].open
+
+
+def test_repeat_stops_when_legacy_entries_appear_after_a_cycle(project, monkeypatch):
+    """A completed real cycle can be followed by a rival appending legacy prose.
+
+    Ablation: move the legacy stop append after its return and the row is absent.
+    """
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(["DW-1"], already_resolved=[{"id": "DW-1", "evidence": "already fixed"}])
+    engine, adapter = make_sweep(project, [triage_effect(plan)], policy=repeat_policy())
+    real_cycle = engine._cycle
+
+    def cycle_with_rival_append(cycle, open_now):
+        progressed = real_cycle(cycle, open_now)
+        with project.deferred_work.open("a", encoding="utf-8") as stream:
+            stream.write("\n" + LEGACY_LEDGER)
+        return progressed
+
+    monkeypatch.setattr(engine, "_cycle", cycle_with_rival_append)
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == done["stop_cause"] == "legacy-appeared"
+    assert done["cycles"] == 1
+    assert len(adapter.sessions) == 1
+    assert deferredwork.has_legacy(project.deferred_work.read_text(encoding="utf-8"))
 
 
 def test_repeat_max_cycles_cap(project):
@@ -6890,6 +6921,8 @@ def test_repeat_max_cycles_cap(project):
     )
     summary = engine.run()
     assert not summary.paused
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == done["stop_cause"] == "max-cycles"
     assert len(adapter.sessions) == 6  # no cycle-3 triage despite DW-3 open
     assert "max-cycles" in journal_text(engine)
     assert ledger_entries(project)["DW-3"].open
@@ -7853,6 +7886,10 @@ def test_a_prune_in_a_non_git_project_keeps_the_store_write_and_journals(project
     # at `<project>/.bmad-loop/decisions.json`, so its parent is that subdirectory
     # and not the project root itself
     assert failed["repo"] == str((project.project / ".bmad-loop").resolve())
+    # DW-192's "WHICH of the two published files": this is the row a `decisions.json`
+    # publisher actually produces, so the store family's constant is graded on a real
+    # producer rather than on a hand-seeded journal row
+    assert failed["file"] == "decisions.json"
     assert "not a git repository" in failed["error"]
 
 
@@ -7892,6 +7929,13 @@ def test_a_clean_published_path_returns_before_git_add(project, monkeypatch):
     This direct helper test pins the earlier check: phase guards do not all prove
     a ledger write, so the shared helper still needs its own clean-file early-out.
 
+    The return is no longer SILENT (DW-191): it journals `sweep-ledger-commit-clean`
+    naming the file, since an ignored path also reads clean here and a dump could
+    not tell a skipped publish apart from a publisher that never ran. That row's own
+    claim belongs to `test_a_gitignored_ledger_publish_journals_the_clean_skip...`
+    below; what this one still pins is that no COMMIT and no DEGRADE row is written
+    and git is never reached.
+
     Ablation: drop the `if verify.path_clean(...): return` arm in `_commit_ledger`
     and this fails inside the staging-helper stub."""
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})  # committed: the file is clean
@@ -7917,7 +7961,10 @@ def test_a_clean_published_path_returns_before_git_add(project, monkeypatch):
         "chore(sweep): a publish with nothing to publish", path=project.deferred_work
     )
 
-    assert not (engine.run_dir / "journal.jsonl").exists()  # no commit row AND no degrade row
+    assert _records(engine, "sweep-ledger-commit") == []  # no commit row...
+    assert _records(engine, "sweep-ledger-commit-unavailable") == []  # ...and no degrade row
+    [clean] = _records(engine, "sweep-ledger-commit-clean")  # the skip is announced (DW-191)
+    assert clean["file"] == "deferred-work.md"
     assert git(project.project, "rev-parse", "HEAD") == head
     assert git(project.project, "status", "--porcelain") == dirty_before  # still theirs
 
@@ -7925,7 +7972,12 @@ def test_a_clean_published_path_returns_before_git_add(project, monkeypatch):
 def test_a_publication_that_becomes_clean_announces_no_commit(project, monkeypatch):
     """Another writer can restore HEAD bytes between the check and staging.
 
-    Ablation: delete the sha-is-None early-out and the journal assertion fails.
+    The arm announces the skip rather than returning silently (DW-191), with the
+    SAME kind the `path_clean` return writes: the operator-facing fact is identical
+    — nothing was published because the pathspec held no change — so no
+    discriminator separates the race from the ordinary clean publish.
+
+    Ablation: delete the sha-is-None early-out and the commit-row assertion fails.
     """
     write_ledger(project, {"DW-1": "open"})
     engine, _ = make_sweep(project, [])
@@ -7946,7 +7998,9 @@ def test_a_publication_that_becomes_clean_announces_no_commit(project, monkeypat
     engine._commit_ledger("chore(sweep): publish", path=ledger)
 
     assert called == [[ledger.resolve()]]
-    assert not (engine.run_dir / "journal.jsonl").exists()
+    assert _records(engine, "sweep-ledger-commit") == []
+    [clean] = _records(engine, "sweep-ledger-commit-clean")
+    assert clean["file"] == "deferred-work.md"
     assert git(project.project, "rev-parse", "HEAD") == head
 
 
@@ -8015,6 +8069,7 @@ def test_a_divergent_root_prune_is_committed_in_the_project_tree(project, tmp_pa
     assert set(committed) == {"DW-2"}  # DW-1 gone from the blob at HEAD
     assert git(project.project, "status", "--porcelain") == ""  # clean for this cycle's bundles
     [commit] = _records(engine, "sweep-ledger-commit")
+    assert commit["file"] == "decisions.json"
     assert commit["commit"] == git(project.project, "rev-parse", "HEAD")
     # ...and the code repo, whose tree the prune never touched, receives nothing
     assert git(elsewhere, "rev-list", "--all", "--count") == "0"
@@ -9402,7 +9457,286 @@ def test_a_ledger_commit_in_a_non_git_project_keeps_the_write_and_journals(proje
     [failed] = _records(engine, "sweep-ledger-commit-unavailable")
     assert failed["repo"] == str(project.implementation_artifacts)  # the ledger's own tree
     assert failed["repo"] != str(project.project)  # ...not the project, which owns no part
+    assert failed["file"] == "deferred-work.md"  # the OTHER family's constant (DW-192)
     assert "not a git repository" in failed["error"]
+
+
+# ------------------- DW-191/DW-192: the ledger commit rows keep their identity
+
+
+def test_a_gitignored_ledger_publish_journals_the_clean_skip_naming_the_file(project):
+    """DW-191. `_commit_ledger`'s `path_clean` early return used to journal NOTHING,
+    and the path it silences most often is the DEFAULT one.
+
+    `verify.path_clean` runs `git status --porcelain` over a single pathspec, and an
+    IGNORED file produces no porcelain record at all — so an ignored ledger reads
+    exactly as clean as an unchanged one. `implementation_artifacts` is a generated
+    output directory that projects routinely gitignore, which made "the ledger was
+    never published" the ordinary outcome, announced by no row of any kind. In a
+    `bmad-loop diagnose` dump that silence is indistinguishable from a publisher
+    that never ran, which is the distinction an operator needs to make.
+
+    The row names the FILE, and that is the half a dump keeps: `message` is in
+    `diagnostics._JOURNAL_DROP_FIELDS`, so without `file` a scrubbed row would say
+    only that something was clean.
+
+    Premise before outcome (docs/testing.md): the ledger is really ignored and the
+    publisher really rewrote it, so a green row cannot come from a phase that
+    skipped its write.
+
+    Ablation: restore the bare `return` at the `path_clean` arm and this reds on the
+    missing record while every other assertion stays green — the publish is silent,
+    not wrong."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    git(project.project, "rm", "--cached", "-q", rel)
+    ignore_before_commit(project, rel)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ignore the ledger")
+    head = git(project.project, "rev-parse", "HEAD")
+    # premise: git really refuses to see this file, so `path_clean` answers clean
+    assert git(project.project, "status", "--porcelain") == ""
+    assert git(project.project, "check-ignore", rel) == rel
+    before = project.deferred_work.read_text(encoding="utf-8")
+
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    assert (
+        engine._close_resolved(
+            TriagePlan(
+                open_ids=frozenset({"DW-1", "DW-2"}),
+                already_resolved=(ResolvedEntry("DW-1", "fixed by a1b2c3d"),),
+            )
+        )
+        == 1
+    )
+
+    # premise: the publisher really wrote, so the silence being graded is the
+    # COMMIT's, not a phase that did nothing
+    assert project.deferred_work.read_text(encoding="utf-8") != before
+    assert ledger_entries(project)["DW-1"].status.startswith("done ")
+    [clean] = _records(engine, "sweep-ledger-commit-clean")
+    assert clean["file"] == "deferred-work.md"  # the LEXICAL basename, a code constant
+    assert clean["message"] == "chore(sweep): close resolved deferred-work entries"
+    assert _records(engine, "sweep-ledger-commit") == []  # nothing was published
+    assert _records(engine, "sweep-ledger-commit-unavailable") == []  # ...and nothing failed
+    assert git(project.project, "rev-parse", "HEAD") == head
+
+
+def test_a_disappearing_untracked_publication_announces_the_clean_skip(project, monkeypatch):
+    """Exercise commit_paths' real empty-operands return after an untracked file
+    disappears between the clean check and staging.
+
+    Ablation: remove the clean append and the required row assertion fails.
+    """
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    ledger = project.deferred_work
+    assert git(project.project, "ls-files", "--", str(ledger)) == ""
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    head = git(project.project, "rev-parse", "HEAD")
+    real_commit = verify.commit_paths
+    results = []
+
+    def remove_before_staging(repo, message, paths):
+        assert paths == [ledger.resolve()]
+        ledger.unlink()
+        result = real_commit(repo, message, paths)
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(verify, "commit_paths", remove_before_staging)
+    engine._commit_ledger("chore(sweep): disappeared", path=ledger)
+
+    assert results == [None]  # the real helper, not a stubbed return
+    [clean] = _records(engine, "sweep-ledger-commit-clean")
+    assert clean["file"] == "deferred-work.md"
+    assert clean["message"] == "chore(sweep): disappeared"
+    assert _records(engine, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+
+
+@pytest.mark.parametrize("outcome", ["clean", "commit", "unavailable"])
+def test_publication_journal_write_errors_propagate_without_retry(project, monkeypatch, outcome):
+    """Best effort applies to Git and resolution, never journal persistence.
+
+    Ablation: move the clean append inside the Git try and this fails because
+    an unavailable append is attempted after the first write fault.
+    """
+    write_ledger(project, {"DW-1": "open"}, commit=outcome == "clean")
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    if outcome == "unavailable":
+        shutil.rmtree(project.project / ".git")
+    attempted = []
+    failure = OSError("journal disk full")
+
+    def fail_append(kind, **fields):
+        attempted.append(kind)
+        raise failure
+
+    monkeypatch.setattr(engine.journal, "append", fail_append)
+    with pytest.raises(OSError, match="journal disk full") as caught:
+        engine._commit_ledger("chore(sweep): publish", path=project.deferred_work)
+
+    assert caught.value is failure
+    expected = "sweep-ledger-commit" + ("" if outcome == "commit" else f"-{outcome}")
+    assert attempted == [expected]
+
+
+def test_the_ledger_commit_rows_name_the_file_they_are_about(project):
+    """DW-192. Both surviving `_commit_ledger` rows carry `file`, because without it
+    a scrubbed dump names no file at all.
+
+    The degrade row identified its subject ONLY through `repo`, and `repo`,
+    `message` and `error` are every one of them in
+    `diagnostics._JOURNAL_DROP_FIELDS` — so `bmad-loop diagnose` rendered three
+    presence booleans and an operator could not tell which of the two published
+    files (`deferred-work.md` from a ledger publisher, `decisions.json` from a
+    pre-answer prune) had gone uncommitted. The success row had the same gap the
+    other way: `commit` is aliased, `message` dropped.
+
+    Graded on both arms in one row because the claim is about the FIELD, not about
+    either arm's own behavior, which the rows above and below already pin. The
+    degrade half also re-asserts `repo` and `error` unchanged: `file` is added
+    BESIDE the existing fields, never in place of them.
+
+    Ablation: drop either `file=name` argument and the matching half reds."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"}, commit=False)
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    engine._commit_ledger("chore(sweep): published", path=project.deferred_work)
+
+    [commit] = _records(engine, "sweep-ledger-commit")
+    assert commit["file"] == "deferred-work.md"
+    assert commit["commit"] == git(project.project, "rev-parse", "HEAD")  # unchanged fields
+    assert commit["message"] == "chore(sweep): published"
+
+    # the degrade arm: the tree holding the file stops being a repository
+    project.deferred_work.write_text(
+        project.deferred_work.read_text(encoding="utf-8") + "\n<!-- more -->\n", encoding="utf-8"
+    )
+    shutil.rmtree(project.project / ".git")
+    engine._commit_ledger("chore(sweep): degraded", path=project.deferred_work)
+
+    [failed] = _records(engine, "sweep-ledger-commit-unavailable")
+    assert failed["file"] == "deferred-work.md"
+    assert failed["repo"] == str(project.implementation_artifacts)  # unchanged fields
+    assert failed["message"] == "chore(sweep): degraded"
+    assert "not a git repository" in failed["error"]
+
+
+def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, monkeypatch):
+    """DW-192's OTHER degrade arm: the one where `path.resolve()` raises, not git.
+
+    `_commit_ledger` catches `OSError`/`RuntimeError` off the resolve — a broken
+    link chain, a permission-denied component, a symlink loop — and the row it then
+    writes names the LEXICAL parent, because `root` never advanced past its
+    pre-`try` binding. `file` is bound in the same place for the same reason, so
+    the one identifying field a scrubbed dump keeps is present on this arm too and
+    not only on the git-fault arm the row above grades. Without it this arm names
+    nothing at all: `repo`, `message` and `error` are every one of them in
+    `diagnostics._JOURNAL_DROP_FIELDS`.
+
+    Ablation: move `name = path.name` inside the `try` beside `target` and this
+    reds with a `NameError` escaping a method the docstring calls strictly best
+    effort — which makes the BINDING POSITION, not merely the field, the graded
+    thing."""
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    ledger = project.deferred_work
+    real_resolve = Path.resolve
+
+    def exploding_resolve(self, *args, **kwargs):
+        # scoped to the published file: everything else in the frame still resolves
+        if self == ledger:
+            raise OSError(40, "Too many levels of symbolic links")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", exploding_resolve)
+
+    engine._commit_ledger("chore(sweep): unresolvable", path=ledger)  # must not raise
+
+    [failed] = _records(engine, "sweep-ledger-commit-unavailable")
+    assert failed["file"] == "deferred-work.md"  # bound before the try, so still here
+    # the LEXICAL parent: the resolve that would have replaced it is what failed
+    assert failed["repo"] == str(ledger.parent)
+    assert "Too many levels" in failed["error"]
+    assert _records(engine, "sweep-ledger-commit") == []  # nothing published...
+    assert _records(engine, "sweep-ledger-commit-clean") == []  # ...and not a clean skip either
+
+
+def test_the_journalled_file_is_the_lexical_tail_not_the_symlink_target(project, tmp_path):
+    """DW-192's one non-obvious call, and the reason `file` can be a BENIGN journal
+    field at all.
+
+    `_commit_ledger` resolves `path` (DW-188) so a symlinked ledger commits in the
+    repository holding its target — which means `target.name` is whatever the
+    OPERATOR named that target. That value is identifier-shaped, so
+    `sanitize.scrub_json` would ship it verbatim, and declaring the field benign
+    would be pre-approving operator text in every dump. `path.name` is
+    `deferred-work.md` at all five publishers and `decisions.json` at both prunes —
+    code constants — so the lexical tail is invariant by construction.
+
+    `repo` still carries the RESOLVED directory, so nothing is lost for a reader of
+    the raw journal; it is only the scrubbed dump that trades the target's name for
+    a name no operator authored.
+
+    All three rows are driven through a resolvable symlink: successful publication,
+    clean skip, and a Git failure after resolution succeeds.
+
+    Ablation: respell any write as `file=target.name` and this reds with the
+    operator's own filename in the journal — which is exactly the value the benign
+    declaration promises can never appear there."""
+    ledger_repo = _copy_code_repo(project, tmp_path / "ledger-repo")
+    target = ledger_repo / "AcmeVault-backlog.md"
+    link = project.deferred_work
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    try:
+        link.symlink_to(target)
+    except OSError as exc:  # pragma: no cover - win32 without developer mode
+        pytest.skip(f"symlinks unavailable on this host: {exc}")
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"}, commit=False)  # writes THROUGH
+    _settle(project.project, ledger_repo)
+    # premise: the indirection is real and the names really differ
+    assert link.is_symlink() and link.readlink() == target
+    assert target.name != link.name
+
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    assert (
+        engine._close_resolved(
+            TriagePlan(
+                open_ids=frozenset({"DW-1", "DW-2"}),
+                already_resolved=(ResolvedEntry("DW-1", "fixed by a1b2c3d"),),
+            )
+        )
+        == 1
+    )
+
+    [commit] = _records(engine, "sweep-ledger-commit")
+    assert commit["file"] == "deferred-work.md"  # the LINK's name, not the target's
+
+    # ...and again over the now-published (so CLEAN) symlinked ledger, which is the
+    # arm the default gitignored shape takes every time
+    engine._commit_ledger("chore(sweep): nothing left to publish", path=project.deferred_work)
+
+    [clean] = _records(engine, "sweep-ledger-commit-clean")
+    assert clean["file"] == "deferred-work.md"
+    assert _records(engine, "sweep-ledger-commit-unavailable") == []  # premise: it really ran
+
+    shutil.rmtree(ledger_repo / ".git")
+    assert link.resolve() == target  # resolution succeeds; Git publication fails
+    engine._commit_ledger("chore(sweep): unavailable", path=link)
+    [failed] = _records(engine, "sweep-ledger-commit-unavailable")
+    assert failed["file"] == "deferred-work.md"
+    assert failed["repo"] == str(target.parent.resolve())
+    assert "not a git repository" in failed["error"]
+    assert "AcmeVault-backlog" not in journal_text(engine)  # the operator's name, nowhere
 
 
 def test_a_ledger_deleted_inside_the_cycle_refuses_the_prune_on_the_real_path(project):
@@ -9668,6 +10002,7 @@ def test_an_undecodable_prune_refusal_ends_a_repeat_run_before_the_boundary_comm
     assert missed["dw_id"] == "DW-2" and missed["effect"] == "close"
     [done] = _records(engine, "sweep-repeat-done")  # exactly one, and it is this stop
     assert done["reason"] == "ledger-unreadable"
+    assert done["stop_cause"] == done["reason"]
     assert done["cycles"] == 1  # the cycle COMPLETED, unlike `legacy-appeared`'s cycle - 1
     # cycle 1's close was published; the boundary commit was NOT taken, so the
     # bytes nobody can decode are absent from HEAD and still dirty on disk.
@@ -9713,6 +10048,7 @@ def test_an_undecodable_prune_in_cycle_two_keeps_the_completed_bundle(project):
     assert [spec.role for spec in adapter.sessions] == ["triage", "dev", "review", "triage"]
     [done] = _records(engine, "sweep-repeat-done")
     assert done["reason"] == "ledger-unreadable" and done["cycles"] == 2
+    assert done["stop_cause"] == done["reason"]
     assert engine.state.tasks["dw-prior-fix"].phase == Phase.DONE
     assert "change for dw-prior-fix" in git(project.project, "show", "HEAD:src.txt")
     rel = project.deferred_work.relative_to(project.project).as_posix()
@@ -9720,6 +10056,102 @@ def test_an_undecodable_prune_in_cycle_two_keeps_the_completed_bundle(project):
     assert {entry.id for entry in committed if not entry.open} == {"DW-1", "DW-3"}
     assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER
     assert _ledger_differs_from_head(project)
+
+
+# ------------------- DW-201: every repeat stop keeps its token through a dump
+
+
+_REPEAT_STOP_TOKENS = frozenset(
+    {"no-open", "no-progress", "max-cycles", "legacy-appeared", "ledger-unreadable"}
+)
+
+
+def test_a_repeat_stop_journals_a_stop_cause_beside_its_reason(project):
+    """DW-201, live. `sweep-repeat-done` says WHY the repeat loop stopped through
+    `reason`, and `reason` is in `diagnostics._JOURNAL_DROP_FIELDS` — so
+    `bmad-loop diagnose` rendered `reason_present: true` and all five stops
+    collapsed into one indistinguishable row. `max-cycles` ("your budget ran out")
+    and `ledger-unreadable` ("a human has to repair the file") are opposite
+    findings, and a dump could tell them apart only by inferring from other rows.
+
+    `stop_cause` is added BESIDE `reason`, never in place of it: the raw journal,
+    `docs/FEATURES.md` and the existing rows above all name `reason`, so both are
+    written and both carry the same token. Same closed-slug convention as
+    `regen_cause` (DW-164) and `drop_cause`.
+
+    One stop is driven for real here — a cycle whose triage skips everything, so
+    nothing is addressable and the loop stops on `no-progress` — which is what
+    grades that the field reaches the journal at all. The row below is the TOTAL
+    half, covering the four stops no single run can reach at once.
+
+    Ablation: drop `stop_cause` from the `not progressed` arm and this reds on the
+    missing key."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "not this cycle"}])
+    engine, _ = make_sweep(project, [triage_effect(plan)], policy=repeat_policy())
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == "no-progress"  # unchanged, still written
+    assert done["stop_cause"] == "no-progress"  # ...and now a copy that survives a dump
+    assert done["stop_cause"] in _REPEAT_STOP_TOKENS
+
+
+def test_every_repeat_stop_pairs_its_reason_with_the_same_stop_cause():
+    """The TOTAL half of DW-201: all five `sweep-repeat-done` writes in `sweep.py`,
+    graded at the source rather than by five separate runs.
+
+    Three claims a behavioral row cannot make together: every write passes BOTH
+    fields, the two are the SAME literal on each write (a `stop_cause` that drifted
+    from its `reason` would be worse than none — a dump would name a stop the raw
+    journal contradicts), and the tokens are exactly the closed five. The closed set
+    is the reason the field can be declared benign in
+    `tests/test_portability_guard.py`: it is an enum of code constants, never
+    free text, so nothing an operator authored can reach a dump through it.
+
+    Source-level for the same reason `test_every_sweep_ledger_commit_names_its_own_tree`
+    above is: "every producer spells the right argument" is a property no single run
+    can observe, and the `legacy-appeared` arm in particular needs freeform ledger
+    text to appear mid-run.
+
+    Ablation: drop `stop_cause` from any one site and the pairing check reds naming
+    its line; change one site's token to a sixth spelling and the closed-set check
+    reds; make a site's two tokens disagree and the equality check reds."""
+    import ast
+
+    tree = ast.parse(Path(sweep_mod.__file__).read_text(encoding="utf-8"))
+    writes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "append"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "sweep-repeat-done"
+    ]
+    # premise: the scan found the producers it is grading, so an AST or spelling
+    # change cannot turn this into a guard over an empty set
+    assert len(writes) == 5, f"expected 5 sweep-repeat-done writes, found {len(writes)}"
+    tokens = {}
+    for node in writes:
+        keywords = {
+            kw.arg: kw.value.value
+            for kw in node.keywords
+            if kw.arg in ("reason", "stop_cause") and isinstance(kw.value, ast.Constant)
+        }
+        assert set(keywords) == {"reason", "stop_cause"}, (
+            f"sweep.py:{node.lineno} writes sweep-repeat-done without a literal "
+            f"reason= and stop_cause= pair: {sorted(keywords)}"
+        )
+        assert keywords["reason"] == keywords["stop_cause"], (
+            f"sweep.py:{node.lineno} reason={keywords['reason']!r} disagrees with "
+            f"stop_cause={keywords['stop_cause']!r}"
+        )
+        tokens[node.lineno] = keywords["stop_cause"]
+    assert set(tokens.values()) == _REPEAT_STOP_TOKENS, f"unexpected stop tokens: {tokens}"
 
 
 def test_the_undecodable_stop_outranks_no_progress(project):
@@ -9751,6 +10183,7 @@ def test_the_undecodable_stop_outranks_no_progress(project):
     assert engine._prune_ledger_unreadable
     [done] = _records(engine, "sweep-repeat-done")
     assert done["reason"] == "ledger-unreadable" and done["cycles"] == 1
+    assert done["stop_cause"] == done["reason"]
     assert "no-progress" not in journal_text(engine)
     assert _records(engine, "sweep-ledger-commit") == []  # nothing was published at all
 
@@ -9782,6 +10215,7 @@ def test_the_undecodable_stop_outranks_max_cycles(project):
     assert refused["reason"] == "ledger-unreadable"
     [done] = _records(engine, "sweep-repeat-done")
     assert done["reason"] == "ledger-unreadable" and done["cycles"] == 1
+    assert done["stop_cause"] == done["reason"]
     assert "max-cycles" not in journal_text(engine)
     attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
     assert f"repair {project.deferred_work} by hand" in attention
@@ -9882,6 +10316,7 @@ def test_an_absent_ledger_prune_refusal_still_lets_the_next_cycle_run(project, m
     assert not engine._prune_ledger_unreadable  # the arm itself sets nothing
     [done] = _records(engine, "sweep-repeat-done")
     assert done["reason"] == "no-open"  # cycle 2 ran and found nothing, unchanged
+    assert done["stop_cause"] == done["reason"]
     assert (
         commits.count(
             ("chore(sweep): commit ledger before next sweep cycle", project.deferred_work)
@@ -10815,6 +11250,7 @@ def test_dropped_build_answer_is_repeat_progress_exactly_once(project):
     assert attention.count("recorded build decision discarded") == 1
     [done] = _records(engine, "sweep-repeat-done")
     assert done["reason"] == "no-progress" and done["cycles"] == 3
+    assert done["stop_cause"] == done["reason"]
     assert not any(k.startswith("dw3-") for k in engine.state.tasks)
     assert ledger_entries(project)["DW-1"].open
 
@@ -10902,6 +11338,7 @@ def test_dropped_name_collision_answer_is_repeat_progress(project):
     # THE BOUND: cycle 3 found DW-1 quarantined, so the loop stopped
     [done] = _records(engine, "sweep-repeat-done")
     assert done["reason"] == "no-progress" and done["cycles"] == 3
+    assert done["stop_cause"] == done["reason"]
     attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
     assert attention.count("recorded build decision discarded") == 1
     assert ledger_entries(project)["DW-1"].open

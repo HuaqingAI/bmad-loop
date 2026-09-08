@@ -1298,6 +1298,77 @@ def test_remaining_journal_sanitization_contract_reaches_both_public_renders(pro
         assert canary not in legend_values, f"LEAK via legend: {canary!r}"
 
 
+@pytest.mark.parametrize("render_format", ["markdown", "json"])
+@pytest.mark.parametrize(
+    "stop_cause", ["no-open", "no-progress", "max-cycles", "legacy-appeared", "ledger-unreadable"]
+)
+def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
+    project, render_format, stop_cause
+):
+    """Each public render independently retains all three publication identities,
+    the five stop slugs, and the dropped fields' presence booleans.
+
+    Ablation: remove Markdown's sweep-entry emission, or add file/stop_cause to
+    _JOURNAL_DROP_FIELDS, and the corresponding positive assertions fail. Remove
+    message/error/repo/reason from that set and the presence assertions fail.
+    """
+    run_dir = _seed_run(project.project)
+    repo_value = f"{HOME_PATH}/_bmad-output/implementation-artifacts"
+    error_value = "fatal: not a git repository"
+    message_value = "chore(sweep): close resolved deferred-work entries"
+    journal = Journal(run_dir)
+    journal.append(
+        "sweep-ledger-commit-unavailable",
+        message=message_value,
+        repo=repo_value,
+        error=error_value,
+        file="deferred-work.md",
+    )
+    journal.append("sweep-ledger-commit-clean", message=message_value, file="decisions.json")
+    journal.append(
+        "sweep-ledger-commit", message=message_value, commit="a" * 40, file="deferred-work.md"
+    )
+    journal.append("sweep-repeat-done", cycles=2, reason=stop_cause, stop_cause=stop_cause)
+
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    markdown = diagnostics.render_markdown(diag, pseudo=pseudo)
+    json_text = diagnostics.render_json(diag, pseudo=pseudo)
+    if render_format == "markdown":
+        # Assert against the Markdown body itself, not JSON rendered beside it.
+        blocks = re.findall(r"```json\n(.*?)\n```", markdown, flags=re.DOTALL)
+        assert len(blocks) == 1
+        entries = json.loads(blocks[0])
+    else:
+        entries = json.loads(json_text)["runs"][0]["journal"]["entries"]
+
+    failed = next(e for e in entries if e["kind"] == "sweep-ledger-commit-unavailable")
+    clean = next(e for e in entries if e["kind"] == "sweep-ledger-commit-clean")
+    published = next(e for e in entries if e["kind"] == "sweep-ledger-commit")
+    stopped = next(e for e in entries if e["kind"] == "sweep-repeat-done")
+
+    # the whole point: these two survive verbatim, on every row that carries them
+    assert failed["file"] == "deferred-work.md"
+    assert clean["file"] == "decisions.json"
+    assert published["file"] == "deferred-work.md"
+    assert stopped["stop_cause"] == stop_cause
+    # ...while every field they were minted to replace still collapses
+    assert failed["repo_present"] is True and "repo" not in failed
+    assert failed["error_present"] is True and "error" not in failed
+    assert failed["message_present"] is True and "message" not in failed
+    assert clean["message_present"] is True and "message" not in clean
+    assert published["message_present"] is True and "message" not in published
+    assert published["commit"].startswith("commit-")  # aliased, not shipped
+    assert stopped["reason_present"] is True and "reason" not in stopped
+    assert stopped["cycles"] == 2  # the unrelated field is untouched
+
+    for rendered in (markdown, json_text):
+        for canary in (repo_value, error_value, message_value, HOME_PATH, *CANARIES):
+            assert canary not in rendered, f"LEAK: {canary!r}"
+    for canary in (repo_value, error_value, message_value):
+        assert canary not in set(pseudo.legend().values()), "LEAK via legend"
+
+
 def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
     """`target` is a BRANCH on the merge kinds and a sprint STATUS on `board-advance-*`.
 
@@ -1901,6 +1972,35 @@ def test_non_ascii_sensitive_value_reaches_the_guard(monkeypatch):
     assert json.loads(rendered)["mystery_ref"] == alias
     assert original not in rendered
     assert json.loads(rendered)["backstop_repairs"] == {f"story:{alias}": 1}
+
+
+def test_markdown_sweep_unicode_key_reaches_the_backstop(project):
+    """An unknown key survives summarize_journal and needs the egress backstop.
+
+    Ablation: remove ensure_ascii=False from the Markdown sweep serialization
+    and the decoded block retains the original key instead of its alias.
+    """
+    run_dir = _seed_run(project.project)
+    original = "café-user"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    alias = pseudo.alias(original, ns="story", epic=1)
+    Journal(run_dir).append(
+        "sweep-ledger-commit-clean", file="deferred-work.md", **{original: True}
+    )
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    [entry] = [e for e in diag.runs[0].journal.entries if e["kind"] == "sweep-ledger-commit-clean"]
+    assert entry[original] is True  # the real collector leaves this key for the guard
+    repairs: list[tuple[str, int]] = []
+
+    rendered = diagnostics.render_markdown(diag, pseudo=pseudo, repairs=repairs)
+
+    [block] = re.findall(r"```json\n(.*?)\n```", rendered, flags=re.DOTALL)
+    [published] = json.loads(block)
+    assert published[alias] is True
+    assert original not in published
+    assert published["file"] == "deferred-work.md"
+    assert repairs == [(f"story:{alias}", 1)]
+    assert "Backstop repairs" in rendered
 
 
 def test_env_tmux_version_folds_a_multi_line_probe(monkeypatch):
