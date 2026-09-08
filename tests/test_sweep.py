@@ -8094,6 +8094,61 @@ def test_a_prune_with_an_empty_but_present_ledger_still_drops_every_answer(proje
     assert _records(engine, "sweep-preanswer-prune-refused") == []  # absence was never claimed
 
 
+def test_a_prune_with_an_undecodable_ledger_refuses_and_keeps_every_answer(project):
+    """DW-182. The other fault `read_for_write` can hand this site, and the one the
+    DW-176 pass left bare.
+
+    That guard tests `text is None`, which covers ABSENCE only. Undecodable bytes do
+    not answer `None` — they raise `LedgerReadError` (DW-146), a plain `Exception` on
+    purpose so no `except OSError` swallows it, and this site named no handler at
+    all. So the raise escaped `_prune_pre_answers`, and this is the LAST call in
+    `_cycle`: every bundle had already run, and a fully completed cycle was reported
+    as crashed out of bookkeeping.
+
+    The refusal is the same shape as absence's for the same reason. The open set is
+    the KEEP list for a store write, so bytes nobody can decode are unknown open
+    work, not zero of it — exactly what absence is. Degrading is not "guessing": it
+    keeps every recorded answer and prunes nothing, so the cost is consumed answers
+    re-offered next sweep, which the DW-176 arm already accepts.
+
+    Four claims: no raise; every pre-answer survives IN THE STORE (the wrong fix —
+    catching and collapsing to `""` — would drop them all and, since DW-160, commit
+    the wipe); the refusal is announced under the SECOND fixed `reason` token with
+    the decode fault attributed in `error`; and nothing was pruned or committed.
+
+    Ablation: restore the bare `text = deferredwork.read_for_write(ledger)` (drop the
+    `try`/`except`) and this reds with the `LedgerReadError` escaping
+    `_prune_pre_answers`."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    for dw in ("DW-1", "DW-2"):
+        decisions_store.record_pre_answer(
+            project.project,
+            dw,
+            DecisionOption(key="2", label="Keep", effect="keep-open"),
+            date="2026-06-12",
+        )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "out-of-band pre-answers")
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    before = decisions_store.load_pre_answers(project.project)
+    assert set(before) == {"DW-1", "DW-2"}  # premise: there IS something to lose
+    # the ledger goes undecodable between `_loop`'s open-set read and this prune
+    project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
+
+    engine._prune_pre_answers()  # must not raise
+
+    assert decisions_store.load_pre_answers(project.project) == before  # nothing dropped
+    [refused] = _records(engine, "sweep-preanswer-prune-refused")
+    assert refused["ledger"] == str(project.deferred_work)
+    assert refused["reason"] == "ledger-unreadable"  # the SECOND fixed token, not free text
+    assert "not valid UTF-8" in refused["error"]  # the fault is attributed, not swallowed
+    assert _records(engine, "decision-preanswers-pruned") == []
+    assert _records(engine, "sweep-ledger-commit") == []  # and no commit of a wipe
+
+
 # ---------- divergent-root ledger publishers: one rule, three topologies ------
 #
 # The five ledger publishers name the LEDGER'S OWN directory and let git resolve
@@ -8969,6 +9024,158 @@ def test_an_undecodable_ledger_during_an_attended_decision_degrades_per_decision
     assert "sweep-decision-effect-unavailable" in miss
 
 
+def test_a_decision_whose_id_the_ledger_lacks_is_not_counted_closed(project, monkeypatch):
+    """DW-186. The NON-RAISING half of the same non-write, and the one no `except`
+    arm can reach.
+
+    `record_decision` returns a boolean and answers False in exactly the two states
+    that mean no `decision:` line was written: no ledger file at all, and no entry
+    carrying the id. `_apply_decision_effect` discarded that boolean and answered
+    `None`, so both states were indistinguishable from a successful write at the
+    call site — and `_decisions_phase` then emitted `post_decision` and incremented
+    `closed` for an entry the ledger never received. That is the same lie the
+    DW-166 `except` arm above exists to refuse, so it takes the same arm and the
+    SAME journal kind: `_HANDBACK_LEDGER_MISS` names one kind for an operator to
+    grep, and a second kind here would make that pointer incomplete.
+
+    A stale id is not exotic. The triage plan is written by a session that read the
+    ledger earlier in the cycle, and a rival writer — `sweep --archive`, a hand
+    edit, a branch checkout — can retire the entry while `prompter.ask` blocks on
+    the human.
+
+    What is deliberately NOT set is `ledger_in_doubt`: that latch means "the bytes
+    on disk are ones nobody could read", and a False return is proof of the
+    opposite — the ledger read fine and simply held no such entry. This row cannot
+    pin that on its own (this walk lands no effect, so it has nothing to publish
+    either way); it is pinned by the withhold's own rows above.
+
+    Seven claims: `closed` is 0, so the cycle's progress signal does not claim a
+    closure; no `post_decision` for the id; the miss is attributed by `dw_id` and
+    `effect` under the one grep-able kind, naming the missing-ENTRY state rather
+    than the missing-ledger one; the ledger's bytes are untouched, so the row is
+    reporting a real non-write and not a write it failed to notice; nothing is
+    published, since this walk landed no effect at all; the human's answer SURVIVES
+    in `<run>/decisions.json` and in `decision-answered`, which is the ordering the
+    degrade exists to protect; and the hand-back prints the ledger-miss line rather
+    than the success line.
+
+    Ablation: discard the boolean again (call `_apply_decision_effect` for its side
+    effect only) and this reds with `closed == 1` and a `post_decision` for an id
+    the ledger never received."""
+    write_ledger(project, {"DW-1": "open"})  # note: no DW-9
+    before = project.deferred_work.read_bytes()
+    engine, _ = make_sweep(project, [])
+    engine.prompting = True
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-9"}),  # triage saw DW-9; the ledger no longer does
+        decisions=(_close_or_keep_decision("DW-9"),),
+    )
+    printed = []
+    asked = _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+    engine.prompter = DecisionPrompter(input_fn=lambda _p: "1", print_fn=printed.append)
+    emits = []
+    original_emit = engine._emit
+
+    def spy_emit(stage, *args, **kwargs):
+        emits.append((stage, kwargs.get("story_key")))
+        return original_emit(stage, *args, **kwargs)
+
+    engine._emit = spy_emit
+
+    answers, closed = engine._decisions_phase(plan)  # must not raise
+
+    assert closed == 0  # nothing was closed, so nothing is counted closed
+    assert [key for stage, key in emits if stage == "pre_decision"] == ["DW-9"]
+    assert [key for stage, key in emits if stage == "post_decision"] == []  # never announced
+    [failed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert failed["dw_id"] == "DW-9" and failed["effect"] == "close"
+    assert failed["error"].endswith("the ledger holds no entry for this id")
+    # the human's answer survives both places, which is why the degrade beats a raise
+    assert set(answers) == {"DW-9"}
+    assert [r["dw_id"] for r in _records(engine, "decision-answered")] == ["DW-9"]
+    stored = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
+    assert stored["DW-9"]["effect"] == "close"
+    assert project.deferred_work.read_bytes() == before  # the ledger really took no line
+    assert _records(engine, "sweep-ledger-commit") == []  # nothing landed, nothing published
+
+    assert len(asked) == 1
+    assert not any("decisions recorded" in line for line in printed)
+    [miss] = [line for line in printed if "not every decision reached" in line]
+    assert "sweep-decision-effect-unavailable" in miss
+
+
+def test_a_false_effect_return_does_not_withhold_an_earlier_decisions_commit(project, monkeypatch):
+    """DW-186. The row above pins what the False arm SKIPS; this one pins what it
+    must not touch — `ledger_in_doubt`, the commit withhold.
+
+    A single-decision walk cannot grade that. `any_effect_landed` is False there, so
+    the commit gate short-circuits on the other conjunct and setting the latch in
+    the False arm would change nothing observable. Two decisions in this order is
+    the shape that separates them: DW-1 is in the ledger and its effect LANDS, so
+    the walk has a human-authorized `decision:` line worth publishing; DW-2 is not
+    in the ledger, so its effect returns False and runs the new arm LAST, where a
+    latch set there would still be set at the gate.
+
+    The withhold means "the bytes on disk are the ones an effect could not read",
+    and a False return is not evidence of that — DW-2 never read anything, it
+    returned at `record_decision`'s `is_file()` probe. Withholding on it would leave
+    DW-1's authorized line dirty in the worktree immediately ahead of this cycle's
+    bundles, which need a clean baseline, and without `--repeat` there is no later
+    cycle to pick it up.
+
+    Four claims: `closed` counts DW-1 only; `post_decision` fires for DW-1 only;
+    DW-2's miss is attributed under the one kind, naming the missing-ENTRY state
+    since the ledger file is right there; and the commit IS taken, with DW-1's
+    `decision:` line reaching `HEAD` — asserted at `HEAD`, since a withheld commit
+    still leaves the working file saying `done`.
+
+    Ablation: add `ledger_in_doubt = True` to the new `if not recorded:` arm and
+    this reds with no `sweep-ledger-commit` row, a dirty tree, and DW-1's line
+    absent from `HEAD`."""
+    write_ledger(project, {"DW-1": "open"})  # note: no DW-2
+    engine, _ = make_sweep(project, [])
+    engine.prompting = True
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}),
+        # ORDER IS LOAD-BEARING: the False return must run LAST, or a later
+        # successful effect would clear a wrongly-set latch and hide the defect.
+        decisions=(_close_or_keep_decision("DW-1"), _close_or_keep_decision("DW-2")),
+    )
+    printed = []
+    _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+    engine.prompter = DecisionPrompter(input_fn=lambda _p: "1", print_fn=printed.append)
+    emits = []
+    original_emit = engine._emit
+
+    def spy_emit(stage, *args, **kwargs):
+        emits.append((stage, kwargs.get("story_key")))
+        return original_emit(stage, *args, **kwargs)
+
+    engine._emit = spy_emit
+
+    _answers, closed = engine._decisions_phase(plan)  # must not raise
+
+    assert closed == 1  # DW-1 only — DW-2's effect never landed
+    assert [key for stage, key in emits if stage == "post_decision"] == ["DW-1"]
+    [failed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert failed["dw_id"] == "DW-2" and failed["effect"] == "close"
+    # the ledger FILE is present, so this is the missing-entry sentence, not the
+    # missing-ledger one — the two mean very different things to an operator
+    assert failed["error"].endswith("the ledger holds no entry for this id")
+    # ...and the withhold was NOT tripped: DW-1's line is committed, not merely written
+    [commit] = _records(engine, "sweep-ledger-commit")
+    assert commit["commit"] == git(project.project, "rev-parse", "HEAD")
+    assert git(project.project, "status", "--porcelain") == ""
+    ledger_rel = str(project.deferred_work.relative_to(project.project)).replace("\\", "/")
+    committed = {
+        e.id: e
+        for e in deferredwork.parse_ledger(git(project.project, "show", f"HEAD:{ledger_rel}"))
+    }
+    assert committed["DW-1"].status.startswith("done ")
+
+
 def test_close_resolved_degrades_on_lock_and_state_root_failures(project, monkeypatch):
     """DW-166. The other two arms of `_close_resolved`'s catch tuple, which the
     undecodable-ledger row above cannot reach.
@@ -9194,6 +9401,13 @@ def test_a_ledger_deleted_inside_the_cycle_refuses_the_prune_on_the_real_path(pr
     can take it. `decisions_only` keeps the run to a single triage session with no
     bundles, which is the cheapest lane through the real path.
 
+    This row also covers the NO-LEDGER half of the DW-186 False return, which it
+    reaches for free: the unlink lands before DW-1's answer is returned, so DW-1's
+    own `record_decision` answers False at its `is_file()` probe without reading
+    anything. Before DW-186 that walk claimed the close; the assertions below now
+    hold it to reporting the miss and claiming nothing, so the half is pinned here
+    rather than merely exercised.
+
     Ablation: restore `read_for_write(ledger) or ""` and drop the `is None` arm —
     this reds with DW-2's answer gone from the store and a `decision-preanswers-pruned`
     row naming it."""
@@ -9248,6 +9462,94 @@ def test_a_ledger_deleted_inside_the_cycle_refuses_the_prune_on_the_real_path(pr
     [refused] = _records(engine, "sweep-preanswer-prune-refused")
     assert refused["ledger"] == str(project.deferred_work)
     assert refused["reason"] == "ledger-absent"
+    assert _records(engine, "decision-preanswers-pruned") == []
+    # DW-1's own effect reports the no-write too (DW-186): the unlink above lands
+    # before its answer, so `record_decision` returns False without reading at all.
+    [missed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert missed["dw_id"] == "DW-1" and missed["effect"] == "close"
+    assert missed["error"].endswith("the ledger file is gone")  # not the missing-entry sentence
+    assert _records(engine, "sweep-ledger-commit") == []  # no effect landed, nothing published
+
+
+def test_an_undecodable_ledger_inside_the_cycle_refuses_the_prune_on_the_real_path(project):
+    """DW-182 through the REAL cycle, the sibling of the deleted-ledger row above.
+
+    The direct-call row grades the guard; this one grades the CLAIM the guard's
+    docstring rests on, which is a cycle-level claim and not a method-level one:
+    `_prune_pre_answers` is the LAST call in `_cycle`, after every bundle has run,
+    so a raise there reports a fully completed cycle as crashed. Only a real
+    `engine.run()` can show that, which is exactly why the absence arm has a
+    real-cycle row of its own.
+
+    Same window and same out-of-band writer as that row — the corruption lands
+    inside `prompter.ask`, while the sweep is blocked on the human — but the fault
+    is a decode failure rather than a vanished file, so it travels the new
+    `LedgerReadError` arm instead of the `is None` one.
+
+    Four claims: the run finishes rather than crashing or pausing; DW-2's live
+    answer survives in the store; the refusal is announced under the SECOND fixed
+    token; and nothing was pruned. DW-1's effect faults on the same corrupt bytes
+    and takes the DW-166 raise arm, which is what makes the prune the last thing
+    standing between this cycle and a crash.
+
+    Ablation: restore the bare `text = deferredwork.read_for_write(ledger)` (drop
+    the `try`/`except`) and this reds on `summary.crashed` — which is the claim
+    itself, stated exactly. `engine.run()` does not propagate: `_run_inner`'s
+    `except Exception` arm catches the escaping `LedgerReadError`, writes
+    `crash.txt` and returns a CRASHED summary. So the bare read does not merely
+    raise somewhere, it converts a cycle whose triage session ran and whose
+    decision phase completed into a run recorded as crashed — over bookkeeping,
+    with nothing left to retry."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    decisions_store.record_pre_answer(
+        project.project,
+        "DW-2",
+        DecisionOption(key="2", label="Keep", effect="keep-open"),
+        date="2026-06-12",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "out-of-band pre-answer")
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        skip=[{"id": "DW-2", "reason": "later"}],  # stays open, so a healthy prune keeps it
+        decisions=[
+            _decision(
+                "DW-1",
+                [
+                    {"key": "1", "label": "Close", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, adapter = make_sweep(
+        project, [triage_effect(plan)], prompting=True, decisions_only=True
+    )
+
+    def corrupt_ledger_then_answer(_prompt):
+        # the out-of-band writer lands while the sweep is blocked on the human —
+        # after `_loop` read the open set, before `_cycle` reaches the prune
+        project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
+        return "1"
+
+    engine.prompter = DecisionPrompter(
+        input_fn=corrupt_ledger_then_answer, print_fn=lambda _line: None
+    )
+
+    summary = engine.run()  # the whole cycle must complete, not crash
+
+    assert not summary.crashed  # THE claim: a raise here would have crashed the run
+    assert not summary.paused
+    assert {spec.role for spec in adapter.sessions} == {"triage"}  # no bundles ran
+    assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER  # the window really opened
+    # the live answer for a still-open entry survives
+    assert set(decisions_store.load_pre_answers(project.project)) == {"DW-2"}
+    [refused] = _records(engine, "sweep-preanswer-prune-refused")
+    assert refused["ledger"] == str(project.deferred_work)
+    assert refused["reason"] == "ledger-unreadable"  # the SECOND fixed token
+    assert "not valid UTF-8" in refused["error"]
     assert _records(engine, "decision-preanswers-pruned") == []
 
 

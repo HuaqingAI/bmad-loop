@@ -1557,13 +1557,50 @@ class SweepEngine(Engine):
     def _prune_pre_answers(self) -> None:
         """Drop consumed pre-answers — entries built or closed this cycle have
         left the open set. Keeps the store from re-applying a stale answer (and a
-        keep-open answer's audit line) on the next sweep."""
+        keep-open answer's audit line) on the next sweep.
+
+        BOTH ledger-read faults degrade here rather than propagating: absence
+        (DW-176) and undecodable bytes (DW-182). The case for staying loud is that
+        this read decides a store WRITE, so refusing to guess is right — but the
+        refusal IS the refusal to guess. It keeps every answer and prunes nothing,
+        so the choice is not "guess vs. crash", it is "keep the store and say so
+        vs. crash the sweep". And this call is the LAST in `_cycle`, after every
+        bundle has run: a raise here reports a fully completed cycle as crashed
+        over bookkeeping, where the refusal costs only consumed answers re-offered
+        on the next sweep. Bytes nobody could decode are unknown open work for
+        exactly the reason absence is, so they take the same journal row under a
+        second fixed `reason` token rather than a kind of their own.
+
+        `OSError` deliberately still propagates, as it does at every other DIRECT
+        caller of `read_for_write` — `_loop`'s two reads take it bare as well — and
+        it says nothing about what the ledger holds. `_close_resolved` and
+        `_decisions_phase` DO name `OSError` in their catch tuples, but around
+        `mark_done_many` and `record_decision`, which read and take the
+        cross-process lock internally: what they are catching there is the lock's
+        own failure, not this reader's.
+        """
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
         ledger = self.workspace.paths.deferred_work
         # REPAIR/WRITE (DW-146): the open set derived here decides a store write,
         # and pruning from bytes nobody could read would drop live answers.
-        text = deferredwork.read_for_write(ledger)
+        try:
+            text = deferredwork.read_for_write(ledger)
+        except deferredwork.LedgerReadError as e:
+            # UNDECODABLE is refused for the same reason absence is (DW-182), and
+            # under the same kind: the open set is the KEEP list for a store write,
+            # so a ledger nobody can decode is unknown open work, not zero of it.
+            # `reason` stays a FIXED token and the decode fault goes in `error`,
+            # already a `diagnostics._JOURNAL_DROP_FIELDS` field. `LedgerReadError`
+            # is a plain `Exception` on purpose (DW-146), so it must be named: no
+            # `except OSError` upstream would ever see it.
+            self.journal.append(
+                "sweep-preanswer-prune-refused",
+                ledger=str(ledger),
+                reason="ledger-unreadable",
+                error=str(e),
+            )
+            return
         # ABSENCE is refused, not collapsed to `""` (DW-176). The `or ""` spelling
         # every observation-shaped caller uses is exact for them because
         # `open_ids("")` and `open_ids(<absent>)` say the same thing about a ledger
@@ -1637,9 +1674,11 @@ class SweepEngine(Engine):
         no record of having dropped it.
 
         Reaches the project store ONLY. `<run>/decisions.json` keeps the answer
-        (the run-local audit trail is untouched by design) and so does the ledger
-        `decision:` line `_apply_decision_effect` wrote. The journal row carries the
-        id and the drop cause alone — no answer prose, no store path."""
+        (the run-local audit trail is untouched by design) and so does whatever
+        `decision:` line `_apply_decision_effect` landed — since DW-186 that call
+        can report it wrote none, and this drop is unchanged either way. The journal
+        row carries the id and the drop cause alone — no answer prose, no store
+        path."""
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
         # `_project_of_run_dir`, never `self.workspace.root`: where `repo_root`
@@ -2715,7 +2754,7 @@ class SweepEngine(Engine):
                 # human's answer must survive a crash. It is the reason this
                 # degrade matters, not a thing to fix by reordering.)
                 try:
-                    self._apply_decision_effect(decision, option)
+                    recorded = self._apply_decision_effect(decision, option)
                 except (
                     deferredwork.LedgerReadError,
                     OSError,
@@ -2758,6 +2797,48 @@ class SweepEngine(Engine):
                     # all-or-nothing `mark_done_many` batch, so nothing there can
                     # have landed, where this walk writes one decision at a time.
                     ledger_in_doubt = True
+                    any_effect_faulted = True
+                    continue
+                # A False RETURN is the same silent non-write, so it takes the same
+                # arm (DW-186). `record_decision` answers False in exactly two
+                # states — no ledger file, and no entry carrying this id — and both
+                # mean no `decision:` line landed, which is the very claim the
+                # `except` above refuses to let the phase make. Bare, the discarded
+                # boolean let `closed` count a closure and `post_decision` announce
+                # one for an entry the ledger never received. The SAME journal kind
+                # on purpose: `_HANDBACK_LEDGER_MISS` prints exactly one kind for an
+                # operator to grep, and a second kind here would make that pointer
+                # incomplete.
+                #
+                # `ledger_in_doubt` is deliberately left ALONE — neither set nor
+                # cleared. The latch means "the bytes on disk are ones nobody could
+                # read", and a False return says nothing either way about that:
+                # `record_decision` answers False from `if not path.is_file()`
+                # BEFORE it reads anything, so a vanished ledger reaches here having
+                # read nothing at all, while a missing entry reaches here off a
+                # perfectly good read. So the latch keeps meaning what it meant —
+                # the verdict of the last attempt that actually READ — and this arm
+                # neither withholds a commit that may carry an earlier decision's
+                # authorized line nor clears a doubt it cannot speak to.
+                #
+                # WHICH of the two states it was is named in `error`, because they
+                # are not the same news: a missing entry is one retired id, where a
+                # ledger that is gone means every earlier `decision:` line this walk
+                # wrote went with it. `is_file()` is the same probe `record_decision`
+                # made, re-taken rather than plumbed out of it — this is a journal
+                # sentence, not a control decision, and a race between the two only
+                # ever mislabels a row nothing acts on.
+                if not recorded:
+                    self.journal.append(
+                        "sweep-decision-effect-unavailable",
+                        dw_id=decision.id,
+                        effect=option.effect,
+                        error=(
+                            "record_decision wrote no line: the ledger file is gone"
+                            if not self.workspace.paths.deferred_work.is_file()
+                            else "record_decision wrote no line: the ledger holds no entry for this id"
+                        ),
+                    )
                     any_effect_faulted = True
                     continue
                 # the ledger read and wrote, so the doubt the last fault raised is
@@ -2848,7 +2929,23 @@ class SweepEngine(Engine):
         else:
             self.journal.append("sweep-return-no-client")
 
-    def _apply_decision_effect(self, decision: Decision, option: DecisionOption) -> None:
+    def _apply_decision_effect(self, decision: Decision, option: DecisionOption) -> bool:
+        """Record the human's decision on its ledger entry, answering whether a
+        `decision:` line actually landed.
+
+        The boolean is the CALLER's non-write signal, not decoration (DW-186).
+        `record_decision` answers False in exactly the two states that mean no line
+        was written — no ledger file at all, and no entry carrying this `dw_id` —
+        and True only when it wrote one. Discarded, those two states are
+        indistinguishable from a successful write at the call site, which then
+        counts a closure and announces a `post_decision` for an entry the ledger
+        never received.
+
+        What False does NOT say is that the ledger was readable: the missing-file
+        arm answers before any read. So the caller treats it as a non-write and
+        nothing more — see `_decisions_phase`, which leaves `ledger_in_doubt`
+        untouched on it for exactly that reason.
+        """
         ledger = self.workspace.paths.deferred_work
         detail = option.resolution or option.intent
         close_note = None
@@ -2862,7 +2959,7 @@ class SweepEngine(Engine):
         # it" and whose status still says open — a human answer half-recorded. The
         # bytes are identical to the pair's: `record_decision` inserts the decision
         # line before it applies the close, which is the order the pair produced.
-        deferredwork.record_decision(
+        return deferredwork.record_decision(
             ledger, decision.id, self._today(), option.label, detail, close_note=close_note
         )
 
@@ -3110,10 +3207,14 @@ class SweepEngine(Engine):
             intent = _answer_str(answer, "intent") or (option.intent if option else "")
             if not intent:
                 # A stale in-run answer: nothing to build from. Dropping it is the
-                # only safe action here — `_apply_decision_effect` already wrote
-                # this decision's ledger line in the cycle that answered it, so
-                # re-asking or re-applying would double-apply — but a recorded
-                # human `build` decision must not vanish on a journal line alone.
+                # only safe action here — where `_apply_decision_effect` landed this
+                # decision's ledger line in the cycle that answered it, re-asking or
+                # re-applying would double-apply. (Since DW-186 that call can report
+                # it wrote no line at all, in which case there is nothing to
+                # double-apply and dropping is still what this lane does — the
+                # entry is left open and the next sweep re-asks it, which is the
+                # same outcome.) But a recorded human `build` decision must not
+                # vanish on a journal line alone.
                 # The ledger entry is untouched, so the next sweep re-triages and
                 # re-asks it through `_decisions_phase`.
                 # `drop_cause` is a closed three-value enum (`no-intent` here,

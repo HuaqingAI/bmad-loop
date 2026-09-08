@@ -1156,15 +1156,25 @@ JOURNAL_KINDS = frozenset(
         "sweep-bundles-truncated",
         "sweep-cycle",
         "sweep-decision-answer-dropped",
-        # DW-166. An attended decision the human answered whose ledger effect did
-        # not land: `prompter.ask` blocks, so a ledger that goes undecodable (or a
-        # ledger lock that fails) while the prompt is open raises out of
-        # `record_decision` AFTER the answer was persisted and journalled. The
-        # sweep degrades per decision and walks on; this row is what says the
+        # DW-166/DW-186. An attended decision the human answered whose ledger
+        # effect did not land, from EITHER of the two ways that happens.
+        # `prompter.ask` blocks, so a ledger that goes undecodable (or a ledger
+        # lock that fails) while the prompt is open RAISES out of
+        # `record_decision`; and `record_decision` RETURNS False — no raise
+        # involved — when there is no ledger file at all, or no entry carrying the
+        # id a rival writer retired while the prompt was open. Both mean no
+        # `decision:` line was written, both reach the same degrade, and both take
+        # this one kind on purpose: `sweep._HANDBACK_LEDGER_MISS` prints exactly
+        # one kind for an operator to grep. Either way the answer was already
+        # persisted and journalled first, and this row is what says the
         # `decision-answered` above it has no ledger line behind it. `dw_id` and
         # `effect` are already benign (`effect` is a closed `DECISION_EFFECTS`
         # value, not authored text) and `error` is already in
-        # `diagnostics._JOURNAL_DROP_FIELDS`, so no new field routing is needed.
+        # `diagnostics._JOURNAL_DROP_FIELDS` — it carries either the exception text
+        # or, for the False return, one of two fixed sentences chosen by whether the
+        # ledger FILE is still there, since a missing ledger loses every line the
+        # walk already wrote where a missing entry loses only this one — so no new
+        # field routing is needed.
         "sweep-decision-effect-unavailable",
         "sweep-decision-option-mismatch",
         # DW-143. The keep-open lane's `stale-option` drop retired the PROJECT-level
@@ -1204,14 +1214,17 @@ JOURNAL_KINDS = frozenset(
         "sweep-migrated",
         "sweep-migration-restore-diverged",
         "sweep-nothing-open",
-        # DW-176. `_prune_pre_answers` refusing to prune because the deferred-work
-        # ledger is ABSENT. The open set is the keep list for a store write, so
-        # collapsing absence to an empty ledger would read as "nothing is open"
-        # and drop every pre-answer the human recorded — and since DW-160 commit
-        # the wipe. Refusal is announced rather than silent so an operator can see
-        # why consumed answers are still in the store. `ledger` is already benign
-        # and `reason` is already in `diagnostics._JOURNAL_DROP_FIELDS`; the
-        # reason is the fixed token `ledger-absent`, never free text.
+        # DW-176/DW-182. `_prune_pre_answers` refusing to prune because the
+        # deferred-work ledger could not be read for a write — ABSENT (DW-176), or
+        # holding bytes nobody could decode (DW-182). The open set is the keep list
+        # for a store write, so collapsing either to an empty ledger would read as
+        # "nothing is open" and drop every pre-answer the human recorded — and
+        # since DW-160 commit the wipe. Refusal is announced rather than silent so
+        # an operator can see why consumed answers are still in the store. `ledger`
+        # is already benign and both `reason` and `error` are already in
+        # `diagnostics._JOURNAL_DROP_FIELDS`; the reason is one of TWO fixed tokens
+        # (`ledger-absent`, `ledger-unreadable`), never free text, and the decode
+        # fault rides in `error` instead.
         "sweep-preanswer-prune-refused",
         "sweep-remaining-estimate-unreadable",
         "sweep-repeat-done",
