@@ -1266,6 +1266,19 @@ class SweepEngine(Engine):
         # the disposition is the RUN's — so a pause/resume of the same run must
         # not re-announce it, while a NEW run re-evaluates from scratch — and
         # the answer is the human's.
+        #
+        # The undecodable-prune carry (DW-182/186) is the exact opposite call, and
+        # the contrast is the argument for both. It lives HERE, on the instance,
+        # never on `state`: its only consumer is the `_loop` frame that just called
+        # `_cycle`, and it has to reach that frame because the repeat boundary
+        # below it COMMITS the ledger — a refusal that stays inside the prune
+        # publishes bytes nobody could decode and crashes cycle N+1 on them
+        # anyway. Persisting it would encode a decision no resume can reach:
+        # `_loop`'s own `read_for_write` raises on the identical bytes at the top
+        # of the cycle body, so a resume of this run never gets far enough to read
+        # the flag. The quarantines above are persisted because their disposition
+        # outlives the frame that made it; this one cannot outlive it at all.
+        self._prune_ledger_unreadable = False
         self.state.run_type = "sweep"
 
     def _quarantine(self, ids: list[str], dw_id: str) -> None:
@@ -1420,6 +1433,42 @@ class SweepEngine(Engine):
             progressed = self._cycle(cycle, selected_ids)
             if self.decisions_only or not self.repeat:
                 return
+            if self._prune_ledger_unreadable:
+                # DW-182/186. `_prune_pre_answers` refused to read the ledger
+                # because nothing could decode it, and that refusal has to END a
+                # repeating run rather than stay inside the cycle: the boundary
+                # `_commit_ledger` below PUBLISHES the ledger, so falling through
+                # would commit the undecodable bytes and cycle N+1 would then
+                # crash on them at this loop's own `read_for_write` anyway. Cycle
+                # `cycle` COMPLETED — that is what the prune's degrade bought —
+                # so `cycles=cycle`, unlike the `legacy-appeared` arm above, which
+                # fires before its cycle does any work and reports `cycle - 1`.
+                # Placed above `not progressed` and `max_cycles` so it is the
+                # reported reason whenever it fires; below the early return so a
+                # non-repeating or `--decisions-only` run is untouched. Not a
+                # pause and not recovery: the repair is a human editing the file,
+                # and re-running `bmad-loop sweep` is the resume. Deliberately NOT
+                # extended to the DW-176 absence refusal — an absent ledger ends
+                # the next cycle cleanly on `no-open`.
+                self.journal.append("sweep-repeat-done", cycles=cycle, reason="ledger-unreadable")
+                # The message NAMES the file and the re-run's precondition. Neither
+                # is guessable: `implementation_artifacts` is configurable to any
+                # absolute path and the ledger may be symlinked out of the project,
+                # so "the ledger" names nothing an operator can open; and this stop
+                # deliberately leaves the file DIRTY, which is exactly what
+                # `cmd_sweep`'s `worktree_clean` refusal rejects in the code repo
+                # (an external ledger repo is not checked), so an unqualified
+                # "re-run `bmad-loop sweep`" sends the
+                # human into an exit-1 they were told not to expect.
+                gates.notify(
+                    self.policy,
+                    self.run_dir,
+                    "the deferred-work ledger could not be decoded mid-sweep",
+                    f"repair {ledger} by hand, then commit or stash any changes in "
+                    f"{self.paths.repo_root} and re-run `bmad-loop sweep` "
+                    "(which requires that worktree to be clean)",
+                )
+                return
             if not progressed:
                 self.journal.append("sweep-repeat-done", cycles=cycle, reason="no-progress")
                 return
@@ -1571,6 +1620,15 @@ class SweepEngine(Engine):
         exactly the reason absence is, so they take the same journal row under a
         second fixed `reason` token rather than a kind of their own.
 
+        The undecodable refusal is not only journaled, it is CARRIED: it sets
+        `_prune_ledger_unreadable`, which `_loop` reads at the repeat boundary and
+        which ends a repeating run there. Without the carry the degrade is a
+        half-measure — the boundary `_commit_ledger`'s pathspec IS the ledger, so
+        the very next thing a repeating run does is COMMIT the bytes this method
+        just refused to read, and cycle N+1 crashes on them at `_loop`'s own bare
+        read regardless. Absence (DW-176) sets nothing, deliberately: a ledger that
+        is gone ends the next cycle cleanly on `no-open` rather than crashing it.
+
         `OSError` deliberately still propagates, as it does at every other DIRECT
         caller of `read_for_write` — `_loop`'s two reads take it bare as well — and
         it says nothing about what the ledger holds. `_close_resolved` and
@@ -1600,6 +1658,14 @@ class SweepEngine(Engine):
                 reason="ledger-unreadable",
                 error=str(e),
             )
+            # ...and the refusal is CARRIED to `_loop`, beside the row rather than
+            # in place of it. The repeat boundary commits the ledger, so a refusal
+            # that stayed local would publish bytes nobody could decode; `_loop`
+            # reads this flag right after `_cycle` and ends a repeating run on
+            # `reason="ledger-unreadable"` without taking that commit. Instance
+            # state, not `state` — see the declaration in `__init__`. The absence
+            # arm below sets nothing: an absent ledger ends the next cycle cleanly.
+            self._prune_ledger_unreadable = True
             return
         # ABSENCE is refused, not collapsed to `""` (DW-176). The `or ""` spelling
         # every observation-shaped caller uses is exact for them because

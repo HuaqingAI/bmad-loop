@@ -1224,7 +1224,13 @@ JOURNAL_KINDS = frozenset(
         # is already benign and both `reason` and `error` are already in
         # `diagnostics._JOURNAL_DROP_FIELDS`; the reason is one of TWO fixed tokens
         # (`ledger-absent`, `ledger-unreadable`), never free text, and the decode
-        # fault rides in `error` instead.
+        # fault rides in `error` instead. The two tokens do NOT stop at this row:
+        # `ledger-unreadable` is also CARRIED to the repeat boundary (DW-182/186),
+        # where it ends a `--repeat` run with `sweep-repeat-done`
+        # `reason="ledger-unreadable"` and WITHOUT the boundary ledger commit —
+        # otherwise the very next act of a repeating run is to publish the bytes
+        # the prune just refused to read. `ledger-absent` stays cycle-local: an
+        # absent ledger ends the next cycle cleanly on `no-open`.
         "sweep-preanswer-prune-refused",
         "sweep-remaining-estimate-unreadable",
         "sweep-repeat-done",

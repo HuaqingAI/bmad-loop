@@ -9553,6 +9553,319 @@ def test_an_undecodable_ledger_inside_the_cycle_refuses_the_prune_on_the_real_pa
     assert _records(engine, "decision-preanswers-pruned") == []
 
 
+def _sweep_with_ledger_fault_at_the_decision_prompt(project, fault, *, progress=True, **kwargs):
+    """Cycle 1 arranged so an out-of-band ledger fault lands in the ONE window the
+    DW-182/DW-176 rows all use: inside `prompter.ask`, after `_loop` read the open
+    set and after `_close_resolved` already published its close, but before
+    `_cycle` reaches `_prune_pre_answers`. `fault` is handed the ledger path and
+    either corrupts or removes it.
+
+    With `progress` the plan also carries an already-resolved DW-1, so the cycle
+    closes an entry (and commits it) before the fault — `_cycle` therefore returns
+    True and the repeat boundary is genuinely reached. Without it nothing
+    addressable happens and the cycle returns False. Either way DW-2's own `close`
+    effect faults on the same broken ledger and is journaled
+    `sweep-decision-effect-unavailable`, which is what leaves the prune as the last
+    thing standing between the cycle and the repeat boundary."""
+    ids = ["DW-1", "DW-2"] if progress else ["DW-2"]
+    write_ledger(project, {dw_id: "open" for dw_id in ids})
+    plan = triage_result(
+        ids,
+        already_resolved=(
+            [{"id": "DW-1", "evidence": "already guarded at src.txt:1"}] if progress else []
+        ),
+        decisions=[
+            _decision(
+                "DW-2",
+                [
+                    {"key": "1", "label": "Close", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, adapter = make_sweep(project, [triage_effect(plan)], prompting=True, **kwargs)
+
+    def fault_then_answer(_prompt):
+        fault(project.deferred_work)
+        return "1"
+
+    engine.prompter = DecisionPrompter(input_fn=fault_then_answer, print_fn=lambda _line: None)
+    return engine, adapter
+
+
+def _ledger_differs_from_head(project) -> bool:
+    """Whether the working ledger and HEAD's copy disagree. Spelled through
+    `git diff --name-only` rather than by reading HEAD's blob: the bytes under test
+    are undecodable on purpose, and `conftest.git` decodes its output."""
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    return git(project.project, "diff", "--name-only", "HEAD", "--", rel) == rel
+
+
+def test_an_undecodable_prune_refusal_ends_a_repeat_run_before_the_boundary_commit(project):
+    """DW-182/186 carried to the repeat boundary — the claim the cycle-local
+    degrade at `1218ec80` could not make.
+
+    Cycle 1 completes: it closes an already-resolved entry (and publishes that
+    close), then the ledger is corrupted while the sweep blocks on the human, so
+    the prune refuses. The refusal has to reach `_loop`, because the next thing a
+    repeating run does is `_commit_ledger` with the LEDGER as its pathspec — which
+    would publish the very bytes the prune just refused to read, and cycle 2 would
+    crash on them at `_loop`'s own bare `read_for_write` regardless. So: the run
+    ends reported rather than crashed, cycle 1's work is kept, HEAD does NOT carry
+    the undecodable bytes, they stay dirty for a human to repair, and cycle 2 never
+    triages.
+
+    Ablation: delete the `if self._prune_ledger_unreadable:` arm from `_loop`.
+    Every assertion below that names the stop reddens, `sweep-ledger-commit` goes
+    to 2, `_ledger_differs_from_head` goes False (the corrupt bytes reach HEAD) and
+    `summary.crashed` flips True, because cycle 2 then raises on them. Setting the
+    flag without reading it reds the same way for the same reason. The separate
+    no-progress row below establishes ordering against `not progressed`."""
+    engine, adapter = _sweep_with_ledger_fault_at_the_decision_prompt(
+        project,
+        lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER),
+        policy=repeat_policy(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused  # ended reported, not crashed
+    assert [spec.role for spec in adapter.sessions] == ["triage"]  # cycle 2 never triaged
+    assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER  # the window really opened
+    [refused] = _records(engine, "sweep-preanswer-prune-refused")
+    assert refused["reason"] == "ledger-unreadable"
+    # The scaffolding every row here rests on, pinned rather than assumed: the fault
+    # lands inside `prompter.ask`, so DW-2's own `close` effect necessarily meets the
+    # same corrupt bytes and takes DW-186's degrade. Were that arm to raise instead,
+    # the cycle would never reach the prune and none of these rows would be testing
+    # what they say they test.
+    [missed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert missed["dw_id"] == "DW-2" and missed["effect"] == "close"
+    [done] = _records(engine, "sweep-repeat-done")  # exactly one, and it is this stop
+    assert done["reason"] == "ledger-unreadable"
+    assert done["cycles"] == 1  # the cycle COMPLETED, unlike `legacy-appeared`'s cycle - 1
+    # cycle 1's close was published; the boundary commit was NOT taken, so the
+    # bytes nobody can decode are absent from HEAD and still dirty on disk.
+    assert len(_records(engine, "sweep-ledger-commit")) == 1
+    assert _ledger_differs_from_head(project)
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    assert "status: done" in git(project.project, "show", f"HEAD:{rel}")  # the close, readable
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    # NAMES the file (no config knob makes it guessable) and the re-run's
+    # clean-worktree precondition, which this very stop leaves violated.
+    assert f"repair {project.deferred_work} by hand" in attention
+    assert f"commit or stash any changes in {project.repo_root}" in attention
+    assert attention.count("the deferred-work ledger could not be decoded mid-sweep:") == 1
+
+
+def test_an_undecodable_prune_in_cycle_two_keeps_the_completed_bundle(project):
+    """A healthy cycle publishes a bundle before cycle 2 refuses its prune.
+
+    Ablation: hard-code the stop's `cycles` to 1 and the count assertion fails;
+    delete the stop arm and the run crashes after publishing the corrupt ledger.
+    The committed bundle source and the cycle-2 close must both survive the stop.
+    """
+    engine, adapter = _sweep_with_ledger_fault_at_the_decision_prompt(
+        project,
+        lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER),
+        policy=repeat_policy(),
+    )
+    write_ledger(project, {dw_id: "open" for dw_id in ("DW-1", "DW-2", "DW-3")})
+    first_plan = triage_result(
+        ["DW-1", "DW-2", "DW-3"],
+        bundles=[{"name": "prior-fix", "dw_ids": ["DW-3"], "intent": "fix"}],
+        skip=[{"id": dw_id, "reason": "next cycle"} for dw_id in ("DW-1", "DW-2")],
+    )
+    adapter.script[:0] = [
+        triage_effect(first_plan),
+        bundle_dev_effect(project, "prior-fix", ["DW-3"]),
+        bundle_review_effect(project, "prior-fix"),
+    ]
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert [spec.role for spec in adapter.sessions] == ["triage", "dev", "review", "triage"]
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == "ledger-unreadable" and done["cycles"] == 2
+    assert engine.state.tasks["dw-prior-fix"].phase == Phase.DONE
+    assert "change for dw-prior-fix" in git(project.project, "show", "HEAD:src.txt")
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    committed = deferredwork.parse_ledger(git(project.project, "show", f"HEAD:{rel}"))
+    assert {entry.id for entry in committed if not entry.open} == {"DW-1", "DW-3"}
+    assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER
+    assert _ledger_differs_from_head(project)
+
+
+def test_the_undecodable_stop_outranks_no_progress(project):
+    """Same refusal in a cycle that did nothing addressable. `_loop` grades the
+    carry ABOVE `not progressed`, so `ledger-unreadable` is the reported reason —
+    a run told it stopped because the cycle was idle would send its operator
+    looking for the wrong thing, and the ledger would still be unreadable.
+
+    Ablation: move the arm below the `not progressed` arm and this reddens on
+    `reason` — the run still stops, but it reports `no-progress`. (Deleting the arm
+    outright reddens it too, so the ORDER claim rests on the move, not the delete.)
+    """
+    engine, adapter = _sweep_with_ledger_fault_at_the_decision_prompt(
+        project,
+        lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER),
+        progress=False,
+        policy=repeat_policy(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert [spec.role for spec in adapter.sessions] == ["triage"]
+    # premise first: the refusal really fired and really armed the carry. Without
+    # it a `no-progress` reason below reads as an ORDERING failure when the honest
+    # cause may be that the fault never happened at all.
+    [refused] = _records(engine, "sweep-preanswer-prune-refused")
+    assert refused["reason"] == "ledger-unreadable"
+    assert engine._prune_ledger_unreadable
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == "ledger-unreadable" and done["cycles"] == 1
+    assert "no-progress" not in journal_text(engine)
+    assert _records(engine, "sweep-ledger-commit") == []  # nothing was published at all
+
+
+def test_the_undecodable_stop_outranks_max_cycles(project):
+    """The other arm the stop is placed above. `max_cycles=1` means cycle 1 is the
+    last one this run was ever going to take, so both arms would fire and only the
+    placement decides which reason is reported — and `max-cycles` is a benign
+    "your budget ran out", which would send the operator away from a ledger that
+    still will not decode. The ATTENTION line only rides the new arm, so reporting
+    `max-cycles` also loses the repair notice entirely.
+
+    Ablation: move ONLY the `max_cycles` arm above the new one (leaving the
+    `not progressed` order intact) and this reddens on `reason` while every other
+    row stays green — which is the point of the row: the sibling above pins the
+    order against `not progressed` and cannot see this swap at all, because its
+    bare `repeat_policy()` budget of 5 is never reached in cycle 1."""
+    engine, adapter = _sweep_with_ledger_fault_at_the_decision_prompt(
+        project,
+        lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER),
+        policy=repeat_policy(max_cycles=1),
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert [spec.role for spec in adapter.sessions] == ["triage"]
+    [refused] = _records(engine, "sweep-preanswer-prune-refused")  # premise
+    assert refused["reason"] == "ledger-unreadable"
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == "ledger-unreadable" and done["cycles"] == 1
+    assert "max-cycles" not in journal_text(engine)
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert f"repair {project.deferred_work} by hand" in attention
+
+
+def test_a_decisions_only_run_is_untouched_by_the_undecodable_prune_refusal(project):
+    """The `--decisions-only` half of the early return the sibling below covers for
+    `repeat`. Worth its own row rather than a parameter: a decisions-only cycle
+    returns from `_cycle` EARLY, so it reaches `_prune_pre_answers` at a different
+    call site from the one every other row here drives — the flag has to be armed
+    from that site too, and `_loop` still has to leave a run that was always going
+    to end after one cycle exactly as it found it.
+
+    Ablation: hoist the `_loop` arm above the `decisions_only or not self.repeat`
+    return and both negatives redden. They stand on a positive premise — the flag
+    IS armed — so neither can pass by the fault failing to fire."""
+    engine, adapter = _sweep_with_ledger_fault_at_the_decision_prompt(
+        project,
+        lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER),
+        policy=repeat_policy(),
+        decisions_only=True,
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert [spec.role for spec in adapter.sessions] == ["triage"]
+    # premise: the decisions-only call site armed the carry all the same
+    [refused] = _records(engine, "sweep-preanswer-prune-refused")
+    assert refused["reason"] == "ledger-unreadable"
+    assert engine._prune_ledger_unreadable
+    assert _records(engine, "sweep-repeat-done") == []
+    attention = engine.run_dir / "ATTENTION"
+    assert "the deferred-work ledger could not be decoded mid-sweep:" not in (
+        attention.read_text(encoding="utf-8") if attention.exists() else ""
+    )
+
+
+def test_a_non_repeat_run_is_untouched_by_the_undecodable_prune_refusal(project):
+    """The carry is read AFTER `_loop`'s `decisions_only or not self.repeat` return,
+    so a single-cycle run keeps ending exactly where it always did: the refusal is a
+    journal row and nothing else — no repeat-done record and no ATTENTION line
+    telling an operator to repair a ledger for a run that was never going to look at
+    it again.
+
+    Ablation: hoist the arm above that early return and both negatives redden. They
+    are checked against a POSITIVE premise — the refusal really did fire and really
+    did set the flag — so they cannot pass by the fault failing to happen."""
+    engine, adapter = _sweep_with_ledger_fault_at_the_decision_prompt(
+        project, lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER)
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert [spec.role for spec in adapter.sessions] == ["triage"]
+    # premise: the refusal fired and armed the carry — the negatives below are
+    # about what `_loop` does with it, not about whether it happened.
+    [refused] = _records(engine, "sweep-preanswer-prune-refused")
+    assert refused["reason"] == "ledger-unreadable"
+    assert engine._prune_ledger_unreadable
+    assert _records(engine, "sweep-repeat-done") == []
+    attention = engine.run_dir / "ATTENTION"
+    assert "the deferred-work ledger could not be decoded mid-sweep:" not in (
+        attention.read_text(encoding="utf-8") if attention.exists() else ""
+    )
+
+
+def test_an_absent_ledger_prune_refusal_still_lets_the_next_cycle_run(project, monkeypatch):
+    """DW-176 is deliberately NOT carried. An absent ledger already ends the next
+    cycle cleanly — `read_for_write` returns None, `or ""` makes it empty, no ids
+    are open and `_loop` stops on `no-open` — so ending the run early would replace
+    a correct report with a worse one, and publishing a DELETED ledger at the
+    boundary is a separate pre-existing finding this change does not touch.
+
+    Ablation: set `_prune_ledger_unreadable` in the `text is None` arm too and this
+    reddens on `reason` — the run would stop on `ledger-unreadable` at the boundary
+    instead of reaching cycle 2 at all. Delete the boundary `_commit_ledger` call
+    and the boundary-call assertion fails even though cycle 2 still sees no ids."""
+    engine, adapter = _sweep_with_ledger_fault_at_the_decision_prompt(
+        project, lambda ledger: ledger.unlink(), policy=repeat_policy()
+    )
+    commits = []
+    commit_ledger = engine._commit_ledger
+
+    def record_commit(message, *, path):
+        commits.append((message, path))
+        return commit_ledger(message, path=path)
+
+    monkeypatch.setattr(engine, "_commit_ledger", record_commit)
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert not project.deferred_work.exists()  # the window really opened
+    [refused] = _records(engine, "sweep-preanswer-prune-refused")
+    assert refused["reason"] == "ledger-absent"  # the OTHER fixed token
+    assert not engine._prune_ledger_unreadable  # the arm itself sets nothing
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == "no-open"  # cycle 2 ran and found nothing, unchanged
+    assert (
+        commits.count(
+            ("chore(sweep): commit ledger before next sweep cycle", project.deferred_work)
+        )
+        == 1
+    )
+
+
 def test_a_run_local_only_stale_answer_writes_nothing_to_the_project_store(project):
     """The prune retires a PROJECT store entry and there is none here — this stale
     answer only ever lived in `<run>/decisions.json`. A store holding OTHER ids must
