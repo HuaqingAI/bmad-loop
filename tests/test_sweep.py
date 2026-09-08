@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from conftest import (
     _OK,
+    UNRESOLVABLE,
     _file_exists_cmd,
     _spec_baseline,
     attach_profile,
@@ -26,6 +27,7 @@ from conftest import (
     migrate_effect,
     nested_repo_root_paths,
     passes_once,
+    refuse_to_resolve,
     seed_outer_decoy_ledger,
     triage_effect,
     write_ledger,
@@ -9742,34 +9744,104 @@ def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, m
     nothing at all: `repo`, `message` and `error` are every one of them in
     `diagnostics._JOURNAL_DROP_FIELDS`.
 
-    Ablation: move `name = path.name` inside the `try` beside `target` and this
-    reds with a `NameError` escaping a method the docstring calls strictly best
-    effort — which makes the BINDING POSITION, not merely the field, the graded
-    thing."""
+    This row grades the `OSError` CLASS of that tuple; the sibling row below grades
+    `RuntimeError`, which the two classes must be driven separately to cover (see
+    that row's docstring). The fault comes from the shared `refuse_to_resolve` seam
+    (DW-195) rather than a local `Path.resolve` stub: a private stub beside a
+    conftest helper that does the same job is the hand-rolled duplicate these
+    conversions exist to remove, and the seam is scoped to the named path exactly
+    as the stub was.
+
+    The remaining claims below are HANDLER properties rather than class ones — the
+    write surviving, HEAD unmoved, `message`, and the sibling arms staying empty — so
+    both class rows assert the identical set. Splitting them would let a regression that
+    commits, or moves HEAD, on the `OSError` leg specifically land green.
+
+    Ablations, both performed:
+      * move `name = path.name` inside the `try` beside `target` and this reds with
+        a `NameError` escaping a method the docstring calls strictly best effort —
+        which makes the BINDING POSITION, not merely the field, the graded thing;
+      * delete `OSError` ALONE from `_commit_ledger`'s `except` tuple and this reds
+        with the refusal escaping `_commit_ledger`."""
     write_ledger(project, {"DW-1": "open"}, commit=False)
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
     ledger = project.deferred_work
-    real_resolve = Path.resolve
-
-    def exploding_resolve(self, *args, **kwargs):
-        # scoped to the published file: everything else in the frame still resolves
-        if self == ledger:
-            raise OSError(40, "Too many levels of symbolic links")
-        return real_resolve(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "resolve", exploding_resolve)
+    before = ledger.read_text(encoding="utf-8")
+    head = git(project.project, "rev-parse", "HEAD")
+    # scoped to the published file: everything else in the frame still resolves
+    refuse_to_resolve(monkeypatch, ledger)
 
     engine._commit_ledger(
         "chore(sweep): unresolvable", path=ledger, family="ledger"
     )  # must not raise
 
     [failed] = _records(engine, "sweep-ledger-commit-unavailable")
+    assert failed["message"] == "chore(sweep): unresolvable"
     assert failed["file"] == "deferred-work.md"  # bound before the try, so still here
     # the LEXICAL parent: the resolve that would have replaced it is what failed
     assert failed["repo"] == str(ledger.parent)
-    assert "Too many levels" in failed["error"]
+    assert UNRESOLVABLE in failed["error"]
+    assert ledger.read_text(encoding="utf-8") == before  # the write survives the degrade
+    assert git(project.project, "rev-parse", "HEAD") == head  # and nothing was committed
     assert _records(engine, "sweep-ledger-commit") == []  # nothing published...
+    assert _records(engine, "sweep-ledger-commit-refused") == []  # ...not a target refusal...
+    assert _records(engine, "sweep-ledger-commit-clean") == []  # ...and not a clean skip either
+
+
+def test_the_degrade_row_survives_a_runtime_error_from_the_resolve(project, monkeypatch):
+    """The `RuntimeError` CLASS of the same `except` tuple, driven on its own (DW-195).
+
+    A per-CLASS ablation is the only honest one for a multi-class handler: deleting the
+    pair passes while an untested class hides behind a tested one. Measured on Python
+    3.13.15 at the baseline commit, before this row existed, `uv run pytest -q
+    tests/test_sweep.py` with `OSError` alone dropped reported `1 failed, 526 passed`,
+    and with `RuntimeError` alone dropped reported `527 passed` — fully green.
+    `RuntimeError` was the ungraded half.
+
+    It was ungraded because its only driver,
+    `test_a_dangling_store_link_is_an_absence_because_the_probes_see_the_resolved_path`,
+    reaches this handler through a real symlink loop behind
+    `if sys.version_info < (3, 13)`: `Path.resolve()` stopped raising `RuntimeError` on
+    a non-strict loop in 3.13, so that coverage is absent on the 3.13 and 3.14 CI legs
+    (`.github/workflows/ci.yml`) and on any modern dev host. Injecting the class through
+    `refuse_to_resolve` makes it version-independent, and a symlink loop remains the
+    real-world fault it stands for.
+
+    Beyond the class, three claims the pre-existing `OSError` row does not make: the
+    on-disk ledger write SURVIVES (the degrade is about the commit, never the file),
+    HEAD is unmoved, and `sweep-ledger-commit`, `sweep-ledger-commit-refused` and
+    `sweep-ledger-commit-clean` are ALL empty. The refusal and clean arms sit
+    immediately after this `except` in `sweep.py`, so their absence is what separates
+    "the resolve degraded" from "the target was refused before git ever ran".
+
+    Ablation: delete `RuntimeError` ALONE from `_commit_ledger`'s `except` tuple and
+    this reds with the `RuntimeError` escaping `_commit_ledger`."""
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    ledger = project.deferred_work
+    before = ledger.read_text(encoding="utf-8")
+    head = git(project.project, "rev-parse", "HEAD")
+    # CPython's own wording, so the injected fault is a faithful stand-in for the real
+    # one: pre-3.13 `pathlib` raises `RuntimeError("Symlink loop from %r" % e.filename)`.
+    loop_error = f"Symlink loop from {str(ledger)!r}"
+    refuse_to_resolve(monkeypatch, ledger, error=RuntimeError(loop_error))
+
+    engine._commit_ledger(
+        "chore(sweep): loop ledger", path=ledger, family="ledger"
+    )  # must not raise
+
+    [failed] = _records(engine, "sweep-ledger-commit-unavailable")
+    assert failed["message"] == "chore(sweep): loop ledger"
+    assert failed["file"] == "deferred-work.md"  # bound before the try, so still here
+    # the LEXICAL parent: the resolve that would have replaced it is what failed
+    assert failed["repo"] == str(ledger.parent)
+    assert loop_error in failed["error"]
+    assert ledger.read_text(encoding="utf-8") == before  # the write survives the degrade
+    assert git(project.project, "rev-parse", "HEAD") == head  # and nothing was committed
+    assert _records(engine, "sweep-ledger-commit") == []  # nothing published...
+    assert _records(engine, "sweep-ledger-commit-refused") == []  # ...not a target refusal...
     assert _records(engine, "sweep-ledger-commit-clean") == []  # ...and not a clean skip either
 
 

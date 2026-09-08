@@ -1060,11 +1060,33 @@ def seed_outer_decoy_ledger(paths: ProjectPaths) -> tuple[Path, bytes]:
 UNRESOLVABLE = "stubbed: the provider is registered but not serving"
 
 
-def refuse_to_resolve(monkeypatch, *targets: Path) -> None:
-    """Make ``Path.resolve()`` raise WinError 64 for exactly ``targets`` — the answer
-    a registered-but-not-serving WSL UNC provider gives (#529/#536), and one CPython's
-    non-strict ``ntpath`` allow-list does not absorb, so ``resolve()`` fails outright
-    instead of degrading to its own lexical walk. That is the #552 condition.
+def refuse_to_resolve(monkeypatch, *targets: Path, error: Exception | None = None) -> None:
+    """Make ``Path.resolve()`` fail for exactly ``targets``.
+
+    By DEFAULT it raises WinError 64 — the answer a registered-but-not-serving WSL UNC
+    provider gives (#529/#536), and one CPython's non-strict ``ntpath`` allow-list does
+    not absorb, so ``resolve()`` fails outright instead of degrading to its own lexical
+    walk. That is the #552 condition, and it is what every call site written before
+    DW-195 means; the keyword is optional precisely so none of them had to be edited.
+
+    ``error`` supplies a DIFFERENT resolve fault instead. A resolve can fail in more than
+    one exception class — POSIX ``Path.resolve()`` raises ``RuntimeError`` on a symlink
+    loop, not ``OSError`` — and a caller grading a handler that catches several classes
+    needs to drive each class separately. Passing the exception here rather than
+    hand-rolling a second local ``Path.resolve`` stub keeps one shared fault seam: a
+    private stub beside this helper is the hand-rolled duplicate these conversions remove.
+
+    ``Exception``, not ``BaseException``: no production handler catches
+    ``KeyboardInterrupt``/``SystemExit``/``GeneratorExit``, so a per-class ablation driven
+    with one of those would be vacuous by construction — the arm under test could be
+    deleted and the row would still red.
+
+    The exception is RE-CONSTRUCTED from its class and args on every matching resolve
+    rather than re-raised as one object. With ~43 call sites this is a shared seam, and a
+    consumer that resolves the same target twice would otherwise accumulate
+    ``__traceback__`` frames and ``__context__`` chaining on a single instance, so the
+    second fault would carry the first one's frames. The class must therefore accept its
+    own ``args`` back, which every plain ``Exception(message)`` does.
 
     Scoped to named paths on purpose: a blanket stub would break every unrelated
     resolve in the process, and a row asserting "the command survived" would then pass
@@ -1076,7 +1098,9 @@ def refuse_to_resolve(monkeypatch, *targets: Path) -> None:
 
     def stub(self, strict: bool = False):
         if str(self) in wanted:
-            raise OSError(0, UNRESOLVABLE, None, 64)
+            if error is None:
+                raise OSError(0, UNRESOLVABLE, None, 64)
+            raise type(error)(*error.args)  # fresh per raise — see the docstring
         return real(self, strict=strict)
 
     monkeypatch.setattr(Path, "resolve", stub)

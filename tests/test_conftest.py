@@ -367,6 +367,61 @@ def test_seed_outer_decoy_ledger_refuses_an_inherited_decoy(project):
     assert decoy.read_bytes() == b"belongs to the caller\n"
 
 
+def test_refuse_to_resolve_defaults_to_the_unc_refusal_and_stays_scoped(project, monkeypatch):
+    """`refuse_to_resolve`'s DEFAULT arm, which ~43 call sites take without saying so.
+
+    Those sites pass no `error=` and depend on the exact fault: WinError 64 carrying
+    `UNRESOLVABLE`, the registered-but-not-serving UNC provider's answer (#529/#536/#552).
+    A regression in the default would surface as a confusing failure in whichever
+    unrelated module ran first, so the contract is pinned at the seam instead.
+
+    Scope is half the contract: a blanket stub would break every unrelated resolve in the
+    process, and a row asserting "the command survived" would then pass for a reason that
+    has nothing to do with the guard under test.
+    """
+    target = project.deferred_work
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("ledger\n", encoding="utf-8")
+    sibling = target.parent / "untouched.md"
+    sibling.write_text("sibling\n", encoding="utf-8")
+    conftest.refuse_to_resolve(monkeypatch, target)
+
+    with pytest.raises(OSError) as caught:
+        target.resolve()
+
+    assert conftest.UNRESOLVABLE in str(caught.value)
+    assert caught.value.errno == 0
+    if sys.platform == "win32":  # the 4th constructor arg is surfaced only there
+        assert caught.value.winerror == 64
+    assert sibling.resolve() == Path(os.path.realpath(sibling))  # unnamed paths still resolve
+
+
+def test_refuse_to_resolve_raises_the_caller_supplied_class(project, monkeypatch):
+    """The `error=` keyword (DW-195): a DIFFERENT resolve fault, same scoping.
+
+    It exists so a caller grading a handler that catches several exception classes can
+    drive each class on its own — a resolve really can fail as `RuntimeError` (a pre-3.13
+    symlink loop) rather than `OSError`, and a joint ablation passes while an untested
+    class hides behind a tested one. A fresh instance per raise, so a consumer resolving
+    the same target twice does not accumulate `__traceback__`/`__context__` on one object.
+    """
+    target = project.deferred_work
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("ledger\n", encoding="utf-8")
+    sibling = target.parent / "untouched.md"
+    sibling.write_text("sibling\n", encoding="utf-8")
+    conftest.refuse_to_resolve(monkeypatch, target, error=RuntimeError("Symlink loop from 'x'"))
+
+    with pytest.raises(RuntimeError, match="Symlink loop from 'x'") as first:
+        target.resolve()
+    with pytest.raises(RuntimeError, match="Symlink loop from 'x'") as second:
+        target.resolve()
+
+    assert first.value is not second.value  # fresh per raise, so no traceback accumulation
+    assert second.value.__context__ is None
+    assert sibling.resolve() == Path(os.path.realpath(sibling))  # still scoped to `target`
+
+
 def test_template_leaves_no_detached_git_maintenance_writing_into_the_copies(project, tmp_path):
     """No background git process may outlive a commit into the sandbox.
 
@@ -1362,23 +1417,72 @@ def _declares_loadgroup(addopts: object) -> bool:
     return chosen == "loadgroup"
 
 
-# EXACT per-module gated-def counts (DW-173), the same inventory contract
-# `_EXPECTED_SESSION_WALL_SITES` and `_EXPECTED_REAP_DEADLINE_SITES` already carry: the
-# assertion below is equality, so it bites in BOTH directions — adding a tmux-gated def
-# fails it just as deleting one does, and either way the fix is to re-pin the number for
-# the intentional change. A floor could only bite downward, which is how these numbers
-# silently went stale before (DW-159 found stories at an actual 44 against a floor of 30:
-# fourteen E2Es could have been deleted with every row still green).
+# EXACT per-module, per-BUCKET gated-def inventory (DW-173, bucketed by DW-189), the same
+# inventory contract `_EXPECTED_SESSION_WALL_SITES` and `_EXPECTED_REAP_DEADLINE_SITES`
+# already carry: every assertion below is equality, so it bites in BOTH directions —
+# adding a tmux-gated def fails it just as deleting one does, and either way the fix is to
+# re-pin the number for the intentional change. A floor could only bite downward, which is
+# how these numbers silently went stale before (DW-159 found stories at an actual 44
+# against a floor of 30: fourteen E2Es could have been deleted with every row still green).
 #
 # Per-module rather than one suite-wide number: a shared count couples the modules, so a
 # deletion in one blames the detector for a change the author made in the other. Both
 # modules are carried here for the same reason — a half-pinned inventory leaves the
 # unpinned module free to drift.
 #
-# The stories count is 16 `test_e2e_*` real-tmux defs plus 3 `test_reap_e2e_*` rows plus
-# 28 local-process identity harness defs. They share the module gate, so a count that
-# trails lets the helpers mask the deletion of E2Es.
-_EXPECTED_E2E_DEF_COUNTS = {"test_generic_tmux.py": 6, "test_stories_e2e.py": 47}
+# Per-BUCKET rather than one per-module total (DW-189): a total alone lets a BREAKDOWN rot
+# into a wrong justification for a right number. Stories used to be pinned at 47 with a
+# comment explaining it as `16 + 3 + 28`; an E2E renamed into a harness name cancels
+# against the harness count, so the total holds, every row stays green, and the comment
+# quietly becomes false. What the buckets below buy is precise about which parts: the
+# NAMED prefixes (`test_tmux_`, `test_e2e_`, `test_reap_e2e_`) are graded as families, so
+# a def leaving or joining one of them is named. `_OTHER_DEFS` is a RESIDUAL, not a
+# family — any 28 gated defs no named prefix claims satisfy it — so what the pair of
+# buckets really pins is the BOUNDARY between the E2E families and the remainder, which
+# is the edge the rotted `16 + 3 + 28` could cross undetected. Changes wholly inside the
+# residual still cancel, and deliberately so: the prose being enforced named three
+# families, the third being "everything else", and subdividing further would assert a
+# breakdown that prose never made.
+#
+# The attribution RULE `_bucket_for` implements and the rows below grade:
+#   * a def is attributed to the LONGEST declared prefix matching its name, so dict ORDER
+#     is never load-bearing. No two prefixes NEST today (`test_reap_e2e_x` does not start
+#     with `test_e2e_`, so every rule agrees on it); longest-match matters the moment a
+#     nested pair like `{"a_": 1, "a_b_": 1}` is declared, where `a_b_x` must read as an
+#     `a_b_`, and `test_e2e_def_count_inventory_attributes_to_the_longest_declared_prefix`
+#     pins exactly that shape;
+#   * a def no declared prefix claims falls to the module's `_OTHER_DEFS` bucket WHEN the
+#     module declares one;
+#   * a module declaring NO `_OTHER_DEFS` bucket refuses an unexplained def BY NAME rather
+#     than absorbing it into a count.
+_OTHER_DEFS = "<other>"  # explicit catch-all; a module omitting it refuses unexplained defs
+_EXPECTED_E2E_DEF_COUNTS: dict[str, dict[str, int]] = {
+    "test_generic_tmux.py": {"test_tmux_": 6},
+    "test_stories_e2e.py": {
+        "test_e2e_": 16,
+        "test_reap_e2e_": 3,
+        # Not asserted, and deliberately so — see the residual note above. Today these are
+        # the local-process identity harness defs: `test_detach_gate_*`,
+        # `test_kill_recorded_child_*`, `test_live_child_*`, `test_proc_starttime_*`,
+        # `test_reap_identity_*`, `test_recorded_*`.
+        _OTHER_DEFS: 28,
+    },
+}
+
+
+def _bucket_for(name: str, buckets: dict[str, int]) -> str | None:
+    """Which declared bucket of `buckets` claims a gated def called `name`, if any.
+
+    LONGEST declared prefix wins, so the inventory's dict order never decides an
+    attribution: `test_reap_e2e_*` reads as its own family under either ordering, and a
+    future prefix pair cannot silently change which bucket a def lands in. Returns
+    `_OTHER_DEFS` when no declared prefix matches and the module declares the catch-all,
+    and `None` — meaning UNEXPLAINED — when it does not.
+    """
+    prefixes = [p for p in buckets if p != _OTHER_DEFS and name.startswith(p)]
+    if prefixes:
+        return max(prefixes, key=len)
+    return _OTHER_DEFS if _OTHER_DEFS in buckets else None
 
 
 def _e2e_def_count_offenders(found: list[tuple[str, str, bool]]) -> list[str]:
@@ -1388,21 +1492,93 @@ def _e2e_def_count_offenders(found: list[tuple[str, str, bool]]) -> list[str]:
     reason: the live guard reads the real `tests/` tree through `_scan_tests()`, so the
     mismatch path this inventory exists to enforce cannot be driven there — only a
     synthetic `found` list can exercise it, in either direction.
+
+    Two kinds of offender, matching the two ways a bucketed inventory can be wrong: a
+    bucket whose count no longer matches what the scan attributed to it, and a def in a
+    module with no `_OTHER_DEFS` bucket that no declared prefix claims. The second names
+    the DEF, not just a count, because "6 gated defs, one of which is not a `test_tmux_`"
+    is the failure a per-module total could never report at all.
+
+    PRECONDITION, and the reason it is written down: this helper iterates the INVENTORY,
+    so it is blind to a module the inventory does not declare — a wholly new module full
+    of gated defs yields no offenders here. The live caller's
+    `set(_EXPECTED_E2E_DEF_COUNTS) == {rel for ...}` assertion is the only thing that
+    covers that case, and leaving the dependency implicit would be the same unenforced
+    claim this bucketing exists to remove.
     """
     offenders: list[str] = []
-    for rel, expected in _EXPECTED_E2E_DEF_COUNTS.items():
-        seen = sum(1 for found_rel, _name, _grouped in found if found_rel == rel)
-        if seen != expected:
-            offenders.append(
-                f"{rel}: expected {expected} tmux-gated test defs, inspected {seen}; "
-                "update the inventory for intentional changes"
-            )
+    for rel, buckets in _EXPECTED_E2E_DEF_COUNTS.items():
+        seen = dict.fromkeys(buckets, 0)
+        for found_rel, name, _grouped in found:
+            if found_rel != rel:
+                continue
+            bucket = _bucket_for(name, buckets)
+            if bucket is None:
+                # Its own remedy clause: none of the three fixes here is re-pinning a
+                # number, so the count offenders' "update the inventory" tail would send
+                # a reader looking for a count to change that does not exist.
+                offenders.append(
+                    f"{rel}::{name}: no declared prefix claims this tmux-gated test def "
+                    f"and {rel} declares no catch-all bucket; rename the def to match a "
+                    "declared prefix, declare a new prefix bucket for its family, or give "
+                    f"{rel} an explicit {_OTHER_DEFS} bucket"
+                )
+                continue
+            seen[bucket] += 1
+        for bucket, expected in buckets.items():
+            if seen[bucket] != expected:
+                offenders.append(
+                    f"{rel} [{bucket}]: expected {expected} tmux-gated test defs, "
+                    f"inspected {seen[bucket]}; "
+                    "update the inventory for intentional changes"
+                )
     return offenders
 
 
-def _synthetic_found(counts: dict[str, int]) -> list[tuple[str, str, bool]]:
-    """A `_scan_tests()`-shaped list holding the named per-module gated-def counts."""
-    return [(rel, f"test_row_{i}", True) for rel, n in counts.items() for i in range(n)]
+def _inventory_copy() -> dict[str, dict[str, int]]:
+    """A mutable deep-enough copy of the inventory, so a perturbing row cannot leak."""
+    return {rel: dict(buckets) for rel, buckets in _EXPECTED_E2E_DEF_COUNTS.items()}
+
+
+# A name stem no DECLARED prefix in any module claims. `test_the_unexplained_stem_is_
+# claimed_by_no_declared_prefix` below holds that generically, over every module in the
+# inventory, rather than by hand per module — a third module, or a new prefix on an
+# existing one, would otherwise void the invariant silently.
+_UNEXPLAINED_DEF_STEM = "test_unexplained_"
+
+
+def _synthetic_found(counts: dict[str, dict[str, int]]) -> list[tuple[str, str, bool]]:
+    """A `_scan_tests()`-shaped list holding the named per-module, per-bucket counts.
+
+    Every minted name is asserted to attribute BACK to the bucket that asked for it,
+    against the module's DECLARED buckets. Without that check a future prefix pair (one
+    declared prefix being another plus digits) would leave these synthetic rows exercising
+    a different attribution from the live scan they exist to share, and the both-directions
+    rows would grade a bucket nobody pinned.
+    """
+    found: list[tuple[str, str, bool]] = []
+    for rel, buckets in counts.items():
+        # The module must be DECLARED. Falling back to the caller's own `buckets` would
+        # attribute minted names against a shape the real inventory does not hold, so a
+        # row perturbing an undeclared module would grade itself rather than the
+        # inventory — and `_e2e_def_count_offenders` never even looks at such a module.
+        assert rel in _EXPECTED_E2E_DEF_COUNTS, (
+            f"{rel} is not in _EXPECTED_E2E_DEF_COUNTS; `_e2e_def_count_offenders` "
+            "iterates the inventory and would silently ignore every def minted for it"
+        )
+        declared = _EXPECTED_E2E_DEF_COUNTS[rel]
+        for bucket, n in buckets.items():
+            for i in range(n):
+                name = (
+                    f"{_UNEXPLAINED_DEF_STEM}{i}" if bucket == _OTHER_DEFS else f"{bucket}row_{i}"
+                )
+                assert _bucket_for(name, declared) == bucket, (
+                    f"{rel}: the synthetic name {name!r} minted for bucket {bucket!r} "
+                    f"attributes to {_bucket_for(name, declared)!r} instead — these rows "
+                    "would be grading a different attribution from the live scan"
+                )
+                found.append((rel, name, True))
+    return found
 
 
 def test_every_real_tmux_e2e_joins_the_serialized_xdist_group():
@@ -1418,36 +1594,188 @@ def test_every_real_tmux_e2e_joins_the_serialized_xdist_group():
         f"`{REAL_MUX_MARK_ALIAS}` from conftest and apply it (and remove any other "
         f"`xdist_group` mark, which xdist would merge into a different group): {offenders}"
     )
+    # `_e2e_def_count_offenders` iterates the INVENTORY, so this is the only assertion
+    # that can see a module the inventory does not declare. See that helper's docstring.
     assert set(_EXPECTED_E2E_DEF_COUNTS) == {rel for rel, _name, _grouped in found}, (
         "the set of modules holding real-tmux E2Es changed. If a new module legitimately "
         "drives real tmux, confirm it applies `real_mux_e2e` and then add it to "
-        f"_EXPECTED_E2E_DEF_COUNTS with its own count; "
+        f"_EXPECTED_E2E_DEF_COUNTS with its own bucket breakdown; "
         f"found {sorted({r for r, _n, _g in found})}"
     )
     counts = _e2e_def_count_offenders(found)
     assert not counts, "\n".join(counts)
 
 
+def test_the_unexplained_stem_is_claimed_by_no_declared_prefix():
+    """`_UNEXPLAINED_DEF_STEM` must stay unexplained in EVERY module of the inventory.
+
+    Generic over the inventory rather than spot-checked per module: the rows below use
+    this stem to mint both the catch-all bucket's names and the by-name refusal probe, so
+    a third module — or a new prefix on an existing one — that happened to claim the stem
+    would quietly turn those rows into something else while leaving them green. A
+    hand-written line per module is exactly the second hand-maintained claim DW-189 exists
+    to delete.
+    """
+    for rel, buckets in _EXPECTED_E2E_DEF_COUNTS.items():
+        # SYMMETRIC, because the stem is used to mint `stem + suffix` names, not the bare
+        # stem: a declared prefix SHORTER than the stem claims the stem itself, and one
+        # LONGER than the stem (`test_unexplained_0`) claims the minted names while
+        # leaving the bare stem unexplained. Testing one direction only would let the
+        # second shape mis-bucket every synthetic name with this row still green.
+        claimed = [
+            p
+            for p in buckets
+            if p != _OTHER_DEFS
+            and (_UNEXPLAINED_DEF_STEM.startswith(p) or p.startswith(_UNEXPLAINED_DEF_STEM))
+        ]
+        assert claimed == [], (
+            f"{rel} declares {claimed}, which claims _UNEXPLAINED_DEF_STEM "
+            f"({_UNEXPLAINED_DEF_STEM!r}) or the names minted from it; pick a stem that "
+            "neither extends nor is extended by any declared prefix"
+        )
+        assert _bucket_for(_UNEXPLAINED_DEF_STEM, buckets) == (
+            _OTHER_DEFS if _OTHER_DEFS in buckets else None
+        )
+
+
 @pytest.mark.parametrize(("delta", "direction"), [(1, "def added"), (-1, "def removed")])
 def test_e2e_def_count_inventory_bites_in_both_directions(delta, direction):
-    """Equality, not a floor: an ADDED gated def fails as loudly as a removed one.
+    """Equality, not a floor, PER BUCKET: an ADDED gated def fails as loudly as a removed
+    one, and it does so in whichever bucket moved rather than only in a module total.
 
     Driven synthetically because the live guard above scans the real `tests/` tree — the
     only mismatch it can ever see is one an author has already committed.
     """
-    for rel, expected in _EXPECTED_E2E_DEF_COUNTS.items():
-        counts = dict(_EXPECTED_E2E_DEF_COUNTS)
-        counts[rel] = expected + delta
-        offenders = _e2e_def_count_offenders(_synthetic_found(counts))
-        assert len(offenders) == 1, f"{direction} in {rel}: {offenders}"
-        assert offenders[0].startswith(f"{rel}: ")
-        assert f"expected {expected} tmux-gated test defs" in offenders[0]
-        assert f"inspected {expected + delta}" in offenders[0]
-        assert "update the inventory for intentional changes" in offenders[0]
+    for rel, buckets in _EXPECTED_E2E_DEF_COUNTS.items():
+        for bucket, expected in buckets.items():
+            counts = _inventory_copy()
+            counts[rel][bucket] = expected + delta
+            offenders = _e2e_def_count_offenders(_synthetic_found(counts))
+            assert len(offenders) == 1, f"{direction} in {rel} [{bucket}]: {offenders}"
+            assert offenders[0].startswith(f"{rel} [{bucket}]: ")
+            assert f"expected {expected} tmux-gated test defs" in offenders[0]
+            assert f"inspected {expected + delta}" in offenders[0]
+            assert "update the inventory for intentional changes" in offenders[0]
+
+
+def test_e2e_def_count_inventory_bites_a_rotted_breakdown_at_an_unchanged_total():
+    """The property a per-module TOTAL could not hold, and the whole reason for DW-189.
+
+    One def moves across the E2E/residual boundary while the module's total stays put, so
+    the flat inventory this replaced stayed green while its comment's `16 + 3 + 28`
+    justification became false. Both moved buckets must be named.
+
+    BOTH directions, because they fail differently in practice. An E2E renamed into a
+    harness-shaped name (`shifted = -1`) quietly deletes real-tmux coverage; a harness def
+    renamed into a `test_e2e_` name (`shifted = +1`) INFLATES the apparent real-tmux E2E
+    count, which is the more dangerous direction — it makes the suite look better covered
+    than it is. A one-directional row would grade only the first.
+
+    The unchanged total is DERIVED from the inventory below, never restated as a literal:
+    writing the number here would reintroduce the hand-maintained figure the header
+    comment claims is gone.
+    """
+    rel = "test_stories_e2e.py"
+    buckets = _EXPECTED_E2E_DEF_COUNTS[rel]
+    for shifted in (-1, 1):
+        counts = _inventory_copy()
+        counts[rel]["test_e2e_"] += shifted
+        counts[rel][_OTHER_DEFS] -= shifted
+        found = _synthetic_found(counts)
+        # total holds — derived, never a literal
+        assert sum(1 for r, _n, _g in found if r == rel) == sum(buckets.values()), shifted
+
+        offenders = _e2e_def_count_offenders(found)
+        assert len(offenders) == 2, (shifted, offenders)
+        assert any(o.startswith(f"{rel} [test_e2e_]: ") for o in offenders), (shifted, offenders)
+        assert any(o.startswith(f"{rel} [{_OTHER_DEFS}]: ") for o in offenders), (
+            shifted,
+            offenders,
+        )
+        for offender in offenders:
+            assert "update the inventory for intentional changes" in offender
+
+
+def test_e2e_def_count_inventory_names_an_unexplained_def_in_a_catch_all_free_module():
+    """The second offender kind: a module with NO catch-all refuses a def BY NAME.
+
+    `test_generic_tmux.py` declares only `test_tmux_`, so a gated def that does not start
+    with it is not "one too many defs" — the inventory can say exactly which def it could
+    not explain. Its declared bucket still balances, so the single offender is the naming
+    one and nothing else.
+    """
+    rel = "test_generic_tmux.py"
+    assert _OTHER_DEFS not in _EXPECTED_E2E_DEF_COUNTS[rel]  # the premise of the row
+    stray = f"{_UNEXPLAINED_DEF_STEM}stray"
+    found = [*_synthetic_found(_inventory_copy()), (rel, stray, True)]
+
+    offenders = _e2e_def_count_offenders(found)
+    assert len(offenders) == 1, offenders
+    assert offenders[0].startswith(f"{rel}::{stray}: ")
+    assert "no declared prefix claims this tmux-gated test def" in offenders[0]
+    # its OWN remedy clause: none of the three fixes is re-pinning a count, so it must
+    # not inherit the count offenders' "update the inventory" tail
+    assert "update the inventory for intentional changes" not in offenders[0]
+    assert "rename the def to match a declared prefix" in offenders[0]
+    assert "declare a new prefix bucket for its family" in offenders[0]
+    assert f"give {rel} an explicit {_OTHER_DEFS} bucket" in offenders[0]
+
+
+def test_e2e_def_count_inventory_is_blind_to_a_module_it_does_not_declare():
+    """The PRECONDITION `_e2e_def_count_offenders`' docstring states, graded rather than
+    asserted in prose.
+
+    The helper iterates the INVENTORY, so a wholly new module full of gated defs — even
+    ones no prefix could explain — produces no offender here at all. That is not a defect
+    to fix in this helper: the live caller's
+    `set(_EXPECTED_E2E_DEF_COUNTS) == {rel for ...}` assertion is the backstop, and
+    duplicating it here would give two places to keep in step. What must not happen is the
+    dependency being documented and unenforced, which is the exact shape DW-189 exists to
+    remove — so the blindness is pinned here and the backstop is pinned by asserting the
+    live scan would catch it.
+
+    `found` is built literally, not through `_synthetic_found`: that helper now REFUSES an
+    undeclared module for this same reason, so it cannot be used to build the input.
+    """
+    undeclared = "test_a_brand_new_tmux_module.py"
+    assert undeclared not in _EXPECTED_E2E_DEF_COUNTS
+    found = [
+        *_synthetic_found(_inventory_copy()),
+        (undeclared, f"{_UNEXPLAINED_DEF_STEM}0", True),
+        (undeclared, "test_tmux_1", True),
+    ]
+
+    assert _e2e_def_count_offenders(found) == []  # blind, by construction
+
+    # ...and the live caller's module-set assertion is what would catch it
+    assert set(_EXPECTED_E2E_DEF_COUNTS) != {rel for rel, _name, _grouped in found}
+    # the refusal that keeps `_synthetic_found` from papering over the same hole
+    with pytest.raises(AssertionError, match="not in _EXPECTED_E2E_DEF_COUNTS"):
+        _synthetic_found({undeclared: {"test_tmux_": 1}})
+
+
+def test_e2e_def_count_inventory_attributes_to_the_longest_declared_prefix():
+    """`test_reap_e2e_*` is its own family, under any dict ordering.
+
+    Both `test_e2e_` and `test_reap_e2e_` are declared for the stories module and neither
+    is a prefix of the other, but a shortest-match or first-match rule over a differently
+    ordered dict would still be a live hazard the moment a nested pair is declared.
+    Pinning LONGEST here is what lets the header comment promise order is never
+    load-bearing.
+    """
+    buckets = _EXPECTED_E2E_DEF_COUNTS["test_stories_e2e.py"]
+    assert _bucket_for("test_reap_e2e_x", buckets) == "test_reap_e2e_"
+    assert _bucket_for("test_e2e_x", buckets) == "test_e2e_"
+    assert _bucket_for(f"{_UNEXPLAINED_DEF_STEM}x", buckets) == _OTHER_DEFS
+    # the same name in a module without the catch-all is unexplained, not absorbed
+    assert _bucket_for(f"{_UNEXPLAINED_DEF_STEM}x", {"test_tmux_": 6}) is None
+    # a longest-match probe over a synthetic nested pair, which the live inventory has no
+    # instance of: shortest-match would answer "a_" here and silently mis-bucket
+    assert _bucket_for("a_b_x", {"a_": 1, "a_b_": 1}) == "a_b_"
 
 
 def test_e2e_def_count_inventory_stays_silent_on_an_exact_match():
-    assert _e2e_def_count_offenders(_synthetic_found(dict(_EXPECTED_E2E_DEF_COUNTS))) == []
+    assert _e2e_def_count_offenders(_synthetic_found(_inventory_copy())) == []
 
 
 def test_the_shared_mark_really_carries_the_shared_group_name():

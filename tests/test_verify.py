@@ -24,6 +24,7 @@ from conftest import (
     nested_repo_root_paths,
     plant_root_markers,
     refuse_to_resolve,
+    seed_outer_decoy_ledger,
     spec_path,
     write_spec,
     write_sprint,
@@ -6551,6 +6552,16 @@ def test_verify_dev_park_zero_diff_excludes_engine_writes_under_the_monorepo_sha
     gains ``app/`` while the plausible wrong spelling names a real outer ledger,
     so the two spellings produce opposite ``park_zero_diff`` observations.
 
+    The outer decoy comes from the shared ``seed_outer_decoy_ledger`` seeder (DW-208)
+    rather than being re-spelled here: the seeder DERIVES the decoy's location from
+    ``paths.deferred_work``, so this row and the rule under test move together if the
+    artifact layout changes, and its exists-guard makes a template that grew an outer
+    ``deferred-work.md`` fail loudly instead of degrading this row's premise into a
+    setup accident. Staging and committing stay here — the seeder only writes, and
+    whether the decoy ends up TRACKED is this row's own premise, graded by value with
+    ``ls-files --error-unmatch`` exactly as the inner ledger's mirror-image UNTRACKED
+    premise is graded below.
+
     Ablation performed: drop ``+ mode_exclude`` from ``proof_of_work_probe``'s
     exclusion composition and this row reddens on the correct spelling's
     ``park_zero_diff is True`` assertion; restoring the composition makes it green.
@@ -6559,14 +6570,14 @@ def test_verify_dev_park_zero_diff_excludes_engine_writes_under_the_monorepo_sha
     assert paths.project != paths.repo_root
     assert paths.project.parent == paths.repo_root
 
-    outer_ledger = project.implementation_artifacts / "deferred-work.md"
-    outer_ledger.write_text("- DW-132 outer decoy\n", encoding="utf-8")
-    git(
-        paths.repo_root,
-        "add",
-        outer_ledger.relative_to(paths.repo_root).as_posix(),
-    )
+    decoy, decoy_bytes = seed_outer_decoy_ledger(paths)
+    from_repo_root = decoy.relative_to(paths.repo_root).as_posix()
+    git(paths.repo_root, "add", from_repo_root)
     git(paths.repo_root, "commit", "-q", "-m", "seed outer deferred-work decoy")
+    # TRACKED, by value: `--error-unmatch` exits non-zero (and `git` raises) on a path
+    # git does not have in the index, so the premise the misrooted spelling's
+    # `park_zero_diff is False` rests on is asserted rather than merely commented.
+    git(paths.repo_root, "ls-files", "--error-unmatch", "--", from_repo_root)
 
     task, sp = _residue_free(
         paths, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
@@ -6615,6 +6626,14 @@ def test_verify_dev_park_zero_diff_excludes_engine_writes_under_the_monorepo_sha
     assert misrooted.ok
     assert misrooted.park_proof_skipped is True
     assert misrooted.park_zero_diff is False
+
+    # Graded HERE, after both verifications, rather than beside the seed call: the seeder
+    # writes and returns these exact bytes, so a check placed there grades nothing. What
+    # is worth grading is that the file the misrooted spelling names IS the seeded decoy
+    # and that nothing in `verify_dev` disturbed it — so the `False` above is about the
+    # pathspec landing on a real, unrelated, unchanged file rather than on residue.
+    assert paths.repo_root / from_project == decoy
+    assert decoy.is_file() and decoy.read_bytes() == decoy_bytes
 
 
 def test_verify_dev_refuses_a_bare_spec_flip_under_the_monorepo_shape(project):
@@ -7202,17 +7221,15 @@ def test_spec_within_roots(project, tmp_path):
 
 
 def _refuse_resolution_as(monkeypatch, target: Path, error_type: type[Exception]) -> None:
-    if error_type is OSError:
-        refuse_to_resolve(monkeypatch, target)
-        return
-    real_resolve = Path.resolve
+    """Make `target` fail to resolve in the named class, through the shared seam.
 
-    def stub(self, strict: bool = False):
-        if str(self) == str(target):
-            raise error_type("injected resolution uncertainty")
-        return real_resolve(self, strict=strict)
-
-    monkeypatch.setattr(Path, "resolve", stub)
+    Every class goes through `refuse_to_resolve`'s `error=` keyword. The `OSError` branch
+    used to take that seam while every other class got a local `Path.resolve` stub beside
+    it, which left the parametrized rows below differing by FAULT SEAM as well as by
+    class — only the seam clears `platform_util._LEXICAL_FALLBACK_NOTED`, so the two rows
+    were not the controlled comparison their parametrization claims.
+    """
+    refuse_to_resolve(monkeypatch, target, error=error_type("injected resolution uncertainty"))
 
 
 @pytest.mark.parametrize("error_type", [OSError, RuntimeError])
