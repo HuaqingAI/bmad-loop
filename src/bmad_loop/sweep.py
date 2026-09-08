@@ -463,6 +463,21 @@ def _plan_identifier(raw: Any, where: str, label_prefix: str) -> tuple[str, str,
     `has no evidence` / `names no blocker` / `gives no reason` / `has no question`
     messages print it behind a section prefix. For a string id the two collapse to
     the strings each site emitted before.
+
+    The two BARE-only callers — a bundle's `dw_ids` members (DW-178) and
+    `validate_migration`'s `mapping[i].dw_id` (DW-180) — have no section-prefixed
+    message at all, so they pass `label_prefix=""` and discard `label`. Sites that
+    print the subject `repr`-QUOTED are not this helper's: `mapping invents unknown
+    key {k!r}` and `mapping repeats key {k!r}` go through `_shown_value`. Those stay
+    byte-identical for a STRING key only, which is the whole of the parity this
+    module promises: the old spelling was `repr(str(raw))`, so a non-string SCALAR
+    key that printed `'5'` or `'None'` now prints `5` or `None` unquoted. That is
+    accepted — `_shown_value(str(raw))` would restore the quoting only by putting an
+    object key's stringified prose back into the message, which is the leak.
+    `validate_migration`'s `manifest says ..., ledger disagrees` needs neither
+    helper: it is reachable only once `source` AND `target` are both non-`None`,
+    which proves its key is a genuine manifest key and its id a genuine ledger id —
+    both strings by construction.
     """
     if isinstance(raw, str):
         return raw, raw, f"{label_prefix} {raw}"
@@ -544,22 +559,26 @@ def validate_triage(
 
     seen: dict[str, str] = {}  # id -> category that claimed it
 
-    def claim(dw_id: str, category: str, subject: str | None = None) -> None:
+    def claim(dw_id: str, category: str, subject: str) -> None:
         """`dw_id` is the plan's identity and keys `seen`; `subject` is what the
-        error PRINTS. The four id-bearing loops pass an explicit subject derived
-        by `_plan_identifier` — `decisions` (DW-157) and `already_resolved`,
-        `blocked`, `skip` (DW-171) — so an object-valued `id` is named by its
-        position instead of by its own stringified contents. `bundles` is the one
-        loop that still defaults: it claims each member of `dw_ids`, and those
-        members keep their `str(...)` treatment (the DW-145/148 Never clause)
-        while the bundle itself is already named positionally by `label`. For a
-        STRING id the subject collapses to the id, so every message here stays
-        byte-identical to before."""
-        shown = dw_id if subject is None else subject
+        error PRINTS. All five id-bearing loops pass an explicit subject derived
+        by `_plan_identifier` — `decisions` (DW-157), `already_resolved`,
+        `blocked`, `skip` (DW-171) and `bundles` (DW-178, which claims each
+        member of `dw_ids` and names it `bundles[i] dw_ids[j]`) — so an
+        object-valued `id` is named by its position instead of by its own
+        stringified contents. Every one of them keeps `str(...)` as the IDENTITY
+        that keys `seen` (the DW-145/148 Never clause); only the display is
+        screened. `subject` is REQUIRED rather than defaulting to `dw_id`: that
+        default is exactly how DW-178 happened — the bundles loop silently took
+        it, and neither DW-157 nor DW-171 noticed the omission — so a sixth
+        id-bearing loop must now name its subject or fail to typecheck rather
+        than fail quietly. Byte-identical
+        wording for a STRING id comes from `_plan_identifier`, which returns the
+        id itself as the subject, not from any fallback here."""
         if dw_id not in universe:
-            errors.append(f"{category} references unknown/closed id {shown}")
+            errors.append(f"{category} references unknown/closed id {subject}")
         elif dw_id in seen:
-            errors.append(f"{shown} appears in both {seen[dw_id]} and {category}")
+            errors.append(f"{subject} appears in both {seen[dw_id]} and {category}")
         else:
             seen[dw_id] = category
 
@@ -619,13 +638,24 @@ def validate_triage(
             names.add(name)
         raw_dw_ids = _plan_list(item, "dw_ids", where, errors)
         # MEMBERS keep their `str(...)` treatment (DW-148 drew that line); only
-        # the container is shape-checked. Guarded on the check having passed so a
+        # the container is shape-checked. What `_plan_identifier` adds on top of
+        # that identity is the DISPLAY name (DW-178): `dw_ids` below is still the
+        # `str(...)` list, and still what feeds `Bundle` and the "has no dw_ids"
+        # guard, while `claim` now prints an object-valued member by its POSITION
+        # instead of its own stringified contents -- these messages reach the
+        # journal. Enumerating the RAW list keeps positions stable, and the
+        # `label_prefix` return is unused here because neither message `claim`
+        # emits is section-prefixed. Guarded on the check having passed so a
         # `null` list does not also report "has no dw_ids".
-        dw_ids = [str(i) for i in raw_dw_ids or []]
+        members = [
+            _plan_identifier(raw_member, f"{where} dw_ids[{member_index}]", "")
+            for member_index, raw_member in enumerate(raw_dw_ids or [])
+        ]
+        dw_ids = [identity for identity, _shown, _member_label in members]
         if raw_dw_ids is not None and not dw_ids:
             errors.append(f"bundle {label} has no dw_ids")
-        for dw_id in dw_ids:
-            claim(dw_id, f"bundle {label}")
+        for dw_id, id_shown, _member_label in members:
+            claim(dw_id, f"bundle {label}", id_shown)
         intent = _plan_str(item, "intent", where, errors)
         if intent is not None:
             intent = intent.strip()
@@ -819,7 +849,12 @@ def validate_triage(
 
     unclaimed = sorted(universe - set(seen))
     if unclaimed:
-        errors.append(f"open entries not triaged: {', '.join(unclaimed)}")
+        # Sorted on the IDENTITY as ever, joined on the DISPLAY name (DW-179).
+        # `universe` is a subset of `shown_open`'s keys by construction — with
+        # `expected_open_ids is None` universe IS `set(shown_open)`, and otherwise
+        # the equality check above already returned on any mismatch — so the
+        # direct index is total, the same invariant `invented` relies on.
+        errors.append(f"open entries not triaged: {', '.join(shown_open[i] for i in unclaimed)}")
 
     if errors:
         return None, errors
@@ -997,21 +1032,50 @@ def validate_migration(
     seen_keys: set[str] = set()
     target_by_key: dict[str, str] = {}
     sources_by_target: dict[str, list[dict[str, Any]]] = {}
-    for item in mapping:
-        key = str(item.get("key", "")) if isinstance(item, dict) else ""
-        dw_id = str(item.get("dw_id", "")) if isinstance(item, dict) else ""
+    # Enumerated for the POSITION only: `key` and `dw_id` keep their `str(...)`
+    # identities, so what maps, what is refused and what `seen_keys` records are
+    # unchanged (DW-180). Screened is what gets PRINTED, because these errors
+    # reach the migrate-decision journal record. The two display shapes split by
+    # the wording each message already had: `invents unknown key` / `repeats key`
+    # print the key `repr`-quoted, which `_shown_value` reproduces for a string,
+    # while `no such entry` prints the id bare, which is `_plan_identifier`'s
+    # `shown`. Both collapse to today's bytes for a STRING value and only for one:
+    # the key half was `repr(str(raw))`, so a non-string SCALAR key that printed
+    # `'5'` now prints `5` unquoted (see `_plan_identifier` for why that trade is
+    # taken). Two messages here need no positional treatment at all, for the same
+    # reachability reason: `repeats key` is past the `source is None` `continue`
+    # and `manifest_by_key`'s keys are `str()`-forced, so its key is provably a
+    # genuine manifest key — it is converted for UNIFORMITY with its sibling, not
+    # from need — and `manifest says ..., ledger disagrees` is left alone outright
+    # because `source` AND `target` are both non-`None` by the time it is
+    # reachable, so its key and its id are both provably genuine.
+    for item_index, item in enumerate(mapping):
+        raw_key = item.get("key", "") if isinstance(item, dict) else ""
+        raw_dw_id = item.get("dw_id", "") if isinstance(item, dict) else ""
+        key = str(raw_key)
+        shown_key = _shown_value(raw_key)
+        dw_id, shown_dw_id, _dw_id_label = _plan_identifier(
+            raw_dw_id, f"mapping[{item_index}].dw_id", ""
+        )
         source = manifest_by_key.get(key)
         if source is None:
-            errors.append(f"mapping invents unknown key {key!r}")
+            errors.append(f"mapping invents unknown key {shown_key}")
             continue
         if key in seen_keys:
-            errors.append(f"mapping repeats key {key!r}")
+            errors.append(f"mapping repeats key {shown_key}")
         seen_keys.add(key)
-        target_by_key.setdefault(key, dw_id)
         target = entries.get(dw_id)
         if target is None:
-            errors.append(f"mapping {key} -> {dw_id}: no such entry in the ledger")
-        elif dw_id in pre_canonical:
+            errors.append(f"mapping {key} -> {shown_dw_id}: no such entry in the ledger")
+            continue
+        # Recorded for the manifest-order pass below only once the id resolved
+        # to a ledger entry: past this point `dw_id` is a key of `entries`, so
+        # the bare `{target}` that pass prints is provably genuine (the same
+        # reasoning `manifest says ..., ledger disagrees` relies on), and an id
+        # `no such entry` already refused is not reported a second time as an
+        # ordering fault.
+        target_by_key.setdefault(key, dw_id)
+        if dw_id in pre_canonical:
             errors.append(
                 f"mapping {key} -> {dw_id}: legacy items must map to newly created entries"
             )

@@ -1337,6 +1337,179 @@ def test_validate_triage_still_accepts_a_plan_whose_section_ids_are_objects(sect
         assert getattr(plan, section) == ((stringified, "later"),)
 
 
+def test_validate_triage_names_a_bundle_dw_id_positionally():
+    """The fifth id-bearing loop, and the one DW-157/DW-171 left behind: a
+    bundle claims each member of `dw_ids`, and `claim` used to default its
+    subject to the `str(...)` identity -- so an object-valued member printed its
+    own contents into a message that reaches the triage-decision journal record
+    and the re-drive feedback file (DW-178). The bundle itself was already named
+    positionally by `label`; the MEMBER was not.
+
+    ABLATION: pass raw `dw_id` instead of `id_shown` as the third argument
+    to the bundles loop's `claim` call; the exact-message assertions fail with
+    `{'leaky': 'secret prose'}` interpolated into the unknown/closed diagnostic.
+
+    BOTH call shapes, unlike the section-loop rows: the open-set equality check
+    inspects `open_ids` only and never a bundle's `dw_ids`, so a non-string member
+    is observable on the LIVE triage call (`validate_triage(rj, open_now)`) as
+    well as on the cached reader's `expected_open_ids=None`. The live one is the
+    journal-exposed path, so pinning only the reload path would leave production
+    uncovered.
+
+    The third plan pins the two POSITIONS independently: every other assertion
+    here is at index 0, where a bundle-index/member-index swap or an enumeration
+    of a filtered list rather than the raw one is invisible. The indices are
+    DELIBERATELY unequal -- `bundles[1] dw_ids[2]`, not `bundles[1] dw_ids[1]`,
+    which a swap renders identically."""
+    leaky = {"leaky": "secret prose"}
+    rj = triage_result(["DW-1"], bundles=[{"name": "b-1", "dw_ids": [leaky], "intent": "x"}])
+
+    plan, errors = validate_triage(rj, None)
+
+    assert plan is None
+    assert errors == [
+        "bundle 'b-1' references unknown/closed id bundles[0] dw_ids[0] (id not a string: dict)",
+        "open entries not triaged: DW-1",
+    ]
+    assert not any("secret prose" in e or "leaky" in e for e in errors)
+
+    # The live call: `DW-1` is triaged, so the ledger set matches and the only
+    # complaint left is the bundle member the open-set check never looks at.
+    _, live_errors = validate_triage(
+        triage_result(
+            ["DW-1"],
+            already_resolved=[{"id": "DW-1", "evidence": "e"}],
+            bundles=[{"name": "b-1", "dw_ids": [leaky], "intent": "x"}],
+        ),
+        {"DW-1"},
+    )
+    assert live_errors == [
+        "bundle 'b-1' references unknown/closed id bundles[0] dw_ids[0] (id not a string: dict)"
+    ]
+    assert not any("secret prose" in e or "leaky" in e for e in live_errors)
+
+    _, positional_errors = validate_triage(
+        triage_result(
+            ["DW-1", "DW-2", "DW-3"],
+            bundles=[
+                {"name": "b-1", "dw_ids": ["DW-1"], "intent": "x"},
+                {"name": "b-2", "dw_ids": ["DW-2", "DW-3", leaky], "intent": "x"},
+            ],
+        ),
+        None,
+    )
+    assert positional_errors == [
+        "bundle 'b-2' references unknown/closed id bundles[1] dw_ids[2] (id not a string: dict)"
+    ]
+
+
+def test_validate_triage_names_a_bundle_dw_id_positionally_in_a_duplicate_claim():
+    """`claim`'s OTHER branch for the bundles loop. The rows above only ever
+    reach the unknown/closed branch, so without this one half of the site's
+    contract is unpinned.
+
+    `already_resolved` is the first claimer because the loops claim in source
+    order (already_resolved, bundles, blocked, skip) and the SECOND claimer is
+    the one that prints -- a `skip`/`blocked` pairing would put the bundle's
+    display name on the `seen[...]` side, where it is not interpolated.
+
+    ABLATION: replace `id_shown` with raw `dw_id` in the bundles loop's
+    `claim` call; this fails with the object's contents as the bare subject."""
+    leaky = {"leaky": "secret prose"}
+    rj = triage_result(
+        [leaky],
+        already_resolved=[{"id": leaky, "evidence": "x"}],
+        bundles=[{"name": "b-1", "dw_ids": [leaky], "intent": "x"}],
+    )
+
+    plan, errors = validate_triage(rj, None)
+
+    assert plan is None
+    assert errors == [
+        "bundles[0] dw_ids[0] (id not a string: dict) appears in both "
+        "already_resolved and bundle 'b-1'"
+    ]
+    assert not any("secret prose" in e or "leaky" in e for e in errors)
+
+
+@pytest.mark.parametrize("dw_id", ["DW-9", ""], ids=["named", "empty"])
+def test_validate_triage_keeps_todays_wording_for_a_string_bundle_dw_id(dw_id):
+    """The other half of DW-178: the positional fallback is keyed on the TYPE,
+    not on truthiness, so an EMPTY member is still a string member and still
+    prints bare -- byte for byte the message this loop emitted before."""
+    rj = triage_result(["DW-1"], bundles=[{"name": "b-1", "dw_ids": [dw_id], "intent": "x"}])
+
+    plan, errors = validate_triage(rj, None)
+
+    assert plan is None
+    assert errors == [
+        f"bundle 'b-1' references unknown/closed id {dw_id}",
+        "open entries not triaged: DW-1",
+    ]
+
+
+def test_validate_triage_names_an_untriaged_open_id_positionally():
+    """The remainder message joined the RAW `universe` ids, so an object-valued
+    `open_ids` member that nothing triaged printed its own contents (DW-179) --
+    even though `shown_open` already held a sanitized display name for it, which
+    is what `invented` indexes. Sorting still happens on the IDENTITY; only the
+    join changed.
+
+    ABLATION: restore `', '.join(unclaimed)` and the first assertion reddens with
+    `{'leaky': 'secret prose'}`; the second row keeps the string wording pinned so
+    the fix cannot be "sanitize everything" at the cost of today's message."""
+    leaky = {"leaky": "secret prose"}
+
+    plan, errors = validate_triage(triage_result([leaky]), None)
+
+    assert plan is None
+    assert errors == ["open entries not triaged: open_ids[0] (not a string: dict)"]
+    assert not any("secret prose" in e or "leaky" in e for e in errors)
+
+    _, string_errors = validate_triage(triage_result(["DW-1", "DW-2"]), None)
+    assert string_errors == ["open entries not triaged: DW-1, DW-2"]
+
+    # A string id beside a sanitized one: each keeps its own rendering.
+    _, mixed_errors = validate_triage(triage_result([leaky, "DW-1"]), None)
+    assert mixed_errors == ["open entries not triaged: DW-1, open_ids[0] (not a string: dict)"]
+
+    # The row that actually pins the SORT KEY, which the ids above cannot: `'5'`
+    # sorts before `'DW-1'` by IDENTITY while `open_ids[0] ...` sorts after it by
+    # DISPLAY name, so re-keying the sort on the display flips this one line and
+    # leaves every other remainder assertion in the suite green.
+    _, sort_errors = validate_triage(triage_result([5, "DW-1"]), None)
+    assert sort_errors == ["open entries not triaged: open_ids[0] (not a string: int), DW-1"]
+
+    # Identity collisions retain the first occurrence's display, in either order.
+    _, object_first = validate_triage(triage_result([5, "5"]), None)
+    _, string_first = validate_triage(triage_result(["5", 5]), None)
+    assert object_first == ["open entries not triaged: open_ids[0] (not a string: int)"]
+    assert string_first == ["open entries not triaged: 5"]
+
+
+def test_validate_triage_still_accepts_a_bundle_whose_dw_ids_member_is_an_object():
+    """The bundles half of DW-171's acceptance clause, which
+    `test_validate_triage_still_accepts_a_plan_whose_section_ids_are_objects`
+    cannot reach -- it is parametrized over the three SECTION loops, whose
+    payload shape is `(id, field)`, and a bundle's is a LIST of ids.
+
+    What it pins is the DW-178 identity/display split on the ACCEPTING path:
+    `dw_ids` is built from `_plan_identifier`'s first return value and only
+    `claim` sees the second, so the stringified object still rides into `Bundle`
+    exactly as it did. ABLATION: build `dw_ids` from the member's `_shown`
+    instead of its `identity` and this reddens with `bundles[0] dw_ids[0] (id not
+    a string: dict)` in the dataclass -- with the ENTIRE rest of the suite still
+    green, which is the reason this row exists."""
+    leaky = {"leaky": "secret prose"}
+    rj = triage_result([leaky], bundles=[{"name": "b-1", "dw_ids": [leaky], "intent": "x"}])
+
+    plan, errors = validate_triage(rj, None)
+
+    assert errors == []
+    assert plan is not None
+    assert plan.bundles[0].dw_ids == ("{'leaky': 'secret prose'}",)
+
+
 @pytest.mark.parametrize(
     ("value", "shown"),
     [
@@ -2109,6 +2282,100 @@ def test_validate_migration_mapping_errors():
     assert "repeats key" in joined
     assert "DW-77: no such entry" in joined
     assert "not mapped" in joined  # the open item's key never appeared
+
+
+def test_validate_migration_names_a_mapping_key_and_dw_id_positionally():
+    """`validate_migration`'s mapping loop is the twin site DW-170's pass over
+    this function did not reach: `key` and `dw_id` were interpolated raw, so an
+    object-valued either printed its own contents into a message that reaches the
+    migrate-decision journal record (DW-180). Both halves keep their `str(...)`
+    IDENTITY -- what maps and what is refused is unchanged -- and split by the
+    display shape each message already had: the key prints `repr`-quoted, so it
+    goes through `_shown_value`; the id prints bare, so it goes through
+    `_plan_identifier`.
+
+    ABLATION: restore `{key!r}` in `invents unknown key` and the first assertion
+    reddens with `{'leaky': 'secret prose'}` quoted into the message; restore the
+    raw `{dw_id}` in `no such entry in the ledger` and the second does."""
+    leaky = {"leaky": "secret prose"}
+    manifest = legacy_manifest()
+    real_key = manifest[0]["key"]
+
+    invented = validate_migration(
+        migrate_result([{"key": leaky, "dw_id": "DW-1"}]), manifest, {}, migrated_ledger()
+    )
+    missing = validate_migration(
+        migrate_result([{"key": real_key, "dw_id": leaky}]), manifest, {}, migrated_ledger()
+    )
+
+    assert invented[0] == "mapping invents unknown key a dict"
+    assert missing[0] == (
+        f"mapping {real_key} -> mapping[0].dw_id (id not a string: dict): "
+        "no such entry in the ledger"
+    )
+    assert not any("secret prose" in e or "leaky" in e for e in invented + missing)
+
+    # An unknown entry is skipped, but must still count toward the raw position.
+    positional = validate_migration(
+        migrate_result(
+            [
+                {"key": real_key, "dw_id": "DW-1"},
+                {"key": "unknown", "dw_id": "DW-1"},
+                {"key": manifest[1]["key"], "dw_id": leaky},
+            ]
+        ),
+        manifest,
+        {},
+        migrated_ledger(),
+    )
+    assert positional == [
+        "mapping invents unknown key 'unknown'",
+        f"mapping {manifest[1]['key']} -> mapping[2].dw_id (id not a string: dict): "
+        "no such entry in the ledger",
+    ]
+    assert not any("secret prose" in e or "leaky" in e for e in positional)
+
+
+@pytest.mark.parametrize("key, shown", [(5, "5"), (1.5, "1.5"), (True, "True"), (None, "None")])
+def test_validate_migration_renders_scalar_keys_without_stringification_quotes(key, shown):
+    """Scalar keys use their raw repr; string keys retain their existing quotes.
+
+    ABLATION: restore `{key!r}` in the unknown-key diagnostic and this fails
+    because the stringified scalar gains quotes.
+    """
+    errors = validate_migration(
+        migrate_result([{"key": key, "dw_id": "DW-1"}]),
+        legacy_manifest(),
+        {},
+        migrated_ledger(),
+    )
+    assert errors[0] == f"mapping invents unknown key {shown}"
+
+
+def test_validate_migration_keeps_todays_wording_for_string_mapping_identifiers():
+    """The other half of DW-180, byte for byte rather than the substring
+    assertions `test_validate_migration_mapping_errors` makes. `_shown_value`
+    IS `repr` for a scalar and `_plan_identifier` returns a string unchanged, so
+    all three messages are what they were before the sanitization landed."""
+    manifest = legacy_manifest()
+    real_key = manifest[0]["key"]
+
+    invented = validate_migration(
+        migrate_result([{"key": "no-such-key", "dw_id": "DW-1"}]),
+        manifest,
+        {},
+        migrated_ledger(),
+    )
+    repeated = validate_migration(
+        migrate_result([{"key": real_key, "dw_id": "DW-1"}, {"key": real_key, "dw_id": "DW-77"}]),
+        manifest,
+        {},
+        migrated_ledger(),
+    )
+
+    assert invented[0] == "mapping invents unknown key 'no-such-key'"
+    assert repeated[0] == f"mapping repeats key {real_key!r}"
+    assert repeated[1] == f"mapping {real_key} -> DW-77: no such entry in the ledger"
 
 
 def test_validate_migration_refuses_mapping_legacy_to_a_pre_existing_entry():
