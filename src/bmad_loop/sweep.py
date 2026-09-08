@@ -21,7 +21,7 @@ from typing import Any, Callable, Iterable, Literal, assert_never
 from . import deferredwork, gates, verify
 from .engine import Engine, RunPaused, _ArmedClose, _LedgerAnchor
 from .escalation import critical_session_reason, env_fault_pause_reason, session_failure_reason
-from .model import PAUSE_STORY_GATE, Phase, StoryTask
+from .model import PAUSE_STORY_GATE, Phase, StoryTask, result_mapping
 from .platform_util import (
     atomic_write_text,
     atomic_write_text_confined,
@@ -196,11 +196,16 @@ def _normalize_bundle_names(rj: dict[str, Any] | None) -> tuple[_BundleNameRepai
     Total on any input (DW-181): a non-mapping document answers `()` with no
     repairs rather than raising out of `.get`. Same totality as the
     `escalation._escalation_list` twin and for the same reason -- callers'
-    totality over parseable JSON, NOT a live crash fix, since `engine.py:6003`
-    dereferences `result.result_json.get(...)` behind an `is not None` check
-    alone and raises before any sweep lane reaches here. The triage lane calls
-    this one line ahead of `validate_triage`, which names the wrong shape on
-    the existing `errors` channel.
+    totality over parseable JSON. DW-181 wrote both guards while
+    `Engine._run_session` still dereferenced `result.result_json.get(...)`
+    behind an `is not None` check alone, so a truthy non-mapping raised there
+    before any sweep lane reached here; DW-206 routed that frame through
+    `model.result_mapping`, and the triage lane now runs to this guard. It
+    calls this one line ahead of `validate_triage`, which names the wrong shape
+    on the existing `errors` channel.
+
+    Kept as its own `isinstance` rather than delegated to `result_mapping`, so
+    the ablation still proves this function total on its own.
     """
     if not isinstance(rj, dict):
         return ()
@@ -970,15 +975,16 @@ def validate_migration(
         # twin was left without (DW-170): `rj = rj or {}` substituted only on a
         # FALSY document, so every other wrong-shape top level -- a list, a string,
         # a number -- reached `.get` and raised `AttributeError` out of THIS
-        # function. What that buys is totality over parseable JSON for this
-        # function's own callers, NOT a live crash fix, and symmetry with the
-        # DW-155 site is the whole argument: `_ensure_migration`, the only
-        # production caller, cannot deliver a non-dict here, because
-        # `engine.py:6003` dereferences `result.result_json.get(...)` behind an
-        # `is not None` check alone -- a truthy non-dict raises THERE, inside
-        # `_run_session`, before this guard is reached. (DW-181 made the later
-        # `_escalation_list` helper total; the earlier engine dereference is
-        # unchanged.) Refused through the existing
+        # function. When DW-170 wrote this guard it bought totality for this
+        # function's own callers only, NOT a live crash fix: `_ensure_migration`,
+        # the only production caller, could not deliver a non-dict here, because
+        # `Engine._run_session` dereferenced `result.result_json.get(...)` behind
+        # an `is not None` check alone -- a truthy non-dict raised THERE, inside
+        # `_run_session`, before this guard was reached. DW-206 routed that frame
+        # through `model.result_mapping` while leaving the document itself
+        # untouched, so the migration lane now runs to this guard and it answers
+        # a real shape rather than an unreachable one -- the same reachability
+        # the `validate_triage` twin gained. Refused through the existing
         # `errors` channel; never raised, never repaired.
         return [f"migration result not a JSON object: {type(rj).__name__}"]
     if rj.get("workflow") != MIGRATE_WORKFLOW:
@@ -4012,7 +4018,7 @@ class SweepEngine(Engine):
         """
         if not self._generic_dev():
             return
-        spec_file = (result_json or {}).get("spec_file")
+        spec_file = result_mapping(result_json).get("spec_file")
         if not spec_file:
             return
         success_status = "in-review" if self._dev_review_enabled() else "done"

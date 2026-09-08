@@ -34,7 +34,7 @@ from .frontmatter import (
     read_frontmatter,
     status_of,
 )
-from .model import StoryTask, VerifyOutcome
+from .model import StoryTask, VerifyOutcome, result_mapping
 from .platform_util import atomic_write_bytes, atomic_write_bytes_confined
 from .policy import POLICY_FILE, Policy
 from .sprintstatus import STATUS_ORDER, story_status
@@ -3981,7 +3981,7 @@ def verify_dev(
     the gate would have, or the orchestrator's own bookkeeping writes would be
     counted as residue on the park's record.
     """
-    rj = result_json or {}
+    rj = result_mapping(result_json)
     spec_file = rj.get("spec_file")
     if not spec_file:
         return VerifyOutcome.retry("dev result.json missing spec_file")
@@ -4063,7 +4063,7 @@ def verify_dev_bundle(
     generic path and passes.
 
     ``engine_written`` has the same contract as :func:`verify_dev`."""
-    rj = result_json or {}
+    rj = result_mapping(result_json)
     spec_file = rj.get("spec_file")
     if not spec_file:
         return VerifyOutcome.retry("dev result.json missing spec_file")
@@ -4143,7 +4143,7 @@ def verify_dev_stories(
     # import stories at module scope (keep this local on any future refactor).
     from . import stories
 
-    rj = result_json or {}
+    rj = result_mapping(result_json)
     story_id = str(task.story_key).strip()
     state = stories.resolve_story_spec(spec_folder, story_id)
     if state.kind == stories.KIND_PENDING:

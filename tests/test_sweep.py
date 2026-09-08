@@ -4259,6 +4259,59 @@ def test_triage_returning_a_nested_null_container_refuses_without_crashing_the_r
     assert "bundles[0] not an object: NoneType" in open(feedback_path).read()
 
 
+def test_triage_returning_a_non_mapping_document_refuses_without_crashing_the_run(project):
+    """DW-206's production surface, and the lane test the DW-181 spec named.
+
+    DW-181 made `_normalize_bundle_names` and `escalation._escalation_list`
+    total on a non-mapping result document, but no sweep lane could reach those
+    guards: `Engine._run_session` dereferenced the raw document behind an
+    `is not None` check alone and raised one frame upstream of both, so
+    `triage_effect(["nope"])` through `SweepEngine.run()` produced a `run-crash`
+    record — `AttributeError: 'list' object has no attribute 'get'` via
+    `_loop -> _cycle -> _ensure_triage -> _run_session`. Routing that frame
+    through `model.result_mapping` makes DW-181's guards reachable, and the run
+    degrades exactly as the nested-null-container twin above does.
+
+    The predicate is a READ-time guard, not a rewrite: `_run_session` reads the
+    document through it but returns the `SessionResult` untouched, so the raw
+    `["nope"]` still reaches this lane. That is what makes the row below the
+    real DW-181 regression test — the document now flows through
+    `critical_escalations` (answering `[]`) and `_normalize_bundle_names`
+    (answering `()`), the two guards that were unreachable, before
+    `validate_triage`'s own DW-155 guard names the top-level shape. Contrast
+    the nested-null twin above, where the wrong shape is NESTED: there the
+    validator receives a real mapping and names the member instead.
+
+    ABLATION: restore the `is not None` form in `_run_session` and this reddens
+    on the very first assertion — the run comes back `crashed=True` with
+    `crash_error="AttributeError: 'list' object has no attribute 'get'"` and a
+    `run-crash` record, instead of the paused/ESCALATED refusal. (The engine's
+    top-level handler is what converts the raise into that record, so the
+    exception does not escape `run()` even when ablated; the `run-crash`
+    assertion below is what pins the difference.)"""
+    write_ledger(project, {"DW-1": "open"})
+    before = project.deferred_work.read_text(encoding="utf-8")
+    engine, adapter = make_sweep(project, [triage_effect(["nope"]), triage_effect(["nope"])])
+
+    summary = engine.run()
+
+    assert summary.paused
+    assert engine.state.tasks["sweep-triage"].phase == Phase.ESCALATED
+    decisions_journalled = _records(engine, "triage-decision")
+    assert [r["ok"] for r in decisions_journalled] == [False, False]
+    assert decisions_journalled[0]["errors"] == ["triage result not a JSON object: list"]
+    # retried with the shape error as feedback, then escalated at the attempt cap
+    prompts = [s.prompt for s in adapter.sessions]
+    assert len(prompts) == 2
+    assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
+    feedback_path = prompts[1].split("--feedback ", 1)[1]
+    assert "triage result not a JSON object: list" in open(feedback_path).read()
+    # nothing escaped `run()`: no crash record, and a refused triage classified
+    # nothing, so the ledger it was reading is left exactly as it was
+    assert _records(engine, "run-crash") == []
+    assert project.deferred_work.read_text(encoding="utf-8") == before
+
+
 def test_overlong_bundle_name_is_normalized_without_triage_retry(project):
     """ABLATION A1: delete direct normalization and the first triage attempt fails."""
     write_ledger(project, {"DW-1": "open"})
@@ -12366,6 +12419,48 @@ def test_migration_escalation_resume_retries(project):
     migrate_id = adapter.sessions[0].task_id
     assert migrate_id == "sweep-migrate-triage-1-g1"
     assert migrate_id not in abandoned
+
+
+def test_migration_returning_a_non_mapping_document_refuses_without_crashing_the_run(project):
+    """The migration twin of the triage lane test above (DW-206).
+
+    `validate_migration`'s DW-170 guard became reachable for exactly the reason
+    `validate_triage`'s did: `Engine._run_session` dereferenced the raw document
+    behind an `is not None` check alone and raised before either lane reached its
+    validator. That guard's own unit test says so in its docstring — it could
+    only ever be exercised by a direct call. This is the lane-level row that was
+    missing.
+
+    The document is left untouched by `_run_session`, so it arrives here raw and
+    is refused on the existing `errors` channel: journalled on `migrate-decision`
+    with `ok=False`, retried with the shape error as feedback, escalated at the
+    attempt cap. This session leaves the legacy ledger unchanged.
+
+    ABLATION: restore the `is not None` form in `_run_session` and the run comes
+    back `crashed=True` with an `AttributeError` and a `run-crash` record instead
+    of the paused refusal."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+
+    def non_mapping_migrate(spec):
+        return SessionResult(status="completed", result_json=["nope"])
+
+    engine, adapter = make_sweep(project, [non_mapping_migrate, non_mapping_migrate])
+
+    summary = engine.run()
+
+    assert summary.paused
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    decisions = _records(engine, "migrate-decision")
+    assert [r["ok"] for r in decisions] == [False, False]
+    assert decisions[0]["errors"] == ["migration result not a JSON object: list"]
+    prompts = [s.prompt for s in adapter.sessions]
+    assert len(prompts) == 2
+    assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
+    feedback_path = prompts[1].split("--feedback ", 1)[1]
+    assert "migration result not a JSON object: list" in open(feedback_path).read()
+    # nothing escaped `run()`, and the un-migrated ledger is left as it was
+    assert _records(engine, "run-crash") == []
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
 
 
 def test_no_legacy_skips_migration(project):

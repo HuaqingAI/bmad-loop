@@ -712,6 +712,58 @@ def test_verify_dev_missing_spec_file_claim(project):
     assert not out.ok and out.retryable and "missing spec_file" in out.reason
 
 
+_NON_MAPPING_DOCUMENTS = [["nope"], "escalations", 7]
+
+
+@pytest.mark.parametrize("document", _NON_MAPPING_DOCUMENTS)
+def test_verify_dev_refuses_a_non_mapping_document_as_a_missing_claim(project, document):
+    """DW-206. These three gates are where the CHANGELOG locates the legible
+    refusal for a non-mapping result document, and they are reachable WITHOUT
+    passing `_run_session`'s guard: `Engine._resumable_session` rebuilds a
+    `SessionResult` straight from `record.result_json` behind an `is not None`
+    check alone, so a document rehydrated by `SessionRecord.from_dict` (which
+    does no shape check) arrives here directly on the resume path.
+
+    A non-mapping claims no `spec_file`, so it refuses exactly as an empty
+    document does — retryable, not an escalation and not a raise.
+
+    ABLATION: revert this gate to `(result_json or {}).get(...)` and every row
+    raises `AttributeError` instead of reddening."""
+    task = make_task(project)
+    out = verify.verify_dev(task, project, document)
+    assert not out.ok and out.retryable and "missing spec_file" in out.reason
+
+
+@pytest.mark.parametrize("document", _NON_MAPPING_DOCUMENTS)
+def test_verify_dev_bundle_refuses_a_non_mapping_document_as_a_missing_claim(project, document):
+    """The bundle twin of the row above — same gate, same refusal, and the lane a
+    sweep bundle's dev leg actually verifies through."""
+    task = make_bundle_task(project)
+    out = verify.verify_dev_bundle(task, project, document)
+    assert not out.ok and out.retryable and "missing spec_file" in out.reason
+
+
+@pytest.mark.parametrize("document", _NON_MAPPING_DOCUMENTS)
+def test_verify_dev_stories_refuses_a_non_mapping_document_at_the_plan_halt_marker(
+    project, document
+):
+    """The stories twin, which refuses on a DIFFERENT gate and so is worth its own
+    row: `verify_dev_stories` resolves the spec deterministically by id rather
+    than trusting a claimed `spec_file`, so its only read of the document is the
+    `plan_halt` marker cross-check. A non-mapping carries no marker, so a
+    plan-halt leg refuses there — the same channel a died-mid-flight
+    `ready-for-dev` takes, which is exactly what that gate exists to catch."""
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    write_story(spec_folder, "1", "user-auth", "ready-for-dev", task.baseline_commit)
+
+    out = verify.verify_dev_stories(
+        task, project, document, spec_folder=spec_folder, review_enabled=False, plan_halt=True
+    )
+
+    assert not out.ok and out.retryable and "no plan_halt marker" in out.reason
+
+
 def test_verify_dev_spec_does_not_exist(project):
     task = make_task(project)
     out = verify.verify_dev(task, project, dev_result(project.project / "ghost.md"))

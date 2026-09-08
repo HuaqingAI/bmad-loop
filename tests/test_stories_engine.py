@@ -1033,6 +1033,42 @@ def test_refused_plan_halt_does_not_journal_a_proof_waiver(project, result_json)
     assert not _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
 
 
+@pytest.mark.parametrize("document", [["nope"], "escalations", 7])
+def test_non_mapping_document_selects_not_a_plan_halt_on_both_reads(project, document):
+    """DW-206: stories mode's two `plan_halt` reads, which a non-mapping document
+    now reaches for the first time.
+
+    `_run_session` guards its own reads but returns the document untouched, so
+    these two frames sit downstream of it and were previously unreachable with
+    this shape — a truthy non-mapping raised `AttributeError` upstream. Both
+    reads must be TOTAL and must agree: a document that carries no readable
+    `plan_halt` marker is not a plan-halt leg.
+
+    That answer is the safe one on both sides. `_verify_dev_artifacts` leaves
+    `plan_checkpoint_pending` False, so the run does not pause for a plan review
+    it has no plan for; and `_run_verify_commands_after_dev` returns True, so the
+    project's build/test gate still RUNS rather than being skipped as it is for a
+    real plan leg. A non-mapping must never buy a session past the gate.
+
+    ABLATION: revert either read to `(result_json or {}).get("plan_halt")` and
+    that row raises `AttributeError` instead of answering."""
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _adapter = make_engine(project, [])
+    baseline = rev_parse_head(project.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline)
+    write_spec(story_spec(project, "1"), "ready-for-dev", baseline)
+
+    outcome = engine._verify_dev_artifacts(task, document)
+
+    # not a plan halt: the checkpoint never arms, and the leg is verified as an
+    # ordinary implementation (which a ready-for-dev spec does not satisfy)
+    assert task.plan_checkpoint_pending is False
+    assert not outcome.ok
+    assert not _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    # the twin read agrees: the build/test gate is not waived
+    assert engine._run_verify_commands_after_dev(task, document) is True
+
+
 @pytest.mark.parametrize("zero_diff", [False, None], ids=["residue", "unknown"])
 def test_accepted_plan_halt_journals_the_non_clean_proof_observation(
     project, monkeypatch, zero_diff
@@ -2155,6 +2191,39 @@ STORY_FINDING = {
     "location": "src/bmad_loop/stories.py:120",
     "severity": "low",
 }
+
+
+def test_stories_non_mapping_dev_result_skips_harvest_and_retries(project):
+    """A malformed result cannot select an id-keyed spec for harvesting.
+
+    Ablation: restore `_harvest_spec_path`'s `(result_json or {}).get(...)`
+    read and the first attempt crashes instead of reaching the successful retry.
+    """
+    write_ledger(project, {})
+    setup_stories(project, [entry("1")])
+    before = project.deferred_work.read_bytes()
+    malformed_effect = stories_dev_effect(deferred=[STORY_FINDING])
+    valid_effect = stories_dev_effect()
+
+    def malformed(spec):
+        malformed_effect(spec)
+        return SessionResult(status="completed", result_json=["nope"])
+
+    def retry(spec):
+        assert project.deferred_work.read_bytes() == before
+        assert not _kinds(engine.journal, "spec-deferrals-harvested")
+        return valid_effect(spec)
+
+    engine, adapter = make_engine(project, [malformed, retry])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert engine.state.tasks["1"].phase == Phase.DONE
+    assert engine.state.tasks["1"].attempt == 2
+    assert len(adapter.sessions) == 2
+    assert project.deferred_work.read_bytes() == before
+    assert not _kinds(engine.journal, "spec-deferrals-harvested")
 
 
 def test_stories_mode_harvests_spec_deferrals_into_the_ledger(project):

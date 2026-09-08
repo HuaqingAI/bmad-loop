@@ -174,6 +174,30 @@ class SessionRecord:
         )
 
 
+def result_mapping(result_json: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the original result dictionary, or an empty dictionary otherwise.
+
+    SessionRecord.from_dict rehydrates result_json unchecked, and third-party
+    adapters may return non-dictionaries despite the declared contract. The
+    first-party generic adapter already rejects such documents at its reader.
+    Keep the narrow annotation to catch incorrect arguments statically; the
+    runtime guard covers those untrusted producers (DW-206/DW-207).
+
+    Consumers use the existing empty-document channel for these reads, without
+    adding an error or event. This replaces falsiness-only `result_json or {}`
+    reads, which raised on truthy non-dictionaries. The raw session document
+    remains available to validators with their own shape-refusal channels.
+
+    Preserve dictionary identity so downstream reconciliation can mutate the
+    same document, including the review loop's normalized local value. Empty
+    dictionaries also retain identity; their field reads answer just as the old
+    empty substitute did. No caller's document is copied or rewritten here.
+    """
+    if isinstance(result_json, dict):
+        return result_json
+    return {}
+
+
 def _rebased_on(path: str | None, root: Path) -> str | None:
     """One persisted spec path, re-anchored on `root`; absolute values pass through.
 

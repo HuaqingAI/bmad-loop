@@ -56,6 +56,7 @@ from .model import (
     SessionRecord,
     StoryTask,
     VerifyOutcome,
+    result_mapping,
 )
 from .platform_util import (
     atomic_replace,
@@ -2462,7 +2463,7 @@ class Engine:
                 # pre-reconcile snapshot whose re-fold may have been dropped by a
                 # spec read fault — re-derive from the spec instead of defaulting
                 # a recommended review away.
-                rj = result.result_json or {}
+                rj = result_mapping(result.result_json)
                 if "followup_review_recommended" in rj:
                     task.followup_review_recommended = bool(rj["followup_review_recommended"])
                 else:
@@ -2641,7 +2642,7 @@ class Engine:
         real spec goes unread."""
         if task.spec_file:
             return
-        spec_file = (result_json or {}).get("spec_file")
+        spec_file = result_mapping(result_json).get("spec_file")
         if not spec_file:
             return
         spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
@@ -2775,7 +2776,7 @@ class Engine:
                 )
                 continue
 
-            rj = result.result_json or {}
+            rj = result_mapping(result.result_json)
             for pref in preference_escalations(rj):
                 # `pref` is LLM-authored — it comes straight out of the session's own
                 # result.json — so its keys become journal field NAMES, and three of
@@ -3662,7 +3663,7 @@ class Engine:
         all read the reconciled spec."""
         if not self._generic_dev():
             return
-        spec_file = (result_json or {}).get("spec_file")
+        spec_file = result_mapping(result_json).get("spec_file")
         if not spec_file:
             return
         spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
@@ -3788,9 +3789,11 @@ class Engine:
         `_salvage_review_timeout` reads the frontmatter fresh and stays disjoint.
         The append is engine-side ONLY — an adapter-side write would perturb the
         adapter's own mtime/hash observation state (#276 M1/M2)."""
+        # Normalize once for both the spec path and the later status read.
+        rj = result_mapping(rj)
         if not self._generic_dev():
             return
-        spec_file = (rj or {}).get("spec_file")
+        spec_file = rj.get("spec_file")
         if not spec_file:
             return
         spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
@@ -3900,7 +3903,7 @@ class Engine:
         path to a merge persists the task before reaching it."""
         if not self._generic_dev():
             return
-        spec_file = (result_json or {}).get("spec_file")
+        spec_file = result_mapping(result_json).get("spec_file")
         if not spec_file:
             return
         spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
@@ -3985,7 +3988,7 @@ class Engine:
 
     def _harvest_spec_path(self, task: StoryTask, result_json: dict | None) -> Path | None:
         """Resolve the spec whose frontmatter this mode may harvest."""
-        spec_file = (result_json or {}).get("spec_file")
+        spec_file = result_mapping(result_json).get("spec_file")
         if not spec_file:
             return None
         return verify.resolve_spec_path(str(spec_file), self.workspace.paths)
@@ -4178,7 +4181,7 @@ class Engine:
             # remain in the spec until the post-checkpoint implementation pass.
             if (
                 status == devcontract.PLAN_HALT_STATUS
-                and (result_json or {}).get("plan_halt") is True
+                and result_mapping(result_json).get("plan_halt") is True
             ):
                 return
             if status not in devcontract.RECONCILABLE_FROM:
@@ -6000,15 +6003,20 @@ class Engine:
         ended = False
         try:
             result = adapter.run(spec)
+            # One shape read for the whole frame (DW-206): `result_json` is
+            # parsed JSON off an adapter, so a non-mapping top level reached the
+            # `.get`s below behind an `is not None` test alone and raised
+            # `AttributeError` here — upstream of every guarded consumer,
+            # including the sweep triage lane's own validator. It now refuses
+            # through the empty-document channel each read already has.
+            rj = result_mapping(result.result_json)
             # A post-kill rescue (#61) is otherwise indistinguishable from a normal
             # completion in the journal; leave a breadcrumb for forensics.
-            if result.result_json is not None and result.result_json.get("post_kill_reconciled"):
+            if rj.get("post_kill_reconciled"):
                 self.journal.append("session-rescued-post-kill", task_id=task_id, role=role)
             # Same forensics need for a missing-marker synthesis (#224): the
             # result is real, but the marker-append the skill owes was skipped.
-            if result.result_json is not None and result.result_json.get(
-                "synthesized_from_frontmatter"
-            ):
+            if rj.get("synthesized_from_frontmatter"):
                 self.journal.append(
                     "session-synthesized-from-frontmatter", task_id=task_id, role=role
                 )
@@ -6016,7 +6024,7 @@ class Engine:
                 # on-disk spec (best-effort) so the next re-read is harvested on the
                 # normal marker path. Covers live-Stop, crash-path, and post-kill
                 # dead-window synthesis — every path that sets this flag.
-                self._repair_spec_marker(task, result.result_json)
+                self._repair_spec_marker(task, rj)
             # Only dev/review sessions are resumable — `_resumable_session` matches
             # exactly those task ids under DEV_RUNNING/REVIEW_RUNNING. For everything
             # else (triage/sweep, labeled plugin-workflow sessions) the payload is
@@ -6067,7 +6075,13 @@ class Engine:
                     session_id=result.session_id,
                     transcript_path=result.transcript_path,
                     result_json=(
-                        dict(result.result_json)
+                        # `dict(rj)`, not `dict(result.result_json)`: a non-mapping
+                        # document raised out of `dict(...)` here too, one line
+                        # past the reads above. The `is not None` arm stays — it
+                        # is what keeps an empty document persisting as `{}`
+                        # rather than collapsing to `None`, which a truthiness
+                        # test on `rj` would silently do (DW-206).
+                        dict(rj)
                         if resumable and result.result_json is not None
                         else None
                     ),

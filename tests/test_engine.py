@@ -1851,11 +1851,16 @@ def test_resume_final_review_cycle_replays_clean_result(project):
     assert "resume-restart" not in kinds
 
 
-def test_resume_final_review_cycle_dirty_replay_defers_without_extra_budget(project):
+@pytest.mark.parametrize("malformed", [False, True])
+def test_resume_final_review_cycle_dirty_replay_defers_without_extra_budget(project, malformed):
     """The same final-cycle replay for a non-convergent review consumes the
     recorded pass, then the loop exits on the normal budget guard — no fresh
     session, no extra cycle — and the story defers. Proves the relaxed guard
-    burns no extra budget once the replayed result is consumed."""
+    burns no extra budget once the replayed result is consumed.
+
+    The malformed row rehydrates a non-mapping review document from state.json.
+    Ablation: restore `_review_and_commit`'s `rj = result.result_json or {}`
+    and that row crashes at the status read instead of deferring."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
         project,
@@ -1878,6 +1883,11 @@ def test_resume_final_review_cycle_dirty_replay_defers_without_extra_budget(proj
     engine._emit = crashing_emit
     assert engine.run().crashed
     assert load_state(engine.run_dir).tasks["1-1-a"].review_cycle == 1
+
+    if malformed:
+        engine.state.tasks["1-1-a"].sessions[-1].result_json = ["nope"]
+        engine._save()
+        assert load_state(engine.run_dir).tasks["1-1-a"].sessions[-1].result_json == ["nope"]
 
     resumed, adapter = resume_engine(project, engine, [])
     summary = resumed.run()
@@ -2199,6 +2209,118 @@ def test_run_session_record_result_json_isolated_from_later_mutation(project):
     assert task.sessions[-1].result_json == {"workflow": "auto-dev"}  # in-memory record
     saved = load_state(engine.run_dir).tasks["1-1-a"]
     assert saved.sessions[-1].result_json == {"workflow": "auto-dev"}  # on-disk snapshot
+
+
+@pytest.mark.parametrize("role", ["dev", "review"])
+@pytest.mark.parametrize(
+    "document", [["nope"], "escalations", 7, 3.5, [["a", 1]], False, 0, "", []]
+)
+def test_run_session_is_total_on_a_non_mapping_result_document(project, document, role):
+    """DW-206: `_run_session` read the raw document behind an `is not None` check
+    alone, so a non-mapping — even a falsy list, string, or number — raised
+    `AttributeError` out of `.get` at the very top of the frame, and could fail again
+    out of `dict(...)` at the record snapshot. That is one frame UPSTREAM of
+    DW-181's guards in `escalation._escalation_list` /
+    `sweep._normalize_bundle_names`, which made them unreachable on the
+    production path.
+
+    `adapters/generic.py _read_result` rejects a non-dict top level, so the
+    exposure is third-party adapters and `SessionRecord.from_dict`'s unchecked
+    rehydration — both reach the engine exactly as this mock does.
+
+    The document is refused through the existing empty-document channel: no new
+    raise, no escalation, no extra journal event. The session still completes,
+    its `session-start` is still paired with a `session-end`, and the persisted
+    snapshot is `{}` — not `None`, which would claim the session recorded no
+    payload at all.
+
+    The `[["a", 1]]` row is the reason this is parametrized rather than a single
+    case. The two old failures were NOT uniform: `.get` raised `AttributeError`
+    on every shape, but the `dict(...)` snapshot was shape-dependent —
+    `ValueError` for a list or string, `TypeError` for a number, and for a
+    pair-list it SUCCEEDED, silently persisting a fabricated `{"a": 1}` into
+    state.json as if the session had returned it. That shape corrupted rather
+    than crashed, so it is the one the crash-shaped rows would never have caught.
+
+    ABLATION: restore `result.result_json.get("post_kill_reconciled")` behind
+    `result.result_json is not None` and every row raises `AttributeError` out of
+    `_run_session`. Restore the `dict(result.result_json)` snapshot instead and
+    the truthy rows fail in three different ways — `ValueError`, `TypeError`,
+    and the pair-list row reddening on a fabricated `{"a": 1}` record. Empty
+    strings and lists already convert to `{}` and do not pin the snapshot."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [SessionResult(status="completed", result_json=document)])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+
+    result = engine._run_session(task, role=role, prompt="/bmad-dev-auto 1-1-a", seq=1)
+
+    # the raw document reaches the caller untouched — the predicate reads it, it
+    # does not rewrite what the adapter returned
+    assert result.result_json == document
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.count("session-start") == 1 and kinds.count("session-end") == 1
+    # neither forensic breadcrumb fires: an unreadable document claims nothing
+    assert "session-rescued-post-kill" not in kinds
+    assert "session-synthesized-from-frontmatter" not in kinds
+    # `{}`, not `None`: both roles are resumable, so the record must say "a payload was
+    # returned and it carried nothing usable", not "no payload was persisted".
+    assert task.sessions[-1].result_json == {}
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.sessions[-1].result_json == {}
+
+
+def test_resume_from_a_rehydrated_non_mapping_dev_result_retries_instead_of_crashing(project):
+    """DW-206's OTHER entry point: the dev lane, reached without passing
+    `_run_session`'s guard at all.
+
+    `_run_session` guards its own reads but returns the document untouched, so
+    the twelve engine/stories/sweep conversions are downstream of it and need
+    their own arrival path. `SessionRecord.from_dict` rehydrates `result_json`
+    from state.json with no shape check, and `Engine._resumable_session`
+    rebuilds a `SessionResult` straight from `record.result_json` behind an
+    `is not None` check alone — so a corrupted or hand-edited run state delivers
+    a non-mapping directly into `_dev_phase`, which never re-enters
+    `_run_session` on the replay path.
+
+    It must degrade, not crash: the document claims no `spec_file`, so
+    `verify_dev` refuses it retryably and the dev leg retries into a real
+    session that succeeds.
+
+    ABLATION: revert `_dev_phase`'s `rj = result.result_json or {}` (or
+    `_harvest_spec_path` / `_post_dev_state_sync`'s reads) and the resumed run
+    comes back `crashed=True` with an `AttributeError` instead of done."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [dev_effect(project, "1-1-a")])
+
+    def crashing_emit(stage, *args, **kwargs):
+        if stage == "post_session":
+            raise RuntimeError("host died in the post-session window")
+        return original_emit(stage, *args, **kwargs)
+
+    original_emit = engine._emit
+    engine._emit = crashing_emit
+    assert engine.run().crashed
+    assert load_state(engine.run_dir).tasks["1-1-a"].phase == Phase.DEV_RUNNING
+
+    # Corrupt the durable record the way `from_dict` would happily rehydrate it.
+    engine.state.tasks["1-1-a"].sessions[0].result_json = ["nope"]
+    engine._save()
+    assert load_state(engine.run_dir).tasks["1-1-a"].sessions[0].result_json == ["nope"]
+
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert not summary.crashed and summary.crash_error is None
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.DONE
+    # the replayed non-mapping was refused retryably, so the leg ran again
+    assert final.attempt == 2
 
 
 def test_run_session_persists_result_json_only_for_resumable_roles(project):

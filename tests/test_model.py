@@ -17,6 +17,7 @@ from bmad_loop.model import (
     StoryTask,
     TokenUsage,
     VerifyOutcome,
+    result_mapping,
 )
 
 
@@ -983,3 +984,85 @@ def test_release_spec_paths_from_mount_keeps_an_out_of_mount_spec_verbatim():
     task.release_spec_paths_from_mount()
 
     assert task.spec_file == "/shared-artifacts/spec.md"
+
+
+# ------------------------------------------------------- result_mapping
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        None,
+        # truthy non-mappings: the shapes that RAISED out of `.get` before
+        # DW-206, because `(doc or {})` substituted only on a falsy value
+        ["nope"],
+        "escalations",
+        7,
+        3.5,
+        ("nope",),
+        {"a", "b"},
+        object(),
+        # falsy non-mappings: the shapes the old idiom already absorbed
+        [],
+        "",
+        0,
+        False,
+        (),
+    ],
+)
+def test_result_mapping_answers_empty_for_every_non_mapping(document):
+    """The one shape predicate every read of a session result document goes
+    through. A result document is parsed JSON, so its top level can be any JSON
+    value, while every consumer reads it with `.get` — so each truthy row here
+    raised `AttributeError` at whichever frame touched it first (DW-206:
+    `Engine._run_session`, one frame upstream of DW-181's own guards). All of
+    them now refuse through the empty-document channel the absent-document row
+    already takes.
+
+    Ablation: replace the body with `result_json or {}` and every truthy
+    non-mapping row reddens (it is returned as itself), while `None` and the
+    falsy rows stay green — which is exactly why the falsy rows are here."""
+    assert result_mapping(document) == {}
+
+
+def test_result_mapping_returns_a_mapping_by_identity_never_a_copy():
+    """Returning the caller's OWN object is load-bearing, not incidental:
+    `Engine._reconcile_generic_terminal_status` mutates the document in place
+    under its own `isinstance` guard, and `_dev_phase` / the review loop bind
+    the result and pass it on. A copy would silently strand every such write.
+
+    Ablation: return `dict(result_json)` instead and the `is` assertions redden
+    while an `==` -only test would not notice."""
+    document = {"spec_file": "x.md"}
+
+    assert result_mapping(document) is document
+
+    empty: dict = {}
+    assert result_mapping(empty) is empty
+
+
+def test_result_mapping_falsy_mapping_answers_identically_to_the_old_substitute():
+    """`{}` is the one input the replaced `(doc or {})` idiom substituted for
+    while the input was already the right shape. `isinstance` lets it fall
+    through to `.get`, which answers the same thing the substitute would have —
+    the equivalence that preserves field-read behavior at the converted sites."""
+    assert result_mapping({}).get("spec_file") is None
+    assert result_mapping(None).get("spec_file") is None
+
+
+def test_result_mapping_absorbs_the_unchecked_session_record_rehydration():
+    """`SessionRecord.from_dict` takes `result_json` off state.json with no shape
+    check, so a hand-edited or corrupted run state is one of the two named
+    producers of a non-mapping document. Reading that record through the
+    predicate is total; reading it with `.get` is not."""
+    record = SessionRecord.from_dict(
+        {
+            "task_id": "1-1-a-dev-1",
+            "role": "dev",
+            "status": "completed",
+            "result_json": ["nope"],
+        }
+    )
+
+    assert record.result_json == ["nope"]  # rehydrated verbatim, unchecked
+    assert result_mapping(record.result_json) == {}
