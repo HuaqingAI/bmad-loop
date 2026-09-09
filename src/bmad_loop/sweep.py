@@ -1535,11 +1535,11 @@ class SweepEngine(Engine):
             # whoever owns it, so this no longer ends on a clean TREE and nothing
             # downstream may assume one. Guarded on a non-empty recovery pass, so
             # a fresh sweep spawns no git at all (see `_close_resolved` for the
-            # guard inventory across all seven sites).
+            # guard inventory across all eight sites).
             # The LEDGER FILE (`_commit_ledger`): this publisher wrote the ledger,
             # so it names the file it published and the commit is narrowed to it.
             # Spelled off `self.workspace.paths` rather than a `ledger` local, at
-            # every one of the five publishers: `self.paths.deferred_work` is a
+            # every one of the six publishers: `self.paths.deferred_work` is a
             # DIFFERENT file under worktree isolation, and only the workspace's
             # copy is the one a publisher just wrote.
             self._commit_ledger(
@@ -2858,6 +2858,9 @@ class SweepEngine(Engine):
                 "already resolved",
                 notes=[f"already resolved: {entry.evidence}" for entry in plan.already_resolved],
             )
+            # Computed INSIDE this `try` (DW-193) so the probe's read faults take
+            # the degrade arm below rather than minting a second row of their own.
+            pending = not closed and self._resolved_write_pending(ledger, ids)
         except (deferredwork.LedgerReadError, OSError, ValueError, StateRootError) as e:
             self.journal.append("sweep-resolved-close-unavailable", dw_ids=ids, error=str(e))
             # `post_close_resolved` still fires and 0 is still returned: the phase
@@ -2867,15 +2870,31 @@ class SweepEngine(Engine):
             return 0
         if closed:
             self.journal.append("sweep-resolved-closed", dw_ids=closed)
-            # ...and the commit rides the SAME guard: a NON-EMPTY pass. With zero
-            # ids flipped `mark_done_many` wrote nothing, so there is nothing to
-            # publish and no git is spawned at all (DW-183/DW-185).
+            # ...and the commit rides a guard on a LANDED WRITE — this pass's here,
+            # or one already on disk on the `pending` arm below (DW-193). What it is
+            # NOT is a guard on the ledger being dirty. The boundary that holds is
+            # the PATHSPEC, so it is about dirt OUTSIDE the published file: an
+            # operator's in-flight edits elsewhere in the enclosing repository stay
+            # with their owner (DW-183/DW-185). Dirt INSIDE the ledger is a different
+            # story and the pending arm widens it — `_commit_ledger` publishes the
+            # whole file, so an out-of-band edit to the ledger (an operator's note, a
+            # rival writer's half-landed change) rides into the `chore(sweep):`
+            # commit beside the close it was asked to publish. The `closed` arm has
+            # always had that property; what is new is that a pass which wrote
+            # NOTHING can now trigger it. Accepted deliberately: the alternative is
+            # a per-hunk publish this bookkeeping does not have, and the entry the
+            # arm exists for — a durable close stranded off HEAD — is the worse loss.
+            # The emptiness short-circuit inside `_resolved_write_pending` is what
+            # keeps a phase that resolved nothing away from git ENTIRELY: with no
+            # ids named there is no write to publish under either arm.
             #
-            # The guard inventory across all seven `_commit_ledger` sites, since
+            # The guard inventory across all eight `_commit_ledger` sites, since
             # it is not uniform and reading it as uniform is the trap:
-            #   * FOUR gate on a write result or a normally returned effect:
+            #   * FIVE gate on a write result or a normally returned effect:
             #     both prunes (`dropped`, and `drop_pre_answer` answering True),
-            #     this site (`closed`), and `_decisions_phase` (`any_effect_landed`).
+            #     this site's TWO arms (`closed`, and `pending` — the same landed
+            #     write, read back off disk after a crash lost only its commit),
+            #     and `_decisions_phase` (`any_effect_landed`).
             #   * THREE gate on something that does NOT prove a write: `_loop`'s
             #     post-recovery publisher counts recovered tasks (which may defer
             #     without editing the ledger), `_loop`'s
@@ -2883,7 +2902,7 @@ class SweepEngine(Engine):
             #     answer can set without touching the ledger, and
             #     `_ensure_migration` gates on `if not errors:`, a verdict on the
             #     rewrite session rather than on bytes changing.
-            # Beneath all seven are TWO uniform floors, in this order:
+            # Beneath all eight are TWO uniform floors, in this order:
             #   * the TARGET VALIDATION (DW-199/203/205), which asks whether the
             #     declared `family`'s file is still there and still readable before
             #     any git runs. It is what the per-site guards above cannot cover:
@@ -2902,8 +2921,75 @@ class SweepEngine(Engine):
                 path=self.workspace.paths.deferred_work,
                 family="ledger",
             )
+        elif pending:
+            # These ids read `done` on disk while this pass flipped none of them —
+            # the shape a crash between a previous pass's write and its commit
+            # leaves behind, and the one this arm exists for (DW-193). It is not the
+            # only writer that can produce it; see `_resolved_write_pending` for what
+            # the probe actually proves. No `sweep-resolved-closed` row: this pass flipped nothing
+            # and must not claim otherwise — and `len(closed)` stays 0, so the
+            # cycle's progress predicate is unchanged. Only the commit is missing,
+            # and the diff being published IS the close of resolved entries, so the
+            # message above describes it exactly; a distinct one would fork the two
+            # publishers for no reader's benefit. `_commit_ledger`'s `path_clean`
+            # makes this a no-op when the write already reached HEAD.
+            self._commit_ledger(
+                "chore(sweep): close resolved deferred-work entries",
+                path=self.workspace.paths.deferred_work,
+                family="ledger",
+            )
         self._emit("post_close_resolved")
         return len(closed)
+
+    def _resolved_write_pending(self, ledger: Path, ids: list[str]) -> bool:
+        """Whether every id in `ids` reads `done` in the ledger ON DISK (DW-193) —
+        the state a crash between `mark_done_many`'s write and its commit leaves
+        behind, which the resume's cached triage plan replays as an empty
+        `mark_done_many` return.
+
+        WHAT IT PROVES, exactly: that these ids read `done` NOW. Not that a previous
+        pass of this phase is what wrote them, and not that the bytes are still
+        those of that write. This read takes NO cross-process ledger lock, where
+        `mark_done_many` above took one for its read-edit-write, so the same rival
+        writers that lock names — a live run's harvest, the TUI decision modal,
+        `sweep --archive` — can have closed these entries instead, or can edit the
+        file between this read and the publish. That is tolerable because of what
+        the answer is USED for: a commit of the ledger file, which is the right
+        outcome for a durable close whoever wrote it, and which `_commit_ledger`
+        re-validates and no-ops on its own. It would NOT be tolerable for a claim
+        about this run's work, which is exactly why the caller writes no
+        `sweep-resolved-closed` row on this arm and still returns `len(closed)`.
+
+        POSITIVE PROOF, per id. `[]` back from a non-empty `ids` is ambiguous:
+        `mark_done_many` skips both already-done ids AND ids the ledger holds no
+        entry for. So every named id must parse to :attr:`DWEntry.done` here — an
+        id the ledger does not carry, or one carrying a status the format does not
+        understand, proves nothing and must not authorize a commit. `.done`, never
+        `not .open`, for the reason that property documents.
+
+        The empty-`ids` arm is CORRECTNESS, not merely an ordering nicety: `all()`
+        over an empty sequence is vacuously True, so deleting it makes a phase that
+        resolved nothing publish — the exact regression DW-185 closed. It also
+        keeps that phase from taking this read at all, which is the property
+        `test_a_phase_that_wrote_nothing_spawns_no_git` grades at the git seam.
+
+        `read_for_write`, not `read_for_observation`: this gates a PUBLISH, so its
+        `None`/`LedgerReadError`/`OSError` answers belong in the caller's existing
+        degrade arm rather than collapsing to an empty text that would read as "no
+        entry is done" — the same answer a healthy ledger of open entries gives.
+        Whether the file is actually dirty stays `_commit_ledger`'s `path_clean`
+        question; this method spawns no git and asks no second one.
+        """
+        if not ids:
+            return False
+        text = deferredwork.read_for_write(ledger)
+        if text is None:
+            return False
+        # LAST-wins on a duplicate id, where the writer's `_apply_done` locates the
+        # FIRST. The two can disagree only on a ledger carrying duplicate ids, which
+        # is a corrupt shape `duplicate_ids` refuses elsewhere; not handled here.
+        entries = {entry.id: entry for entry in deferredwork.parse_ledger(text)}
+        return all(dw_id in entries and entries[dw_id].done for dw_id in ids)
 
     # `dict[str, Any]` per answer, not `dict[str, str]`: `unusable_answer_reason`
     # deliberately screens only the fields a reader consumes, so `resolution` and
@@ -3465,9 +3551,9 @@ class SweepEngine(Engine):
             # `_apply_decision_effect` is this walk's only ledger write, so a walk
             # that answered nothing (every decision pre-answered, skipped
             # unattended, or dropped) wrote nothing, and no git is spawned
-            # (DW-183/DW-185). This is one of the FOUR sites gating on a write
+            # (DW-183/DW-185). This is one of the FIVE sites gating on a write
             # result or returned effect; three gate on something weaker, and `path_clean`
-            # is the uniform floor beneath all seven — the inventory is spelled out
+            # is the uniform floor beneath all eight — the inventory is spelled out
             # at `_close_resolved`.
             #
             # The LEDGER FILE, not the project and not `self.workspace.root`: this
@@ -3665,7 +3751,7 @@ class SweepEngine(Engine):
         bookkeeping") — the two families name different files because they write
         different files:
 
-        * the five ledger PUBLISHERS pass `self.workspace.paths.deferred_work`.
+        * the six ledger PUBLISHERS pass `self.workspace.paths.deferred_work`.
           The ledger hangs off `implementation_artifacts`, which
           `bmadconfig._resolve` accepts as any absolute path and
           `ProjectPaths.rebased` leaves unmoved when it sits outside the project
@@ -3779,7 +3865,7 @@ class SweepEngine(Engine):
         is asked about the RESOLVED target (DW-188) and those are the bytes that
         would be published; before, because a refused publish must spawn no git at
         all — the same property the per-site guards buy. The two families need
-        different validation (the five ledger publishers read through
+        different validation (the six ledger publishers read through
         `deferredwork.read_for_write`, the two prunes check existence only), and
         the family is a caller's declaration because deriving it from the path
         would be precisely the "chosen by role" test the rule above refuses; a

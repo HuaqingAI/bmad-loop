@@ -1308,7 +1308,7 @@ JOURNAL_KINDS = frozenset(
         # `_commit_ledger` whose `verify.GitError` is journalled instead of
         # propagating, leaving the write on disk rather than aborting the sweep.
         # TWO producers reach it. The pre-answer prunes (DW-160) name the project,
-        # so `repo` is a project root that is not a git repo. The five ledger
+        # so `repo` is a project root that is not a git repo. The six ledger
         # publishers (DW-175) name the ledger's own directory, so `repo` can be a
         # freestanding `implementation_artifacts` enclosed by no repository at all,
         # which is a plain host directory and not a git tree in any sense
@@ -1344,12 +1344,18 @@ JOURNAL_KINDS = frozenset(
         "sweep-remaining-estimate-unreadable",
         "sweep-repeat-done",
         "sweep-resolved-closed",
-        # DW-166. The degrade arm of the row above: `_close_resolved`'s batched
-        # `mark_done_many` could not write — undecodable ledger bytes, or the
-        # cross-process ledger lock failing — so nothing was closed and the
-        # entries stay `open` for the next cycle to re-triage, instead of the bare
-        # call ending the whole sweep as crashed. `dw_ids` carries the ids that
-        # were TO BE closed and is routed by name in
+        # DW-166. The degrade arm of the row above, with TWO producers inside
+        # `_close_resolved`'s one `try`, instead of the bare call ending the whole
+        # sweep as crashed. FIRST: the batched `mark_done_many` could not write —
+        # undecodable ledger bytes, or the cross-process ledger lock failing — so
+        # nothing was closed and the entries stay `open` for the next cycle to
+        # re-triage. SECOND (DW-193): the same read taken by
+        # `_resolved_write_pending`, the probe deciding whether an already-landed
+        # close still needs publishing, whose ids may already be `done` with
+        # nothing about to close at all. The two deliberately share one row rather
+        # than minting a second kind; what the row means across both is that the
+        # phase read no usable ledger and published nothing. `dw_ids` carries the
+        # ids the plan named and is routed by name in
         # `diagnostics._JOURNAL_KEYLIST_FIELDS`; `error` is already a drop field.
         "sweep-resolved-close-unavailable",
         "sweep-return-no-client",
