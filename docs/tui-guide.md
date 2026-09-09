@@ -570,7 +570,12 @@ from — press `d`. The Deferred Work pane title shows the outstanding count
 (question, context, and each option with its effect and the triage
 recommendation). Each answer is durable: a `close` is applied immediately, and
 a `build`/`keep-open` is saved to `.bmad-loop/decisions.json`, so the next sweep
-acts on it (build → bundle, keep-open → recorded) without asking again. Skip a
+acts on it (build → bundle, keep-open → recorded) without asking again. The
+ledger can take no `decision:` line, though — the entry retired by another
+writer while the modal was open, or the ledger file gone (DW-198). The modal
+says so in a `warning` toast (naming the id, and the store answer where one was
+still saved), the walk carries on to the next decision, and that answer is not
+counted in the `recorded N decision(s)` summary. Skip a
 modal to leave that one for later. The same set is available on the CLI via
 `bmad-loop decisions` (`--list` to just view).
 

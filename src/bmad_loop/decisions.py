@@ -354,13 +354,40 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
 
 def apply_pre_answer(
     project: Path, decision: Decision, option: DecisionOption, *, date: str, commit: bool = True
-) -> None:
-    """Record a human's out-of-band answer durably. Always writes a ledger
-    `decision:` audit line; `close` also flips the entry to done (so it leaves
-    the open set now), while `build`/`keep-open` are saved to the pre-answer
-    store for the next sweep to consume. When `commit`, the ledger and store are
-    committed on their own (only those paths) — best effort, so a non-git or
-    dirty tree never blocks the on-disk record.
+) -> bool:
+    """Record a human's out-of-band answer durably, answering whether a ledger
+    `decision:` audit line actually landed. `close` also flips the entry to done
+    (so it leaves the open set now), while `build`/`keep-open` are saved to the
+    pre-answer store for the next sweep to consume. When `commit`, the ledger and
+    store are committed on their own (only those paths) — best effort, so a
+    non-git or dirty tree never blocks the on-disk record.
+
+    The boolean is `record_decision`'s own, and it is the CALLER's non-write
+    signal, not decoration — the same discipline `sweep._apply_decision_effect`
+    applies inside the sweep (DW-186), carried to the two out-of-band surfaces
+    (DW-198). `record_decision` answers False in exactly the two states that mean
+    no line was written — no ledger file at all, and no entry carrying this id, a
+    rival writer being free to retire one while the prompt blocks on the human —
+    and True only when it wrote one. Discarded, those two states were
+    indistinguishable from a write at both call sites, which then announced
+    closures the ledger never took: `cli.cmd_decisions` printed `closed now` and
+    `tui.app._record_decision` counted the decision into `recorded N decision(s)`.
+
+    What False does NOT say is that the ledger was readable: the missing-file arm
+    answers before any read. So a caller may report a non-write and nothing more;
+    it may not infer a read fault from it.
+
+    False is not an error and withholds nothing. The pre-answer store write and
+    the best-effort commit below both still run on it, unchanged by the boolean.
+    So for `build`/`keep-open` the human's answer really was saved to the store,
+    and a caller's report must not deny that — but it must not promise a later
+    sweep will consume it either: a sweep's triage is derived from the ledger's
+    open ids, so an id the ledger no longer carries is never surfaced again and
+    `prune_pre_answers` drops the stored answer as no longer open. A `close`
+    non-write writes nothing itself, which is all it says: the unconditional
+    commit below is a separate matter, and against a TRACKED ledger that has gone
+    absent `verify.commit_paths` deliberately keeps the missing path as a deletion
+    to stage, so that call can publish the removal rather than no-op.
 
     Precondition: `date` is ISO `YYYY-MM-DD`. The ledger writers raise
     `ValueError` on anything else (it would otherwise land a `status:` line that
@@ -381,7 +408,7 @@ def apply_pre_answer(
     # "close it" over a status that still says open. The bytes are identical to
     # the pair's. The commit below stays OUTSIDE any lock — locks are held only
     # around file I/O, never across a subprocess (#286).
-    deferredwork.record_decision(
+    recorded = deferredwork.record_decision(
         ledger, decision.id, date, option.label, detail, close_note=close_note
     )
     if option.effect != "close":
@@ -395,3 +422,4 @@ def apply_pre_answer(
             )
         except verify.GitError:
             pass  # files are written; git history is best effort
+    return recorded

@@ -860,6 +860,259 @@ def test_decisions_answer_records_and_carries_forward(project, capsys, monkeypat
     assert decisions.pending_missed_decisions(project.project) == []
 
 
+def _make_run_with_two_decisions(project, run_id="20260101-000000-aaaa"):
+    """`_make_run_with_decision`'s two-decision sibling (options `1`=build,
+    `2`=keep-open), so a walk has somewhere to continue to after the first."""
+    run_dir = project.project / ".bmad-loop" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "project": str(project.project),
+                "started_at": "now",
+                "run_type": "sweep",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "triage.json").write_text(
+        json.dumps(
+            {
+                "workflow": "deferred-sweep-triage",
+                "open_ids": ["DW-1", "DW-2"],
+                "already_resolved": [],
+                "bundles": [],
+                "blocked": [],
+                "skip": [],
+                "decisions": [
+                    {
+                        "id": dw_id,
+                        "question": f"build the widening for {dw_id}?",
+                        "context": "ctx",
+                        "options": [
+                            {"key": "1", "label": "Widen", "effect": "build", "intent": "widen it"},
+                            {"key": "2", "label": "Keep", "effect": "keep-open"},
+                        ],
+                        "recommendation": "1",
+                    }
+                    for dw_id in ("DW-1", "DW-2")
+                ],
+                "escalations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_decisions_reports_a_close_the_ledger_never_took(project, capsys, monkeypatch):
+    """The lie DW-198 removes: `apply_pre_answer` discarded `record_decision`'s
+    False, so this loop read every non-exception as a success and printed
+    `closed now` for an entry the ledger holds no `decision:` line for.
+
+    Reproduced with a rival writer rather than a hand-made pending decision:
+    `pending_missed_decisions` only offers ids the ledger currently has open, so
+    the entry has to vanish AFTER the listing and BEFORE the record — from inside
+    `ask`, which is exactly where the real prompt blocks on the human.
+
+    Exit 0 is asserted deliberately: a non-write is a degrade, not a failure, and
+    the command's exit codes are a compatibility contract.
+
+    Ablation: return `True` unconditionally from `apply_pre_answer`, or drop the
+    `if not recorded` arm here, and this reddens on `closed now`."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    _make_run_with_rich_decision(project)
+
+    class _StubPrompter:
+        def ask(self, decision):
+            # a rival writer retired the entry while this prompt blocked
+            write_ledger(project, {"DW-2": "open"})
+            return decision.option("2")  # choose close
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert "closed now" not in out
+    # Ablation: append the saved-answer suffix for close; this assertion fails.
+    assert "saved to the pre-answer store" not in out
+    assert "DW-1: no decision line was written: the ledger holds no entry for this id" in out
+
+
+def test_decisions_names_an_absent_ledger_rather_than_a_missing_entry(project, capsys, monkeypatch):
+    """The other of `record_decision`'s two False states, and why the outcome line
+    re-probes `is_file()` to say which fired: a retired id is one entry, where a
+    ledger that is gone took every `decision:` line the walk already wrote with it.
+
+    Ablation: collapse the two-state probe to the single "holds no entry" sentence
+    and this reddens while the sibling above still passes."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_rich_decision(project)
+
+    class _StubPrompter:
+        def ask(self, decision):
+            project.deferred_work.unlink()  # the whole ledger went, mid-prompt
+            return decision.option("2")  # choose close
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert "closed now" not in out
+    # Ablation: append the saved-answer suffix for close; this assertion fails.
+    assert "saved to the pre-answer store" not in out
+    assert "DW-1: no decision line was written: the ledger file is gone" in out
+
+
+def test_decisions_continues_when_the_non_write_diagnostic_probe_fails(
+    project, capsys, monkeypatch
+):
+    """A later observation failure must not abort a completed non-write.
+
+    Ablation: remove the diagnostic probe's OSError handler and the command
+    returns failure before asking DW-2.
+    """
+    from conftest import write_ledger
+
+    from bmad_loop import decisions
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    _make_run_with_two_decisions(project)
+    asked = []
+
+    class _StubPrompter:
+        def ask(self, decision):
+            asked.append(decision.id)
+            if decision.id == "DW-1":
+                write_ledger(project, {"DW-2": "open"})
+            return decision.option("1")
+
+    apply = decisions.apply_pre_answer
+    is_file = Path.is_file
+    probe_faults = []
+
+    def failing_probe(path):
+        if path == project.deferred_work:
+            # Only the diagnostic fails; later decisions see the recovered FS.
+            monkeypatch.setattr(Path, "is_file", is_file)
+            probe_faults.append(path)
+            raise PermissionError("ledger observation denied")
+        return is_file(path)
+
+    def record_then_fail_probe(*args, **kwargs):
+        recorded = apply(*args, **kwargs)
+        if not recorded:
+            monkeypatch.setattr(Path, "is_file", failing_probe)
+        return recorded
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+    monkeypatch.setattr(decisions, "apply_pre_answer", record_then_fail_probe)
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+    assert probe_faults == [project.deferred_work]
+    assert asked == ["DW-1", "DW-2"]
+    out = capsys.readouterr().out
+    assert (
+        "DW-1: no decision line was written; ledger state unavailable; "
+        "your answer was saved to the pre-answer store" in out
+    )
+    assert "DW-2: queued — the next sweep will build it" in out
+    assert decisions.load_pre_answers(project.project)["DW-1"]["effect"] == "build"
+
+
+def test_decisions_build_non_write_still_reports_the_saved_answer(project, capsys, monkeypatch):
+    """A non-write must not deny what DID land, and must not promise what will not.
+    The pre-answer store write runs regardless of the ledger, so the answer really
+    was saved and the line says exactly that — but NOT that the next sweep will
+    build it, which is false: a sweep's triage is derived from the ledger's open
+    ids, so a retired id is never surfaced again, nothing materializes, and
+    `_prune_pre_answers` drops the stored answer as no longer open. Annotating the
+    old outcome (`queued — the next sweep will build it, but ...`) would keep that
+    promise alive, so the outcome is replaced outright for every effect.
+
+    The walk continuing is asserted through DW-2's own outcome line: a loop that
+    returned or raised on the non-write would never print it."""
+    from conftest import write_ledger
+
+    from bmad_loop import decisions
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    _make_run_with_two_decisions(project)
+
+    class _StubPrompter:
+        def ask(self, decision):
+            if decision.id == "DW-1":
+                write_ledger(project, {"DW-2": "open"})  # DW-1 retired mid-prompt
+            return decision.option("1")  # choose build
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert (
+        "DW-1: no decision line was written: the ledger holds no entry for this id; "
+        "your answer was saved to the pre-answer store" in out
+    )
+    # the promise the annotated wording used to carry, on the line that cannot keep it
+    assert "DW-1: queued" not in out
+    # the walk carried on, and the entry the ledger still had got the plain outcome
+    assert "DW-2: queued — the next sweep will build it\n" in out
+    # ...and the answer really is saved, which is all the line above claims
+    stored = decisions.load_pre_answers(project.project)
+    assert stored["DW-1"]["effect"] == "build"
+    assert decisions.pending_missed_decisions(project.project) == []
+
+
+def test_decisions_keep_open_non_write_drops_the_recorded_claim(project, capsys, monkeypatch):
+    """The third effect's lane, and the one whose old wording was self-contradictory:
+    `kept open (recorded)` annotated with a non-write reads "recorded ... but nothing
+    was written", where `(recorded)` is the exact claim the annotation retracts. Every
+    effect's outcome is replaced outright for that reason, not annotated.
+
+    Like the `build` sibling, the line still states what DID land — the pre-answer
+    store write ran — and promises nothing about a later sweep.
+
+    Ablation: annotate rather than replace (`outcome = f"{outcome}, but {miss}"`) and
+    this reddens on the `(recorded)` assertion."""
+    from conftest import write_ledger
+
+    from bmad_loop import decisions
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    _make_run_with_two_decisions(project)
+
+    class _StubPrompter:
+        def ask(self, decision):
+            if decision.id == "DW-1":
+                write_ledger(project, {"DW-2": "open"})  # DW-1 retired mid-prompt
+            return decision.option("2")  # choose keep-open
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert (
+        "DW-1: no decision line was written: the ledger holds no entry for this id; "
+        "your answer was saved to the pre-answer store" in out
+    )
+    assert "(recorded)" not in out.split("DW-2")[0]  # not on DW-1's line
+    # the answer really was saved, which is the only thing that line claims
+    assert decisions.load_pre_answers(project.project)["DW-1"]["effect"] == "keep-open"
+
+
 def test_decisions_names_the_decision_a_bad_date_failed(project, capsys, monkeypatch):
     """`apply_pre_answer`'s `date` precondition raises `ValueError`, and the loop's
     handler must attribute it to the decision that did not land.

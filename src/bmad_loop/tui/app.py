@@ -399,10 +399,17 @@ class BmadLoopApp(App[None]):
         self.push_screen(DecisionModal(decision), on_choice)
 
     def _record_decision(self, decision: object, option: object) -> bool:
+        """Record one answered decision, answering whether `_walk_decisions` may
+        count it into `recorded N decision(s)`.
+
+        False means either a caught fault (which may follow a partial write) or
+        a ledger non-write. The toasts distinguish these by wording and severity;
+        the caller excludes both from its count and continues the walk.
+        """
         # decision/option cross the widget boundary as `object`; their runtime types
         # are the Decision/DecisionOption that apply_pre_answer and `.id` expect.
         try:
-            decisions.apply_pre_answer(
+            recorded = decisions.apply_pre_answer(
                 self.project,
                 decision,  # pyright: ignore[reportArgumentType]
                 option,  # pyright: ignore[reportArgumentType]
@@ -435,6 +442,20 @@ class BmadLoopApp(App[None]):
             self.notify(
                 f"failed to record {decision.id}: {e}",  # pyright: ignore[reportAttributeAccessIssue]
                 severity="error",
+            )
+            return False
+        if not recorded:
+            # Report the persistence contract from apply_pre_answer, excluding
+            # the non-write from the walk's count. Path resolution can itself fail,
+            # so this toast does not distinguish missing files from retired ids.
+            saved = (
+                ""
+                if option.effect == "close"  # pyright: ignore[reportAttributeAccessIssue]
+                else "; your answer was saved to the pre-answer store"
+            )
+            self.notify(
+                f"{decision.id}: no decision line was written to the ledger{saved}",  # pyright: ignore[reportAttributeAccessIssue]
+                severity="warning",
             )
             return False
         return True

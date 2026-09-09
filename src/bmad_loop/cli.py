@@ -4074,7 +4074,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     for decision in pending:
         option = prompter.ask(decision)
         try:
-            decisions.apply_pre_answer(project, decision, option, date=today)
+            recorded = decisions.apply_pre_answer(project, decision, option, date=today)
         except (
             OSError,
             bmadconfig.BmadConfigError,
@@ -4122,6 +4122,24 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             outcome = "queued — the next sweep will build it"
         else:
             outcome = "kept open (recorded)"
+        if not recorded:
+            # Replace success claims with what apply_pre_answer actually persisted.
+            # This later probe is only diagnostic: paths predates the prompt and
+            # may differ from the writer's reloaded config. A probe fault must not
+            # turn a completed non-write into a failed walk.
+            outcome = "no decision line was written"
+            try:
+                why = (
+                    "the ledger file is gone"
+                    if not paths.deferred_work.is_file()
+                    else "the ledger holds no entry for this id"
+                )
+            except OSError:
+                outcome += "; ledger state unavailable"
+            else:
+                outcome += f": {why}"
+            if option.effect != "close":
+                outcome += "; your answer was saved to the pre-answer store"
         print(f"  {decision.id}: {outcome}")
     print("\nrun `bmad-loop sweep` to act on any builds.")
     return 0

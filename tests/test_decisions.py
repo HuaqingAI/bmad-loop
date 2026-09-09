@@ -586,6 +586,81 @@ def test_apply_pre_answer_close_marks_done_no_store(project):
     assert decisions.load_pre_answers(project.project) == {}  # close needs no carry-forward
 
 
+def test_apply_pre_answer_returns_true_when_the_entry_is_there(project):
+    """The positive half of the boolean contract (DW-198), pinned on its own so
+    the two False rows below are not the only thing holding the return value —
+    a function that returned False unconditionally would satisfy them both."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    from bmad_loop.sweep import Decision
+
+    opt = DecisionOption(key="1", label="Close", effect="close", resolution="superseded")
+    d = Decision(id="DW-1", question="close?", context="", options=(opt,), recommendation="1")
+
+    assert decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13") is True
+
+
+def test_apply_pre_answer_returns_false_when_the_entry_was_retired(project):
+    """`record_decision`'s first non-write state, propagated (DW-198): the ledger
+    reads fine and simply carries no entry for this id — a rival writer retired it
+    while the prompt blocked on the human. No raise, so both callers used to read
+    the non-exception as a successful close.
+
+    Ablation: return `True` unconditionally from `apply_pre_answer` (or drop the
+    `return` and let it fall off the end as `None`) and this reddens."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-2": "open"})  # a ledger, but not this id
+    from bmad_loop.sweep import Decision
+
+    opt = DecisionOption(key="1", label="Close", effect="close", resolution="superseded")
+    d = Decision(id="DW-1", question="close?", context="", options=(opt,), recommendation="1")
+
+    assert decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13") is False
+    # ...and nothing was minted for the id the ledger does not carry
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert {e.id for e in deferredwork.parse_ledger(text)} == {"DW-2"}
+    assert "decision:" not in text
+
+
+def test_apply_pre_answer_returns_false_when_the_ledger_file_is_gone(project):
+    """The second non-write state, which `record_decision` answers BEFORE any read
+    (`if not path.is_file()`). That is why False may not be read as a read fault:
+    this call never opened the file at all.
+
+    Ablation: return `True` unconditionally from `apply_pre_answer` and this reddens
+    on the return value. The negative assertion below is the weaker half and needs
+    its own — have `record_decision` create the ledger it cannot find (write the
+    entry into a fresh file rather than returning False) and it reddens there, where
+    the return-value assertion alone would still pass."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    project.deferred_work.unlink()
+    from bmad_loop.sweep import Decision
+
+    opt = DecisionOption(key="1", label="Close", effect="close", resolution="superseded")
+    d = Decision(id="DW-1", question="close?", context="", options=(opt,), recommendation="1")
+
+    assert decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13") is False
+    assert not project.deferred_work.exists()  # no ledger conjured to write into
+
+
+def test_apply_pre_answer_build_non_write_still_saves_the_store_answer(project):
+    """False withholds nothing (DW-198). The ledger line is what did not land; the
+    pre-answer store write runs regardless, so the saved `build` answer remains
+    structurally usable. This asserts persistence, not future sweep execution."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-2": "open"})  # no DW-1 entry to record against
+    from bmad_loop.sweep import Decision
+
+    opt = DecisionOption(key="1", label="Widen", effect="build", intent="widen field")
+    d = Decision(id="DW-1", question="build it?", context="", options=(opt,), recommendation="1")
+
+    assert decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13") is False
+    stored = decisions.load_pre_answers(project.project)["DW-1"]
+    assert stored["effect"] == "build"
+    assert decisions.unusable_answer_reason(stored, allow_close=False) is None
+
+
 def test_apply_pre_answer_commit_leaves_unrelated_changes(project):
     install_bmad_config(project)
     write_ledger(project, {"DW-1": "open"})
