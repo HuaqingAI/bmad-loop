@@ -6481,7 +6481,7 @@ def test_decisions_phase_keys_on_the_run_dir_project_not_workspace_root(project,
     engine.workspace = Workspace(root=elsewhere, paths=engine.workspace.paths)
     engine.run_dir.mkdir(parents=True, exist_ok=True)
 
-    answers, closed = engine._decisions_phase(plan)
+    answers, closed, _unlanded = engine._decisions_phase(plan)
 
     assert answers["DW-1"]["effect"] == "keep-open"  # the READ found the project store
     assert answers["DW-2"]["key"] == "2"  # the interactive write landed too
@@ -7419,7 +7419,7 @@ def _drop_keep_open_answer_and_persist(project):
         json.dumps({"DW-1": _STALE_KEEP_OPEN_ANSWER}, indent=2), encoding="utf-8"
     )
     _, dropped = engine._materialize_bundles(
-        _stale_keep_open_plan(), {"DW-1": _STALE_KEEP_OPEN_ANSWER}
+        _stale_keep_open_plan(), {"DW-1": _STALE_KEEP_OPEN_ANSWER}, effect_unlanded=frozenset()
     )
     # PRECONDITION: the drop happened, and `_quarantine` persisted it ITSELF —
     # no `save_state` call here, because durability at the mutation is the point
@@ -7443,8 +7443,10 @@ def test_a_dropped_decision_stays_quarantined_across_a_resume(project):
 
     resumed, _ = resume_sweep(project, engine, [])
     assert resumed.state.sweep_dropped_decisions == ["DW-1"]
-    resumed_answers, _ = resumed._decisions_phase(_stale_keep_open_plan())
-    _, dropped_again = resumed._materialize_bundles(_stale_keep_open_plan(), resumed_answers)
+    resumed_answers, _, _unlanded = resumed._decisions_phase(_stale_keep_open_plan())
+    _, dropped_again = resumed._materialize_bundles(
+        _stale_keep_open_plan(), resumed_answers, effect_unlanded=frozenset()
+    )
 
     assert not dropped_again  # already announced; not progress a second time
     assert len(_mismatches(resumed)) == 1
@@ -7499,15 +7501,20 @@ def test_a_build_answer_drop_stays_quarantined_across_a_resume(project, drop_cau
     (engine.run_dir / "decisions.json").write_text(
         json.dumps({"DW-1": answer}, indent=2), encoding="utf-8"
     )
-    _, dropped = engine._materialize_bundles(dropping_plan, {"DW-1": answer})
+    _, dropped = engine._materialize_bundles(
+        dropping_plan, {"DW-1": answer}, effect_unlanded=frozenset()
+    )
     assert dropped and engine.state.sweep_dropped_decisions == ["DW-1"]
     assert load_state(engine.run_dir).sweep_dropped_decisions == ["DW-1"]
 
     resumed, _ = resume_sweep(project, engine, [])
-    _, dropped_again = resumed._materialize_bundles(dropping_plan, {"DW-1": answer})
+    _, dropped_again = resumed._materialize_bundles(
+        dropping_plan, {"DW-1": answer}, effect_unlanded=frozenset()
+    )
     revival, dropped_on_revival = resumed._materialize_bundles(
         TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(agreeing,)),
         {"DW-1": answer},
+        effect_unlanded=frozenset(),
     )
 
     assert not dropped_again and not dropped_on_revival
@@ -7554,7 +7561,7 @@ def test_a_resumed_cycles_agreeing_option_does_not_revive_a_quarantined_answer(p
     )
     resumed, _ = resume_sweep(project, engine, [])
     bundles, dropped_again = resumed._materialize_bundles(
-        agreeing_plan, {"DW-1": _STALE_KEEP_OPEN_ANSWER}
+        agreeing_plan, {"DW-1": _STALE_KEEP_OPEN_ANSWER}, effect_unlanded=frozenset()
     )
 
     assert not dropped_again
@@ -7614,7 +7621,7 @@ def test_a_new_run_re_evaluates_a_dropped_keep_open_answer(project):
     assert fresh.state.sweep_dropped_decisions == []
 
     _, dropped = fresh._materialize_bundles(
-        _stale_keep_open_plan(), {"DW-1": _STALE_KEEP_OPEN_ANSWER}
+        _stale_keep_open_plan(), {"DW-1": _STALE_KEEP_OPEN_ANSWER}, effect_unlanded=frozenset()
     )
 
     assert dropped  # progress again in the new run, not swallowed
@@ -7728,13 +7735,13 @@ def test_the_keep_open_stale_drop_prunes_the_project_pre_answer_that_fed_it(
             ),
         )
 
-    answers, _closed = engine._decisions_phase(plan)
+    answers, _closed, _unlanded = engine._decisions_phase(plan)
     # PRECONDITION: the answer reached this run through the PROJECT store, not a
     # hand-written run-local file — the carrier every earlier row bypasses
     assert answers == {"DW-1": _STALE_KEEP_OPEN_ANSWER}
     assert [r["dw_id"] for r in _records(engine, "decision-preanswered")] == ["DW-1"]
 
-    _, dropped = engine._materialize_bundles(plan, answers)
+    _, dropped = engine._materialize_bundles(plan, answers, effect_unlanded=frozenset())
 
     assert dropped is True
     [drop] = _records(engine, "sweep-decision-answer-dropped")
@@ -7796,15 +7803,17 @@ def test_a_second_run_reads_no_stale_answer_because_the_first_pruned_it(project)
     first, _ = make_sweep(project, [])
     first.run_dir.mkdir(parents=True, exist_ok=True)
     _cache_keep_open_triage(first)
-    first_answers, _closed = first._decisions_phase(plan)
-    _, dropped_first = first._materialize_bundles(plan, first_answers)
+    first_answers, _closed, _unlanded = first._decisions_phase(plan)
+    _, dropped_first = first._materialize_bundles(plan, first_answers, effect_unlanded=frozenset())
     assert dropped_first  # PRECONDITION: run 1 really did drop (and so prune)
 
     second, _ = make_sweep(project, [], run_id="sweep-run-2")
     second.run_dir.mkdir(parents=True, exist_ok=True)
     assert second.run_dir != first.run_dir
-    second_answers, _closed = second._decisions_phase(plan)
-    _, dropped_second = second._materialize_bundles(plan, second_answers)
+    second_answers, _closed, _unlanded = second._decisions_phase(plan)
+    _, dropped_second = second._materialize_bundles(
+        plan, second_answers, effect_unlanded=frozenset()
+    )
 
     assert second_answers == {}  # nothing left in the store to seed
     assert not dropped_second
@@ -7843,7 +7852,7 @@ def test_prune_dropped_pre_answer_keys_on_the_run_dir_project_not_workspace_root
     engine.run_dir.mkdir(parents=True, exist_ok=True)
 
     _, dropped = engine._materialize_bundles(
-        _stale_keep_open_plan(), {"DW-1": _STALE_KEEP_OPEN_ANSWER}
+        _stale_keep_open_plan(), {"DW-1": _STALE_KEEP_OPEN_ANSWER}, effect_unlanded=frozenset()
     )
 
     assert dropped
@@ -7877,7 +7886,7 @@ def _drop_stale_in_a_divergent_project(project, engine):
     write_ledger(project, {"DW-1": "open"})
     _seed_project_keep_open_answer(project, others={"DW-2": _STALE_KEEP_OPEN_ANSWER})
     return lambda: engine._materialize_bundles(
-        _stale_keep_open_plan(), {"DW-1": _STALE_KEEP_OPEN_ANSWER}
+        _stale_keep_open_plan(), {"DW-1": _STALE_KEEP_OPEN_ANSWER}, effect_unlanded=frozenset()
     )
 
 
@@ -8853,7 +8862,7 @@ def _decisions_phase_with_no_effect_landing(engine):
     prompt is taken, and `_apply_decision_effect` — the walk's only ledger write — is
     never reached, so no effect lands."""
     engine.prompting = False
-    answers, closed = engine._decisions_phase(
+    answers, closed, _unlanded = engine._decisions_phase(
         TriagePlan(
             open_ids=frozenset({"DW-1", "DW-2"}),
             decisions=(_close_or_keep_decision("DW-1"),),
@@ -9183,7 +9192,7 @@ def test_an_undecodable_ledger_during_an_attended_decision_degrades_per_decision
 
     engine._emit = spy_emit
 
-    answers, closed = engine._decisions_phase(plan)  # must not raise
+    answers, closed, _unlanded = engine._decisions_phase(plan)  # must not raise
 
     assert closed == 1  # DW-2 only — DW-1's effect never landed
     assert set(answers) == {"DW-1", "DW-2"}  # the human's answers both survive
@@ -9277,7 +9286,7 @@ def test_a_decision_whose_id_the_ledger_lacks_is_not_counted_closed(project, mon
 
     engine._emit = spy_emit
 
-    answers, closed = engine._decisions_phase(plan)  # must not raise
+    answers, closed, _unlanded = engine._decisions_phase(plan)  # must not raise
 
     assert closed == 0  # nothing was closed, so nothing is counted closed
     assert [key for stage, key in emits if stage == "pre_decision"] == ["DW-9"]
@@ -9349,7 +9358,7 @@ def test_a_false_effect_return_does_not_withhold_an_earlier_decisions_commit(pro
 
     engine._emit = spy_emit
 
-    _answers, closed = engine._decisions_phase(plan)  # must not raise
+    _answers, closed, _unlanded = engine._decisions_phase(plan)  # must not raise
 
     assert closed == 1  # DW-1 only — DW-2's effect never landed
     assert [key for stage, key in emits if stage == "post_decision"] == ["DW-1"]
@@ -9368,6 +9377,642 @@ def test_a_false_effect_return_does_not_withhold_an_earlier_decisions_commit(pro
         for e in deferredwork.parse_ledger(git(project.project, "show", f"HEAD:{ledger_rel}"))
     }
     assert committed["DW-1"].status.startswith("done ")
+
+
+def _decision_lines(text: str) -> int:
+    """How many `decision:` LINES the ledger carries. Line-anchored deliberately: a
+    close note reads "closed by human decision: <resolution>", so a bare substring
+    count answers 2 for a single decision line and would pass an ablation."""
+    return sum(1 for line in text.splitlines() if line.startswith("decision:"))
+
+
+_REAPPLY_RESOLUTION = "retired upstream in a1b2c3d"
+
+
+def _stored_close_answer(label="Close it"):
+    """EXACTLY what `_decisions_phase`'s interactive arm persists for a `close`
+    answer: key/label/effect/answered_at and nothing else.
+
+    No `resolution` on purpose. The arm writes none, and the project store cannot
+    hold a `close` at all (DW-147), so a stored `close` carrying a resolution is a
+    shape no writer produces — seeding one here would let an assertion about the
+    resolution reaching the ledger pass off the fixture instead of off the option
+    the walk is supposed to resolve."""
+    return {"key": "1", "label": label, "effect": "close", "answered_at": "2026-09-08"}
+
+
+def _reapply_decision(dw_id, label="Close it"):
+    """`_close_or_keep_decision` with a resolution string nothing else in this file
+    uses, so an assertion that it reached the ledger can only be satisfied by the
+    OPTION — the one source the re-apply has for a resolution. `label` is a
+    parameter because re-authoring it is how a test makes `_agreeing_option` refuse."""
+    return Decision(
+        id=dw_id,
+        question="q",
+        context="",
+        options=(
+            DecisionOption(key="1", label=label, effect="close", resolution=_REAPPLY_RESOLUTION),
+            DecisionOption(key="2", label="Keep", effect="keep-open"),
+        ),
+        recommendation="1",
+    )
+
+
+def _seed_run_store(engine, answers):
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    (engine.run_dir / "decisions.json").write_text(json.dumps(answers, indent=2), encoding="utf-8")
+
+
+def test_a_stored_close_whose_effect_never_landed_is_reapplied_on_resume(project):
+    """DW-167. The limbo the answer-first write order opens, closed on the READ side.
+
+    The interactive arm persists the answer and journals `decision-answered` BEFORE
+    it applies the effect, deliberately — the human's answer must survive a crash —
+    so a crash in that window leaves `<run>/decisions.json` holding
+    `effect: "close"` over an entry the ledger still lists as open. Every consumer
+    then read that answer as consumed: the reload accepts it (`allow_close=True` is
+    correct for this store, DW-147, whose in-run writer is its legitimate producer),
+    `pending` filters the id out so it is never re-asked, and no
+    `_materialize_bundles` lane matches `close` so nothing acts on it. The decision
+    was neither re-asked nor applied, and only a NEW run whose fresh triage happened
+    to raise the same question ever recovered it.
+
+    A stored `close` for an id the LEDGER STILL LISTS AS OPEN is therefore an effect
+    that has not landed, and this walk re-applies it. Routed through
+    `_apply_decision_effect` — the phase's only ledger write — so the landed boolean
+    feeds the same `any_effect_landed`/`ledger_in_doubt` flags and the same commit
+    gate the interactive arm feeds; nothing here is a second write path.
+
+    Six claims: the entry is `done`; exactly ONE `decision:` line, carrying the
+    resolution of the option the human picked — the walk's only source for one, since
+    the stored answer holds key/label/effect/answered_at and nothing else;
+    `sweep-decision-effect-reapplied` names the id and effect; `closed` counts it, so
+    the cycle reports progress; the ledger is COMMITTED, since the walk now has
+    something to publish; and the decision is never re-prompted even with `prompting`
+    on.
+
+    Ablation: delete the re-apply walk (restore the current resume behaviour, where a
+    stored `close` is simply reloaded into `answers`) and this reds on every claim —
+    the entry stays `open`, no `decision:` line exists, `closed` is 0 and no commit
+    is taken."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [])
+    engine.prompting = True  # attended, and still nothing to ask
+    _seed_run_store(engine, {"DW-1": _stored_close_answer()})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_reapply_decision("DW-1"),))
+    asked = []
+    engine.prompter = DecisionPrompter(
+        input_fn=lambda prompt: asked.append(prompt) or "1", print_fn=lambda _line: None
+    )
+
+    answers, closed, unlanded = engine._decisions_phase(plan)
+
+    assert closed == 1  # the re-applied close is this cycle's progress
+    assert asked == []  # never re-prompted: the store already holds the answer
+    assert unlanded == frozenset()  # a landed close is not a DW-200 signal
+    assert set(answers) == {"DW-1"}
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done ")
+    text = project.deferred_work.read_text(encoding="utf-8")
+    # LINE-anchored: the close note is itself "closed by human decision: <resolution>",
+    # so a bare substring count answers 2 for one decision line and grades nothing.
+    assert _decision_lines(text) == 1  # exactly one, not a second on re-entry
+    # the OPTION's resolution, which is the only place the walk can get one: the
+    # stored answer carries none, so this string cannot have come from the fixture
+    assert _REAPPLY_RESOLUTION in text
+    [row] = _records(engine, "sweep-decision-effect-reapplied")
+    assert row["dw_id"] == "DW-1" and row["effect"] == "close"
+    [commit] = _records(engine, "sweep-ledger-commit")
+    assert commit["commit"] == git(project.project, "rev-parse", "HEAD")
+    ledger_rel = str(project.deferred_work.relative_to(project.project)).replace("\\", "/")
+    committed = {
+        e.id: e
+        for e in deferredwork.parse_ledger(git(project.project, "show", f"HEAD:{ledger_rel}"))
+    }
+    assert committed["DW-1"].status.startswith("done ")
+
+
+def test_a_reapply_with_no_agreeing_option_lands_a_bare_note(project):
+    """DW-167's degrade when the option is gone. `resolution` reaches the ledger from
+    the OPTION alone — the interactive arm persists key/label/effect/answered_at, and
+    the project store cannot hold a `close` at all (DW-147), so no stored `close`
+    answer ever carries one. When this cycle's triage has re-authored the option the
+    key resolves to, `_agreeing_option` refuses it (DW-123's discipline, shared with
+    both `_materialize_bundles` lanes) and the walk has no resolution left.
+
+    It still applies the close, and that is the deliberate part: the human authorized
+    CLOSING the entry, and the option's prose was the rationale, not the decision. So
+    the note degrades to a bare `closed by human decision` and the `decision:` line
+    carries the answer's own label with no detail, rather than the walk inventing a
+    disposition or silently dropping an authorized close.
+
+    Five claims: the entry closes anyway; the `decision:` line carries the label and
+    NO ` — detail`; the resolution note is the bare sentence; the re-authored option's
+    own resolution never reaches the ledger; and the refusal is journaled as a
+    mismatch carrying `answer_effect: "close"` — the third value that field can take,
+    and the only producer of it.
+
+    Ablation, RUN: restore `resolution=_answer_str(answer, "resolution") or (...)` and
+    nothing changes (the answer has no resolution — that is the point); take
+    `resolution` from `decision.option(answer_key)` instead of the AGREEING option and
+    this reds, with the re-authored option's resolution on the entry."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [])
+    _seed_run_store(engine, {"DW-1": _stored_close_answer(label="Close it")})
+    # same key "1", re-authored label: the key still resolves, the option disagrees
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1"}),
+        decisions=(_reapply_decision("DW-1", label="Close it as decayed"),),
+    )
+
+    _answers, closed, _unlanded = engine._decisions_phase(plan)
+
+    assert closed == 1  # the close the human authorized still lands
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done ")
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert _decision_lines(text) == 1
+    [line] = [ln for ln in text.splitlines() if ln.startswith("decision:")]
+    assert line.endswith(" Close it")  # the answer's label, and no ` — detail`
+    assert "—" not in line
+    assert "resolution: closed by human decision" in text  # bare: no `: <resolution>`
+    assert _REAPPLY_RESOLUTION not in text  # the disagreeing option never speaks
+    [mismatch] = _mismatches(engine)
+    assert mismatch["decision"] == "DW-1" and mismatch["answer_effect"] == "close"
+    assert [r["dw_id"] for r in _records(engine, "sweep-decision-effect-reapplied")] == ["DW-1"]
+
+
+@pytest.mark.parametrize("fault", ["oserror", "stateroot"])
+def test_a_reapply_whose_ledger_write_faults_degrades_and_carries_on(project, monkeypatch, fault):
+    """The re-apply's `except` arm, which is the interactive arm's reused rather than
+    re-decided. The gate read SUCCEEDS here — the ledger is fine, DW-1 is open — and
+    the fault lands on the write itself, which is where `record_decision`'s
+    cross-process lock (#286/#469) fails: `OSError` from the acquisition against a
+    live holder, and `runs.StateRootError` from deriving the lock's state-root
+    sidecar in an environment naming no usable root. The second is NOT an `OSError`,
+    so leaving it out of the tuple lets it escape and end the sweep as crashed — the
+    outcome this walk's whole degrade posture exists to prevent, reached through a
+    different door.
+
+    A repair that cannot be made must cost the repair and nothing else. Four claims:
+    no raise; nothing counted closed; the fault attributed under the one grep-able
+    kind with the id and effect; and no commit, since this walk landed nothing.
+
+    Ablation, RUN: narrow the tuple to `except deferredwork.LedgerReadError` and both
+    parameters red with the exception escaping `_decisions_phase`."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [])
+    _seed_run_store(engine, {"DW-1": _stored_close_answer()})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_reapply_decision("DW-1"),))
+    exc = (
+        OSError(11, "Resource deadlock avoided")
+        if fault == "oserror"
+        else runs.StateRootError("no usable state root")
+    )
+
+    def boom(*_args, **_kwargs):
+        raise exc
+
+    # `sweep` holds the MODULE, so patching the attribute here is what it resolves
+    monkeypatch.setattr(deferredwork, "record_decision", boom)
+
+    _answers, closed, _unlanded = engine._decisions_phase(plan)  # must not raise
+
+    assert closed == 0
+    assert ledger_entries(project)["DW-1"].open  # the entry is exactly as found
+    [failed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert failed["dw_id"] == "DW-1" and failed["effect"] == "close"
+    assert _records(engine, "sweep-decision-effect-reapplied") == []
+    assert _records(engine, "sweep-ledger-commit") == []
+
+
+def test_a_reapply_whose_write_reports_no_line_is_not_counted_closed(project, monkeypatch):
+    """The re-apply's non-raising non-write, the DW-186 shape reached from this walk.
+    `record_decision` returns False in exactly the two states meaning no `decision:`
+    line was written, and both are reachable HERE as a race the gate cannot close:
+    the entry was open when the gate read the ledger and a rival writer retired it
+    (or removed the file) before this write.
+
+    Counting it closed would be the same lie the `except` arm above refuses — a
+    `closed` increment and a re-apply row for an entry the ledger never received —
+    so it takes the same disposition and the same kind.
+
+    Four claims: nothing counted closed; NO `sweep-decision-effect-reapplied`, since
+    nothing was re-applied; the miss attributed with the two-state sentence, naming
+    the missing-ENTRY state because the ledger file is right there; and no commit.
+
+    Ablation, RUN: replace `if not recorded:` with `if False:` and this reds with
+    `closed == 1` and a `sweep-decision-effect-reapplied` row for a line that was
+    never written."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [])
+    _seed_run_store(engine, {"DW-1": _stored_close_answer()})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_reapply_decision("DW-1"),))
+    monkeypatch.setattr(deferredwork, "record_decision", lambda *_a, **_k: False)
+
+    _answers, closed, _unlanded = engine._decisions_phase(plan)  # must not raise
+
+    assert closed == 0
+    assert _records(engine, "sweep-decision-effect-reapplied") == []
+    [failed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert failed["dw_id"] == "DW-1" and failed["effect"] == "close"
+    # the ledger FILE is present, so this is the missing-entry sentence
+    assert failed["error"].endswith("the ledger holds no entry for this id")
+    assert _records(engine, "sweep-ledger-commit") == []
+
+
+def test_a_faulted_close_is_reapplied_by_a_resume_off_the_cached_triage(project, monkeypatch):
+    """DW-167 through the REAL path, end to end, which is the shape the intent names
+    and the one the hand-built rows above cannot produce.
+
+    Nothing here is hand-written: an attended phase runs a real triage session, the
+    human answers `close`, and `record_decision` faults on that first write exactly
+    the way DW-166 describes — the prompt blocks, so a ledger going undecodable while
+    it is open raises after the answer is already persisted and journaled. That
+    leaves the genuine article on disk: `<run>/decisions.json` holding a `close` over
+    a still-open DW-1, written by the interactive arm in its own shape.
+
+    The resume then re-enters `_decisions_phase` off the CACHED triage — `resume_sweep`
+    hands it an empty adapter script, so `_ensure_triage` running a session at all
+    would fail, and an empty prompter input, so re-asking DW-1 would raise
+    `StopIteration`. Both are load-bearing: this is what makes the `plan.decisions`
+    scoping meaningful, since the cached plan is where a suppressed decision actually
+    comes from, and it is what pins the FEATURES claim that a later cycle repairs the
+    DW-166 degrade without needing a new run.
+
+    Five claims: the first phase really did leave the limbo (open entry, stored
+    close, nothing counted); the resume closes it; the resolution comes off the
+    cached triage's option; the re-apply row names it; and no second prompt or second
+    `decision-answered` row appears anywhere in the shared journal.
+
+    Ablation, RUN: delete the re-apply walk and this reds with DW-1 still open after
+    the resume and no re-apply row."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(
+        project, [triage_effect(_close_decision_plan())], answers=["1"], prompting=True
+    )
+    _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+    plan = engine._ensure_triage({"DW-1"}, 1)  # runs the session, caches triage.json
+    assert [d.id for d in plan.decisions] == ["DW-1"]  # PRECONDITION
+
+    real_record = deferredwork.record_decision
+    calls: list[object] = []
+
+    def flaky(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:  # the write behind the human's answer, and only it
+            raise deferredwork.LedgerReadError("ledger went undecodable mid-prompt")
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(deferredwork, "record_decision", flaky)
+
+    _answers, closed, _unlanded = engine._decisions_phase(plan)
+
+    # PRECONDITION: the limbo DW-167 names, produced by the real writer
+    assert closed == 0
+    assert ledger_entries(project)["DW-1"].open
+    stored = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
+    assert stored["DW-1"]["effect"] == "close"
+    assert "resolution" not in stored["DW-1"]  # the interactive arm's own shape
+
+    resumed, _ = resume_sweep(project, engine, [], prompting=True)
+    resumed_plan = resumed._ensure_triage({"DW-1"}, 1)  # cache only: no session to run
+    _resumed_answers, resumed_closed, _ = resumed._decisions_phase(resumed_plan)
+
+    assert resumed_closed == 1
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done ")
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert _decision_lines(text) == 1
+    assert "moot" in text  # the cached triage option's resolution, via `_agreeing_option`
+    assert [r["dw_id"] for r in _records(resumed, "sweep-decision-effect-reapplied")] == ["DW-1"]
+    # one prompt across BOTH engines (they share a journal): the resume asked nothing
+    assert len(_records(resumed, "decision-answered")) == 1
+    assert len(_records(resumed, "decision-pending")) == 1
+
+
+def test_a_reapply_walk_only_runs_a_second_time_over_ids_this_cycle_still_asks(project):
+    """DW-167's scope, which is not the whole store. The re-apply is confined to ids
+    in THIS cycle's `plan.decisions`, because `pending`'s filter over that tuple IS
+    the suppression DW-167 names: an id the fresh triage no longer asks about has no
+    suppressed decision to repair, and its own routing — a plan bundle, a direct
+    close, a skip — already stands.
+
+    DW-2 here is the shape that must be left alone: a stored `close` over a
+    still-open entry, exactly like DW-1, but absent from this cycle's decisions. It
+    is the ledger's business now, not this walk's.
+
+    Ablation: widen the candidate list from `plan.decisions` to `answers` and this
+    reds — DW-2 is closed and a second `sweep-decision-effect-reapplied` row
+    appears."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    _seed_run_store(
+        engine,
+        {"DW-1": _stored_close_answer(), "DW-2": _stored_close_answer(label="Close it too")},
+    )
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}),
+        decisions=(_close_or_keep_decision("DW-1"),),  # note: DW-2 is not asked
+    )
+
+    _answers, closed, _unlanded = engine._decisions_phase(plan)
+
+    assert closed == 1
+    assert [r["dw_id"] for r in _records(engine, "sweep-decision-effect-reapplied")] == ["DW-1"]
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done ")
+    assert entries["DW-2"].open  # untouched: this cycle never asked about it
+
+
+@pytest.mark.parametrize("stored", [True, False])
+def test_a_close_whose_effect_already_landed_is_not_reapplied(project, stored):
+    """DW-167's mirror-image crash, and the reason "still open in the ledger" is the
+    ONLY re-apply discriminator. Crash the other way round — the effect landed and
+    the answer write was lost (or wasn't, the store having been written first) — and
+    the entry is already `done` with its `decision:` line on it. `record_decision`
+    applies a decision line to a done entry as readily as an open one, so a walk
+    gated on anything weaker than the live open set would add a SECOND line for one
+    human answer and re-report a closure the cycle already counted.
+
+    Both store states are graded because they are the two ways this crash lands and
+    they must agree: the answer being present is not evidence about the ledger, and
+    the answer being absent must not make the id look unhandled.
+
+    Four claims: the ledger's bytes are byte-identical, so no second `decision:` line
+    and no second `resolution:`; no `sweep-decision-effect-reapplied` row; `closed`
+    is 0, so the cycle does not count a closure twice; and no commit is spawned,
+    since this walk landed nothing (DW-183/DW-185).
+
+    Ablation, RUN: drop the `d.id in still_open` filter and the store-written arm
+    reds with a second `decision:` line, a re-apply row and `closed == 1`. The
+    store-empty arm needs the candidate gate and the answer lookup ablated with it —
+    measured — and that is the finding, not a gap: with no stored answer the two
+    gates are independently sufficient, so the arm's job is to show the walk stays
+    out of the ordinary pending path rather than to grade the open-set filter
+    twice."""
+    write_ledger(project, {"DW-1": "open"})
+    # the post-effect ledger, produced by the very primitive the effect uses
+    assert deferredwork.record_decision(
+        project.deferred_work,
+        "DW-1",
+        "2026-09-08",
+        "Close it",
+        "handled",
+        close_note="closed by human decision: handled",
+    )
+    before = project.deferred_work.read_bytes()
+    assert _decision_lines(before.decode("utf-8")) == 1  # PRECONDITION
+    engine, _ = make_sweep(project, [])
+    _seed_run_store(engine, {"DW-1": _stored_close_answer()} if stored else {})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_close_or_keep_decision("DW-1"),))
+
+    _answers, closed, _unlanded = engine._decisions_phase(plan)
+
+    assert project.deferred_work.read_bytes() == before  # no second line of any kind
+    # `engine.journal.entries()` rather than `_records`, which reads the file
+    # directly: on the store-written arm this phase writes no journal row AT ALL —
+    # itself part of the claim — so there is no journal file for `_records` to open.
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "sweep-decision-effect-reapplied" not in kinds
+    assert closed == 0
+    assert "sweep-ledger-commit" not in kinds  # nothing landed, nothing published
+
+
+@pytest.mark.parametrize("fault", ["absent", "undecodable"])
+def test_a_reapply_gate_that_cannot_read_the_ledger_refuses_every_candidate(project, fault):
+    """DW-167's gate is the DW-146 REPAIR/WRITE arm, because it gates a WRITE: the
+    open set it derives decides whether a `decision:` line is applied. So absence and
+    undecodable bytes are both refused as unknown open work rather than collapsed to
+    "nothing is open" — the `is None` test, never falsiness, since an
+    empty-but-PRESENT ledger genuinely has zero open ids and correctly re-applies
+    nothing. Collapsing either would be the wrong direction twice over: it re-applies
+    nothing (right, by luck) while saying nothing about why.
+
+    One row PER CANDIDATE, not one per file: the news is per-decision — "this stored
+    answer may still be unapplied" — and a single file-shaped row would name no id an
+    operator can chase. Two candidates here is what grades that.
+
+    Four claims: nothing is re-applied; exactly two
+    `sweep-decision-effect-unavailable` rows, one per candidate id, each naming the
+    effect; the fault itself is named in `error`; and no commit is spawned.
+
+    Ablation: replace the refusal with `open_ids(text or "")` and this reds with no
+    rows at all — the degraded empty text has no open ids, so both candidates are
+    silently skipped."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    _seed_run_store(
+        engine, {"DW-1": _stored_close_answer(), "DW-2": _stored_close_answer(label="Close 2")}
+    )
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}),
+        decisions=(_close_or_keep_decision("DW-1"), _close_or_keep_decision("DW-2")),
+    )
+    if fault == "absent":
+        project.deferred_work.unlink()
+    else:
+        project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
+
+    _answers, closed, _unlanded = engine._decisions_phase(plan)  # must not raise
+
+    assert closed == 0
+    # `engine.journal.entries()` rather than `_records`, which opens the file: under
+    # the ablation below this phase writes NOTHING, so `_records` would red with a
+    # FileNotFoundError instead of naming the missing rows.
+    entries = engine.journal.entries()
+    assert [e for e in entries if e["kind"] == "sweep-decision-effect-reapplied"] == []
+    refused = [e for e in entries if e["kind"] == "sweep-decision-effect-unavailable"]
+    assert [r["dw_id"] for r in refused] == ["DW-1", "DW-2"]
+    assert {r["effect"] for r in refused} == {"close"}
+    for row in refused:
+        assert row["error"].startswith("re-apply gate could not read the ledger: ")
+        if fault == "absent":
+            assert row["error"].endswith("the ledger file is gone")
+        else:
+            assert "is not valid UTF-8" in row["error"]
+    assert [e for e in entries if e["kind"] == "sweep-ledger-commit"] == []
+
+
+def _unlanded_build_plan():
+    """A cycle that asks DW-9 a BUILD question the ledger has no entry for, so the
+    human's answer is recorded and `record_decision` reports writing no line."""
+    return TriagePlan(
+        open_ids=frozenset({"DW-9"}),  # triage saw DW-9; the ledger no longer does
+        decisions=(
+            Decision(
+                id="DW-9",
+                question="q",
+                context="",
+                options=(DecisionOption(key="1", label="Widen", effect="build", intent="widen x"),),
+                recommendation="1",
+            ),
+        ),
+    )
+
+
+def _answer_an_unlanded_build(project, monkeypatch):
+    """Drive the interactive arm to the False return on a `build` answer, returning
+    the engine, its answers and the DW-200 signal the phase reported."""
+    # DW-9 IS in the ledger when the phase starts, and a rival writer retires it
+    # while the prompt blocks — the window DW-200 names. Seeding a ledger that never
+    # held DW-9 reaches the same False return by a route no operator hits.
+    write_ledger(project, {"DW-1": "open", "DW-9": "open"})
+    engine, _ = make_sweep(project, [])
+    engine.prompting = True
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+
+    def answer_and_retire(_prompt):
+        # the rival writer: `sweep --archive`, a hand edit, a branch checkout
+        write_ledger(project, {"DW-1": "open"}, commit=False)
+        return "1"
+
+    engine.prompter = DecisionPrompter(input_fn=answer_and_retire, print_fn=lambda _line: None)
+    answers, closed, unlanded = engine._decisions_phase(_unlanded_build_plan())
+    assert closed == 0 and unlanded == frozenset({"DW-9"})  # PRECONDITION
+    return engine, answers, unlanded
+
+
+def test_a_build_answer_whose_effect_never_landed_builds_no_bundle(project, monkeypatch):
+    """DW-200. The build lane routed purely on the stored `effect`, so a `build`
+    answer whose `record_decision` reported writing no `decision:` line still
+    materialized a bundle — and spent a dev session on an id the ledger holds no
+    entry for, briefed from a `_write_intent` read that finds nothing to brief with.
+    `record_decision` returns False in exactly the two states that mean the entry is
+    not there (no ledger file, no such id), and a rival writer retiring an entry
+    while `prompter.ask` blocks on the human is the reachable one.
+
+    The close lane has refused to claim a landing on that boolean since DW-186; this
+    is the build lane's half of the same discipline, and a DROP rather than a re-ask
+    for the same reason the lane's other two drops are: there is no `decision:` line
+    to double-apply, the entry is left exactly as found for the next sweep to
+    re-triage, and the quarantine is what frees the id.
+
+    Five claims: no bundle carries DW-9; one `sweep-decision-answer-dropped` naming
+    the fourth `drop_cause`; the operator is notified on the surface they actually
+    read; the id is quarantined ON DISK, which is what makes the drop survive a
+    resume; and the drop is reported as repeat progress (DW-135).
+
+    Ablation: make the lane unconditional again (delete the `if decision.id in
+    effect_unlanded` arm) and this reds with a `decision-dw-9` bundle, no drop row
+    and `dropped` False."""
+    engine, answers, unlanded = _answer_an_unlanded_build(project, monkeypatch)
+
+    bundles, dropped = engine._materialize_bundles(
+        _unlanded_build_plan(), answers, effect_unlanded=unlanded
+    )
+
+    assert bundles == []  # nothing to build against, so nothing is built
+    assert dropped  # progress: the id is released for a later cycle to re-triage
+    [drop] = _records(engine, "sweep-decision-answer-dropped")
+    assert drop["decision"] == "DW-9" and drop["drop_cause"] == "effect-unlanded"
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("recorded build decision discarded") == 1
+    assert engine.state.sweep_dropped_decisions == ["DW-9"]
+    assert load_state(engine.run_dir).sweep_dropped_decisions == ["DW-9"]
+
+
+def test_an_unlanded_build_drop_is_neither_re_announced_nor_revived_on_resume(project, monkeypatch):
+    """DW-200's durable half. The signal itself is a per-PHASE verdict — it is
+    rebuilt empty by every `_decisions_phase`, and a resumed run never re-answers the
+    decision that produced it — so on its own it would let a replayed cycle
+    re-materialize the bundle it just refused. `sweep_dropped_decisions` is what
+    carries the disposition across the resume, the same way it does for the three
+    older drop lanes (DW-124), and the quarantine check ahead of this lane is what
+    reads it.
+
+    The resumed call passes an EMPTY signal deliberately: that is the real shape of a
+    resume, and it is what makes the quarantine the load-bearing half rather than a
+    belt on top of one.
+
+    Three claims: still no bundle; no second drop row; no second ATTENTION line.
+
+    Ablation, RUN: drop `sweep_dropped_decisions` from `RunState.to_dict` and this
+    reds — the resumed run reads an empty quarantine and the stored answer, whose
+    intent the agreeing option still supplies, rebuilds `decision-dw-9`. Note what
+    does NOT grade here: reordering the new lane against the quarantine check changes
+    nothing, because the signal is empty on every pass after the one that answered
+    the decision. The two guards are not redundant — they cover different passes."""
+    engine, answers, unlanded = _answer_an_unlanded_build(project, monkeypatch)
+    engine._materialize_bundles(_unlanded_build_plan(), answers, effect_unlanded=unlanded)
+
+    resumed, _ = resume_sweep(project, engine, [])
+    assert resumed.state.sweep_dropped_decisions == ["DW-9"]
+    bundles, dropped_again = resumed._materialize_bundles(
+        _unlanded_build_plan(), answers, effect_unlanded=frozenset()
+    )
+
+    assert bundles == []
+    assert not dropped_again  # already announced; not progress a second time
+    assert len(_records(resumed, "sweep-decision-answer-dropped")) == 1
+    attention = (resumed.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("recorded build decision discarded") == 1
+
+
+def test_a_build_answer_whose_effect_raised_still_materializes_its_bundle(project, monkeypatch):
+    """DW-200's SCOPE, pinned from the outside: the fourth drop lane covers the False
+    RETURN alone, and the `except` arm's run-anyway trade is untouched.
+
+    The two non-writes are not the same news. `record_decision` returning False is
+    positive proof the ledger holds no entry for the id — there is nothing to build
+    against, and `_write_intent` would brief a dev session off an entry that is not
+    there. A RAISE says only that the bytes could not be read, which is no evidence
+    about the entry at all; withholding the bundle there would discard a human's
+    recorded build decision over a transient read, so the trade the DW-166 arm made
+    stays and the comment at that arm now says it describes that arm alone.
+
+    The ledger goes undecodable inside `input_fn` — the window between `ask` and the
+    effect — so `record_decision`'s locked `read_for_write` raises. It is restored
+    before `_materialize_bundles`, since the assertion is about the LANE and not about
+    what a later ledger read would do with corrupt bytes.
+
+    Four claims: the effect is journaled as unavailable, so the phase really did take
+    the `except` arm; the DW-200 signal is EMPTY, so the raise fed it nothing; the
+    bundle materializes off the stored answer anyway; and no drop row is written.
+
+    Ablation, RUN: add the `except` arm's id to `effect_unlanded` beside the False
+    return's and this reds — no bundle, and an `effect-unlanded` drop row."""
+    write_ledger(project, {"DW-1": "open"})
+    good = project.deferred_work.read_bytes()
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1"}),
+        decisions=(
+            Decision(
+                id="DW-1",
+                question="q",
+                context="",
+                options=(DecisionOption(key="1", label="Widen", effect="build", intent="widen x"),),
+                recommendation="1",
+            ),
+        ),
+    )
+    engine, _ = make_sweep(project, [])
+    engine.prompting = True
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+
+    def answer(_prompt):
+        project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
+        return "1"
+
+    engine.prompter = DecisionPrompter(input_fn=answer, print_fn=lambda _line: None)
+
+    answers, closed, unlanded = engine._decisions_phase(plan)  # must not raise
+
+    assert closed == 0
+    [failed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert failed["dw_id"] == "DW-1" and failed["effect"] == "build"
+    assert "not valid UTF-8" in failed["error"]  # the RAISE, not the False return
+    assert unlanded == frozenset()  # ...which feeds the DW-200 signal nothing
+
+    project.deferred_work.write_bytes(good)
+    bundles, dropped = engine._materialize_bundles(plan, answers, effect_unlanded=unlanded)
+
+    assert [b.name for b in bundles] == ["decision-dw-1"]  # the run-anyway trade
+    assert [b.intent for b in bundles] == ["widen x"]
+    assert not dropped
+    assert _records(engine, "sweep-decision-answer-dropped") == []
 
 
 def test_close_resolved_degrades_on_lock_and_state_root_failures(project, monkeypatch):
@@ -9449,7 +10094,7 @@ def test_decision_effect_degrades_on_lock_and_state_root_failures(project, monke
 
     monkeypatch.setattr(deferredwork, "record_decision", boom)
 
-    answers, closed = engine._decisions_phase(plan)  # must not raise
+    answers, closed, _unlanded = engine._decisions_phase(plan)  # must not raise
 
     assert closed == 0  # neither effect landed
     assert set(answers) == {"DW-1", "DW-2"}  # ...and the walk still reached both
@@ -9497,7 +10142,7 @@ def test_a_walk_ending_in_a_fault_commits_nothing_and_says_so(
         decisions=(_close_or_keep_decision("DW-1"), _close_or_keep_decision("DW-2")),
     )
 
-    answers, closed = engine._decisions_phase(plan)  # must not raise
+    answers, closed, _unlanded = engine._decisions_phase(plan)  # must not raise
 
     assert closed == int(first_effect_lands)
     assert set(answers) == {"DW-1", "DW-2"}  # ...and the human's answers survive
@@ -10989,7 +11634,9 @@ def test_a_build_answer_drop_leaves_the_project_pre_answer_in_place(project, dro
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
 
-    _, dropped = engine._materialize_bundles(dropping_plan, {"DW-1": answer})
+    _, dropped = engine._materialize_bundles(
+        dropping_plan, {"DW-1": answer}, effect_unlanded=frozenset()
+    )
 
     assert dropped
     [drop] = _records(engine, "sweep-decision-answer-dropped")
@@ -11025,7 +11672,11 @@ def test_the_stale_drop_refuses_a_readonly_project_store(project):
     store.chmod(0o444)
     try:
         with pytest.raises(PermissionError):
-            engine._materialize_bundles(_stale_keep_open_plan(), {"DW-1": _STALE_KEEP_OPEN_ANSWER})
+            engine._materialize_bundles(
+                _stale_keep_open_plan(),
+                {"DW-1": _STALE_KEEP_OPEN_ANSWER},
+                effect_unlanded=frozenset(),
+            )
     finally:
         store.chmod(0o644)
 
@@ -11044,10 +11695,10 @@ def test_the_stale_drop_refuses_a_readonly_project_store(project):
     fresh, _ = make_sweep(project, [], run_id="sweep-run-2")
     fresh.run_dir.mkdir(parents=True, exist_ok=True)
     plan = _stale_keep_open_plan()
-    reseeded, _closed = fresh._decisions_phase(plan)
+    reseeded, _closed, _unlanded = fresh._decisions_phase(plan)
     assert reseeded == {"DW-1": _STALE_KEEP_OPEN_ANSWER}  # the locked store still fed it
 
-    _, dropped_again = fresh._materialize_bundles(plan, reseeded)
+    _, dropped_again = fresh._materialize_bundles(plan, reseeded, effect_unlanded=frozenset())
 
     assert dropped_again
     assert len(_records(fresh, "sweep-decision-answer-dropped")) == 1
@@ -11131,7 +11782,7 @@ def test_stored_answers_with_a_non_dict_top_level_degrade_to_none(project):
     engine.run_dir.mkdir(parents=True, exist_ok=True)
     (engine.run_dir / "decisions.json").write_text('["DW-1"]', encoding="utf-8")
 
-    answers, closed = engine._decisions_phase(plan)
+    answers, closed, _unlanded = engine._decisions_phase(plan)
 
     assert answers == {} and closed == 0
     [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
@@ -11148,7 +11799,7 @@ def test_unreadable_stored_answers_degrade_to_none(project):
     engine.run_dir.mkdir(parents=True, exist_ok=True)
     (engine.run_dir / "decisions.json").write_text('{"DW-1": {"key": "1"', encoding="utf-8")
 
-    answers, closed = engine._decisions_phase(plan)
+    answers, closed, _unlanded = engine._decisions_phase(plan)
 
     assert answers == {} and closed == 0
     [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
@@ -11164,7 +11815,7 @@ def test_undecodable_stored_answers_degrade_to_none(project):
     engine.run_dir.mkdir(parents=True, exist_ok=True)
     (engine.run_dir / "decisions.json").write_bytes(b'{"DW-1": {"key": "\xff"}}')
 
-    answers, closed = engine._decisions_phase(plan)
+    answers, closed, _unlanded = engine._decisions_phase(plan)
 
     assert answers == {}
     [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
@@ -11183,7 +11834,7 @@ def test_oserror_reading_stored_answers_degrades_to_none(project, monkeypatch):
     store.write_text(json.dumps({"DW-1": {"key": "1"}}), encoding="utf-8")
     fault_read_text(monkeypatch, store)
 
-    answers, closed = engine._decisions_phase(plan)
+    answers, closed, _unlanded = engine._decisions_phase(plan)
 
     assert answers == {} and closed == 0
     [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
@@ -11207,7 +11858,7 @@ def test_whole_file_fault_is_replaced_by_seeded_decision_write_back(project):
     run_store = engine.run_dir / "decisions.json"
     run_store.write_text('["DW-1"]', encoding="utf-8")
 
-    answers, _closed = engine._decisions_phase(plan)
+    answers, _closed, _unlanded = engine._decisions_phase(plan)
 
     assert answers == {"DW-1": good}
     assert json.loads(run_store.read_text(encoding="utf-8")) == {"DW-1": good}
@@ -11223,7 +11874,7 @@ def test_whole_file_fault_is_replaced_by_interactive_decision_write_back(project
     run_store = engine.run_dir / "decisions.json"
     run_store.write_text('{"DW-1": {"key": "1"', encoding="utf-8")
 
-    answers, _closed = engine._decisions_phase(plan)
+    answers, _closed, _unlanded = engine._decisions_phase(plan)
 
     rewritten = json.loads(run_store.read_text(encoding="utf-8"))
     assert answers["DW-1"]["effect"] == "build"
@@ -11254,7 +11905,7 @@ def test_malformed_pre_answer_is_dropped_and_the_write_back_keeps_the_unusable_v
     run_store = engine.run_dir / "decisions.json"
     run_store.write_text(json.dumps({"DW-1": 7}), encoding="utf-8")
 
-    answers, _closed = engine._decisions_phase(plan)
+    answers, _closed, _unlanded = engine._decisions_phase(plan)
 
     assert answers == {"DW-3": good}
     [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
@@ -11286,7 +11937,7 @@ def test_materialize_bundles_skips_a_non_dict_answer(project):
     engine.run_dir.mkdir(parents=True, exist_ok=True)
     (engine.run_dir / "journal.jsonl").write_text("", encoding="utf-8")
 
-    bundles, dropped = engine._materialize_bundles(plan, {"DW-1": 7})
+    bundles, dropped = engine._materialize_bundles(plan, {"DW-1": 7}, effect_unlanded=frozenset())
 
     assert not dropped
     # built nothing of its own, and did not suppress the plan bundle over its id
@@ -11312,7 +11963,7 @@ def test_interactive_answer_write_back_keeps_an_unusable_stored_value(project):
     store = engine.run_dir / "decisions.json"
     store.write_text(json.dumps({"DW-9": 7}), encoding="utf-8")
 
-    answers, _closed = engine._decisions_phase(plan)
+    answers, _closed, _unlanded = engine._decisions_phase(plan)
 
     assert answers["DW-1"]["effect"] == "build"  # PRECONDITION: the prompt ran
     assert "DW-9" not in answers  # unusable in memory...
@@ -11468,7 +12119,7 @@ def test_unusable_stored_answer_shape_is_dropped_from_the_run_store(project, val
     store = engine.run_dir / "decisions.json"
     store.write_text(json.dumps({"DW-1": value}), encoding="utf-8")
 
-    answers, closed = engine._decisions_phase(plan)
+    answers, closed, _unlanded = engine._decisions_phase(plan)
 
     assert answers == {} and closed == 0
     [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
@@ -11490,10 +12141,15 @@ def test_close_effect_stays_a_usable_stored_answer(project):
     engine.run_dir.mkdir(parents=True, exist_ok=True)
     stored = {"key": "1", "label": "Widen", "effect": "close", "answered_at": "2026-09-06"}
     (engine.run_dir / "decisions.json").write_text(json.dumps({"DW-1": stored}), encoding="utf-8")
-    # this phase journals nothing at all on the happy path, so `_records` needs the file
+    # `_records` opens the file, so it has to exist. This phase no longer journals
+    # NOTHING here: DW-1 is open, its stored answer is a `close` and it is in
+    # `plan.decisions`, so the DW-167 re-apply walk runs and lands the close. That is
+    # incidental to this test's subject — that the shared predicate ACCEPTS a stored
+    # `close` rather than re-offering the decision — which the two assertions below
+    # pin and the re-apply leaves untouched.
     (engine.run_dir / "journal.jsonl").write_text("", encoding="utf-8")
 
-    answers, _closed = engine._decisions_phase(plan)
+    answers, _closed, _unlanded = engine._decisions_phase(plan)
 
     assert answers == {"DW-1": stored}
     assert _records(engine, "sweep-decisions-reload-failed") == []
@@ -11532,7 +12188,7 @@ def test_close_in_the_project_store_is_refused_and_the_decision_re_offered(proje
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
 
-    answers, closed = engine._decisions_phase(plan)
+    answers, closed, _unlanded = engine._decisions_phase(plan)
 
     assert answers == {"DW-2": good} and closed == 0
     [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
@@ -11585,12 +12241,12 @@ def test_keep_open_answer_with_a_corrupt_build_only_field_still_suppresses_its_b
     (engine.run_dir / "decisions.json").write_text(json.dumps({"DW-1": stored}), encoding="utf-8")
     (engine.run_dir / "journal.jsonl").write_text("", encoding="utf-8")
 
-    answers, _closed = engine._decisions_phase(plan)
+    answers, _closed, _unlanded = engine._decisions_phase(plan)
 
     assert answers == {"DW-1": stored}  # ...and the answer is still usable
     assert _records(engine, "sweep-decisions-reload-failed") == []
 
-    bundles, dropped = engine._materialize_bundles(plan, answers)
+    bundles, dropped = engine._materialize_bundles(plan, answers, effect_unlanded=frozenset())
 
     assert bundles == []  # the protection the human bought is still in force
     assert not dropped
@@ -11624,7 +12280,7 @@ def test_unusable_pre_answer_shape_is_dropped_and_the_write_back_republishes_it(
     run_store = engine.run_dir / "decisions.json"
     run_store.write_text(json.dumps({"DW-1": {"effect": "frobnicate"}}), encoding="utf-8")
 
-    answers, _closed = engine._decisions_phase(plan)
+    answers, _closed, _unlanded = engine._decisions_phase(plan)
 
     assert answers == {"DW-3": good}
     [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
@@ -11662,7 +12318,9 @@ def test_materialize_bundles_never_derives_an_intent_from_a_non_string(project):
     (engine.run_dir / "journal.jsonl").write_text("", encoding="utf-8")
 
     bundles, dropped = engine._materialize_bundles(
-        plan, {"DW-1": {"key": "9", "effect": "build", "intent": ["a", "b"]}}
+        plan,
+        {"DW-1": {"key": "9", "effect": "build", "intent": ["a", "b"]}},
+        effect_unlanded=frozenset(),
     )
 
     assert bundles == []
@@ -11698,7 +12356,9 @@ def test_materialize_bundles_falls_back_to_the_agreeing_option_for_non_string_sc
         "intent": ["a", "b"],
         "bundle_name": 7,
     }
-    bundles, dropped = engine._materialize_bundles(plan, {"DW-1": answer})
+    bundles, dropped = engine._materialize_bundles(
+        plan, {"DW-1": answer}, effect_unlanded=frozenset()
+    )
 
     assert not dropped
     assert [(b.name, b.intent) for b in bundles] == [("widen-x", "widen the field")]
@@ -11735,7 +12395,9 @@ def test_keep_open_lane_does_not_resolve_an_option_from_a_non_string_key(project
     (engine.run_dir / "journal.jsonl").write_text("", encoding="utf-8")
 
     bundles, dropped = engine._materialize_bundles(
-        plan, {"DW-1": {"key": 1, "label": "Keep", "effect": "keep-open"}}
+        plan,
+        {"DW-1": {"key": 1, "label": "Keep", "effect": "keep-open"}},
+        effect_unlanded=frozenset(),
     )
 
     assert [b.name for b in bundles] == ["safe-fix"]  # not suppressed

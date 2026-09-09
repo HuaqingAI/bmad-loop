@@ -1607,9 +1607,10 @@ class SweepEngine(Engine):
         """One triage -> close -> decide -> bundle pass. Returns whether the
         cycle completed any addressable work — the repeat loop's progress
         predicate. Dropping a recorded decision answer counts (DW-123, widened
-        from the keep-open lane to all three drop lanes by DW-135): the drop
-        releases its id from a stored answer nothing can act on, so a later
-        cycle's fresh triage can address it. It cannot spin the loop —
+        from the keep-open lane to the build lanes by DW-135; DW-200's
+        `effect-unlanded` lane is a later addition that counts on the same
+        footing): the drop releases its id from a stored answer nothing can act
+        on, so a later cycle's fresh triage can address it. It cannot spin the loop —
         `_materialize_bundles` bounds each id to one drop per run, and since
         DW-124 that bound is persisted on `state`, so it holds across a
         pause/resume too and the signal fires at most once per id. Caveat: on
@@ -1623,8 +1624,10 @@ class SweepEngine(Engine):
         self._warn_stranded_bundles()
         plan = self._ensure_triage(open_now, cycle)
         closed = self._close_resolved(plan)
-        answers, decisions_closed = self._decisions_phase(plan)
-        bundles, answer_dropped = self._materialize_bundles(plan, answers)
+        answers, decisions_closed, effect_unlanded = self._decisions_phase(plan)
+        bundles, answer_dropped = self._materialize_bundles(
+            plan, answers, effect_unlanded=effect_unlanded
+        )
         if self.decisions_only:
             self.journal.append("sweep-decisions-only", bundles_not_run=len(bundles))
             self._prune_pre_answers()
@@ -1684,13 +1687,21 @@ class SweepEngine(Engine):
         read regardless. Absence (DW-176) sets nothing, deliberately: a ledger that
         is gone ends the next cycle cleanly on `no-open` rather than crashing it.
 
-        `OSError` deliberately still propagates, as it does at every other DIRECT
-        caller of `read_for_write` — `_loop`'s two reads take it bare as well — and
-        it says nothing about what the ledger holds. `_close_resolved` and
-        `_decisions_phase` DO name `OSError` in their catch tuples, but around
+        `OSError` deliberately still propagates here, as it does at `_loop`'s two
+        bare reads, and it says nothing about what the ledger holds. `_close_resolved`
+        and `_decisions_phase` DO name `OSError` in their catch tuples, but around
         `mark_done_many` and `record_decision`, which read and take the
         cross-process lock internally: what they are catching there is the lock's
         own failure, not this reader's.
+
+        The ONE direct caller of `read_for_write` that catches it is
+        `_decisions_phase`'s DW-167 re-apply gate, and the asymmetry is the point.
+        What that read buys is a REPAIR — re-applying a stored `close` whose effect
+        an earlier crash lost — so a fault there costs the repair and nothing else:
+        the entry simply stays open, exactly as it was on entry, and a later cycle
+        can try again. This method's read gates a store WRITE whose failure mode is
+        losing the human's answers, so it refuses and carries the refusal to `_loop`
+        rather than degrading quietly.
         """
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
@@ -2665,7 +2676,14 @@ class SweepEngine(Engine):
     # `answered_at` can legitimately hold non-strings and a keep-open answer may
     # carry a corrupt `intent`. The narrower annotation read as a guarantee that
     # would justify deleting `_answer_str`; it never was one.
-    def _decisions_phase(self, plan: TriagePlan) -> tuple[dict[str, dict[str, Any]], int]:
+    #
+    # THIRD return element (DW-200): the ids whose `build` answer was recorded while
+    # `record_decision` reported writing no `decision:` line. RETURNED rather than
+    # latched on `self`, so `_cycle` cannot hand `_materialize_bundles` a stale or
+    # forgotten set — the same reason that argument is required there.
+    def _decisions_phase(
+        self, plan: TriagePlan
+    ) -> tuple[dict[str, dict[str, Any]], int, frozenset[str]]:
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
         decisions_path = self.run_dir / "decisions.json"
@@ -2815,6 +2833,164 @@ class SweepEngine(Engine):
         ledger_in_doubt = False
         any_effect_faulted = False
         any_effect_landed = False
+        # DW-200's signal, collected in the interactive arm below and handed to
+        # `_materialize_bundles` through `_cycle`: the ids whose `build` answer was
+        # persisted while `record_decision` reported writing no `decision:` line.
+        # It covers the False RETURN only — `sweep_dropped_decisions` is the
+        # durable half, so a resume neither re-announces the drop nor revives it.
+        effect_unlanded: set[str] = set()
+        # DW-167. The stored answer is written BEFORE the effect is applied (see the
+        # interactive arm's comment below, which explains why that order stays), so
+        # a crash in that window leaves `<run>/decisions.json` holding an
+        # `effect: "close"` over an entry the ledger still lists as open. On resume
+        # the read above accepts that answer — `allow_close=True` is correct for
+        # this store (DW-147), its in-run writer is the legitimate producer — and
+        # `pending` filters the id out, while no `_materialize_bundles` lane matches
+        # `close`. The decision was therefore never re-asked and never applied.
+        #
+        # Closed on the READ side rather than by reordering the write: a stored
+        # `close` for an id the LEDGER STILL LISTS AS OPEN is an effect that has not
+        # landed, so re-apply it here instead of counting it consumed. "Still open
+        # in the ledger" is the only discriminator — the mirror-image crash (effect
+        # landed, answer write lost or not) leaves the entry `done`, which this walk
+        # skips, so no second `decision:` line is ever added.
+        #
+        # Scoped to ids in THIS cycle's `plan.decisions` on purpose: `pending`'s
+        # filter over that tuple IS the suppression DW-167 names, so an id the fresh
+        # triage no longer asks about has no suppressed decision to repair and its
+        # own routing already stands.
+        reapply = [
+            d
+            for d in plan.decisions
+            if isinstance(answers.get(d.id), dict) and answers[d.id].get("effect") == "close"
+        ]
+        if reapply:
+            ledger = self.workspace.paths.deferred_work
+            # REPAIR/WRITE (DW-146), the shape `_prune_pre_answers` reads in: this
+            # open set GATES a ledger write, so absence and undecodable bytes are
+            # both refused as unknown open work rather than collapsed to "nothing is
+            # open". `is None`, never falsiness — an empty-but-PRESENT ledger
+            # genuinely has zero open ids and correctly re-applies nothing.
+            fault: str | None = None
+            try:
+                ledger_text = deferredwork.read_for_write(ledger)
+            except (deferredwork.LedgerReadError, OSError) as e:
+                ledger_text, fault = None, f"re-apply gate could not read the ledger: {e}"
+            else:
+                if ledger_text is None:
+                    fault = "re-apply gate could not read the ledger: the ledger file is gone"
+            if fault is not None:
+                # One row per CANDIDATE, not one per file: the news is per-decision
+                # ("this answer may still be unapplied"), and a single file-shaped
+                # row would name no id to chase. The kind is the one
+                # `_HANDBACK_LEDGER_MISS` names, so an operator greps one spelling
+                # for every non-write — but on the pure resume this walk exists for
+                # nobody answered anything, `answered_interactively` is False and the
+                # hand-back never prints, and unlike DW-200's lane below this arm
+                # raises no notify. So the row is the journal record, not an
+                # announcement. What DOES surface an unreadable ledger on that path
+                # is `_prune_pre_answers` later in the same cycle:
+                # `sweep-preanswer-prune-refused` with `reason="ledger-unreadable"`,
+                # plus the `_prune_ledger_unreadable` carry that ends a repeating run
+                # rather than committing bytes nobody could decode.
+                for decision in reapply:
+                    self.journal.append(
+                        "sweep-decision-effect-unavailable",
+                        dw_id=decision.id,
+                        effect="close",
+                        error=fault,
+                    )
+                # `ledger_in_doubt` is deliberately NOT set. The latch withholds a
+                # commit that would publish bytes an effect could not read, and
+                # nothing can have landed behind a gate that refused before any write
+                # was attempted: this gate runs ahead of every other arm in the phase,
+                # so `any_effect_landed` is still False here and the commit gate below
+                # is already shut on its other conjunct. Setting it would only reach
+                # PAST this refusal to suppress a commit the interactive arm goes on to
+                # earn — and a decision that arm answers and lands is proof the ledger
+                # reads again, which is exactly what the latch means when cleared.
+                any_effect_faulted = True
+                reapply = []
+            else:
+                still_open = deferredwork.open_ids(ledger_text or "")
+                reapply = [d for d in reapply if d.id in still_open]
+        for decision in reapply:
+            answer = answers[decision.id]
+            answer_key = _answer_str(answer, "key")
+            # `key` and `label` come from the stored answer, which is the only place
+            # they survive a resume; `resolution` and `intent` can come ONLY from an
+            # agreeing option (DW-123's one agreement discipline — never
+            # re-implemented here). The interactive arm above persists exactly
+            # key/label/effect/answered_at, and the project store cannot hold a
+            # `close` at all (DW-147), so no stored `close` answer ever carries a
+            # `resolution` to prefer: reading one off the answer would be dead code
+            # dressed as a fallback. `_apply_decision_effect` derives its note as
+            # `option.resolution or option.intent`, so when NO option agrees — the
+            # key is gone, or the label was re-authored — the walk degrades to a bare
+            # `closed by human decision` with no detail, and the `decision:` line
+            # carries the answer's label alone. That is the honest floor: the human's
+            # rationale lived in the option they picked, and this cycle no longer has
+            # it. The close still lands, which is the decision that was authorized.
+            option = self._agreeing_option(decision, answer, answer_key)
+            effect_option = DecisionOption(
+                key=answer_key or (option.key if option else ""),
+                label=_answer_str(answer, "label") or (option.label if option else ""),
+                effect="close",
+                intent=option.intent if option else "",
+                resolution=option.resolution if option else "",
+            )
+            # Routed through `_apply_decision_effect` — the walk's ONLY ledger write
+            # — so its landed boolean feeds the same three flags and the same commit
+            # gate the interactive arm feeds, and the two dispositions below are the
+            # interactive arm's, reused rather than re-decided.
+            try:
+                recorded = self._apply_decision_effect(decision, effect_option)
+            except (
+                deferredwork.LedgerReadError,
+                OSError,
+                ValueError,
+                StateRootError,
+            ) as e:
+                self.journal.append(
+                    "sweep-decision-effect-unavailable",
+                    dw_id=decision.id,
+                    effect="close",
+                    error=str(e),
+                )
+                ledger_in_doubt = True
+                any_effect_faulted = True
+                continue
+            if not recorded:
+                # A race, not a contradiction: the entry was open when the gate
+                # read and retired before this write. `ledger_in_doubt` is left
+                # alone for the interactive arm's reason — a False return says
+                # nothing about whether the bytes on disk are readable.
+                self.journal.append(
+                    "sweep-decision-effect-unavailable",
+                    dw_id=decision.id,
+                    effect="close",
+                    error=(
+                        "record_decision wrote no line: the ledger file is gone"
+                        if not self.workspace.paths.deferred_work.is_file()
+                        else "record_decision wrote no line: the ledger holds no entry for this id"
+                    ),
+                )
+                any_effect_faulted = True
+                continue
+            self.journal.append(
+                "sweep-decision-effect-reapplied", dw_id=decision.id, effect="close"
+            )
+            # NO `post_decision` emit, and that is not an omission. `pre_decision` and
+            # `post_decision` BRACKET a human-decision item — the interactive arm emits
+            # the first before `prompter.ask` blocks and the second once the effect
+            # lands — so a plugin watching the pair sees one open and one close per
+            # question actually put to a human. This walk puts no question to anyone:
+            # it repairs an item whose `pre_decision` was emitted by the run that
+            # crashed. Emitting only the close half here would hand that plugin an
+            # unpaired `post_decision` for a prompt this process never opened.
+            any_effect_landed = True
+            ledger_in_doubt = False
+            closed += 1
         if not self.prompting:
             pending = [d for d in pending if d.id not in self.state.sweep_skipped_decisions]
             for decision in pending:
@@ -2905,16 +3081,24 @@ class SweepEngine(Engine):
                     # so the cycle's progress signal does not count a closure the
                     # ledger never received.
                     #
-                    # What the human is left with differs by effect, and neither
-                    # is repaired THIS RUN — the answer is already in
-                    # `<run>/decisions.json`, so the next cycle reloads it into
-                    # `answers` and `pending` filters the id out. Only a NEW run
-                    # re-offers it. For `close`, the entry simply stays open and a
-                    # later run's triage can re-close it. For `build`, the bundle
+                    # What the human is left with differs by effect. The answer is
+                    # already in `<run>/decisions.json`, so the next cycle reloads
+                    # it into `answers` and `pending` filters the id out — nothing
+                    # is RE-ASKED this run either way. For `close`, the entry stays
+                    # open, and the DW-167 re-apply walk above is what picks it up:
+                    # a later cycle (or a resume) finds the stored `close` over a
+                    # still-open entry and applies it, so a ledger that reads again
+                    # repairs itself without a new run. For `build`, the bundle
                     # still materializes and runs off the stored answer — the work
                     # happens, but the entry carries no `decision:` audit line
-                    # recording who authorized it. Both are recoverable; crashing
-                    # the sweep mid-walk is not, which is the trade this arm makes.
+                    # recording who authorized it. That run-anyway trade is
+                    # ACCEPTED for THIS ARM ALONE and stays: an unreadable ledger
+                    # says nothing about whether the entry exists, so withholding
+                    # the bundle would discard a human's build decision over a
+                    # transient read. DW-200's fourth drop lane is scoped to the
+                    # False RETURN below, which is positive proof there is no entry
+                    # to build for. Both outcomes are recoverable; crashing the
+                    # sweep mid-walk is not, which is the trade this arm makes.
                     #
                     # `ledger_in_doubt` withholds this phase's commit below. The
                     # commit's pathspec IS the ledger, so a commit taken while the
@@ -2972,6 +3156,19 @@ class SweepEngine(Engine):
                             else "record_decision wrote no line: the ledger holds no entry for this id"
                         ),
                     )
+                    if option.effect == "build":
+                        # DW-200. The build lane routed purely on the stored
+                        # `effect`, so a `build` answer whose `decision:` line never
+                        # landed still materialized a bundle and spent a dev session
+                        # on an id the ledger holds no entry for. The close lane got
+                        # this discipline from DW-186 — `closed` is not incremented
+                        # and no `post_decision` is announced — and this set is what
+                        # gives the build lane the same one, at the only place the
+                        # non-write is known. Scoped to the False RETURN and to
+                        # `build`: the `except` arm above is the unreadable-ledger
+                        # case, whose accepted trade is unchanged, and a `keep-open`
+                        # answer mints no bundle to withhold.
+                        effect_unlanded.add(decision.id)
                     any_effect_faulted = True
                     continue
                 # the ledger read and wrote, so the doubt the last fault raised is
@@ -3004,7 +3201,7 @@ class SweepEngine(Engine):
             )
         if answered_interactively:
             self._return_after_decisions(every_effect_landed=not any_effect_faulted)
-        return answers, closed
+        return answers, closed, frozenset(effect_unlanded)
 
     def _return_after_decisions(self, *, every_effect_landed: bool) -> None:
         """Once the human has answered this cycle's decisions over an attached
@@ -3437,12 +3634,17 @@ class SweepEngine(Engine):
         disagreeing option is discarded outright, its mismatch journaled the way
         `sweep-bundle-name-discarded` is.
 
-        ONE agreement discipline for both lanes of `_materialize_bundles` (DW-123):
-        the build lane had this test inline while the keep-open lane trusted the
-        stored `effect` with no resolution at all, so a renumbered option let a stale
-        keep-open answer suppress a bundle under a `human-chose-keep-open` skip that
-        reads as the human's decision. What the two lanes still differ on is the
-        DISPOSITION of a `None` — see each call site.
+        ONE agreement discipline for every site that resolves a stored answer against
+        a live option (DW-123): the build lane had this test inline while the
+        keep-open lane trusted the stored `effect` with no resolution at all, so a
+        renumbered option let a stale keep-open answer suppress a bundle under a
+        `human-chose-keep-open` skip that reads as the human's decision. Both lanes of
+        `_materialize_bundles` run it, and since DW-167 so does `_decisions_phase`'s
+        re-apply walk — a THIRD caller, and the only one outside this file's bundling
+        half. What the callers differ on is the DISPOSITION of a `None`: the build
+        lane falls back to the answer's own intent, the keep-open lane drops the
+        answer, and the re-apply walk lands the close anyway with an empty note. See
+        each call site.
         """
         option = decision.option(answer_key)
         if option is None:
@@ -3451,11 +3653,12 @@ class SweepEngine(Engine):
         if label_matched and option.effect == _answer_str(answer, "effect"):
             return option
         # No triage prose in the record (labels, questions): the fields are closed
-        # effect enums and a bare boolean. `answer_effect` says which LANE wrote the
-        # record — it is the stored answer's own effect, invariant per lane but no
-        # longer invariant across the two that reach here, and it is what separates a
-        # discarded build option from a discarded keep-open one in a journal both
-        # write with the same kind.
+        # effect enums and a bare boolean. `answer_effect` says which CALLER wrote the
+        # record — it is the stored answer's own effect, invariant per caller but no
+        # longer invariant across the three that reach here, and it is what separates
+        # a discarded build option from a discarded keep-open one, and both from a
+        # re-apply walk's `close` (DW-167), in a journal all three write with the same
+        # kind.
         self.journal.append(
             "sweep-decision-option-mismatch",
             decision=decision.id,
@@ -3467,10 +3670,14 @@ class SweepEngine(Engine):
         return None
 
     def _materialize_bundles(
-        self, plan: TriagePlan, answers: dict[str, dict[str, Any]]
+        self,
+        plan: TriagePlan,
+        answers: dict[str, dict[str, Any]],
+        *,
+        effect_unlanded: frozenset[str],
     ) -> tuple[list[Bundle], bool]:
         """This cycle's bundles, and whether ANY recorded answer was dropped by one
-        of the three drop lanes below — `_cycle`'s progress signal.
+        of the four drop lanes below — `_cycle`'s progress signal.
 
         Every drop is progress for the same reason (DW-123, widened to the build
         lanes by DW-135): it quarantines the id in `state.sweep_dropped_decisions`,
@@ -3479,6 +3686,13 @@ class SweepEngine(Engine):
         because that same list bounds each id to ONE drop per run — persisted, so
         the bound holds across a pause/resume too (DW-124) — and a given id can
         raise it at most once however many repeat cycles run.
+
+        `effect_unlanded` is `_decisions_phase`'s per-id verdict (DW-200): the ids
+        whose `build` answer this run recorded while `record_decision` reported
+        writing no `decision:` line, so the ledger holds no entry to build for. It
+        is REQUIRED and keyword-only for the reason
+        `_return_after_decisions.every_effect_landed` is required — an empty default
+        is the optimistic claim, and a new caller would inherit it by forgetting.
         """
         self._emit("pre_materialize_bundles")
         bundles = list(plan.bundles)
@@ -3498,6 +3712,45 @@ class SweepEngine(Engine):
                 continue
             if decision.id in self.state.sweep_dropped_decisions:
                 continue  # announced dropped earlier this run (see __init__)
+            if decision.id in effect_unlanded:
+                # DW-200. The human answered `build`, the answer was persisted and
+                # journaled `decision-answered` — and then `record_decision`
+                # reported writing no `decision:` line, which it does in exactly the
+                # two states that mean the ledger holds no entry for this id (no
+                # ledger file, no such entry). Routing on the stored `effect` alone,
+                # this lane still built a bundle and spent a dev session briefing it
+                # from `_write_intent`'s ledger read — on an entry that is not there.
+                # The close lane has refused to claim that since DW-186; this is the
+                # build lane's half of the same discipline.
+                #
+                # A DROP rather than a re-ask, matching the two build-lane drops
+                # below: there is no `decision:` line to double-apply, the entry (if
+                # a rival writer merely retired it) is left exactly as found, and the
+                # quarantine is what makes a later cycle's fresh triage free to
+                # address the id. The signal covers the False RETURN only — the
+                # `except` arm's run-anyway trade is deliberately untouched, since an
+                # unreadable ledger is no evidence the entry is gone.
+                #
+                # `sweep_dropped_decisions` is the durable half, checked one line
+                # above: `effect_unlanded` is rebuilt per phase and empty on a
+                # resume, so the quarantine is what stops a replayed cycle both from
+                # re-announcing the drop and from reviving the bundle.
+                self.journal.append(
+                    "sweep-decision-answer-dropped",
+                    decision=decision.id,
+                    drop_cause="effect-unlanded",
+                )
+                gates.notify(
+                    self.policy,
+                    self.run_dir,
+                    f"decision {decision.id}: recorded build decision discarded",
+                    "its ledger entry was gone when the decision was recorded, so "
+                    "there is nothing to build against — see "
+                    "`sweep-decision-effect-unavailable` for which state it was",
+                )
+                self._quarantine(self.state.sweep_dropped_decisions, decision.id)
+                answer_dropped = True  # progress: see this method's docstring
+                continue
             # ONE spelling of the key for the whole loop body: the lookup, the
             # mismatch record and the note below must name the same string, and
             # `str(answer.get("key"))` stringified a missing key to the literal
@@ -3526,19 +3779,20 @@ class SweepEngine(Engine):
                 # A stale in-run answer: nothing to build from. Dropping it is the
                 # only safe action here — where `_apply_decision_effect` landed this
                 # decision's ledger line in the cycle that answered it, re-asking or
-                # re-applying would double-apply. (Since DW-186 that call can report
-                # it wrote no line at all, in which case there is nothing to
-                # double-apply and dropping is still what this lane does — the
-                # entry is left open and the next sweep re-asks it, which is the
-                # same outcome.) But a recorded human `build` decision must not
-                # vanish on a journal line alone.
+                # re-applying would double-apply. An answer whose line never landed
+                # no longer reaches this lane at all: since DW-200 the
+                # `effect-unlanded` drop above claims it first, so what arrives here
+                # is an answer whose `decision:` line IS on the entry (or was written
+                # out of band) and whose triage option has since lost its intent. But
+                # a recorded human `build` decision must not vanish on a journal line
+                # alone.
                 # The ledger entry is untouched, so the next sweep re-triages and
                 # re-asks it through `_decisions_phase`.
-                # `drop_cause` is a closed three-value enum (`no-intent` here,
-                # `name-collision` below, `stale-option` in the keep-open lane) so
-                # the drop lanes are discriminated by an enum rather than by free
-                # text or by a second journal kind (`reason` is deliberately not a
-                # benign journal field).
+                # `drop_cause` is a closed four-value enum (`effect-unlanded` above,
+                # `no-intent` here, `name-collision` below, `stale-option` in the
+                # keep-open lane) so the drop lanes are discriminated by an enum
+                # rather than by free text or by a second journal kind (`reason` is
+                # deliberately not a benign journal field).
                 self.journal.append(
                     "sweep-decision-answer-dropped",
                     decision=decision.id,
@@ -3739,8 +3993,8 @@ class SweepEngine(Engine):
                 continue
             # Unlike the build lane, a keep-open answer has no payload beyond
             # "keep-open" itself, so without a currently-resolvable, agreeing option
-            # there is nothing left to trust and the answer is dropped. Hence a THIRD
-            # `drop_cause` covering both failures — a renumbered option (which wrote
+            # there is nothing left to trust and the answer is dropped. Hence a
+            # `drop_cause` OF ITS OWN covering both failures — a renumbered option (which wrote
             # a mismatch record just now) and a vanished one (which could not) —
             # rather than one named for the mismatch alone. Dropping is deliberately
             # the loud direction: honouring a stale keep-open answer silently skips

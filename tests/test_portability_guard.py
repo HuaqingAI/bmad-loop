@@ -443,12 +443,15 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "adapter_dev",
         "adapter_review",
         "already_resolved",
-        # `sweep-decision-option-mismatch`'s lane discriminator: the STORED
+        # `sweep-decision-option-mismatch`'s caller discriminator: the STORED
         # answer's own effect, a closed `DECISION_EFFECTS` value (build/close/
         # keep-open) taken from the answer, never authored text. Both lanes of
-        # `_materialize_bundles` now run one agreement helper and write this kind
+        # `_materialize_bundles` run one agreement helper and write this kind
         # through it (DW-123), so this is what separates a discarded `build`
-        # option from a discarded `keep-open` one.
+        # option from a discarded `keep-open` one. THREE producers since DW-167,
+        # and so three reachable values: `_decisions_phase`'s re-apply walk
+        # resolves a stored `close` through the same helper, which is the only
+        # way `close` reaches this field.
         "answer_effect",
         "attempt",
         "blocked",
@@ -488,11 +491,17 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # `diagnostics._JOURNAL_DROP_FIELDS` already reduces to a presence flag.
         "discharged_owed_move",
         # `sweep-decision-answer-dropped`'s discriminator: WHICH drop lane fired, as
-        # a closed three-value enum (`no-intent` | `name-collision` |
-        # `stale-option`). `stale-option` is the keep-open lane's (DW-123) and covers
-        # both of its failures — a renumbered option and a vanished one — because
-        # only the first can also write a `sweep-decision-option-mismatch`, so the
-        # cause cannot be named for the mismatch alone.
+        # a closed four-value enum (`effect-unlanded` | `no-intent` |
+        # `name-collision` | `stale-option`). `stale-option` is the keep-open lane's
+        # (DW-123) and covers both of its failures — a renumbered option and a
+        # vanished one — because only the first can also write a
+        # `sweep-decision-option-mismatch`, so the cause cannot be named for the
+        # mismatch alone. `effect-unlanded` is DW-200's: a `build` answer this run
+        # recorded while `record_decision` reported writing no `decision:` line, so
+        # the ledger holds no entry to build against. It is the build lane's half of
+        # the discipline DW-186 gave the close lane, and it names the NON-WRITE
+        # rather than the answer — the answer itself is intact and re-askable, which
+        # is why the entry is left alone the way `no-intent`'s is.
         # Second producer: `sweep-decision-preanswer-pruned` (DW-143), which carries
         # the cause of the drop it belongs to — the same enum, though only the
         # keep-open lane prunes, so in practice only `stale-option` reaches it.
@@ -588,7 +597,8 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # keep-open), so it carries no authored text. Read beside `answer_effect`
         # above, which is the STORED answer's: the record used to be written from
         # one lane, where the answer's own effect was invariably "build" and
-        # discriminated nothing, and since DW-123 two lanes share the site.
+        # discriminated nothing; since DW-123 two lanes share the site, and since
+        # DW-167 the re-apply walk is a third.
         "option_effect",
         "original",
         "owed_after_implement",
@@ -1189,8 +1199,20 @@ JOURNAL_KINDS = frozenset(
         "sweep-bundles-truncated",
         "sweep-cycle",
         "sweep-decision-answer-dropped",
-        # DW-166/DW-186. An attended decision the human answered whose ledger
-        # effect did not land, from EITHER of the two ways that happens.
+        # DW-167. A stored `close` answer whose ledger effect never landed, applied
+        # on resume. The answer is persisted BEFORE `record_decision` runs — the
+        # human's answer must survive a crash — so a crash in that window left
+        # `<run>/decisions.json` claiming `effect: "close"` over an entry the ledger
+        # still lists as open, and the read side then counted it consumed: `pending`
+        # filtered the id out and no materialization lane matches `close`, so the
+        # decision was never re-asked and never applied. This row is what says the
+        # `decision:` line landed LATER than the `decision-answered` above it, off
+        # the stored answer rather than a fresh prompt. `dw_id` and `effect` only,
+        # both already benign (`effect` is a closed `DECISION_EFFECTS` value, and in
+        # practice always `close` — the only effect this walk re-applies).
+        "sweep-decision-effect-reapplied",
+        # DW-166/DW-186. A decision whose ledger effect did not land, from EITHER of
+        # the two ways that happens.
         # `prompter.ask` blocks, so a ledger that goes undecodable (or a ledger
         # lock that fails) while the prompt is open RAISES out of
         # `record_decision`; and `record_decision` RETURNS False — no raise
@@ -1208,6 +1230,13 @@ JOURNAL_KINDS = frozenset(
         # ledger FILE is still there, since a missing ledger loses every line the
         # walk already wrote where a missing entry loses only this one — so no new
         # field routing is needed.
+        # THIRD producer since DW-167: the resume re-apply walk, whose ledger-read
+        # GATE takes this same kind — one row per candidate id when the ledger is
+        # absent or undecodable, and the `except`/False-return rows again for the
+        # re-applying write itself. Per CANDIDATE and not per file, so the row names
+        # an id an operator can chase; the fixed sentence names the gate, since the
+        # news there is "this stored answer may still be unapplied" rather than a
+        # write that was attempted and lost.
         "sweep-decision-effect-unavailable",
         "sweep-decision-option-mismatch",
         # DW-143. The keep-open lane's `stale-option` drop retired the PROJECT-level
