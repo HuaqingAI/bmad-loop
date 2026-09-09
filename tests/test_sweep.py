@@ -7912,7 +7912,7 @@ def test_a_prune_in_a_non_git_project_keeps_the_store_write_and_journals(project
     swallowed — `sweep-ledger-commit-unavailable` naming the tree and the error,
     so an operator reading the journal learns the store is uncommitted.
 
-    Total over the callers, which all eight are: the ledger publishers name the
+    Total over the callers, which all nine are: the ledger publishers name the
     LEDGER FILE under the same name-the-file-you-published rule and inherit this
     degrade, which is required rather than incidental — keeping them loud would turn
     every ledger commit whose artifacts directory is in no repository into a
@@ -7976,7 +7976,7 @@ def test_commit_ledger_requires_the_published_path():
 
     Graded through the signature rather than by calling it, because the claim is
     about the parameter and not about any one caller's behavior; the AST guard below
-    is what holds the eight call sites to the two sanctioned spellings.
+    is what holds the nine call sites to the two sanctioned spellings.
 
     `family` is graded here rather than left to pyright for the reason `path` is,
     and it is the stronger claim of the two: a default (`family: ... = "ledger"`)
@@ -8309,7 +8309,7 @@ def test_a_prune_with_an_undecodable_ledger_refuses_and_keeps_every_answer(proje
 
 # ---------- divergent-root ledger publishers: one rule, three topologies ------
 #
-# The six ledger publishers name the LEDGER'S OWN directory and let git resolve
+# The seven ledger publishers name the LEDGER'S OWN directory and let git resolve
 # it to the enclosing repository (`_commit_ledger`'s owner-of-the-file rule).
 # `implementation_artifacts` is configurable to any absolute path
 # (`bmadconfig._resolve`, and `ProjectPaths.rebased` leaves an outside path
@@ -8550,18 +8550,20 @@ def test_a_divergent_root_ledger_commit_lands_in_the_tree_that_owns_the_ledger(
     third shape — artifacts in no repository at all — it degrades instead of
     committing, which is what the `GitError` arm is for.
 
-    Four of the six ledger sites are driven here, across all three topologies:
+    Four of the seven ledger sites are driven here, across all three topologies:
     `_close_resolved`'s `closed` arm and the attended `_decisions_phase` end to end,
     and `_loop`'s two commits with only the dirt-producer above each stubbed (see
-    those setups for why). Two are NOT driven at this layer. The post-migration
+    those setups for why). Three are NOT driven at this layer. The post-migration
     commit in `_ensure_migration` dispatches a rewrite session and stamps or resets a
     baseline against `workspace.root`, which these rows deliberately point at a
     foreign repo, so the setup would grade session and baseline machinery instead of
-    the commit's root; `_close_resolved`'s DW-193 `pending` arm publishes the same
-    file with the same spelling as the `closed` arm beside it, so re-running three
-    topologies over its crashed-write premise would re-measure one root twice.
-    `test_every_sweep_ledger_commit_names_its_own_tree` below is what holds both, and
-    it is total over all eight callers rather than these four.
+    the commit's root; `_close_resolved`'s DW-193 `pending` arm and
+    `_publish_stranded_close`, the DW-193 recovery publisher at `_loop`'s
+    empty-open-set exit, both publish the same file with the same spelling as the
+    `closed` arm beside them, so re-running three topologies over their crashed-write
+    premise would re-measure one root twice over.
+    `test_every_sweep_ledger_commit_names_its_own_tree` below is what holds all
+    three, and it is total over all nine callers rather than these four.
 
     The `HEAD` blob is the assertion, not the working file: a publisher that wrote
     but never committed still passes a `parse_ledger(read_text())` check, which is
@@ -9220,6 +9222,708 @@ def test_a_stranded_close_is_published_by_a_resume_off_the_cached_triage(project
     assert committed["DW-1"].done and committed["DW-2"].open
 
 
+def _cache_triage(engine, result_json, cycle: int = 1) -> Path:
+    """Plant a triage cache exactly where `_ensure_triage` writes one — the file
+    whose PRESENCE is `_publish_stranded_close`'s resume-only term."""
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    suffix = "" if cycle == 1 else f"-{cycle}"
+    path = engine.run_dir / f"triage{suffix}.json"
+    path.write_text(json.dumps(result_json, indent=2), encoding="utf-8")
+    return path
+
+
+def _no_git(monkeypatch, where: str):
+    """Pin both git calls `_commit_ledger` makes to a raise, so "nothing was
+    published" is graded at the git SEAM rather than by an absent journal row —
+    the same instrument `test_a_phase_that_wrote_nothing_spawns_no_git` uses, and
+    for the same reason: `_commit_ledger`'s `path_clean` no-op would otherwise
+    absorb the ablation."""
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError(f"_commit_ledger reached git {where}")
+
+    monkeypatch.setattr(verify, "path_clean", boom)
+    monkeypatch.setattr(verify, "commit_paths", boom)
+
+
+def test_a_stranded_close_that_retired_the_last_open_entry_is_published_by_the_resume(
+    project, monkeypatch
+):
+    """DW-193's ROUTING half, end to end through a real `run()`: the crash stranded
+    a close that retired the LAST open entry, so the resume never reaches
+    `_close_resolved` at all.
+
+    This is the shape the follow-up review reproduced as failing. With the open set
+    empty, `_loop` returns on `sweep-nothing-open` BEFORE `_cycle` calls
+    `_ensure_triage`/`_close_resolved`, so no phase gate — however wide — ever runs
+    and the durable write stays off HEAD for the rest of a single-cycle run. Widening
+    `if closed:` alone cannot reach it; the fix is a THIRD publisher at that exit.
+
+    Nothing is hand-built. A real triage session runs and caches `<run>/triage.json`;
+    the close's write then lands and its commit does not, which is the crash window
+    the entry names; and the resumed engine is driven by `run()`, not by a phase call,
+    so the whole routing decision is what is graded. `resume_sweep` hands it an EMPTY
+    adapter script, so a session spawned from the recovery path would fail loudly —
+    load-bearing, since `_publish_stranded_close` reads the cache DIRECTLY rather than
+    through `_ensure_triage`, which dispatches a triage session past its cache branch.
+
+    Premise before outcome (docs/testing.md): the tree starts clean at a HEAD whose
+    ledger still reads `open`, the hand-applied flip is asserted on disk, and HEAD is
+    asserted unchanged before the resume runs.
+
+    Three claims: the ids read `done` at HEAD; a `sweep-ledger-commit` row records the
+    publish; and `sweep-nothing-open` still fires afterwards, with the stop rows and
+    the `return` beneath the new arm untouched — the publish sits ABOVE them, so a
+    reader sees the recovered commit and then the stop.
+
+    Ablation: delete the `self._publish_stranded_close(cycle)` call from `_loop`'s
+    empty-open-set arm and this reds with no `sweep-ledger-commit` row and DW-1 still
+    `open` in the HEAD blob, while `sweep-nothing-open` still fires — which is exactly
+    the reproduction the review recorded.
+
+    Inverse ablations: add either close-phase emission or the resolved-closed
+    journal row to the recovery publisher, singly; the absence assertions fail.
+    """
+    write_ledger(project, {"DW-1": "open"})  # the ONLY open entry
+    rel = ledger_rel(project)
+    head_before = git(project.project, "rev-parse", "HEAD")
+    at_head = {
+        e.id: e for e in deferredwork.parse_ledger(git(project.project, "show", f"HEAD:{rel}"))
+    }
+    assert at_head["DW-1"].open  # premise: HEAD has not seen the close
+
+    engine, _adapter = make_sweep(
+        project,
+        [
+            triage_effect(
+                triage_result(
+                    ["DW-1"], already_resolved=[{"id": "DW-1", "evidence": "fixed by a1b2c3d"}]
+                )
+            )
+        ],
+    )
+    _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+    plan = engine._ensure_triage({"DW-1"}, 1)  # runs the session, caches triage.json
+    assert [e.id for e in plan.already_resolved] == ["DW-1"]  # PRECONDITION
+    assert (engine.run_dir / "triage.json").is_file()
+
+    # the crash: `mark_done_many`'s write landed, `_commit_ledger` never ran — and it
+    # retired the last open entry, so the resume has nothing open to drive a cycle
+    mark_ledger_done(project, ["DW-1"])
+    assert ledger_entries(project)["DW-1"].done
+    assert not deferredwork.open_ids(project.deferred_work.read_text(encoding="utf-8"))
+    assert git(project.project, "rev-parse", "HEAD") == head_before  # ...HEAD never saw it
+
+    resumed, resumed_adapter = resume_sweep(project, engine, [])
+    stages = []
+    original_emit = resumed._emit
+
+    def spy_emit(stage, *args, **kwargs):
+        stages.append(stage)
+        return original_emit(stage, *args, **kwargs)
+
+    monkeypatch.setattr(resumed, "_emit", spy_emit)
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert resumed_adapter.sessions == []  # no session was spent on the recovery
+    assert _records(resumed, "sweep-resolved-closed") == []
+    assert "pre_close_resolved" not in stages and "post_close_resolved" not in stages
+    [commit] = _records(resumed, "sweep-ledger-commit")
+    head_after = git(project.project, "rev-parse", "HEAD")
+    assert commit["commit"] == head_after != head_before
+    committed = {
+        e.id: e for e in deferredwork.parse_ledger(git(project.project, "show", f"HEAD:{rel}"))
+    }
+    assert committed["DW-1"].done  # the stranded write reached HEAD
+    # ...and the stop the arm sits above is unchanged, and still comes after it
+    kinds = journal_kinds(resumed)
+    assert "sweep-nothing-open" in kinds
+    assert kinds.index("sweep-ledger-commit") < kinds.index("sweep-nothing-open")
+
+
+def test_the_no_open_exit_republish_of_an_already_published_close_is_a_no_op(project, monkeypatch):
+    """The routing arm's republish: `_commit_ledger` is still REACHED, and
+    `verify.path_clean` makes it a no-op (DW-193).
+
+    The twin of `test_close_resolved_republish_of_an_already_published_close_is_a_no_op`
+    one level up, and it holds for the same reason: the arm is keyed on the ledger's
+    on-disk `done` entries, which stay `done` forever once published, so every later
+    resume over the same cached plan reaches this publisher again. This row says that
+    costs nothing.
+
+    The CLEAN ROW is the positive claim and the reason it is asserted at all — the arm
+    was reached and answered "nothing to publish", which an absent `sweep-ledger-commit`
+    row alone would not distinguish from an arm that never ran. That distinction is the
+    whole difference between this row and the fresh-sweep row above, whose arm really
+    does return before any git.
+
+    Same state as the stranded-write row above, with one thing changed: the close was
+    committed. Premise before outcome (docs/testing.md) — the flip is asserted `done`
+    both on disk AND in the HEAD blob, and the worktree is asserted clean, before the
+    resume runs.
+
+    Ablation (measured): delete the `self._publish_stranded_close(cycle)` call from
+    `_loop`'s empty-open-set arm and this reds on the clean row — the run journals no
+    `sweep-ledger-commit-clean` at all."""
+    write_ledger(project, {"DW-1": "open"})  # the ONLY open entry
+    rel = ledger_rel(project)
+
+    engine, _adapter = make_sweep(
+        project,
+        [
+            triage_effect(
+                triage_result(
+                    ["DW-1"], already_resolved=[{"id": "DW-1", "evidence": "fixed by a1b2c3d"}]
+                )
+            )
+        ],
+    )
+    _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+    plan = engine._ensure_triage({"DW-1"}, 1)  # runs the session, caches triage.json
+    assert [e.id for e in plan.already_resolved] == ["DW-1"]
+
+    # ...and this time the close was PUBLISHED before the crash
+    mark_ledger_done(project, ["DW-1"])
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "the close, already published")
+    head = git(project.project, "rev-parse", "HEAD")
+    at_head = {
+        e.id: e for e in deferredwork.parse_ledger(git(project.project, "show", f"HEAD:{rel}"))
+    }
+    assert at_head["DW-1"].done  # premise: HEAD already carries the close...
+    assert ledger_entries(project)["DW-1"].done  # ...so the probe still answers True
+    assert git(project.project, "status", "--porcelain") == ""  # ...and there is nothing to publish
+
+    resumed, resumed_adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert resumed_adapter.sessions == []
+    assert len(_records(resumed, "sweep-ledger-commit-clean")) == 1  # the arm WAS reached
+    assert _records(resumed, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert "sweep-nothing-open" in journal_kinds(resumed)
+
+
+def test_a_later_resume_publishes_new_ledger_dirt_beside_an_already_published_close(project):
+    """The accepted whole-ledger boundary also holds on a later resume (DW-193).
+
+    A done id stays proof for this cache after publication; a later ledger note
+    therefore publishes too; this characterizes the documented scope of the
+    publisher, without claiming ownership of the note.
+
+    Ablation (measured): give the arm the "is this close already PUBLISHED?" term the
+    intent auditor's rejected finding asked for — refuse when every id the cached plan
+    names already reads `done` in the ledger blob at HEAD — and this row reds, along
+    with the republish no-op row beside it. It reds FIRST at the `sweep-ledger-commit-clean`
+    premise, because that term suppresses the first run's no-op publish too, and the
+    `[commit]` unpack below would fail for the same reason: the second run finds the
+    close published, refuses, and the note never reaches HEAD. That is precisely the
+    accepted property being pinned. The probe is
+    keyed on ids that stay `done` forever, never on provenance or on the close being
+    unpublished, so every later resume of this cycle reaches the publisher again and
+    takes whatever else is dirty in the whole-file pathspec along with it."""
+    write_ledger(project, {"DW-1": "done 2026-06-01"})
+    engine, _adapter = make_sweep(project, [])
+    _cache_triage(
+        engine,
+        triage_result(["DW-1"], already_resolved=[{"id": "DW-1", "evidence": "fixed"}]),
+    )
+    summary = engine.run()
+    assert not summary.crashed and not summary.paused
+    assert len(_records(engine, "sweep-ledger-commit-clean")) == 1
+    head = git(project.project, "rev-parse", "HEAD")
+    note = "\n<!-- later operator note -->\n"
+    project.deferred_work.write_text(
+        project.deferred_work.read_text(encoding="utf-8") + note, encoding="utf-8"
+    )
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert adapter.sessions == []
+    [commit] = _records(resumed, "sweep-ledger-commit")
+    assert commit["commit"] == git(project.project, "rev-parse", "HEAD") != head
+    # `.strip()`, because the `git` helper strips its output: the note's own
+    # surrounding newlines are not what this row is about — its presence at HEAD is.
+    assert note.strip() in git(project.project, "show", f"HEAD:{ledger_rel(project)}")
+
+
+def test_a_fresh_nothing_open_sweep_spawns_no_git_at_the_no_open_exit(project, monkeypatch):
+    """The precision half of the routing arm: a FRESH sweep over a ledger with
+    nothing open still reaches no git at all (DW-193).
+
+    The cache-presence term is what carries the whole resume/fresh distinction, with
+    no extra state flag — `triage{suffix}.json` exists only because a previous pass of
+    this run already triaged. A fresh run has not, so `_publish_stranded_close` returns
+    before any read and the exit behaves exactly as it did.
+
+    The ledger is dirtied by hand first, so `_commit_ledger`'s `path_clean` could not
+    no-op even if it were reached, and the no-git claim is graded at the git seam
+    rather than by an absent journal row — the instrument
+    `test_a_phase_that_wrote_nothing_spawns_no_git` uses, for the same reason.
+
+    TWO halves, and they are graded by different mutations — measured, because the
+    obvious single ablation does not hold. Deleting the cache stat/presence block
+    leaves the no-git half GREEN: `_read_json` on an absent file raises
+    `FileNotFoundError`, which the cache-read arm below already degrades, so the
+    publish is refused anyway. What that guard alone owns is the SILENCE — a fresh
+    sweep must not report a cache it never had as a reload failure — so the absent
+    `sweep-triage-reload-failed` row is asserted beside the absent commit, and it is
+    that assertion the guard's deletion reds (measured).
+
+    Ablations: drop the cache stat/presence block and the reload-failed
+    assertion reds while the git stub stays untouched; strip the arm's guards
+    entirely (cache presence, cache load and the `if not pending:` refusal) so it
+    publishes unconditionally, and this reds inside the stub."""
+    write_ledger(project, {"DW-1": "done 2026-06-01"})  # nothing open, and committed
+    engine, adapter = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    assert not (engine.run_dir / "triage.json").exists()  # premise: a FRESH run
+    project.deferred_work.write_text(
+        project.deferred_work.read_text(encoding="utf-8") + "\n<!-- operator note -->\n",
+        encoding="utf-8",
+    )
+    head = git(project.project, "rev-parse", "HEAD")
+    dirty_before = git(project.project, "status", "--porcelain")
+    assert dirty_before  # premise: there is something a stray commit could take
+
+    _no_git(monkeypatch, "for a fresh sweep with no triage cache")
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert adapter.sessions == []
+    assert "sweep-nothing-open" in journal_kinds(engine)
+    assert _records(engine, "sweep-ledger-commit") == []
+    # ...and the arm was SILENT: a cache this run never wrote is not a reload fault
+    assert _records(engine, "sweep-triage-reload-failed") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert git(project.project, "status", "--porcelain") == dirty_before  # ...still theirs
+
+
+@pytest.mark.parametrize("shape", ["directory", "stat-not-a-directory"])
+def test_a_cache_path_that_is_not_a_regular_file_at_the_no_open_exit_is_silent(
+    project, monkeypatch, shape
+):
+    """A `triage{suffix}.json` that is not a regular FILE is the same "no cache for
+    this cycle" answer as an absent one, and must be just as SILENT (DW-193).
+
+    The arm's gate is a current-cycle cache FILE. Two shapes reach it without one:
+    the path exists but is a DIRECTORY, and `stat` itself answers
+    `NotADirectoryError` because a component of the path is not a directory. Neither
+    is a cache this run wrote, so neither may be reported as a reload FAULT — the
+    same misreport the fresh-sweep row's silence assertion exists to prevent, for the
+    other two shapes. Graded the same way as that row: the ledger is dirtied by hand
+    first so `path_clean` could not no-op even if it were reached, and the no-git
+    claim is taken at the git seam via `_no_git`.
+
+    Ablations, one per shape, both measured green without this row. Delete
+    `if not stat.S_ISREG(cache_mode): return` and the `directory` row reds: the
+    directory reaches `_read_json`, which raises `IsADirectoryError`, and the outer
+    cache handler reports it as `sweep-triage-reload-failed` — so the silence
+    assertion fails while the git stub stays untouched. Drop `NotADirectoryError`
+    from the inner `stat` catch tuple and the `stat-not-a-directory` row reds the
+    same way rather than on a crash, since `NotADirectoryError` is an `OSError` and
+    the outer handler swallows it into that same journal row."""
+    write_ledger(project, {"DW-1": "done 2026-06-01"})  # nothing open, and committed
+    engine, adapter = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    cache = engine.run_dir / "triage.json"
+    if shape == "directory":
+        cache.mkdir()
+        assert cache.is_dir()  # premise: present, but not a FILE
+    else:
+        original = Path.stat
+
+        def refused(path, *args, **kwargs):
+            if path == cache:
+                raise NotADirectoryError(20, "Not a directory", str(path))
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", refused)
+    project.deferred_work.write_text(
+        project.deferred_work.read_text(encoding="utf-8") + "\n<!-- operator note -->\n",
+        encoding="utf-8",
+    )
+    head = git(project.project, "rev-parse", "HEAD")
+    dirty_before = git(project.project, "status", "--porcelain")
+    assert dirty_before  # premise: there is something a stray commit could take
+
+    _no_git(monkeypatch, "for a cache path that is not a regular file")
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused  # returns, never raises
+    assert adapter.sessions == []
+    assert "sweep-nothing-open" in journal_kinds(engine)  # ...and the stop is unchanged
+    # SILENT: neither shape is a cache this run wrote, so neither is a reload fault
+    assert _records(engine, "sweep-triage-reload-failed") == []
+    assert _records(engine, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert git(project.project, "status", "--porcelain") == dirty_before  # ...still theirs
+
+
+def test_the_no_open_exit_publishes_nothing_for_a_cached_plan_not_all_done(project, monkeypatch):
+    """The second precision row: the cache is present, but the plan's ids do not all
+    read `done`, so the same per-id proof the phase arm applies refuses the publish
+    (DW-193).
+
+    The cached plan names a done id followed by one the ledger no longer carries.
+    Passing only the first id to the shared probe would incorrectly publish. Positive
+    per-id evidence of a landed write is the rule at BOTH sites; the ledger merely
+    being dirty is never enough.
+
+    Ablations: truncate the routing helper's ids to its first element, or weaken
+    the shared probe's all to any, and this fails inside the git stub."""
+    write_ledger(project, {"DW-1": "done 2026-06-01"})  # nothing open
+    engine, _adapter = make_sweep(project, [])
+    _cache_triage(
+        engine,
+        triage_result(
+            ["DW-1", "DW-404"],
+            already_resolved=[
+                {"id": "DW-1", "evidence": "fixed"},
+                {"id": "DW-404", "evidence": "fixed by a1b2c3d"},
+            ],
+        ),
+    )
+    assert "DW-404" not in ledger_entries(project)  # premise: nothing proves this close
+    project.deferred_work.write_text(
+        project.deferred_work.read_text(encoding="utf-8") + "\n<!-- operator note -->\n",
+        encoding="utf-8",
+    )
+    head = git(project.project, "rev-parse", "HEAD")
+    dirty_before = git(project.project, "status", "--porcelain")
+    assert dirty_before
+
+    _no_git(monkeypatch, "for a cached plan whose ids are not all done")
+    engine._loop()
+
+    # premise, after the fact: the cache really did load — this row is about the
+    # per-id probe, not about a cache the arm could not read
+    assert _records(engine, "sweep-triage-reload-failed") == []
+    assert "sweep-nothing-open" in journal_kinds(engine)
+    assert _records(engine, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert git(project.project, "status", "--porcelain") == dirty_before
+
+
+def test_the_no_open_exit_spawns_no_git_for_a_cached_plan_that_resolved_nothing(
+    project, monkeypatch
+):
+    """The third precision row: the cache is present and loads cleanly, but its plan
+    resolved NOTHING — so the emptiness short-circuit inside `_resolved_write_pending`
+    stops the arm before it reads the ledger, and no git is spawned (DW-193).
+
+    This is the routing arm's copy of a claim the phase arm already carries
+    (`test_a_phase_that_wrote_nothing_spawns_no_git`'s empty row), and it has to be
+    made twice because the two sites reach the probe by different routes: the phase
+    takes its ids from the plan it was handed, this arm from a cached plan nothing in
+    `_loop` validated for content. `all()` over no ids is vacuously True, so without
+    that check a resume whose triage resolved nothing would publish whatever the ledger
+    happened to be carrying.
+
+    Distinct from the fresh-sweep row above, which measures the cache-presence guard:
+    here the cache EXISTS and is valid, so that guard passes and the emptiness check is
+    the only thing left standing between the arm and git. The ledger is dirtied by hand
+    first so `_commit_ledger`'s `path_clean` could not no-op even if it were reached,
+    and the claim is graded at the git seam.
+
+    Ablation (measured): delete `if not ids: return False` from
+    `_resolved_write_pending` and this fails on a second ledger read; without that
+    read assertion it fails inside the git stub. Move the emptiness check below
+    read_for_write and the second-read assertion also fails. (That mutation also reds the phase arm's empty row,
+    which is the point: one check, two routes, and each route needs its own row to
+    prove it is on the path.)"""
+    write_ledger(project, {"DW-1": "done 2026-06-01"})  # nothing open
+    engine, _adapter = make_sweep(project, [])
+    _cache_triage(engine, triage_result([], skip=[]))  # a plan that resolved NOTHING
+    project.deferred_work.write_text(
+        project.deferred_work.read_text(encoding="utf-8") + "\n<!-- operator note -->\n",
+        encoding="utf-8",
+    )
+    head = git(project.project, "rev-parse", "HEAD")
+    dirty_before = git(project.project, "status", "--porcelain")
+    assert dirty_before  # premise: there is something a stray commit could take
+
+    _no_git(monkeypatch, "for a cached plan that resolved nothing")
+    real_read = deferredwork.read_for_write
+    ledger_reads = []
+
+    def read_once(path):
+        ledger_reads.append(path)
+        assert len(ledger_reads) == 1, "empty plan performed a second ledger read"
+        return real_read(path)
+
+    monkeypatch.setattr(deferredwork, "read_for_write", read_once)
+    engine._loop()
+    assert ledger_reads == [project.deferred_work]
+
+    # premise, after the fact: the cache really did load — this row is about the
+    # EMPTINESS check, not about a cache the arm could not read
+    assert _records(engine, "sweep-triage-reload-failed") == []
+    assert "sweep-nothing-open" in journal_kinds(engine)
+    assert _records(engine, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert git(project.project, "status", "--porcelain") == dirty_before  # ...still theirs
+
+
+def test_the_no_open_exit_does_not_publish_off_an_earlier_cycles_triage_cache(project, monkeypatch):
+    """CURRENT CYCLE ONLY: at cycle 2's no-open exit, cycle 1's finished
+    `triage.json` authorizes nothing (DW-193).
+
+    The suffix is load-bearing, not cosmetic. Cycle 1's plan was replayed by the
+    cycle that ran it; cycle 2 has not triaged, so there is no pass of THIS cycle
+    whose write a crash could have stranded — and reading the stale cache would turn
+    a resume-only recovery into a general publisher that fires at every repeat
+    boundary. `triage-2.json` is the file this arm looks for, and it does not exist.
+
+    Every ingredient for a publish is present except the suffix: the cached plan's id
+    reads `done` on disk and the ledger is dirty, so an arm reading `triage.json`
+    would commit here.
+
+    Ablation: respell the arm's `suffix` as `""` and this reds inside the git stub."""
+    write_ledger(project, {"DW-1": "done 2026-06-01"})  # nothing open at cycle 2
+    engine, _adapter = make_sweep(project, [], repeat=True)
+    _cache_triage(
+        engine,
+        triage_result(["DW-1"], already_resolved=[{"id": "DW-1", "evidence": "fixed by a1b2c3d"}]),
+    )
+    assert not (engine.run_dir / "triage-2.json").exists()  # premise: cycle 2 never triaged
+    assert ledger_entries(project)["DW-1"].done  # ...and the probe WOULD answer True
+    engine.state.sweep_cycle = 2
+    project.deferred_work.write_text(
+        project.deferred_work.read_text(encoding="utf-8") + "\n<!-- operator note -->\n",
+        encoding="utf-8",
+    )
+    head = git(project.project, "rev-parse", "HEAD")
+
+    _no_git(monkeypatch, "off a completed earlier cycle's triage cache")
+    engine._loop()
+
+    [stop] = _records(engine, "sweep-repeat-done")
+    assert stop["reason"] == "no-open" and stop["stop_cause"] == "no-open"
+    assert _records(engine, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+
+
+def test_the_no_open_exit_publishes_a_stranded_close_at_a_later_repeat_cycle(project, monkeypatch):
+    """The POSITIVE `--repeat` row: the arm publishes at cycle 2 off cycle 2's OWN
+    cache (DW-193).
+
+    Its negative twin above pins that a completed cycle 1's `triage.json` authorizes
+    nothing here; alone, that row is satisfied by an arm that never fires past cycle 1
+    at all. This one is what makes the suffix a lookup rather than a veto: a repeating
+    run strands closes exactly the way a single-cycle one does, and cycle N's stranded
+    write is off HEAD until something publishes it.
+
+    Premise before outcome (docs/testing.md): `triage-2.json` is the cache on disk and
+    `triage.json` is asserted ABSENT, so the row cannot pass off the cycle-1 file its
+    twin refuses; the flip is asserted `done` on disk and asserted absent from the HEAD
+    blob before the loop runs.
+
+    Ordering is asserted, not just presence: the commit precedes `sweep-repeat-done`,
+    so a reader of the journal sees the recovered publish and then the stop.
+
+    Ablation (measured): move `self._publish_stranded_close(cycle)` inside `_loop`'s
+    `if cycle == 1:` arm — a narrowing the rest of the suite is blind to — and this
+    reds with no `sweep-ledger-commit` row and DW-1 still `open` in the HEAD blob."""
+    write_ledger(project, {"DW-1": "open"})  # committed: a clean tree
+    rel = ledger_rel(project)
+    head_before = git(project.project, "rev-parse", "HEAD")
+    at_head = {
+        e.id: e for e in deferredwork.parse_ledger(git(project.project, "show", f"HEAD:{rel}"))
+    }
+    assert at_head["DW-1"].open  # premise: HEAD has not seen the close
+
+    engine, _adapter = make_sweep(project, [], repeat=True)
+    _cache_triage(
+        engine,
+        triage_result(["DW-1"], already_resolved=[{"id": "DW-1", "evidence": "fixed by a1b2c3d"}]),
+        cycle=2,
+    )
+    assert not (engine.run_dir / "triage.json").exists()  # premise: cycle 2's cache ONLY
+    engine.state.sweep_cycle = 2
+
+    # the crash at cycle 2: the write landed, the commit never ran, and it retired the
+    # last open entry — so cycle 2 reaches the no-open exit without running a phase
+    mark_ledger_done(project, ["DW-1"])
+    assert ledger_entries(project)["DW-1"].done
+    assert not deferredwork.open_ids(project.deferred_work.read_text(encoding="utf-8"))
+
+    engine._loop()
+
+    [commit] = _records(engine, "sweep-ledger-commit")
+    head_after = git(project.project, "rev-parse", "HEAD")
+    assert commit["commit"] == head_after != head_before
+    committed = {
+        e.id: e for e in deferredwork.parse_ledger(git(project.project, "show", f"HEAD:{rel}"))
+    }
+    assert committed["DW-1"].done  # the stranded write reached HEAD
+    kinds = journal_kinds(engine)
+    assert kinds.index("sweep-ledger-commit") < kinds.index("sweep-repeat-done")
+
+
+@pytest.mark.parametrize("fault", ["json", "utf8", "read", "stat"])
+def test_an_unreadable_triage_cache_at_the_no_open_exit_degrades(project, monkeypatch, fault):
+    """Cache metadata, OS read, UTF-8, and JSON faults all degrade at run().
+
+    Ablations: restore the unprotected `is_file()` check and the `stat` row reds ON
+    PYTHON 3.14 ONLY — measured. That version's `is_file()` SWALLOWS the metadata
+    fault and answers False, so the arm returns silently and this row's
+    `sweep-triage-reload-failed` never appears; on 3.11-3.13 the same call RE-RAISES
+    the `PermissionError` into the outer cache handler, which journals that very row,
+    so the ablation converges on the passing behavior and the row stays green there.
+    CI runs all four, so the explicit `stat()` is what makes the degrade uniform
+    across them rather than version-dependent. The other three are version-free:
+    remove OSError, UnicodeDecodeError, or JSONDecodeError from the cache handler
+    individually and the corresponding fault rows fail on a crashed run.
+    """
+    write_ledger(project, {"DW-1": "done 2026-06-01"})
+    engine, _adapter = make_sweep(project, [])
+    cache = _cache_triage(
+        engine,
+        triage_result(["DW-1"], already_resolved=[{"id": "DW-1", "evidence": "fixed"}]),
+    )
+    if fault == "json":
+        cache.write_text('{"workflow": "deferred-swe', encoding="utf-8")
+    elif fault == "utf8":
+        cache.write_bytes(b"\xff")
+    else:
+        method = "stat" if fault == "stat" else "read_text"
+        original = getattr(Path, method)
+
+        def refused(path, *args, **kwargs):
+            if path == cache:
+                raise PermissionError(13, "Permission denied", str(path))
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, method, refused)
+    head = git(project.project, "rev-parse", "HEAD")
+
+    _no_git(monkeypatch, "after a triage cache it could not read")
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused  # degrades, never raises
+    [failed] = _records(engine, "sweep-triage-reload-failed")
+    assert failed["errors"] and "unreadable: " in failed["errors"][0]
+    assert "sweep-nothing-open" in journal_kinds(engine)  # ...and the stop is unchanged
+    assert _records(engine, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+
+
+@pytest.mark.parametrize(
+    "cached, expected_error",
+    [
+        ('{"workflow": "not-the-triage-workflow"}', "workflow must be "),
+        ("[]", "not a JSON object: list"),
+    ],
+    ids=["invalid-plan", "non-object-top-level"],
+)
+def test_a_cache_that_does_not_validate_at_the_no_open_exit_degrades(
+    project, monkeypatch, cached, expected_error
+):
+    """The other two ways the arm's cache load can refuse: bytes that DECODE but do
+    not validate, and a top level that is not a JSON object at all (DW-193).
+
+    The sibling row above covers only undecodable bytes, which never reach the
+    validator — so without these two the `isinstance(cached, dict)` split and the
+    `plan is None` refusal were both unguarded, and collapsing them to a bare
+    `plan, errors = validate_triage(cached, None)` left the suite green (measured).
+    That collapse is not a style change: a decodable-but-invalid cache then crashes
+    the run with `AttributeError: 'NoneType' object has no attribute
+    'already_resolved'` — precisely the sweep-ending raise out of a bookkeeping
+    publisher that DW-166's degrade discipline exists to prevent.
+
+    The validator also rejects non-object values before calling `.get` (DW-155).
+    Removing only the caller's type split is safe while the plan-is-None guard
+    remains. The combined mutation above crashes by dereferencing the rejected
+    plan, not by passing a list to the validator. This row also pins the caller's
+    existing diagnostic text.
+
+    Both assert the validator's own errors reach the journal, not just that some row
+    fired: `sweep-triage-reload-failed` is the operator's only account of why a cached
+    plan was discarded, and an empty `errors` list would leave the refusal unattributed.
+
+    Ablations (measured): collapse the two branches to a bare
+    `plan, errors = validate_triage(cached, None)` and BOTH rows red on
+    `not summary.crashed` — the `AttributeError` ends the run as crashed rather than
+    escaping `run()`, which is the outcome the degrade exists to prevent; delete the
+    `if plan is None:` journal write alone and both rows red on the unpack of a
+    missing account."""
+    write_ledger(project, {"DW-1": "done 2026-06-01"})  # nothing open
+    engine, _adapter = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    (engine.run_dir / "triage.json").write_text(cached, encoding="utf-8")
+    project.deferred_work.write_text(
+        project.deferred_work.read_text(encoding="utf-8") + "\n<!-- operator note -->\n",
+        encoding="utf-8",
+    )
+    head = git(project.project, "rev-parse", "HEAD")
+    assert git(project.project, "status", "--porcelain")  # premise: a stray commit could take it
+
+    _no_git(monkeypatch, "after a triage cache that did not validate")
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused  # degrades, never raises
+    [failed] = _records(engine, "sweep-triage-reload-failed")
+    assert any(expected_error in e for e in failed["errors"])
+    assert "sweep-nothing-open" in journal_kinds(engine)  # ...and the stop is unchanged
+    assert _records(engine, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+
+
+@pytest.mark.parametrize("fault", ["os", "decode"])
+def test_a_probe_fault_at_the_no_open_exit_degrades(project, monkeypatch, fault):
+    """A ledger-probe fault at the new arm takes the row `_close_resolved`'s degrade
+    arm already writes — `sweep-resolved-close-unavailable` with `dw_ids` + `error` —
+    publishes nothing, and ends on the existing `return` without raising (DW-193).
+
+    Both reachable ledger-read faults are exercised: an OS refusal and actual
+    undecodable bytes, which read_for_write wraps in LedgerReadError.
+
+    Staged as a SECOND-read failure because that is the only reachable shape: `_loop`'s
+    own top-of-cycle read runs first, and a ledger that faults there stops the run on
+    `sweep-cycle-ledger-refused` long before this exit. A rival writer (or a revoked
+    permission) between the two reads is what this pins.
+
+    Ablations: drop OSError or LedgerReadError individually from this arm's
+    catch tuple and the corresponding row reports a crashed run."""
+    write_ledger(project, {"DW-1": "done 2026-06-01"})
+    engine, _adapter = make_sweep(project, [])
+    _cache_triage(
+        engine,
+        triage_result(["DW-1"], already_resolved=[{"id": "DW-1", "evidence": "fixed by a1b2c3d"}]),
+    )
+    assert ledger_entries(project)["DW-1"].done  # premise: a healthy read WOULD publish
+    head = git(project.project, "rev-parse", "HEAD")
+
+    real_read = deferredwork.read_for_write
+    reads: list[int] = []
+
+    def flaky(path):
+        reads.append(1)
+        if len(reads) == 1:  # `_loop`'s own cycle read still succeeds
+            return real_read(path)
+        if fault == "os":
+            raise PermissionError(13, "Permission denied")
+        path.write_bytes(b"\xff")
+        return real_read(path)
+
+    monkeypatch.setattr(deferredwork, "read_for_write", flaky)
+    _no_git(monkeypatch, "after a probe fault")
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused  # degrades, never raises
+    [failed] = _records(engine, "sweep-resolved-close-unavailable")
+    expected_error = "Permission denied" if fault == "os" else "not valid UTF-8"
+    assert failed["dw_ids"] == ["DW-1"] and expected_error in failed["error"]
+    assert "sweep-nothing-open" in journal_kinds(engine)
+    assert _records(engine, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+
+
 def _close_resolved_with_nothing_resolved(engine):
     """`_close_resolved` over a plan whose `already_resolved` is empty: the phase
     runs, `mark_done_many` flips nothing, and `closed` comes back empty."""
@@ -9399,7 +10103,7 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     """Every `_commit_ledger` call in `sweep.py` names the FILE the caller just
     published — checked by the argument's VALUE, not its presence.
 
-    The behavioral rows above drive five of the eight callers; this one is TOTAL,
+    The behavioral rows above drive six of the nine callers; this one is TOTAL,
     and it is what holds the post-migration publisher (which cannot be driven at
     that layer) plus any caller added later. Presence alone is
     not enough: `path=self.workspace.root` is an explicit argument that would
@@ -9409,10 +10113,13 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     one of exactly two sanctioned spellings, and the two families must be the right
     SIZE:
 
-    * six LEDGER publishers, all spelling `self.workspace.paths.deferred_work`.
-      Two of them are `_close_resolved`'s pair of arms (DW-193): the `closed` arm
-      publishes this pass's write, the `pending` arm a previous pass's write that a
-      crash stranded before its commit.
+    * seven LEDGER publishers, all spelling `self.workspace.paths.deferred_work`.
+      Three of them are DW-193's: `_close_resolved`'s pair of arms — the `closed`
+      arm publishes this pass's write, the `pending` arm a previous pass's write
+      that a crash stranded before its commit — plus `_publish_stranded_close`,
+      the recovery publisher at `_loop`'s empty-open-set exit, which reaches the
+      same stranded write off the CACHED triage plan on the resume where the crash
+      retired the last open entry and no phase runs at all.
       `implementation_artifacts` is configurable to any absolute path, so only the
       ledger's own file is correct in all three topologies — and only the
       WORKSPACE's copy of it, since `self.paths.deferred_work` is a different file
@@ -9432,7 +10139,7 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     "every call site spells the right argument" is a property no single run can
     observe. That `path` is required at all is
     `test_commit_ledger_requires_the_published_path`'s claim; this guard only holds
-    what the eight in-tree callers put in it.
+    what the nine in-tree callers put in it.
 
     Known limit: the store spelling embeds one bare name — `project` — so a site
     that bound that name to something else would pass, though both prune sites
@@ -9448,7 +10155,7 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     the wrong one is a silently weaker guard rather than a type error.
 
     Ablation: respell any publisher's `path=` as `decisions_store.store_path(project)`
-    and the family counts red (5 ledger, 3 store); respell it `self.workspace.root`,
+    and the family counts red (6 ledger, 3 store); respell it `self.workspace.root`,
     revert one to `self.workspace.paths.deferred_work.parent`, or drop the argument
     and the per-call check reds naming that line. Flip any one call's `family=` to
     the other token, or compute it, and the declaration checks red naming that
@@ -9466,7 +10173,7 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     ]
     # premise: the scan actually finds the calls it is grading, so an AST shape
     # change cannot turn this into a guard over an empty set
-    assert len(calls) == 8, f"expected 8 _commit_ledger callers, found {len(calls)}"
+    assert len(calls) == 9, f"expected 9 _commit_ledger callers, found {len(calls)}"
     published = {}
     declared = {}
     for node in calls:
@@ -9495,7 +10202,7 @@ def test_every_sweep_ledger_commit_names_its_own_tree():
     assert unsanctioned == {}, f"unsanctioned _commit_ledger paths: {unsanctioned}"
     ledger_published = sorted(line for line, s in published.items() if s in _LEDGER_PUBLISHED)
     store_published = sorted(line for line, s in published.items() if s in _STORE_PUBLISHED)
-    assert len(ledger_published) == 6, f"expected 6 ledger publishers: {ledger_published}"
+    assert len(ledger_published) == 7, f"expected 7 ledger publishers: {ledger_published}"
     assert len(store_published) == 2, f"expected 2 store prunes: {store_published}"
     # ...and each family's calls declare THAT family (DW-199/203/205). The two
     # validations are not interchangeable: `family="store"` on a ledger publisher
@@ -11367,7 +12074,7 @@ def test_the_journalled_file_is_the_lexical_tail_not_the_symlink_target(project,
     OPERATOR named that target. That value is identifier-shaped, so
     `sanitize.scrub_json` would ship it verbatim, and declaring the field benign
     would be pre-approving operator text in every dump. `path.name` is
-    `deferred-work.md` at all six publishers and `decisions.json` at both prunes —
+    `deferred-work.md` at all seven publishers and `decisions.json` at both prunes —
     code constants — so the lexical tail is invariant by construction.
 
     `repo` still carries the RESOLVED directory, so nothing is lost for a reader of

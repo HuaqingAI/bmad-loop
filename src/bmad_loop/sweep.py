@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import stat
 import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -1535,11 +1536,11 @@ class SweepEngine(Engine):
             # whoever owns it, so this no longer ends on a clean TREE and nothing
             # downstream may assume one. Guarded on a non-empty recovery pass, so
             # a fresh sweep spawns no git at all (see `_close_resolved` for the
-            # guard inventory across all eight sites).
+            # guard inventory across all nine sites).
             # The LEDGER FILE (`_commit_ledger`): this publisher wrote the ledger,
             # so it names the file it published and the commit is narrowed to it.
             # Spelled off `self.workspace.paths` rather than a `ledger` local, at
-            # every one of the six publishers: `self.paths.deferred_work` is a
+            # every one of the seven publishers: `self.paths.deferred_work` is a
             # DIFFERENT file under worktree isolation, and only the workspace's
             # copy is the one a publisher just wrote.
             self._commit_ledger(
@@ -1606,6 +1607,18 @@ class SweepEngine(Engine):
             self._selection_started = True
             open_now = {entry.id for entry in entries if entry.open}
             if not open_now:
+                # DW-193's ROUTING half, and the reason a phase-local fix alone
+                # cannot keep that entry's promise. When the crash that stranded a
+                # close between `mark_done_many`'s write and its commit retired the
+                # LAST open entry, this `return` fires before `_cycle` ever calls
+                # `_ensure_triage`/`_close_resolved`, so no phase gate — however
+                # wide — is ever reached and the durable write stays off HEAD for
+                # the rest of a single-cycle run. The publish attempt therefore sits
+                # ABOVE the stop rows below: a reader sees the recovered commit and
+                # then the stop, in that order. The rows and the `return` beneath
+                # are unchanged, and `_publish_stranded_close` degrades rather than
+                # raising, so every path still ends here.
+                self._publish_stranded_close(cycle)
                 if cycle == 1:
                     self.journal.append("sweep-nothing-open", ledger=str(ledger))
                 else:
@@ -1732,6 +1745,109 @@ class SweepEngine(Engine):
                 family="ledger",
             )
             cycle += 1
+
+    def _publish_stranded_close(self, cycle: int) -> None:
+        """Publish a close whose ledger write landed but whose commit never ran,
+        at `_loop`'s empty-open-set exit (DW-193).
+
+        The RESUME-ONLY term is the CACHE, and it carries the whole
+        recovery/fresh-sweep distinction with no extra state flag: `triage{suffix}
+        .json` for THIS cycle exists only because a previous pass of this run
+        already triaged it, so a fresh `bmad-loop sweep` over an empty-or-absent
+        ledger returns here before any read and spawns no git at all — graded at the
+        git seam by `test_a_fresh_nothing_open_sweep_spawns_no_git_at_the_no_open_exit`
+        for THIS arm, the way `test_a_phase_that_wrote_nothing_spawns_no_git` grades
+        it for the phase-local one. The CURRENT-CYCLE suffix is load-bearing for the same
+        reason: under `--repeat`, cycle 1's finished `triage.json` must not
+        authorize a publish at cycle 2's no-open exit, where the cycle that would
+        have replayed it never ran.
+
+        The cache is loaded the way `_ensure_triage`'s cache branch loads it —
+        `_read_json` plus `validate_triage(cached, None)`, whose `None` skips the
+        open-set equality re-check, which is exactly what a nothing-open resume
+        needs since the ledger has moved since the plan was written. It is read
+        DIRECTLY rather than through `_ensure_triage`: past that method's cache
+        branch it dispatches a triage SESSION, and a nothing-open resume must never
+        spend one.
+
+        Second term: the SAME per-id probe the phase arm uses
+        (`_resolved_write_pending`), over the cached plan's `already_resolved` ids.
+        One rule at both sites — publish on positive per-id evidence of a landed
+        write, never on the ledger merely being dirty — so everything that method
+        documents about what the probe does and does not prove applies verbatim
+        here, including its empty-`ids` short-circuit.
+
+        Faults DEGRADE and end on `_loop`'s own unchanged `return`. A cache that
+        cannot be read or does not validate journals `sweep-triage-reload-failed`,
+        the kind `_ensure_triage` already mints for exactly that; a probe fault
+        journals `sweep-resolved-close-unavailable` with `dw_ids` + `error`, the row
+        `_close_resolved`'s degrade arm already writes for the same read. No new
+        journal kind is minted at either — reusing the two readers' own rows keeps
+        the kind registry untouched. Neither publishes anything.
+
+        No `sweep-resolved-closed` row and no phase emissions: this is a PUBLISHER,
+        not a replay of `_close_resolved`. `pre_close_resolved`/`post_close_resolved`
+        pairing stays inside `_cycle`, which is why the phase is not called from
+        here even though it would reach the same commit.
+
+        WHOSE DIRT CAN RIDE ALONG, the caveat the phase arm's comment states and
+        that binds HARDER here. The boundary that holds is the PATHSPEC:
+        `_commit_ledger` narrows both git calls to the ledger file, so an operator's
+        in-flight edits anywhere ELSE in the enclosing repository stay with their
+        owner (DW-183/DW-185). Inside the ledger there is no such boundary — the
+        file is published WHOLE — so an out-of-band edit to it rides into the
+        `chore(sweep):` commit beside whatever this arm was asked to publish. The
+        phase arm has that property only while a stranded write is outstanding;
+        this one keeps it FOREVER, because the probe is keyed on ids that stay
+        `done` once published, so every later resume of the same cycle reaches this
+        publisher again (`path_clean` no-ops it while the file matches HEAD, but an
+        operator's note written months after the close is exactly what stops it
+        matching). Accepted deliberately by the DW-193 decision, on the same terms
+        as the phase arm: the alternative is a per-hunk publish this bookkeeping
+        does not have, and a durable close left off HEAD is the worse loss.
+        """
+        suffix = "" if cycle == 1 else f"-{cycle}"
+        triage_path = self.run_dir / f"triage{suffix}.json"
+        try:
+            # Use stat directly: is_file suppresses OS faults on Python 3.14,
+            # while older runtimes can raise. Absence stays silent; a metadata
+            # fault belongs to the same degrade as a failed cache read.
+            try:
+                cache_mode = triage_path.stat().st_mode
+            except (FileNotFoundError, NotADirectoryError):
+                return
+            if not stat.S_ISREG(cache_mode):
+                return
+            cached = _read_json(triage_path)
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+            self.journal.append("sweep-triage-reload-failed", errors=[f"unreadable: {exc}"])
+            return
+        if isinstance(cached, dict):
+            plan, errors = validate_triage(cached, None)
+        else:
+            plan, errors = None, [f"not a JSON object: {type(cached).__name__}"]
+        if plan is None:
+            self.journal.append("sweep-triage-reload-failed", errors=errors)
+            return
+        ledger = self.workspace.paths.deferred_work
+        ids = [entry.id for entry in plan.already_resolved]
+        try:
+            pending = self._resolved_write_pending(ledger, ids)
+        except (deferredwork.LedgerReadError, OSError, ValueError, StateRootError) as e:
+            self.journal.append("sweep-resolved-close-unavailable", dw_ids=ids, error=str(e))
+            return
+        if not pending:
+            return
+        # the ledger file: the write this arm publishes is a previous pass's write
+        # to the ledger, so it names the file it publishes and the commit is
+        # narrowed to it. The WORKSPACE's copy, for the reason the publishers above
+        # spell it that way. Same message as `_close_resolved`'s two arms: the diff
+        # being published IS the close of resolved entries.
+        self._commit_ledger(
+            "chore(sweep): close resolved deferred-work entries",
+            path=self.workspace.paths.deferred_work,
+            family="ledger",
+        )
 
     def _finish_inflight_bundles(self) -> int:
         """Re-drive every bundle this run left in flight, keyed on the task's own
@@ -2888,13 +3004,20 @@ class SweepEngine(Engine):
             # keeps a phase that resolved nothing away from git ENTIRELY: with no
             # ids named there is no write to publish under either arm.
             #
-            # The guard inventory across all eight `_commit_ledger` sites, since
+            # The guard inventory across all nine `_commit_ledger` sites, since
             # it is not uniform and reading it as uniform is the trap:
-            #   * FIVE gate on a write result or a normally returned effect:
+            #   * SIX gate on a write result or a normally returned effect:
             #     both prunes (`dropped`, and `drop_pre_answer` answering True),
             #     this site's TWO arms (`closed`, and `pending` — the same landed
             #     write, read back off disk after a crash lost only its commit),
-            #     and `_decisions_phase` (`any_effect_landed`).
+            #     `_decisions_phase` (`any_effect_landed`), and
+            #     `_publish_stranded_close` — `_loop`'s empty-open-set recovery
+            #     arm, which runs the SAME per-id probe as `pending` over the
+            #     CACHED triage plan and so gates on the same landed write. Its
+            #     extra term is the CACHE: `triage{suffix}.json` for the current
+            #     cycle must already be on disk, which is true only on a resume,
+            #     so a fresh sweep over a ledger with nothing open still reaches
+            #     no git at all.
             #   * THREE gate on something that does NOT prove a write: `_loop`'s
             #     post-recovery publisher counts recovered tasks (which may defer
             #     without editing the ledger), `_loop`'s
@@ -2902,7 +3025,7 @@ class SweepEngine(Engine):
             #     answer can set without touching the ledger, and
             #     `_ensure_migration` gates on `if not errors:`, a verdict on the
             #     rewrite session rather than on bytes changing.
-            # Beneath all eight are TWO uniform floors, in this order:
+            # Beneath all nine are TWO uniform floors, in this order:
             #   * the TARGET VALIDATION (DW-199/203/205), which asks whether the
             #     declared `family`'s file is still there and still readable before
             #     any git runs. It is what the per-site guards above cannot cover:
@@ -3551,9 +3674,9 @@ class SweepEngine(Engine):
             # `_apply_decision_effect` is this walk's only ledger write, so a walk
             # that answered nothing (every decision pre-answered, skipped
             # unattended, or dropped) wrote nothing, and no git is spawned
-            # (DW-183/DW-185). This is one of the FIVE sites gating on a write
+            # (DW-183/DW-185). This is one of the SIX sites gating on a write
             # result or returned effect; three gate on something weaker, and `path_clean`
-            # is the uniform floor beneath all eight — the inventory is spelled out
+            # is the uniform floor beneath all nine — the inventory is spelled out
             # at `_close_resolved`.
             #
             # The LEDGER FILE, not the project and not `self.workspace.root`: this
@@ -3751,7 +3874,7 @@ class SweepEngine(Engine):
         bookkeeping") — the two families name different files because they write
         different files:
 
-        * the six ledger PUBLISHERS pass `self.workspace.paths.deferred_work`.
+        * the seven ledger PUBLISHERS pass `self.workspace.paths.deferred_work`.
           The ledger hangs off `implementation_artifacts`, which
           `bmadconfig._resolve` accepts as any absolute path and
           `ProjectPaths.rebased` leaves unmoved when it sits outside the project
@@ -3865,7 +3988,7 @@ class SweepEngine(Engine):
         is asked about the RESOLVED target (DW-188) and those are the bytes that
         would be published; before, because a refused publish must spawn no git at
         all — the same property the per-site guards buy. The two families need
-        different validation (the six ledger publishers read through
+        different validation (the seven ledger publishers read through
         `deferredwork.read_for_write`, the two prunes check existence only), and
         the family is a caller's declaration because deriving it from the path
         would be precisely the "chosen by role" test the rule above refuses; a
