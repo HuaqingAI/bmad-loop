@@ -26,6 +26,7 @@ from conftest import (
     refuse_to_resolve,
     seed_outer_decoy_ledger,
     spec_path,
+    write_ledger,
     write_spec,
     write_sprint,
 )
@@ -5901,6 +5902,141 @@ def test_commit_paths_raises_when_no_operand_survives_resolution(project, monkey
     assert isinstance(caught.value.__cause__, error_type)
     assert not any(args[:1] == ("add",) for args in git_calls)
     assert uncertain.read_text() == "uncommitted exact write\n"
+
+
+# ------------------------------------------- unpublishable_target (DW-199/203/205, DW-209/213)
+
+_UNDECODABLE_LEDGER = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
+
+
+def test_unpublishable_target_refuses_an_absent_ledger(project):
+    """The `target-absent` half of the ledger family: `read_for_write` answers `None`
+    for a file that is not there, and that is the whole probe.
+
+    This is the shape the guard exists for — `verify.commit_paths` deliberately
+    keeps a missing-but-TRACKED path as a DELETION to stage, so an absent ledger
+    reaching git publishes its own removal.
+
+    Ablation: return `None` unconditionally from the ledger arm and this reds."""
+    write_ledger(project, {"DW-1": "open"})
+    ledger = project.deferred_work
+    ledger.unlink()
+
+    assert verify.unpublishable_target(ledger, "ledger") == ("target-absent", None)
+
+
+def test_unpublishable_target_refuses_an_undecodable_ledger_with_the_fault(project):
+    """`target-unreadable`, carrying the decode fault as the second element. The
+    ledger's own read contract (DW-146) raises `LedgerReadError` for bytes nobody
+    can decode, and that is what this arm folds into a refusal.
+
+    Ablation: drop `deferredwork.LedgerReadError` from the `except` tuple and the
+    call raises instead of answering, reddening the assertion below."""
+    write_ledger(project, {"DW-1": "open"})
+    project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
+
+    cause, error = verify.unpublishable_target(project.deferred_work, "ledger")
+
+    assert cause == "target-unreadable"
+    assert "not valid UTF-8" in error
+
+
+def test_unpublishable_target_folds_a_ledger_oserror_into_the_refusal(project, monkeypatch):
+    """The arm that has to be said out loud: `read_for_write`'s contract lets
+    `OSError` PROPAGATE, and here it deliberately does not. Both callers are
+    best-effort bookkeeping whose degrade discipline exists so a publication fault
+    never aborts the work that wrote the file, so an unreadable target joins the
+    undecodable cause rather than escaping into a caller with no handler for it.
+
+    Ablation: drop `OSError` from the `except` tuple and this reds with the
+    `PermissionError` escaping instead of the tuple coming back."""
+    write_ledger(project, {"DW-1": "open"})
+    fault_read_text(monkeypatch, project.deferred_work)
+
+    cause, error = verify.unpublishable_target(project.deferred_work, "ledger")
+
+    assert cause == "target-unreadable"
+    assert "Permission denied" in error
+
+
+def test_unpublishable_target_refuses_an_absent_store(project):
+    """The store family, whose whole probe is existence.
+
+    Ablation: return `None` unconditionally from the store arm and this reds."""
+    store = project.project / ".bmad-loop" / "decisions.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+
+    assert verify.unpublishable_target(store, "store") == ("target-absent", None)
+
+
+def test_unpublishable_target_publishes_a_present_store_that_is_not_decodable(project):
+    """EXISTENCE ONLY for the store, and that boundary is exactly why the family is
+    DECLARED by the caller rather than derived from the path: the store's writer
+    emits valid UTF-8 JSON, so bytes that will not decode represent a replacement
+    after that write, and publication deliberately preserves the existing
+    content policy rather than newly refusing them.
+
+    Ablation: route the store family through the ledger validator and this reds
+    with `target-unreadable` where `None` is expected."""
+    store = project.project / ".bmad-loop" / "decisions.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_bytes(b'{"DW-1": "\xff"}')  # present, and not UTF-8
+
+    assert verify.unpublishable_target(store, "store") is None
+
+
+def test_unpublishable_target_reads_a_present_empty_ledger_as_publishable(project):
+    """An empty ledger is present, readable bookkeeping and stays publishable — the
+    absence probe is `is None`, not falsiness.
+
+    Ablation: change the ledger arm's `is None` to a falsiness check and this
+    reds: empty text would be refused as absent."""
+    write_ledger(project, {"DW-1": "open"})
+    project.deferred_work.write_text("", encoding="utf-8")
+
+    assert verify.unpublishable_target(project.deferred_work, "ledger") is None
+
+
+def test_a_dangling_link_resolves_to_an_absence_before_the_probes_run(project):
+    """The probes are taken on the RESOLVED argument, and that is what decides what
+    the `is_symlink()` disjunct actually buys — not the spelling. A DANGLING link
+    does not survive the resolve as a link: non-strict `Path.resolve` collapses it
+    to the plain non-existent path it points at, so both probes answer False and
+    the store is refused `target-absent`. That is the right answer for it —
+    `atomic_write_text_confined` REFUSES to write through a link at the store's
+    own name, so a dangling one holds no write of ours to publish — but it is the
+    opposite of what "keeps a dangling link publishable" would mean.
+
+    On Python 3.13+ the disjunct keeps a symlink LOOP publishable: it resolves to
+    the link ITSELF (`exists()` False, `is_symlink()` True). Python 3.11-3.12
+    raise during resolve, which each caller handles on its own.
+
+    Ablation: on Python 3.13+, drop `or target.is_symlink()` and the loop case
+    starts refusing too. Reverse the arm to `if target.exists():` and the dangling
+    case stops being refused on every version."""
+    store = project.project / ".bmad-loop" / "decisions.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        store.symlink_to(store.parent / "gone.json")
+    except OSError as exc:  # pragma: no cover - win32 without developer mode
+        pytest.skip(f"symlinks unavailable on this host: {exc}")
+    # premise: the link is real, and the RESOLVE is what erases it
+    assert store.is_symlink()
+    resolved = store.resolve()
+    assert not resolved.exists() and not resolved.is_symlink()
+
+    assert verify.unpublishable_target(resolved, "store") == ("target-absent", None)
+
+    # Path.resolve changed its non-strict loop behavior in Python 3.13.
+    loop = store.parent / "loop.json"
+    loop.symlink_to("loop.json")
+    if sys.version_info < (3, 13):
+        with pytest.raises(RuntimeError):
+            loop.resolve()
+    else:
+        resolved_loop = loop.resolve()
+        assert not resolved_loop.exists() and resolved_loop.is_symlink()
+        assert verify.unpublishable_target(resolved_loop, "store") is None
 
 
 def test_commit_paths_noop_when_unchanged(project):

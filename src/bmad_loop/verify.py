@@ -18,7 +18,7 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, overload
+from typing import Any, Literal, assert_never, overload
 
 import yaml
 
@@ -5086,6 +5086,85 @@ def patch_new_files(patch_path: Path) -> set[str]:
             if rel:
                 new_files.add(rel)
     return new_files
+
+
+def unpublishable_target(
+    target: Path, family: Literal["ledger", "store"]
+) -> tuple[Literal["target-absent", "target-unreadable"], str | None] | None:
+    """Why `target` must not be published, or `None` when it may be. Returns
+    `(refuse_cause, error)` — the two fields a refusal carries beyond the
+    caller's own identifying ones.
+
+    TWO publishers share it, which is why it is a module-level seam rather than
+    sweep machinery: `sweep._commit_ledger`'s nine call sites (the seven ledger
+    publishers and the two pre-answer prunes), and `decisions.apply_pre_answer`'s
+    out-of-band commit (DW-209/213). It lives HERE, beside `commit_paths`, because
+    the hazard it guards is a property of that function — the missing-but-TRACKED
+    path `commit_paths` deliberately keeps as a DELETION to stage — so the guard
+    and the contract it gates read as one thing. `deferredwork` is already
+    imported above and sits below this module, so the layering
+    (`deferredwork` < `verify` < `sweep` < `decisions`) is unchanged and no cycle
+    is created.
+
+    The FAMILY is declared by the caller, never derived here. A `path ==
+    paths.deferred_work` test would be exactly the "chosen by role" test
+    `_commit_ledger`'s own naming rule refuses, and it would answer wrongly for a
+    publisher whose ledger is symlinked (the argument is the RESOLVED target) or
+    for any file a later caller publishes.
+
+    LEDGER: `deferredwork.read_for_write`, because the ledger's own read
+    contract (DW-146) already answers both questions in the two shapes this
+    guard asks them — `None` for absence, `LedgerReadError` for bytes nobody
+    can decode. Its `OSError` normally propagates; here it does not, because
+    both callers are best-effort bookkeeping whose whole degrade discipline
+    exists so a publication fault never aborts the work that wrote the file, so
+    it joins the undecodable cause rather than escaping. No lock is taken: this
+    is a read the writer above already took. A later disappearance or replacement
+    can still change what git publishes, as `_commit_ledger` documents.
+
+    STORE: existence only, preserving the publishers' existing content
+    policy. The writer emits valid UTF-8 JSON, but this guard does not check
+    whether those bytes were replaced after the write. `_prune_pre_answers`'
+    own DW-176 absence refusal is about the LEDGER it reads, not the store.
+
+    Both probes are taken on the RESOLVED argument, which is what decides what
+    the `is_symlink()` disjunct actually buys — and it is not what the spelling
+    suggests. A DANGLING link does not survive the resolve as a link: non-strict
+    `Path.resolve` collapses it to the plain non-existent path it points at, so
+    both probes answer False and the store is refused `target-absent`. That is
+    the right answer for it (the prune's writer,
+    `atomic_write_text_confined`, REFUSES to write through a link at the
+    store's own name, so a dangling one holds no write of ours to publish), but
+    it means the disjunct is doing a different job: on Python 3.13+, a symlink
+    LOOP resolves to the link ITSELF, which `exists()` calls False and
+    `is_symlink()` calls True. The disjunct preserves publication of that link
+    entry. Python 3.11–3.12 instead raise during resolve, which each caller
+    handles on its own — `_commit_ledger` takes its existing
+    `sweep-ledger-commit-unavailable` arm before this helper runs, and
+    `apply_pre_answer` folds the fault into a `target-unreadable` refusal.
+
+    Returns the `refuse_cause` token as a `Literal` rather than a bare `str`,
+    which is what makes the closed two-value claim
+    `tests/test_portability_guard.py` declares `refuse_cause` benign on a
+    typechecked property rather than a comment."""
+    if family == "ledger":
+        try:
+            if deferredwork.read_for_write(target) is None:
+                return ("target-absent", None)
+        except (deferredwork.LedgerReadError, OSError) as e:
+            return ("target-unreadable", str(e))
+        return None
+    if family == "store":
+        if not (target.exists() or target.is_symlink()):
+            return ("target-absent", None)
+        return None
+    # Spelled as an exhaustive dispatch, not `if ledger / else store`: a THIRD
+    # family added to the `Literal` would otherwise typecheck at every call site
+    # and fall silently through to existence-only validation — precisely the
+    # "inherit a validation it does not want" failure the required keyword-only
+    # argument at the sweep's call sites exists to prevent. This reds under
+    # pyright the moment the union grows, before any run.
+    assert_never(family)
 
 
 def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:

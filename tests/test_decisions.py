@@ -4,7 +4,7 @@ import json
 import sys
 
 import pytest
-from conftest import fault_read_text, install_bmad_config, write_ledger
+from conftest import fault_read_text, install_bmad_config, refuse_to_resolve, write_ledger
 
 from bmad_loop import decisions, deferredwork, platform_util, runs
 from bmad_loop.sweep import DecisionOption
@@ -497,12 +497,13 @@ def test_pending_missed_decisions_empty_when_nothing_open(project):
 # ------------------------------------------------------- apply
 
 
-def test_apply_pre_answer_build_records_store_and_ledger(project):
+@pytest.mark.parametrize("effect", ["build", "keep-open"])
+def test_apply_pre_answer_build_records_store_and_ledger(project, effect):
     install_bmad_config(project)
     write_ledger(project, {"DW-1": "open"})
     from bmad_loop.sweep import Decision
 
-    opt = DecisionOption(key="1", label="Build", effect="build", intent="widen field")
+    opt = DecisionOption(key="1", label="Answer", effect=effect, intent="widen field")
     d = Decision(id="DW-1", question="build it?", context="", options=(opt,), recommendation="1")
     decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
 
@@ -510,10 +511,27 @@ def test_apply_pre_answer_build_records_store_and_ledger(project):
         e.id: e
         for e in deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
     }
-    assert "decision: 2026-06-13 Build — widen field" in entries["DW-1"].body
-    assert entries["DW-1"].open  # build stays open until a sweep builds it
-    assert decisions.load_pre_answers(project.project)["DW-1"]["effect"] == "build"
+    assert "decision: 2026-06-13 Answer — widen field" in entries["DW-1"].body
+    assert entries["DW-1"].open
+    assert decisions.load_pre_answers(project.project)["DW-1"]["effect"] == effect
+    # Ablation: include the store only for build; keep-open then has no HEAD answer.
+    assert (
+        json.loads(_git(project, "show", "HEAD:.bmad-loop/decisions.json"))["DW-1"]["effect"]
+        == effect
+    )
     assert "chore(decisions): pre-answer DW-1" in _git_log(project)
+    # BOTH written operands ride that one commit (DW-209/213). Asserting the
+    # pathspec, not merely that a commit exists: gate one builds the operand list
+    # from what this call wrote, and a recorded `build` wrote both.
+    # Ablation: delete `if recorded:` from that gate (never publish the ledger) and
+    # this reds here while every assertion above still passes.
+    published = _git(project, "show", "--name-only", "--format=", "HEAD").split()
+    assert sorted(published) == sorted(
+        [
+            project.deferred_work.relative_to(project.project).as_posix(),
+            ".bmad-loop/decisions.json",
+        ]
+    )
 
 
 def test_apply_pre_answer_sanitizes_a_multiline_detail(project):
@@ -597,7 +615,7 @@ def test_apply_pre_answer_returns_true_when_the_entry_is_there(project):
     opt = DecisionOption(key="1", label="Close", effect="close", resolution="superseded")
     d = Decision(id="DW-1", question="close?", context="", options=(opt,), recommendation="1")
 
-    assert decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13") is True
+    assert decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13").recorded is True
 
 
 def test_apply_pre_answer_returns_false_when_the_entry_was_retired(project):
@@ -606,8 +624,8 @@ def test_apply_pre_answer_returns_false_when_the_entry_was_retired(project):
     while the prompt blocked on the human. No raise, so both callers used to read
     the non-exception as a successful close.
 
-    Ablation: return `True` unconditionally from `apply_pre_answer` (or drop the
-    `return` and let it fall off the end as `None`) and this reddens."""
+    Ablation: hardcode `recorded=True` on the `PreAnswerResult` `apply_pre_answer`
+    returns and this reddens."""
     install_bmad_config(project)
     write_ledger(project, {"DW-2": "open"})  # a ledger, but not this id
     from bmad_loop.sweep import Decision
@@ -615,7 +633,7 @@ def test_apply_pre_answer_returns_false_when_the_entry_was_retired(project):
     opt = DecisionOption(key="1", label="Close", effect="close", resolution="superseded")
     d = Decision(id="DW-1", question="close?", context="", options=(opt,), recommendation="1")
 
-    assert decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13") is False
+    assert decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13").recorded is False
     # ...and nothing was minted for the id the ledger does not carry
     text = project.deferred_work.read_text(encoding="utf-8")
     assert {e.id for e in deferredwork.parse_ledger(text)} == {"DW-2"}
@@ -627,8 +645,8 @@ def test_apply_pre_answer_returns_false_when_the_ledger_file_is_gone(project):
     (`if not path.is_file()`). That is why False may not be read as a read fault:
     this call never opened the file at all.
 
-    Ablation: return `True` unconditionally from `apply_pre_answer` and this reddens
-    on the return value. The negative assertion below is the weaker half and needs
+    Ablation: hardcode `recorded=True` on the returned `PreAnswerResult` and this
+    reddens on the return value. The negative assertion below is the weaker half and needs
     its own — have `record_decision` create the ledger it cannot find (write the
     entry into a fresh file rather than returning False) and it reddens there, where
     the return-value assertion alone would still pass."""
@@ -640,7 +658,7 @@ def test_apply_pre_answer_returns_false_when_the_ledger_file_is_gone(project):
     opt = DecisionOption(key="1", label="Close", effect="close", resolution="superseded")
     d = Decision(id="DW-1", question="close?", context="", options=(opt,), recommendation="1")
 
-    assert decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13") is False
+    assert decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13").recorded is False
     assert not project.deferred_work.exists()  # no ledger conjured to write into
 
 
@@ -655,7 +673,7 @@ def test_apply_pre_answer_build_non_write_still_saves_the_store_answer(project):
     opt = DecisionOption(key="1", label="Widen", effect="build", intent="widen field")
     d = Decision(id="DW-1", question="build it?", context="", options=(opt,), recommendation="1")
 
-    assert decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13") is False
+    assert decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13").recorded is False
     stored = decisions.load_pre_answers(project.project)["DW-1"]
     assert stored["effect"] == "build"
     assert decisions.unusable_answer_reason(stored, allow_close=False) is None
@@ -672,6 +690,372 @@ def test_apply_pre_answer_commit_leaves_unrelated_changes(project):
     decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
     # the unrelated change is still uncommitted (commit_paths staged only the ledger)
     assert "src.txt" in _git_status(project)
+
+
+# ------------------------------- the commit publishes only what THIS call wrote (DW-209/213)
+
+
+def _close_decision():
+    from bmad_loop.sweep import Decision
+
+    opt = DecisionOption(key="1", label="Close", effect="close", resolution="superseded")
+    return (
+        Decision(id="DW-1", question="close?", context="", options=(opt,), recommendation="1"),
+        opt,
+    )
+
+
+def test_apply_pre_answer_never_commits_away_a_ledger_that_vanished(project):
+    """THE reproduced hazard (DW-213). The ledger is TRACKED at HEAD and is unlinked
+    while the prompter blocks on the human. `record_decision` answers False without
+    raising, and the commit block used to run anyway over `[ledger, store]` —
+    `verify.commit_paths` deliberately keeps a missing-but-TRACKED path as a
+    DELETION to stage, so the call published the ledger's own REMOVAL under a
+    `chore(decisions): pre-answer DW-1` message, taking every `decision:` line and
+    open entry out of HEAD.
+
+    The claim is what does NOT happen: no new commit, and HEAD still carries the
+    pre-call bytes verbatim.
+
+    Ablation: restore the unconditional `[ledger, store_path(project)]` operand
+    list and this reds on all three assertions — a new commit exists, its message
+    is the pre-answer one, and `git show HEAD:<ledger>` raises because the path is
+    gone at HEAD."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    head_before = _git(project, "rev-parse", "HEAD").strip()
+    blob_before = _git(project, "show", f"HEAD:{rel}")
+    project.deferred_work.unlink()
+    d, opt = _close_decision()
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    assert result.recorded is False
+    assert result.refusals == ()  # nothing was WRITTEN, so nothing was refused either
+    assert _git(project, "rev-parse", "HEAD").strip() == head_before
+    assert _git(project, "show", f"HEAD:{rel}") == blob_before
+    assert "chore(decisions): pre-answer" not in _git_log(project)
+
+
+@pytest.mark.parametrize("ledger_missing", [False, True], ids=["retired-entry", "absent-ledger"])
+def test_apply_pre_answer_close_non_write_spawns_no_git_at_all(
+    project, monkeypatch, ledger_missing
+):
+    """DW-185's rule at this caller: a phase that wrote nothing runs no git. A
+    `close` whose ledger is gone writes neither operand (a `close` records no store
+    entry), so the operand list is empty and the commit is skipped outright rather
+    than reaching git and finding nothing to do.
+
+    Graded by making both git helpers RAISE rather than recording their calls: a
+    recording stub would let a regression pass whenever the call happened to be
+    harmless, where a raise cannot be ignored by any arm.
+
+    Ablation: always include the ledger operand. The present dirty retired-entry
+    case reaches git and raises, independently of the target guard."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-2": "open"})
+    if ledger_missing:
+        project.deferred_work.unlink()
+    else:
+        with project.deferred_work.open("a", encoding="utf-8") as fh:
+            fh.write("\nan unrelated in-flight edit\n")
+
+    def never(*_a, **_k):
+        raise AssertionError("a non-write reached git")
+
+    monkeypatch.setattr(decisions.verify, "path_clean", never)
+    monkeypatch.setattr(decisions.verify, "commit_paths", never)
+    d, opt = _close_decision()
+
+    assert decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13").recorded is False
+
+
+@pytest.mark.parametrize("effect", ["build", "keep-open"])
+@pytest.mark.parametrize("ledger_missing", [False, True], ids=["retired-entry", "absent-ledger"])
+def test_apply_pre_answer_build_non_write_publishes_the_store_alone(
+    project, effect, ledger_missing
+):
+    """The operand list is per-OPERAND, not all-or-nothing: a non-close whose ledger
+    entry is gone still WROTE the pre-answer store, so the store publishes and the
+    ledger — which this call did not write — is absent from the commit's pathspec.
+
+    The tracked ledger is dirty or absent, so an over-broad operand list would
+    publish an unrelated edit or deletion instead of silently seeing clean bytes.
+
+    Ablation: restore the unconditional `[ledger, store_path(project)]` list and
+    this reds — the retired ledger's unrelated edit appears in the commit. Gate
+    two independently protects absence; the empty refusal assertion catches an
+    unwritten ledger reaching that gate. Restricting the store to build also reds
+    the keep-open cases because their HEAD answer never lands."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-2": "open"})  # no DW-1 entry to record against
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    ledger_head = _git(project, "show", f"HEAD:{ledger_rel}")
+    if ledger_missing:
+        project.deferred_work.unlink()
+    else:
+        with project.deferred_work.open("a", encoding="utf-8") as fh:
+            fh.write("\nan unrelated in-flight edit\n")  # dirty, and not ours to publish
+    from bmad_loop.sweep import Decision
+
+    opt = DecisionOption(key="1", label="Answer", effect=effect, intent="widen field")
+    d = Decision(id="DW-1", question="build it?", context="", options=(opt,), recommendation="1")
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    assert result.recorded is False
+    assert result.refusals == ()
+    assert "chore(decisions): pre-answer DW-1" in _git_log(project)
+    published = _git(project, "show", "--name-only", "--format=", "HEAD").split()
+    assert published == [".bmad-loop/decisions.json"]
+    assert (
+        json.loads(_git(project, "show", "HEAD:.bmad-loop/decisions.json"))["DW-1"]["effect"]
+        == effect
+    )
+    assert _git(project, "show", f"HEAD:{ledger_rel}") == ledger_head
+    assert ledger_rel in _git_status(project)  # the ledger's own edit stays with its owner
+
+
+def test_apply_pre_answer_recorded_close_still_publishes_the_ledger(project):
+    """The over-gating guard for the row above: gating on "did this call write it"
+    must not stop the ordinary `close` from publishing. The ledger IS what this
+    call wrote, so it is the commit's sole operand — and the store, which a `close`
+    never writes, is not.
+
+    Ablation: always include the store operand; its unrelated dirty answer reaches
+    HEAD and the pathspec and preserved-store assertions fail."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    decisions.record_pre_answer(project.project, "DW-9", _OPT, date="2026-06-13")
+    _git(project, "add", ".bmad-loop/decisions.json")
+    _git(project, "commit", "-m", "seed pre-answer store")
+    store_head = _git(project, "show", "HEAD:.bmad-loop/decisions.json")
+    decisions.record_pre_answer(project.project, "DW-8", _OPT, date="2026-06-13")
+    store_dirty = decisions.store_path(project.project).read_bytes()
+    d, opt = _close_decision()
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    assert result.recorded is True
+    assert result.publish_note() is None
+    assert "chore(decisions): pre-answer DW-1" in _git_log(project)
+    published = _git(project, "show", "--name-only", "--format=", "HEAD").split()
+    assert published == [ledger_rel]
+    assert _git(project, "show", "HEAD:.bmad-loop/decisions.json") == store_head
+    assert decisions.store_path(project.project).read_bytes() == store_dirty
+    assert ".bmad-loop/decisions.json" in _git_status(project)
+
+
+def test_apply_pre_answer_refusal_drops_the_operand_and_rides_back_on_the_result(
+    project, monkeypatch
+):
+    """The SECOND gate (DW-199/203/205's guard, shared with the sweep's nine
+    publishers). It fires only on a race between the write above and the staging
+    below — the first gate has already removed every operand this call did not
+    write — which is why a refusal is worth reporting rather than noise: it means
+    an answer that really WAS written could not be published.
+
+    `decisions.py` has no journal, so the refusal rides back on the return value.
+    It never raises, and a refused operand reaches no git at all.
+
+    Ablation: delete the `verify.unpublishable_target` call from `apply_pre_answer`
+    and this reds through the `AssertionError` the `commit_paths` stub raises."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+
+    monkeypatch.setattr(
+        decisions.verify, "unpublishable_target", lambda _t, _f: ("target-absent", None)
+    )
+
+    def never(*_a, **_k):
+        raise AssertionError("a refused publication reached git")
+
+    monkeypatch.setattr(decisions.verify, "path_clean", never)
+    monkeypatch.setattr(decisions.verify, "commit_paths", never)
+    d, opt = _close_decision()
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    assert result.recorded is True  # the LINE landed; only the publish did not
+    assert result.refusals == (
+        decisions.PublishRefusal(file="deferred-work.md", cause="target-absent", error=None),
+    )
+    assert result.publish_note() == "not committed to git: deferred-work.md (target-absent)"
+    # ...and the ledger really does still carry the line nothing published
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert "decision: 2026-06-13 Close — superseded" in text
+
+
+@pytest.mark.parametrize("refused_family", ["ledger", "store"])
+def test_apply_pre_answer_publishes_the_survivor_when_one_operand_is_refused(
+    project, monkeypatch, refused_family
+):
+    """A refusal drops ITS operand, not the commit. A build writes two operands:
+    refuse either one and the other must reach HEAD alone, while the refused
+    write stays dirty and the result names it.
+
+    Ablation: clear `operands` in the refusal arm. The store-refused case loses
+    the ledger already accepted, and fails its HEAD assertion."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    ledger_head = _git(project, "show", f"HEAD:{ledger_rel}")
+    monkeypatch.setattr(
+        decisions.verify,
+        "unpublishable_target",
+        lambda _t, family: ("target-absent", None) if family == refused_family else None,
+    )
+    from bmad_loop.sweep import Decision
+
+    opt = DecisionOption(key="1", label="Widen", effect="build", intent="widen field")
+    d = Decision(id="DW-1", question="build it?", context="", options=(opt,), recommendation="1")
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    assert result.recorded is True
+    assert result.refusals == (
+        decisions.PublishRefusal(
+            file="deferred-work.md" if refused_family == "ledger" else "decisions.json",
+            cause="target-absent",
+            error=None,
+        ),
+    )
+    assert "chore(decisions): pre-answer DW-1" in _git_log(project)
+    published = _git(project, "show", "--name-only", "--format=", "HEAD").split()
+    if refused_family == "ledger":
+        assert published == [".bmad-loop/decisions.json"]
+        assert (
+            json.loads(_git(project, "show", "HEAD:.bmad-loop/decisions.json"))["DW-1"]["effect"]
+            == "build"
+        )
+        assert _git(project, "show", f"HEAD:{ledger_rel}") == ledger_head
+        assert ledger_rel in _git_status(project)
+    else:
+        assert published == [ledger_rel]
+        assert "decision: 2026-06-13 Widen — widen field" in _git(
+            project, "show", f"HEAD:{ledger_rel}"
+        )
+        assert decisions.load_pre_answers(project.project)["DW-1"]["effect"] == "build"
+        assert "?? .bmad-loop/decisions.json" in _git(
+            project, "status", "--porcelain", "--untracked-files=all"
+        )
+
+
+def test_apply_pre_answer_swallows_a_git_fault_without_refusing_or_raising(project, monkeypatch):
+    """The older degrade, unchanged by the two gates above it: git publication is
+    best effort, so a `GitError` — a non-git tree, a locked index, git absent —
+    leaves the on-disk record standing and never reaches the caller. It is NOT a
+    refusal: nothing declined to publish, the publish itself failed, and the two
+    surfaces have no report for it by design.
+
+    Ablation: remove `except verify.GitError: pass` from `apply_pre_answer` and
+    this reds where the call raises out of the fixture."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+
+    def boom(*_a, **_k):
+        raise decisions.verify.GitError("git is unusable here")
+
+    monkeypatch.setattr(decisions.verify, "commit_paths", boom)
+    d, opt = _close_decision()
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    assert result.recorded is True
+    assert result.refusals == ()  # a failed publish is not a refused one
+    assert result.publish_note() is None
+    # ...and the write the commit could not publish is still on disk
+    entries = {
+        e.id: e
+        for e in deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+    }
+    assert entries["DW-1"].status.startswith("done")
+    assert "chore(decisions): pre-answer" not in _git_log(project)
+
+
+def test_apply_pre_answer_folds_a_resolve_fault_into_target_unreadable(project, monkeypatch):
+    """`Path.resolve` can raise `OSError` (a broken chain, a permission-denied
+    component) or `RuntimeError` (a symlink loop on 3.11-3.12). `decisions.py` has
+    no journal to route that to and the cause enum is closed by contract, so it
+    takes the refusal arm as `target-unreadable`: a target whose path cannot be
+    resolved cannot be read well enough to publish. It never escapes.
+
+    Injected AFTER the ledger write rather than before it, which is both the shape
+    the guard is about (a fault arising in the window between the write and the
+    staging) and the only way to reach the publisher at all: the write's own
+    cross-process lock resolves the same path to derive its sidecar, so a fault
+    standing before the call aborts it long before any operand is built.
+
+    Ablation: drop the `try` around the resolve and this reds with the injected
+    error propagating out of `apply_pre_answer`."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    real_record = decisions.deferredwork.record_decision
+
+    def record_then_break(*a, **kw):
+        out = real_record(*a, **kw)
+        refuse_to_resolve(monkeypatch, project.deferred_work)
+        return out
+
+    monkeypatch.setattr(decisions.deferredwork, "record_decision", record_then_break)
+
+    def never(*_a, **_k):
+        raise AssertionError("an unresolvable operand reached git")
+
+    monkeypatch.setattr(decisions.verify, "commit_paths", never)
+    d, opt = _close_decision()
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    assert result.recorded is True
+    [refusal] = result.refusals
+    assert refusal.file == "deferred-work.md"
+    assert refusal.cause == "target-unreadable"
+    assert refusal.error
+    # ...and the fault reaches the surfaces, where a bare cause would read exactly
+    # like a plain absence. Ablation: render `f"{r.file} ({r.cause})"` for every
+    # refusal in `publish_note` and this reds while the assertions above pass.
+    note = result.publish_note()
+    assert note is not None and note.startswith("not committed to git: deferred-work.md (")
+    assert f"target-unreadable: {refusal.error}" in note
+
+
+def test_apply_pre_answer_commit_false_writes_on_disk_and_refuses_nothing(project):
+    """`commit=False` short-circuits ahead of both gates: no git, no refusals, and
+    the on-disk writes are unchanged.
+
+    Ablation: move the `if not commit:` return below the operand build and the
+    refusal assertion still passes, so this row's weight is the git one — delete
+    the early return entirely and the `chore(decisions):` assertion reds."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    d, opt = _close_decision()
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13", commit=False)
+
+    assert result.recorded is True
+    assert result.refusals == ()
+    assert result.publish_note() is None
+    assert "chore(decisions): pre-answer" not in _git_log(project)
+    entries = {
+        e.id: e
+        for e in deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+    }
+    assert entries["DW-1"].status.startswith("done")
+
+
+def _git(project, *args):
+    import subprocess
+
+    return subprocess.run(
+        ["git", "-C", str(project.project), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
 
 
 def _git_log(project):

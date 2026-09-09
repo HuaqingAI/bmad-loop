@@ -4074,7 +4074,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     for decision in pending:
         option = prompter.ask(decision)
         try:
-            recorded = decisions.apply_pre_answer(project, decision, option, date=today)
+            result = decisions.apply_pre_answer(project, decision, option, date=today)
         except (
             OSError,
             bmadconfig.BmadConfigError,
@@ -4122,7 +4122,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             outcome = "queued — the next sweep will build it"
         else:
             outcome = "kept open (recorded)"
-        if not recorded:
+        if not result.recorded:
             # Replace success claims with what apply_pre_answer actually persisted.
             # This later probe is only diagnostic: paths predates the prompt and
             # may differ from the writer's reloaded config. A probe fault must not
@@ -4140,6 +4140,15 @@ def cmd_decisions(args: argparse.Namespace) -> int:
                 outcome += f": {why}"
             if option.effect != "close":
                 outcome += "; your answer was saved to the pre-answer store"
+        # A written operand that could not be published (DW-209/213). Separate from
+        # the non-write above and reportable on TOP of a successful record: the
+        # operand list is already gated on what the call wrote, so a refusal means
+        # an answer that really landed on disk is missing from git history. It is
+        # not an error — the exit code, the walk and the outcome wording above are
+        # all unchanged by it.
+        note = result.publish_note()
+        if note is not None:
+            outcome += f"; {note}"
         print(f"  {decision.id}: {outcome}")
     print("\nrun `bmad-loop sweep` to act on any builds.")
     return 0

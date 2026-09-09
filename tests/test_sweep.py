@@ -9114,7 +9114,7 @@ def test_close_resolved_over_an_absent_ledger_publishes_nothing(project, monkeyp
 
     Graded on the absence of `sweep-ledger-commit-refused`, i.e. on `_commit_ledger`
     never being REACHED, and not on the git stub — that distinction is the whole
-    reason this row is written this way. `_unpublishable`'s DW-199 `target-absent`
+    reason this row is written this way. `verify.unpublishable_target`'s DW-199 `target-absent`
     check is a second floor beneath this arm and it fires before `verify.path_clean`,
     so a stub-only assertion passes whether the probe guards anything or not
     (measured: flipping the probe to answer `True` on absence leaves a git-seam
@@ -13445,7 +13445,7 @@ def test_a_vanished_ledger_is_refused_at_the_decision_phase_gate(project):
     The claim is what does NOT happen: no commit, and HEAD still carries the blob.
     The refusal row is what makes that legible rather than silent.
 
-    Ablation: delete the `refusal = self._unpublishable(...)` call from
+    Ablation: delete the `refusal = verify.unpublishable_target(...)` call from
     `_commit_ledger` (or make it always answer None) and this reds on every
     assertion below — `sweep-ledger-commit` gains the deletion commit, HEAD's blob
     lookup raises because the path is gone at HEAD, and no refusal row exists."""
@@ -13602,7 +13602,7 @@ def test_commit_ledger_refuses_an_unpublishable_target_without_reaching_git(
     merely records would let a regression pass whenever the recorded call happened
     to be harmless, where a raise cannot be ignored by any arm.
 
-    Ablation: delete the `refusal = self._unpublishable(...)` call and every case
+    Ablation: delete the `refusal = verify.unpublishable_target(...)` call and every case
     reds through the `AssertionError` those stubs raise (the store case reaches
     `path_clean` too, since a missing operand is only discovered inside git).
     Replace the lexical `path.name` with `target.name` in the publisher and the
@@ -13670,6 +13670,9 @@ def test_a_dangling_store_link_is_an_absence_because_the_probes_see_the_resolved
     On Python 3.13+, the disjunct keeps a symlink LOOP publishable: it resolves
     to the link ITSELF (`exists()` False, `is_symlink()` True). Python 3.11–3.12
     raise during resolve instead, taking the publisher's existing degrade arm.
+    This row owns the version split as the PUBLISHER sees it; the loop's own
+    publishable answer is graded directly at the helper's module, in
+    `tests/test_verify.py::test_a_dangling_link_resolves_to_an_absence_before_the_probes_run`.
 
     Ablation: on Python 3.13+, drop `or target.is_symlink()` and the loop starts
     refusing too. Reverse the arm to `if target.exists():` and the dangling case
@@ -13717,7 +13720,6 @@ def test_a_dangling_store_link_is_an_absence_because_the_probes_see_the_resolved
     else:
         resolved_loop = loop.resolve()
         assert not resolved_loop.exists() and resolved_loop.is_symlink()
-        assert engine._unpublishable(resolved_loop, "store") is None
 
 
 def test_an_empty_present_ledger_is_published(project):
@@ -13748,7 +13750,7 @@ def test_a_present_store_publishes_even_though_it_is_not_decodable_as_a_ledger(p
     JSON; invalid bytes here represent a replacement after that write. Publication
     deliberately preserves its existence-only policy for the store family.
 
-    Ablation: make `_unpublishable` apply the ledger validator to the store family
+    Ablation: make `verify.unpublishable_target` apply the ledger validator to the store family
     and this reds — the publish is refused with `target-unreadable` and no commit
     row appears. Prune call-site family declarations are held separately by
     `test_every_sweep_ledger_commit_names_its_own_tree`."""

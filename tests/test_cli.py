@@ -918,8 +918,8 @@ def test_decisions_reports_a_close_the_ledger_never_took(project, capsys, monkey
     Exit 0 is asserted deliberately: a non-write is a degrade, not a failure, and
     the command's exit codes are a compatibility contract.
 
-    Ablation: return `True` unconditionally from `apply_pre_answer`, or drop the
-    `if not recorded` arm here, and this reddens on `closed now`."""
+    Ablation: hardcode `recorded=True` on `apply_pre_answer`'s `PreAnswerResult`,
+    or drop the `if not result.recorded` arm here, and this reddens on `closed now`."""
     from conftest import write_ledger
 
     install_bmad_config(project)
@@ -972,6 +972,51 @@ def test_decisions_names_an_absent_ledger_rather_than_a_missing_entry(project, c
     assert "DW-1: no decision line was written: the ledger file is gone" in out
 
 
+def test_decisions_names_a_written_answer_it_could_not_publish(project, capsys, monkeypatch):
+    """DW-209/213 on this surface. The commit's operand list is already gated on
+    what the call WROTE, so a publishable-target refusal means an answer that
+    really landed on disk is missing from git history — worth telling the human
+    about, unlike the swallowed `GitError` beside it.
+
+    Reported ON TOP of the ordinary outcome rather than replacing it: the record
+    succeeded, so `queued — the next sweep will build it` still stands, exit 0 is
+    unchanged (a refusal is a degrade, not a failure), and the walk still advances
+    to DW-2.
+
+    Ablation: drop the `result.publish_note()` append in `cmd_decisions` and this
+    reddens on the `not committed to git` assertion while every other one here
+    still passes."""
+    from conftest import write_ledger
+
+    from bmad_loop import verify
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    _make_run_with_two_decisions(project)
+    asked = []
+
+    class _StubPrompter:
+        def ask(self, decision):
+            asked.append(decision.id)
+            return decision.option("1")  # build
+
+    # The race the guard exists for: both written operands go unpublishable
+    # between the write and the staging.
+    monkeypatch.setattr(verify, "unpublishable_target", lambda _t, _f: ("target-absent", None))
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+
+    assert asked == ["DW-1", "DW-2"]
+    out = capsys.readouterr().out
+    assert (
+        "DW-1: queued — the next sweep will build it; "
+        "not committed to git: deferred-work.md (target-absent), "
+        "decisions.json (target-absent)" in out
+    )
+    assert "DW-2: queued" in out
+
+
 def test_decisions_continues_when_the_non_write_diagnostic_probe_fails(
     project, capsys, monkeypatch
 ):
@@ -1009,10 +1054,10 @@ def test_decisions_continues_when_the_non_write_diagnostic_probe_fails(
         return is_file(path)
 
     def record_then_fail_probe(*args, **kwargs):
-        recorded = apply(*args, **kwargs)
-        if not recorded:
+        result = apply(*args, **kwargs)
+        if not result.recorded:
             monkeypatch.setattr(Path, "is_file", failing_probe)
-        return recorded
+        return result
 
     monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
     monkeypatch.setattr(decisions, "apply_pre_answer", record_then_fail_probe)

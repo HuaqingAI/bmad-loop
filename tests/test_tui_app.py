@@ -7221,9 +7221,9 @@ async def test_decision_modal_toasts_a_ledger_that_took_no_decision_line(
     landed; the toast makes no promise about future sweep execution. Close options
     save no store answer, so their warnings must not claim one was saved.
 
-    Ablation: return `True` unconditionally from `apply_pre_answer`, or drop
-    `_record_decision`'s `if not recorded` arm, and this reddens on both the toast
-    and the `recorded 2 decision(s)` that then appears.
+    Ablation: hardcode `recorded=True` on `apply_pre_answer`'s `PreAnswerResult`,
+    or drop `_record_decision`'s `if not result.recorded` arm, and this reddens on
+    both the toast and the `recorded 2 decision(s)` that then appears.
     """
     install_bmad_config(project)
     project.deferred_work.write_text(
@@ -7303,14 +7303,159 @@ async def test_decision_modal_toasts_a_ledger_that_took_no_decision_line(
         assert app.is_running
 
 
+@pytest.mark.parametrize(
+    "cause,error",
+    [
+        ("target-absent", None),
+        ("target-unreadable", "cannot open /tmp/[/]/[red]/decisions.json"),
+    ],
+)
+async def test_decision_modal_toast_carries_both_a_non_write_and_a_refusal(
+    project, monkeypatch, cause, error
+):
+    """The COMBINED arm, which neither sibling reaches: the ledger took no
+    `decision:` line AND the one operand this call did write — the pre-answer
+    store, since the effect is not `close` — could not be published.
+
+    Both facts belong in the ONE toast the walk raises for that decision. Its
+    siblings each exercise a single clause (one patches nothing, so there is no
+    refusal; the other keeps the entries open, so `recorded` is True and control
+    takes the standalone-toast arm), which left `{unpublished}` in the non-write
+    f-string deletable with `-k decision` fully green.
+
+    Ablation: delete `{unpublished}` from `_record_decision`'s non-write
+    `self.notify(...)` and this reds on the `not committed to git` clause, while
+    both sibling rows still pass.
+    """
+    # Ablation: remove markup=False from this toast arm; the bracketed fault
+    # then raises MarkupError in the real notification renderer.
+    from bmad_loop import verify
+
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: first thing\n\norigin: t\nlocation: a.py:1\nreason: t.\nstatus: open\n\n"
+        "### DW-2: second thing\n\norigin: t\nlocation: b.py:1\nreason: t.\nstatus: open\n",
+        encoding="utf-8",
+    )
+    _write_two_triage_decisions(make_run(project.project, "20260101-000000-aaaa", run_type="sweep"))
+    monkeypatch.setattr(verify, "unpublishable_target", lambda _t, _f: (cause, error))
+
+    detail = cause if error is None else f"{cause}: {error}"
+    app = BmadLoopApp(project.project)
+    async with app.run_test(notifications=True) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("d")
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        # A rival writer retires both entries while the human reads the modal, so
+        # no `decision:` line lands — while the `build` answer still writes the
+        # store, which is then refused publication.
+        project.deferred_work.write_text(
+            "# Deferred Work\n\n"
+            "### DW-9: unrelated\n\norigin: t\nlocation: c.py:1\nreason: t.\nstatus: open\n",
+            encoding="utf-8",
+        )
+        await pilot.click(await ready(pilot, "#opt-1"))
+        await until(
+            pilot,
+            lambda: any("DW-1: no decision line was written" in m for m in notifications(app)),
+        )
+        await until(
+            pilot,
+            lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
+        )
+        await pilot.click(await ready(pilot, "#opt-1"))
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+        toasts = [n for n in app._notifications if "DW-1" in n.message]
+        assert len(toasts) == 1  # ONE toast, not the non-write one plus a second
+        [toast] = toasts
+        assert toast.severity == "warning"
+        assert "no decision line was written to the ledger" in toast.message
+        assert "your answer was saved to the pre-answer store" in toast.message
+        assert f"not committed to git: decisions.json ({detail})" in toast.message
+        # Neither answer was recorded, so nothing claims otherwise.
+        assert not any("decision(s)" in m for m in notifications(app))
+        assert app.is_running
+
+
+@pytest.mark.parametrize(
+    "cause,error",
+    [
+        ("target-absent", None),
+        ("target-unreadable", "cannot open /tmp/[/]/[red]/decisions.json"),
+    ],
+)
+async def test_decision_modal_toasts_an_answer_it_could_not_publish(
+    project, monkeypatch, cause, error
+):
+    """DW-209/213 on this surface. `apply_pre_answer` commits only the operands the
+    call actually wrote, so a publishable-target refusal means an answer that really
+    landed on disk went unpublished — its own `warning` toast, orthogonal to the
+    non-write one.
+
+    What it must NOT change is the count: the ledger line landed, so the answer is
+    answered, and `recorded 2 decision(s)` still fires. The walk advances the same
+    way, and nothing reads as an `error`.
+
+    Ablation: drop `_record_decision`'s `if note is not None:` arm and this reddens
+    on the toast while `recorded 2 decision(s)` still passes; hand the refusal to
+    the `recorded` boolean instead and it reddens on the count.
+    """
+    # Ablation: remove markup=False from this toast arm; the bracketed fault
+    # then raises MarkupError in the real notification renderer.
+    from bmad_loop import verify
+
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: first thing\n\norigin: t\nlocation: a.py:1\nreason: t.\nstatus: open\n\n"
+        "### DW-2: second thing\n\norigin: t\nlocation: b.py:1\nreason: t.\nstatus: open\n",
+        encoding="utf-8",
+    )
+    _write_two_triage_decisions(make_run(project.project, "20260101-000000-aaaa", run_type="sweep"))
+    # The race the guard exists for: the written operands go unpublishable between
+    # the write and the staging.
+    monkeypatch.setattr(verify, "unpublishable_target", lambda _t, _f: (cause, error))
+
+    detail = cause if error is None else f"{cause}: {error}"
+    app = BmadLoopApp(project.project)
+    async with app.run_test(notifications=True) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("d")
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        await pilot.click(await ready(pilot, "#opt-1"))
+        await until(
+            pilot,
+            lambda: any("DW-1: not committed to git" in m for m in notifications(app)),
+        )
+        await until(
+            pilot,
+            lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
+        )
+        await pilot.click(await ready(pilot, "#opt-1"))
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+        toasts = [n for n in app._notifications if "not committed to git" in n.message]
+        assert len(toasts) == 2
+        assert {n.severity for n in toasts} == {"warning"}
+        assert all(f"deferred-work.md ({detail})" in n.message for n in toasts)
+        # The line DID land, so the answer is answered: the refusal changes neither
+        # the count nor the walk, and it is not the non-write toast.
+        await until(pilot, lambda: any("recorded 2 decision(s)" in m for m in notifications(app)))
+        assert not any("no decision line was written" in m for m in notifications(app))
+        assert not any("failed to record" in m for m in notifications(app))
+        assert app.is_running
+
+
 async def test_decision_walk_counts_only_the_answer_the_ledger_took(project):
     """A mixed walk records DW-1, then retires DW-2 before its answer is written.
 
     The zero-of-two sibling catches unconditional counting. This row additionally
     requires a partial-success notification to retain the one recorded answer.
 
-    Ablation: return `True` unconditionally from `apply_pre_answer`, or drop
-    `_record_decision`'s `if not recorded` arm, and this reddens on
+    Ablation: hardcode `recorded=True` on `apply_pre_answer`'s `PreAnswerResult`,
+    or drop `_record_decision`'s `if not result.recorded` arm, and this reddens on
     `recorded 2 decision(s)`.
     """
     install_bmad_config(project)

@@ -405,11 +405,18 @@ class BmadLoopApp(App[None]):
         False means either a caught fault (which may follow a partial write) or
         a ledger non-write. The toasts distinguish these by wording and severity;
         the caller excludes both from its count and continues the walk.
+
+        A publish REFUSAL (DW-209/213) is a third, orthogonal thing and does not
+        touch the boolean: the operand list `apply_pre_answer` commits is already
+        gated on what that call wrote, so a refusal means an answer that really
+        landed on disk is missing from git history — news worth a `warning` toast,
+        but not a reason to stop counting the answer as answered. It rides on the
+        non-write toast where there is one and raises its own otherwise.
         """
         # decision/option cross the widget boundary as `object`; their runtime types
         # are the Decision/DecisionOption that apply_pre_answer and `.id` expect.
         try:
-            recorded = decisions.apply_pre_answer(
+            result = decisions.apply_pre_answer(
                 self.project,
                 decision,  # pyright: ignore[reportArgumentType]
                 option,  # pyright: ignore[reportArgumentType]
@@ -444,7 +451,8 @@ class BmadLoopApp(App[None]):
                 severity="error",
             )
             return False
-        if not recorded:
+        note = result.publish_note()
+        if not result.recorded:
             # Report the persistence contract from apply_pre_answer, excluding
             # the non-write from the walk's count. Path resolution can itself fail,
             # so this toast does not distinguish missing files from retired ids.
@@ -453,11 +461,21 @@ class BmadLoopApp(App[None]):
                 if option.effect == "close"  # pyright: ignore[reportAttributeAccessIssue]
                 else "; your answer was saved to the pre-answer store"
             )
+            unpublished = "" if note is None else f"; {note}"
             self.notify(
-                f"{decision.id}: no decision line was written to the ledger{saved}",  # pyright: ignore[reportAttributeAccessIssue]
+                f"{decision.id}: no decision line was written to the ledger{saved}{unpublished}",  # pyright: ignore[reportAttributeAccessIssue]
                 severity="warning",
+                markup=False,
             )
             return False
+        if note is not None:
+            # An otherwise-successful record whose written operand went
+            # unpublished. Its own toast, and the answer still counts.
+            self.notify(
+                f"{decision.id}: {note}",  # pyright: ignore[reportAttributeAccessIssue]
+                severity="warning",
+                markup=False,
+            )
         return True
 
     def action_resume_run(self) -> None:

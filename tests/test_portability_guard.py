@@ -626,7 +626,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "refs",
         # `sweep-ledger-commit-refused` (DW-199/203/205): WHY `_commit_ledger`
         # declined to publish its target, as a closed TWO-value enum
-        # (`target-absent` | `target-unreadable`), both literals in `sweep.py`.
+        # (`target-absent` | `target-unreadable`), both literals in
+        # `verify.unpublishable_target` — lifted out of `sweep.py` by DW-209/213, which
+        # gave `decisions.apply_pre_answer`'s out-of-band commit the same guard; that
+        # caller has no journal and carries its refusal on its return value instead.
         # Minted for the reason `stop_cause`, `drop_cause` and `regen_cause` below
         # were — the natural spelling is `reason`, which sits in
         # `diagnostics._JOURNAL_DROP_FIELDS` and ships as a presence boolean, which
@@ -1300,7 +1303,10 @@ JOURNAL_KINDS = frozenset(
         # `chore(sweep):` message, and a resume whose ledger held undecodable bytes
         # published them and only then raised on them. `refuse_cause` is the new
         # benign field naming which of TWO fixed tokens fired (`target-absent` |
-        # `target-unreadable`); `file` is the same already-benign lexical basename
+        # `target-unreadable`, both minted in `verify.unpublishable_target`, which
+        # DW-209/213 lifted out of `sweep.py` so the out-of-band `bmad-loop decisions`
+        # publisher shares one guard with these nine); `file` is the same
+        # already-benign lexical basename
         # the sibling rows carry, and `message` plus the optional `error` are
         # already in `diagnostics._JOURNAL_DROP_FIELDS`.
         "sweep-ledger-commit-refused",

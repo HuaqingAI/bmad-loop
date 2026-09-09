@@ -53,7 +53,9 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from . import bmadconfig, deferredwork, runs, verify
 from .platform_util import atomic_write_text_confined
@@ -352,42 +354,125 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
     return sorted(pending, key=lambda d: int(d.id.split("-")[1]))
 
 
+@dataclass(frozen=True)
+class PublishRefusal:
+    """One operand `apply_pre_answer` WROTE but could not publish.
+
+    `file` is the LEXICAL basename of the operand — `deferred-work.md`
+    (`ProjectPaths.deferred_work`) or `decisions.json` (`STORE_REL`), a code
+    constant at both operands and never operator-controlled prose, which is what
+    makes it safe for both surfaces to print verbatim. `cause` is
+    `verify.unpublishable_target`'s closed two-token enum; `error` carries the
+    decode or OS fault where the refusal has one to attribute, and is `None` for a
+    plain absence (an empty string would read as a fault)."""
+
+    file: str
+    cause: Literal["target-absent", "target-unreadable"]
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class PreAnswerResult:
+    """What `apply_pre_answer` persisted: whether a ledger `decision:` line landed,
+    and which written operands went unpublished.
+
+    `recorded` is `record_decision`'s own boolean with DW-198's exact meaning —
+    a line landed, False is not an error, it withholds nothing, and it says
+    nothing about whether the ledger was readable. `refusals` is a separate axis
+    and usually empty: the operand list is already gated on what this call wrote,
+    so a refusal means an answer that really WAS written could not be published,
+    which is why both surfaces report it rather than treating it as noise."""
+
+    recorded: bool
+    refusals: tuple[PublishRefusal, ...] = ()
+
+    def publish_note(self) -> str | None:
+        """One shared wording for both out-of-band surfaces, or `None` when no
+        target was refused. Publication remains best effort. The caller supplies
+        its own separator: `cli` appends it to the outcome line it already prints,
+        and the TUI either
+        appends it to the existing non-write toast or raises one of its own.
+
+        The fault rides WITH the cause where the refusal has one, the way the
+        sweep's `error` field rides beside its `refuse_cause`. Without it the two
+        causes read alike at both surfaces, and `target-unreadable` is the one that
+        names something a human can act on — a decode fault, an `EACCES`, a symlink
+        loop. `target-absent` has no exception text and takes the bare wording; an
+        empty parenthetical would read as a fault."""
+        if not self.refusals:
+            return None
+        named = ", ".join(
+            f"{r.file} ({r.cause})" if r.error is None else f"{r.file} ({r.cause}: {r.error})"
+            for r in self.refusals
+        )
+        return f"not committed to git: {named}"
+
+
 def apply_pre_answer(
     project: Path, decision: Decision, option: DecisionOption, *, date: str, commit: bool = True
-) -> bool:
+) -> PreAnswerResult:
     """Record a human's out-of-band answer durably, answering whether a ledger
     `decision:` audit line actually landed. `close` also flips the entry to done
     (so it leaves the open set now), while `build`/`keep-open` are saved to the
-    pre-answer store for the next sweep to consume. When `commit`, the ledger and
-    store are committed on their own (only those paths) — best effort, so a
+    pre-answer store for the next sweep to consume. When `commit`, the files THIS
+    call wrote are committed on their own (only those paths) — best effort, so a
     non-git or dirty tree never blocks the on-disk record.
 
-    The boolean is `record_decision`'s own, and it is the CALLER's non-write
-    signal, not decoration — the same discipline `sweep._apply_decision_effect`
-    applies inside the sweep (DW-186), carried to the two out-of-band surfaces
-    (DW-198). `record_decision` answers False in exactly the two states that mean
-    no line was written — no ledger file at all, and no entry carrying this id, a
-    rival writer being free to retire one while the prompt blocks on the human —
-    and True only when it wrote one. Discarded, those two states were
-    indistinguishable from a write at both call sites, which then announced
-    closures the ledger never took: `cli.cmd_decisions` printed `closed now` and
-    `tui.app._record_decision` counted the decision into `recorded N decision(s)`.
+    `PreAnswerResult.recorded` is `record_decision`'s own boolean, and it is the
+    CALLER's non-write signal, not decoration — the same discipline
+    `sweep._apply_decision_effect` applies inside the sweep (DW-186), carried to
+    the two out-of-band surfaces (DW-198). `record_decision` answers False in
+    exactly the two states that mean no line was written — no ledger file at all,
+    and no entry carrying this id, a rival writer being free to retire one while
+    the prompt blocks on the human — and True only when it wrote one. Discarded,
+    those two states were indistinguishable from a write at both call sites, which
+    then announced closures the ledger never took: `cli.cmd_decisions` printed
+    `closed now` and `tui.app._record_decision` counted the decision into
+    `recorded N decision(s)`.
 
     What False does NOT say is that the ledger was readable: the missing-file arm
     answers before any read. So a caller may report a non-write and nothing more;
     it may not infer a read fault from it.
 
-    False is not an error and withholds nothing. The pre-answer store write and
-    the best-effort commit below both still run on it, unchanged by the boolean.
-    So for `build`/`keep-open` the human's answer really was saved to the store,
-    and a caller's report must not deny that — but it must not promise a later
-    sweep will consume it either: a sweep's triage is derived from the ledger's
-    open ids, so an id the ledger no longer carries is never surfaced again and
-    `prune_pre_answers` drops the stored answer as no longer open. A `close`
-    non-write writes nothing itself, which is all it says: the unconditional
-    commit below is a separate matter, and against a TRACKED ledger that has gone
-    absent `verify.commit_paths` deliberately keeps the missing path as a deletion
-    to stage, so that call can publish the removal rather than no-op.
+    False is not an error and withholds nothing. The pre-answer store write still
+    runs on it, unchanged by the boolean. So for `build`/`keep-open` the human's
+    answer really was saved to the store, and a caller's report must not deny that
+    — but it must not promise a later sweep will consume it either: a sweep's
+    triage is derived from the ledger's open ids, so an id the ledger no longer
+    carries is never surfaced again and `prune_pre_answers` drops the stored
+    answer as no longer open.
+
+    THE COMMIT IS GATED TWICE, and the two gates answer different questions
+    (DW-209/213).
+
+    "Did this call write it?" is DW-185's rule — a phase that wrote nothing runs
+    no git — and it is what decides the operand list: the ledger is an operand
+    only when `recorded` is True, and the store only when the effect is not
+    `close` (a `close` writes no store entry). An empty list spawns no git at all.
+    Unconditional, the block reached `verify.commit_paths` with `[ledger, store]`
+    whatever had happened, and against a TRACKED ledger that has gone absent
+    `commit_paths` deliberately keeps the missing path as a DELETION to stage — so
+    a `close` whose ledger file had vanished published that ledger's own REMOVAL
+    under a `chore(decisions): pre-answer <id>` message, taking every `decision:`
+    line and open entry out of HEAD. The `recorded` gate is what closes that: the
+    absent-ledger state never puts the ledger in front of `git add`.
+
+    "Is the target still publishable?" is DW-199/203/205's guard, shared verbatim
+    with the sweep's nine publishers as `verify.unpublishable_target`, and it
+    narrows the residual race between the write above and the staging below. The
+    FAMILY is declared here, never derived from the path. Because the first gate
+    is upstream of the second, this one fires only on a race or a resolve fault,
+    which is exactly why a refusal is worth reporting: it means an answer that
+    really was written could not be published. A resolve fault (`OSError` on a
+    broken chain, `RuntimeError` on a symlink loop under 3.11–3.12) takes the same
+    refusal arm with cause `target-unreadable` — a target whose path cannot be
+    resolved cannot be read well enough to publish — because this module has no
+    journal to route it to and the cause enum is closed by contract.
+
+    A refusal drops only ITS operand; the survivors still publish, and a refusal
+    never raises. The swallowed `verify.GitError` below is a different, older
+    degrade and stays silent and unreported: the files are written, and git
+    history is best effort. The commit stays OUTSIDE every lock (#286).
 
     Precondition: `date` is ISO `YYYY-MM-DD`. The ledger writers raise
     `ValueError` on anything else (it would otherwise land a `status:` line that
@@ -413,13 +498,41 @@ def apply_pre_answer(
     )
     if option.effect != "close":
         record_pre_answer(project, decision.id, option, date=date)
-    if commit:
+    if not commit:
+        return PreAnswerResult(recorded=recorded)
+    # GATE ONE — only what THIS call wrote, each paired with the family it
+    # declares for the guard. Never derived from the path (see the docstring).
+    wrote: list[tuple[Path, Literal["ledger", "store"]]] = []
+    if recorded:
+        wrote.append((ledger, "ledger"))
+    if option.effect != "close":
+        wrote.append((store_path(project), "store"))
+    # GATE TWO — the shared publishable-target guard, on the RESOLVED operand
+    # because that is the file git would publish, and before any git runs because
+    # a refused publish must spawn none.
+    operands: list[Path] = []
+    refusals: list[PublishRefusal] = []
+    for path, family in wrote:
         try:
-            verify.commit_paths(
-                project,
-                f"chore(decisions): pre-answer {decision.id}",
-                [ledger, store_path(project)],
-            )
+            target = path.resolve()
+        except (OSError, RuntimeError) as e:
+            refusals.append(PublishRefusal(file=path.name, cause="target-unreadable", error=str(e)))
+            continue
+        refusal = verify.unpublishable_target(target, family)
+        if refusal is None:
+            operands.append(target)
+            continue
+        cause, error = refusal
+        # `path.name`, never `target.name`, and here is where that is a CHOICE: a
+        # resolved target is reached through a symlink an OPERATOR named, so its
+        # tail is arbitrary operator text, while the lexical tail is a code
+        # constant at both operands (`deferred-work.md`, `decisions.json`). That is
+        # what lets both surfaces print it verbatim — the same rule
+        # `sweep._commit_ledger`'s `file` journal field is held to.
+        refusals.append(PublishRefusal(file=path.name, cause=cause, error=error))
+    if operands:
+        try:
+            verify.commit_paths(project, f"chore(decisions): pre-answer {decision.id}", operands)
         except verify.GitError:
             pass  # files are written; git history is best effort
-    return recorded
+    return PreAnswerResult(recorded=recorded, refusals=tuple(refusals))
