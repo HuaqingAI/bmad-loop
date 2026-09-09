@@ -25,6 +25,7 @@ from conftest import (
     ignore_before_commit,
     install_bmad_config,
     install_build_auto_skill,
+    mark_ledger_done,
     migrate_effect,
     nested_repo_root_paths,
     passes_once,
@@ -9586,29 +9587,65 @@ def test_a_reapply_whose_ledger_write_faults_degrades_and_carries_on(project, mo
     assert _records(engine, "sweep-ledger-commit") == []
 
 
-def test_a_reapply_whose_write_reports_no_line_is_not_counted_closed(project, monkeypatch):
+@pytest.mark.parametrize(
+    "rival, sentence",
+    [
+        pytest.param(
+            lambda project: write_ledger(project, {"DW-2": "open"}, commit=False),
+            "the ledger holds no entry for this id",
+            id="entry-gone",
+        ),
+        pytest.param(
+            lambda project: project.deferred_work.unlink(),
+            "the ledger file is gone",
+            id="file-gone",
+        ),
+    ],
+)
+def test_a_reapply_whose_write_reports_no_line_is_not_counted_closed(
+    project, monkeypatch, rival, sentence
+):
     """The re-apply's non-raising non-write, the DW-186 shape reached from this walk.
-    `record_decision` returns False in exactly the two states meaning no `decision:`
-    line was written, and both are reachable HERE as a race the gate cannot close:
-    the entry was open when the gate read the ledger and a rival writer retired it
-    (or removed the file) before this write.
+    `record_decision` returns False in the two states meaning no `decision:` line was
+    written, and both are reachable HERE as a race the gate cannot close: the entry
+    was open when the gate read the ledger and a rival writer retired it, or removed
+    the ledger outright, before this write. (Under `require_open` this walk has a
+    THIRD refusal — an entry present and no longer open — which the row below
+    covers.)
+
+    Each row PRODUCES the state it names rather than stubbing the verdict: the rival
+    runs inside the patched `record_decision`, which is after the gate's open-set
+    read, and the real `record_decision` then answers False for its own reasons. A
+    stub returning False with DW-1 still sitting in the ledger open would grade the
+    sentence's FALLTHROUGH instead of either state it names.
 
     Counting it closed would be the same lie the `except` arm above refuses — a
     `closed` increment and a re-apply row for an entry the ledger never received —
-    so it takes the same disposition and the same kind.
+    so it takes the same disposition and the same kind. The two states are not the
+    same news, which is why the sentence distinguishes them: a missing entry is one
+    retired id, where a ledger that is gone took every `decision:` line the walk had
+    already written with it.
 
-    Four claims: nothing counted closed; NO `sweep-decision-effect-reapplied`, since
-    nothing was re-applied; the miss attributed with the two-state sentence, naming
-    the missing-ENTRY state because the ledger file is right there; and no commit.
+    Four claims per row: nothing counted closed; NO `sweep-decision-effect-reapplied`,
+    since nothing was re-applied; the miss attributed with THIS row's sentence; and
+    no commit.
 
-    Ablation, RUN: replace `if not recorded:` with `if False:` and this reds with
-    `closed == 1` and a `sweep-decision-effect-reapplied` row for a line that was
-    never written."""
+    Ablations, RUN: replace `if not recorded:` with `if False:` and both rows red
+    with `closed == 1` and a `sweep-decision-effect-reapplied` row for a line that
+    was never written. Replace `_non_write_state`'s `the ledger file is gone` return
+    with the missing-entry sentence and the `file-gone` row alone reds — the
+    `entry-gone` row cannot see that branch, which is why both are here."""
     write_ledger(project, {"DW-1": "open"})
     engine, _ = make_sweep(project, [])
     _seed_run_store(engine, {"DW-1": _stored_close_answer()})
     plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_reapply_decision("DW-1"),))
-    monkeypatch.setattr(deferredwork, "record_decision", lambda *_a, **_k: False)
+    real_record = deferredwork.record_decision
+
+    def rival_then_record(*args, **kwargs):
+        rival(project)  # after the gate read the open set, before the real write
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(deferredwork, "record_decision", rival_then_record)
 
     _answers, closed, _unlanded = engine._decisions_phase(plan)  # must not raise
 
@@ -9616,9 +9653,130 @@ def test_a_reapply_whose_write_reports_no_line_is_not_counted_closed(project, mo
     assert _records(engine, "sweep-decision-effect-reapplied") == []
     [failed] = _records(engine, "sweep-decision-effect-unavailable")
     assert failed["dw_id"] == "DW-1" and failed["effect"] == "close"
-    # the ledger FILE is present, so this is the missing-entry sentence
-    assert failed["error"].endswith("the ledger holds no entry for this id")
+    assert failed["error"].endswith(sentence)
     assert _records(engine, "sweep-ledger-commit") == []
+
+
+@pytest.mark.parametrize("fault", [PermissionError("denied"), OSError("metadata I/O failure")])
+def test_a_refused_replay_survives_a_fault_in_its_diagnostic_probe(project, monkeypatch, fault):
+    """A metadata fault after refusal is observation, so it must not crash replay.
+
+    Retire the entry after the gate and let the real recorder refuse it. Only
+    then fault the diagnostic's is_file probe, leaving the earlier repair reads
+    intact. Removing the diagnostic guard must raise here before its journal row.
+
+    Ablation, RUN: the test fails with the unguarded probe, then passes with the
+    guard; the effect stays uncounted and no ledger commit is attempted.
+    """
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [])
+    _seed_run_store(engine, {"DW-1": _stored_close_answer()})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_reapply_decision("DW-1"),))
+    real_record = deferredwork.record_decision
+    real_is_file = Path.is_file
+
+    def fault_ledger_probe(path, *args, **kwargs):
+        if path == project.deferred_work:
+            raise fault
+        return real_is_file(path, *args, **kwargs)
+
+    def retire_then_fault_probe(*args, **kwargs):
+        write_ledger(project, {}, commit=False)
+        recorded = real_record(*args, **kwargs)
+        assert recorded is False
+        monkeypatch.setattr(Path, "is_file", fault_ledger_probe)
+        return recorded
+
+    monkeypatch.setattr(deferredwork, "record_decision", retire_then_fault_probe)
+
+    _answers, closed, _unlanded = engine._decisions_phase(plan)
+
+    assert closed == 0
+    [failed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert failed["dw_id"] == "DW-1" and failed["effect"] == "close"
+    assert failed["error"].endswith("the ledger holds no entry for this id")
+    assert _records(engine, "sweep-decision-effect-reapplied") == []
+    assert _records(engine, "sweep-ledger-commit") == []
+
+
+def test_a_rival_close_between_the_replay_gate_and_its_write_is_refused(project, monkeypatch):
+    """The replay's still-open premise, enforced where it can actually be kept.
+
+    The gate that selects re-apply candidates reads the ledger's open set OUTSIDE
+    `record_decision`'s lock, and a snapshot cannot hold across the write it
+    authorizes: `record_decision` deliberately applies a `decision:` line to a done
+    entry as readily as an open one, so a rival writer closing the entry in that
+    window left the ledger with a SECOND decision line over a close already recorded,
+    and this walk reporting it as a repair. The gate stays the filter;
+    `require_open=True` — checked inside the same locked read->edit->write as the
+    mutation — is the enforcement, and this walk is the only caller that passes it.
+
+    A refusal takes the walk's existing False-return arm, so nothing new is invented
+    for it: no re-apply row, no `closed` increment, no commit. What IS new is the
+    sentence, because the third state is not the missing-entry state and must not be
+    reported as one — an operator told "the ledger holds no entry for this id" would
+    go hunting an entry that is sitting in the ledger, done.
+
+    The rival lands inside the patched `record_decision`, which is after the gate's
+    open-set read and before the real write: exactly the window the lock exists to
+    cover, reached without threads.
+
+    Five claims: no second `decision:` line; nothing counted closed; no re-apply row;
+    the row names the retired-but-present state; and no commit.
+
+    Ablation, RUN: drop `require_open=True` at the walk's `_apply_decision_effect`
+    call (or the `require_open` check inside `record_decision`) and this reds with a
+    decision line on the done entry, `closed == 1` and a re-apply row."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [])
+    _seed_run_store(engine, {"DW-1": _stored_close_answer()})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_reapply_decision("DW-1"),))
+    real_record = deferredwork.record_decision
+
+    def rival_then_record(*args, **kwargs):
+        mark_ledger_done(project, ["DW-1"])  # the rival writer, inside the window
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(deferredwork, "record_decision", rival_then_record)
+
+    _answers, closed, _unlanded = engine._decisions_phase(plan)
+
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert _decision_lines(text) == 0  # the rival's close is left exactly as found
+    assert closed == 0
+    assert _records(engine, "sweep-decision-effect-reapplied") == []
+    [failed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert failed["dw_id"] == "DW-1" and failed["effect"] == "close"
+    assert failed["error"].endswith("the ledger entry is present but no longer open")
+    assert _records(engine, "sweep-ledger-commit") == []
+
+
+def test_an_ordinary_recorder_still_lands_a_decision_on_a_done_entry(project):
+    """The default half of the same change, from the sweep's side: `require_open` is
+    keyword-only and defaults False, so every caller that does not opt in keeps
+    today's documented behavior — a decision recorded on an entry someone else
+    already closed still lands, because it is still what the human chose.
+
+    `_apply_decision_effect` is the shared writer behind the interactive decision
+    arm, so calling it without the flag is exactly what that arm does.
+
+    Ablation, RUN (measured): drop the `require_open and` guard in
+    `record_decision`, so the still-open check runs for every caller, and this reds
+    — no decision line on the done entry. Note what does NOT grade it: flipping
+    `record_decision`'s own default to True leaves it green, because
+    `_apply_decision_effect` passes the flag explicitly from its own default. The
+    two defaults are separate opt-outs and the unit rows in `test_deferredwork.py`
+    grade the other one."""
+    write_ledger(project, {"DW-1": "open"})
+    mark_ledger_done(project, ["DW-1"])
+    engine, _ = make_sweep(project, [])
+    decision = _reapply_decision("DW-1")
+
+    assert engine._apply_decision_effect(decision, decision.options[0]) is True
+
+    text = project.deferred_work.read_text(encoding="utf-8")
+    assert _decision_lines(text) == 1
+    assert _REAPPLY_RESOLUTION in text
 
 
 def test_a_faulted_close_is_reapplied_by_a_resume_off_the_cached_triage(project, monkeypatch):
@@ -9926,7 +10084,10 @@ def test_an_unlanded_build_drop_is_neither_re_announced_nor_revived_on_resume(pr
     resume, and it is what makes the quarantine the load-bearing half rather than a
     belt on top of one.
 
-    Three claims: still no bundle; no second drop row; no second ATTENTION line.
+    Three claims: still no bundle; no second drop row; no second ATTENTION line —
+    plus the verdict list's own bound: the drop CLEARED DW-9 from
+    `sweep_unlanded_decisions` as it quarantined it, so the id is in exactly one
+    list and the verdict cannot accumulate ids whose drop is already covered.
 
     Ablation, RUN: drop `sweep_dropped_decisions` from `RunState.to_dict` and this
     reds — the resumed run reads an empty quarantine and the stored answer, whose
@@ -9936,9 +10097,11 @@ def test_an_unlanded_build_drop_is_neither_re_announced_nor_revived_on_resume(pr
     the decision. The two guards are not redundant — they cover different passes."""
     engine, answers, unlanded = _answer_an_unlanded_build(project, monkeypatch)
     engine._materialize_bundles(_unlanded_build_plan(), answers, effect_unlanded=unlanded)
+    assert engine.state.sweep_unlanded_decisions == []  # consumed by the drop it made
 
     resumed, _ = resume_sweep(project, engine, [])
     assert resumed.state.sweep_dropped_decisions == ["DW-9"]
+    assert resumed.state.sweep_unlanded_decisions == []  # ...on disk too
     bundles, dropped_again = resumed._materialize_bundles(
         _unlanded_build_plan(), answers, effect_unlanded=frozenset()
     )
@@ -9948,6 +10111,179 @@ def test_an_unlanded_build_drop_is_neither_re_announced_nor_revived_on_resume(pr
     assert len(_records(resumed, "sweep-decision-answer-dropped")) == 1
     attention = (resumed.run_dir / "ATTENTION").read_text(encoding="utf-8")
     assert attention.count("recorded build decision discarded") == 1
+
+
+@pytest.mark.parametrize("effect", ["close", "keep-open"])
+def test_a_non_build_non_write_records_no_unlanded_verdict(project, monkeypatch, effect):
+    """DW-200's verdict is scoped to `build` answers, and that scoping is the whole
+    reason the list is safe to persist.
+
+    The other two effects have nothing to withhold. A `close` whose
+    `record_decision` reported no line already takes DW-186's discipline — not
+    counted closed, no `post_decision` — and mints no bundle to refuse; a
+    `keep-open` mints none either. Recording either here would put an id on a
+    durable list whose only reader is the build lane, where it would sit until the
+    run ended describing a bundle that was never going to exist, and — for an id a
+    later cycle re-asks and the human then answers `build` — could refuse a bundle
+    on the strength of a DIFFERENT answer's non-write.
+
+    The shape is the reachable one: the entry is retired by a rival writer while
+    the prompt blocks, so the real `record_decision` returns False for its own
+    reasons rather than being stubbed.
+
+    Three claims: the phase really did take the False-return arm (the unavailable
+    row names this effect); the returned signal is empty; and the persisted verdict
+    list is empty on disk. `_save()` runs FIRST so `state.json` exists either way —
+    otherwise "no verdict was persisted" and "no state was written at all" are the
+    same missing file, and the disk assertion could not distinguish them.
+
+    Ablation, RUN: replace `if option.effect == "build":` with `if True:` and both
+    rows red on the signal and the persisted list."""
+    write_ledger(project, {"DW-1": "open", "DW-9": "open"})
+    engine, _ = make_sweep(project, [])
+    engine.prompting = True
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-9"}),
+        decisions=(
+            Decision(
+                id="DW-9",
+                question="q",
+                context="",
+                options=(DecisionOption(key="1", label="Do it", effect=effect, intent="widen x"),),
+                recommendation="1",
+            ),
+        ),
+    )
+
+    def answer_and_retire(_prompt):
+        write_ledger(project, {"DW-1": "open"}, commit=False)  # the rival writer
+        return "1"
+
+    engine.prompter = DecisionPrompter(input_fn=answer_and_retire, print_fn=lambda _l: None)
+    engine._save()  # so the disk assertion below reads a file that exists
+
+    _answers, closed, unlanded = engine._decisions_phase(plan)
+
+    assert closed == 0
+    [failed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert failed["dw_id"] == "DW-9" and failed["effect"] == effect  # the False return
+    assert unlanded == frozenset()
+    assert engine.state.sweep_unlanded_decisions == []
+    assert load_state(engine.run_dir).sweep_unlanded_decisions == []
+
+
+def test_an_unlanded_build_verdict_outlives_the_frame_that_observed_it(project, monkeypatch):
+    """DW-200's durability boundary. The verdict is durable from the moment it is
+    OBSERVED, not from the moment its drop is announced.
+
+    The returned signal alone covers only the frame that answered the decision: it
+    is rebuilt empty by every `_decisions_phase`, and the stored answer on disk
+    still says `build`. So an interruption anywhere in the interval between
+    `record_decision`'s False return and `_materialize_bundles` reaching its lane —
+    a stop, a crash, a `bmad-loop resume` — used to reconstruct the engine, reload
+    that answer, re-enter with an empty signal, and materialize the very bundle the
+    verdict refuses: a dev session spent on an id the ledger holds no entry for,
+    which is the whole defect DW-200 names. `state.sweep_unlanded_decisions` is
+    what carries the verdict across that interval, persisted at the observation
+    site, and the lane checks the union of the two.
+
+    The resume here is the real shape: a reconstructed engine off the run's own
+    `state.json`, the answer RELOADED from `<run>/decisions.json` rather than
+    handed over in memory, and an EMPTY signal — which is what a resumed phase
+    actually reports.
+
+    Six claims: the verdict is on disk before any drop is announced; the resume
+    still builds no bundle; the drop row and its notify fire exactly once, on the
+    resumed run; the id is quarantined in `sweep_dropped_decisions`; and the
+    verdict list is left without it, so the two lists never both hold the id.
+
+    Ablation, RUN: drop the `or decision.id in self.state.sweep_unlanded_decisions`
+    half of the lane's union (or the `_quarantine` call that persists the verdict)
+    and this reds with a `decision-dw-9` bundle, no drop row and `dropped` False."""
+    engine, _answers, _unlanded = _answer_an_unlanded_build(project, monkeypatch)
+
+    # PRECONDITION: observed and persisted, and nothing announced yet
+    assert engine.state.sweep_unlanded_decisions == ["DW-9"]
+    assert load_state(engine.run_dir).sweep_unlanded_decisions == ["DW-9"]
+    assert load_state(engine.run_dir).sweep_dropped_decisions == []
+    assert _records(engine, "sweep-decision-answer-dropped") == []
+
+    resumed, _ = resume_sweep(project, engine, [])
+    reloaded = json.loads((resumed.run_dir / "decisions.json").read_text(encoding="utf-8"))
+    assert reloaded["DW-9"]["effect"] == "build"  # the answer a resume reads back
+
+    bundles, dropped = resumed._materialize_bundles(
+        _unlanded_build_plan(), reloaded, effect_unlanded=frozenset()
+    )
+
+    assert bundles == []
+    assert dropped  # progress: the id is released for a later cycle to re-triage
+    [drop] = _records(resumed, "sweep-decision-answer-dropped")
+    assert drop["decision"] == "DW-9" and drop["drop_cause"] == "effect-unlanded"
+    attention = (resumed.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("recorded build decision discarded") == 1
+    persisted = load_state(resumed.run_dir)
+    assert persisted.sweep_dropped_decisions == ["DW-9"]
+    assert persisted.sweep_unlanded_decisions == []  # consumed by the drop it produced
+
+
+def test_a_cycle_spends_no_session_on_a_build_whose_effect_never_landed(project, monkeypatch):
+    """The same refusal through `_cycle`, which is the only `src/` caller of both
+    methods and the frame that forwards the verdict between them. The rows above
+    call `_decisions_phase` and `_materialize_bundles` directly, so none of them
+    grades the wiring, the drop's contribution to the repeat progress predicate, or
+    the claim the lane exists for: that NO dev session is dispatched.
+
+    A real triage session raises DW-9 as a build decision, the human answers it, and
+    a rival writer retires the entry while the prompt blocks — the reachable window.
+
+    Four claims: the cycle reports progress (a drop counts, DW-135/DW-200); the only
+    session the adapter ran is the triage one, so nothing was briefed off an entry
+    that is not there; no bundle task was minted; and the drop is announced once with
+    the fourth cause and quarantined on disk.
+
+    Ablation, RUN: delete the lane's `effect-unlanded` arm and this reds — a
+    `dw-decision-dw-9` task and a second adapter session. Note what does NOT grade
+    here: replacing `_cycle`'s forwarded `effect_unlanded` with `frozenset()` leaves
+    this green, because since the durability amendment the persisted verdict covers
+    the same ids in the same process. The argument stays REQUIRED for the reason
+    `_return_after_decisions.every_effect_landed` is — an empty default is the
+    optimistic claim a new caller inherits by forgetting — not because a black-box
+    row can distinguish it from the list beside it."""
+    write_ledger(project, {"DW-9": "open"})
+    triage = triage_result(
+        ["DW-9"],
+        decisions=[
+            {
+                "id": "DW-9",
+                "question": "widen?",
+                "context": "ctx",
+                "options": [
+                    {"key": "1", "label": "Widen", "effect": "build", "intent": "widen x"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+                "recommendation": "1",
+            }
+        ],
+    )
+    engine, adapter = make_sweep(project, [triage_effect(triage)], prompting=True)
+    _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+
+    def answer_and_retire(_prompt):
+        write_ledger(project, {}, commit=False)  # the rival writer, mid-prompt
+        return "1"
+
+    engine.prompter = DecisionPrompter(input_fn=answer_and_retire, print_fn=lambda _l: None)
+
+    assert engine._cycle(1, {"DW-9"}) is True  # the drop is addressable work
+
+    assert len(adapter.sessions) == 1  # triage only: no dev session on a missing entry
+    assert [k for k in engine.state.tasks if k.startswith("dw")] == []
+    [drop] = _records(engine, "sweep-decision-answer-dropped")
+    assert drop["decision"] == "DW-9" and drop["drop_cause"] == "effect-unlanded"
+    assert load_state(engine.run_dir).sweep_dropped_decisions == ["DW-9"]
 
 
 def test_a_build_answer_whose_effect_raised_still_materializes_its_bundle(project, monkeypatch):

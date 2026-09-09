@@ -131,29 +131,46 @@ def test_sweep_decision_quarantines_round_trip():
     not `set[str]` because `save_state` serializes through `json.dumps`, which
     cannot encode a set; `sweeps_triggered` beside them already has that shape.
 
+    `sweep_unlanded_decisions` (DW-200) rides the same way for a different reason,
+    and is deliberately not folded into either: it records a VERDICT — this `build`
+    answer's `decision:` line never landed — observed in the decision phase and
+    consumed in materialization, so an interruption between those two phases must
+    not lose it. The drop that announces it clears it, so the two lists never both
+    hold an id.
+
     The dumps/loads here is the point: a set would raise on the way out."""
     state = _state()
     assert state.sweep_skipped_decisions == [] and state.sweep_dropped_decisions == []
+    assert state.sweep_unlanded_decisions == []
     state.sweep_skipped_decisions.append("DW-1")
     state.sweep_dropped_decisions.extend(["DW-2", "DW-3"])
+    state.sweep_unlanded_decisions.append("DW-4")
     back = RunState.from_dict(json.loads(json.dumps(state.to_dict())))
     assert back.sweep_skipped_decisions == ["DW-1"]
     assert back.sweep_dropped_decisions == ["DW-2", "DW-3"]
+    assert back.sweep_unlanded_decisions == ["DW-4"]
 
 
 def test_sweep_decision_quarantines_default_when_absent_from_dict():
     """A `state.json` written before DW-124 carries neither key, and must resume
     exactly as it does today: both quarantines empty, every decision re-evaluated.
 
+    A `state.json` written before DW-200 is the same case for the third list, and
+    the default matters more there than for a quarantine: reading it absent as
+    empty means an old paused run resumes with no unlanded verdicts, which is
+    exactly what it had.
+
     Ablation: change from_dict's `d.get("sweep_dropped_decisions", [])` to
-    `d["sweep_dropped_decisions"]` and this fails with KeyError while the
-    round-trip above stays green — to_dict always writes both keys, so the two
-    tests cover disjoint halves."""
+    `d["sweep_dropped_decisions"]` (or the same for `sweep_unlanded_decisions`)
+    and this fails with KeyError while the round-trip above stays green — to_dict
+    always writes all three keys, so the two tests cover disjoint halves."""
     d = _state().to_dict()
     del d["sweep_skipped_decisions"]
     del d["sweep_dropped_decisions"]
+    del d["sweep_unlanded_decisions"]
     back = RunState.from_dict(d)
     assert back.sweep_skipped_decisions == [] and back.sweep_dropped_decisions == []
+    assert back.sweep_unlanded_decisions == []
 
 
 def test_sweep_decision_quarantines_coerce_their_elements():
@@ -161,12 +178,14 @@ def test_sweep_decision_quarantines_coerce_their_elements():
     foreign state file is reachable, and every consumer membership-tests these
     lists against a DW id string.
 
-    Ablation: drop either `str()` in from_dict and the matching half fails."""
+    Ablation: drop any `str()` in from_dict and the matching half fails."""
     d = _state().to_dict()
     d["sweep_skipped_decisions"] = [1]
     d["sweep_dropped_decisions"] = [2]
+    d["sweep_unlanded_decisions"] = [3]
     back = RunState.from_dict(d)
     assert back.sweep_skipped_decisions == ["1"] and back.sweep_dropped_decisions == ["2"]
+    assert back.sweep_unlanded_decisions == ["3"]
 
 
 def test_sweeps_refused_coerces_both_halves():

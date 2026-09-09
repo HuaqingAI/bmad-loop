@@ -1226,17 +1226,21 @@ JOURNAL_KINDS = frozenset(
         # `effect` are already benign (`effect` is a closed `DECISION_EFFECTS`
         # value, not authored text) and `error` is already in
         # `diagnostics._JOURNAL_DROP_FIELDS` — it carries either the exception text
-        # or, for the False return, one of two fixed sentences chosen by whether the
+        # or, for the False return, one of a FIXED SET of sentences, so no new field
+        # routing is needed. The interactive arm chooses between two by whether the
         # ledger FILE is still there, since a missing ledger loses every line the
-        # walk already wrote where a missing entry loses only this one — so no new
-        # field routing is needed.
+        # walk already wrote where a missing entry loses only this one.
         # THIRD producer since DW-167: the resume re-apply walk, whose ledger-read
         # GATE takes this same kind — one row per candidate id when the ledger is
         # absent or undecodable, and the `except`/False-return rows again for the
         # re-applying write itself. Per CANDIDATE and not per file, so the row names
         # an id an operator can chase; the fixed sentence names the gate, since the
         # news there is "this stored answer may still be unapplied" rather than a
-        # write that was attempted and lost.
+        # write that was attempted and lost. That walk has a THIRD sentence the
+        # interactive arm cannot reach: it passes `require_open=True`, so
+        # `record_decision` also refuses an entry that is present and no longer open
+        # — a rival writer closed it between the walk's gate and its write, which is
+        # not the missing-entry state and must not be reported as one.
         "sweep-decision-effect-unavailable",
         "sweep-decision-option-mismatch",
         # DW-143. The keep-open lane's `stale-option` drop retired the PROJECT-level

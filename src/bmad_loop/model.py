@@ -823,6 +823,18 @@ class RunState:
     # run reached about it lives here.
     sweep_skipped_decisions: list[str] = field(default_factory=list)
     sweep_dropped_decisions: list[str] = field(default_factory=list)
+    # sweep runs only, and a VERDICT rather than a disposition (DW-200): ids whose
+    # `build` answer this run recorded while `record_decision` reported writing no
+    # `decision:` line. It answers a different question from the two lists above —
+    # "this answer's ledger line never landed", not "this disposition was already
+    # announced" — and neither replaces the other. Persisted because the verdict is
+    # observed in `_decisions_phase` and consumed in `_materialize_bundles`: an
+    # interruption anywhere between them must not resume into a materialized bundle
+    # for an id the ledger holds no entry for. Cleared by the drop that announces
+    # it, in the same `_save()` that quarantines the id in
+    # `sweep_dropped_decisions`. An id no later drop announces remains until the
+    # run ends; this list never doubles as a second announcement gate.
+    sweep_unlanded_decisions: list[str] = field(default_factory=list)
     # auto-sweep triggers already fired this run (e.g. "epic-1", "run-end");
     # guards re-fire on resume
     sweeps_triggered: list[str] = field(default_factory=list)
@@ -916,6 +928,7 @@ class RunState:
             "sweep_cycle": self.sweep_cycle,
             "sweep_skipped_decisions": self.sweep_skipped_decisions,
             "sweep_dropped_decisions": self.sweep_dropped_decisions,
+            "sweep_unlanded_decisions": self.sweep_unlanded_decisions,
             "sweeps_triggered": self.sweeps_triggered,
             "sweeps_refused": self.sweeps_refused,
             "target_branch": self.target_branch,
@@ -952,6 +965,7 @@ class RunState:
             sweep_cycle=int(d.get("sweep_cycle", 1)),
             sweep_skipped_decisions=[str(s) for s in d.get("sweep_skipped_decisions", [])],
             sweep_dropped_decisions=[str(s) for s in d.get("sweep_dropped_decisions", [])],
+            sweep_unlanded_decisions=[str(s) for s in d.get("sweep_unlanded_decisions", [])],
             sweeps_triggered=[str(s) for s in d.get("sweeps_triggered", [])],
             sweeps_refused={str(k): str(v) for k, v in d.get("sweeps_refused", {}).items()},
             target_branch=str(d.get("target_branch", "")),

@@ -1418,6 +1418,19 @@ def mark_open(path: Path, dw_id: str, note: str, operation_id: str) -> bool:
     return bool(mark_open_many(path, [dw_id], note, operation_id))
 
 
+def _entry_is_open(text: str, dw_id: str) -> bool:
+    """Whether `text` carries `dw_id` with a status :attr:`DWEntry.open` accepts.
+
+    Pure, and locating the entry with :func:`_find_entry` — the same first-wins
+    locator :func:`_apply_decision` and :func:`_apply_done` edit through — so
+    :func:`record_decision`'s `require_open` check and its write cannot disagree
+    about which entry they mean. False for a missing entry and for a status the
+    format does not understand — `.open` is deliberately not ``not done``, and a
+    caller that asked for an open entry gets a refusal for both."""
+    entry = _find_entry(text, dw_id)
+    return entry is not None and entry.open
+
+
 def _apply_decision(text: str, dw_id: str, date: str, label: str, detail: str) -> str | None:
     """Insert one `decision: <date> <label> — <detail>` line *within* `text`,
     right after the entry's status line. None when the entry is missing.
@@ -1451,11 +1464,12 @@ def record_decision(
     detail: str,
     *,
     close_note: str | None = None,
+    require_open: bool = False,
 ) -> bool:
     """Record a human decision on one entry and, when `close_note` is given, act
     on it by flipping the entry to `status: done <date>` — both in ONE read and
-    ONE atomic write. Returns True when the entry was found (and therefore
-    carries a decision line), False when it was not.
+    ONE atomic write. Returns True when a decision line was written, False when
+    the ledger or entry is absent, or `require_open` refuses a non-open entry.
 
     ONE locked read->edit->write: the whole cycle runs under the cross-process
     ledger lock (#286/#469), so concurrent mutators — a second run, a sweep, the
@@ -1479,6 +1493,28 @@ def record_decision(
     else already closed is still what the human chose. `close_note` is the
     resolution note for the flip, distinct from `detail`, which is the decision's
     own rationale.
+
+    `require_open` is the ONE exception to that rule, and it defaults to False so
+    every existing caller — ``cli.cmd_decisions``, the TUI decision modal,
+    :func:`~bmad_loop.decisions.apply_pre_answer`, the sweep's interactive
+    decision arm — keeps exactly the behaviour above: a decision recorded on an
+    entry someone else already closed still lands. Passed True by one caller,
+    the sweep's DW-167 replay walk, which re-applies a `close` the run that
+    answered it never got onto the ledger. That walk's premise is that the entry
+    is STILL OPEN — a done entry means the effect already landed — and it takes
+    an open-set snapshot before it writes; but a snapshot read outside this lock
+    cannot enforce a promise the lock exists to hold, so a rival writer closing
+    the entry in between produced a second `decision:` line on an entry whose
+    close had already been recorded. With `require_open` the predicate and the
+    mutation are ONE critical section: a third refusal state joins the two
+    documented above — the entry is present but no longer open — and it returns
+    False having written nothing, exactly as the other two do. The caller
+    distinguishes the three for its journal row; nothing here reports which. That
+    third state is the one non-write that always PAYS a lock acquisition: the
+    advisory probe below knows nothing about `require_open` (it asks only what
+    :func:`_apply_decision` would do), so it cannot short-circuit a still-open
+    refusal the way it does a missing entry — which is correct, since the answer
+    it would be short-circuiting on is exactly the one a rival writer can change.
 
     Precondition: `date` is ISO `YYYY-MM-DD` — one check for both halves, since
     the decision line and the close share it; anything else raises `ValueError`,
@@ -1520,6 +1556,13 @@ def record_decision(
             return False
         # REPAIR/WRITE (DW-146): this text is edited and published below.
         text = read_for_write(path) or ""
+        if require_open and not _entry_is_open(text, dw_id):
+            # UNDER the lock, deliberately: this is the caller's still-open
+            # premise being enforced at the mutation boundary rather than by its
+            # own earlier read. Refuse the way the other two states do — return
+            # False, write nothing — so the caller's existing non-write arm
+            # covers it without a new return shape.
+            return False
         updated = _apply_decision(text, dw_id, date, label, detail)
         if updated is None:
             return False

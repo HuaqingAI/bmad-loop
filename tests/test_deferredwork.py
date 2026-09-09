@@ -3886,6 +3886,89 @@ def test_record_decision_records_a_decision_on_an_already_done_entry(tmp_path):
     assert "resolution:" not in entry.body
 
 
+def test_record_decision_require_open_refuses_a_done_entry(tmp_path, monkeypatch):
+    """`require_open=True` adds a THIRD non-write state to the two documented ones:
+    the entry is present and no longer open. It returns False having written
+    nothing, exactly as a missing file and a missing entry do, so the one caller
+    that passes it — the sweep's DW-167 replay walk, which re-applies a `close` an
+    earlier run never got onto the ledger — needs no new return shape for it.
+
+    The refusal is taken UNDER the lock, on the same text the write would edit.
+    That is the whole point: the walk takes an open-set snapshot before it calls,
+    and a snapshot read outside the lock cannot enforce a promise across the write
+    it authorizes — a rival writer closing the entry in between produced a second
+    `decision:` line over a close already recorded.
+
+    Three claims: False; the entry's bytes are untouched (no decision line, status
+    unchanged); and NO write is published, so the refusal cannot cost a rewrite.
+
+    Ablation, RUN: drop the `require_open and not _entry_is_open(...)` guard and
+    this reds on all three — the line lands on the done entry, which is exactly
+    what the default behavior above still does."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    writes = []
+    _counting_write(monkeypatch, writes)
+
+    assert (
+        record_decision(path, "DW-2", "2026-06-11", "keep", "already fixed", require_open=True)
+        is False
+    )
+
+    assert writes == []
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_record_decision_require_open_refuses_an_unparseable_status(tmp_path, monkeypatch):
+    """`entry.open`, not `not entry.done`. A status the format cannot read is
+    NEITHER, and `DWEntry.done`'s docstring exists to stop exactly this derivation:
+    deriving the guard from `not done` would let `status: opne` satisfy a
+    still-open premise, take a `decision:` line and — for a `close` — a status flip
+    the caller believed it was applying to an open entry.
+
+    The caller's question is "is this entry still open", so the predicate has to be
+    the caller's. A broken status line is a repair for a human, not an entry to
+    write through.
+
+    Ablation, RUN: substitute `return entry is not None and not entry.done` in
+    `_entry_is_open` and this reds — the decision line lands and a write is
+    published — while every other row in this file and in `test_sweep.py` stays
+    green."""
+    path = write_ledger(tmp_path, LEDGER.replace("status: open\n\n", "status: opne\n\n", 1))
+    before = path.read_text(encoding="utf-8")
+    entry = deferredwork._find_entry(before, "DW-1")
+    assert entry is not None and not entry.open and not entry.done  # neither, by design
+    writes = []
+    _counting_write(monkeypatch, writes)
+
+    assert record_decision(path, "DW-1", "2026-06-11", "close", "moot", require_open=True) is False
+
+    assert writes == []
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_record_decision_require_open_still_records_on_an_open_entry(tmp_path):
+    """The other half: `require_open` refuses only what it names. An entry the
+    ledger still lists as open records exactly as it does without the flag, which
+    is what makes the replay walk a repair rather than a no-op.
+
+    Ablation: negate the guard (`if require_open and _entry_is_open(...)`) and this
+    reds with False and no decision line."""
+    path = write_ledger(tmp_path)
+
+    assert (
+        record_decision(
+            path, "DW-1", "2026-06-11", "close", "moot", close_note="moot", require_open=True
+        )
+        is True
+    )
+
+    entry = deferredwork._find_entry(path.read_text(encoding="utf-8"), "DW-1")
+    assert entry is not None
+    assert entry.status.startswith("done ")
+    assert "decision: 2026-06-11 close — moot" in entry.body
+
+
 def test_record_decision_returns_false_for_a_missing_entry(tmp_path, monkeypatch):
     """A missing id records nothing, writes nothing, and takes no lock (#736).
 
@@ -4344,6 +4427,51 @@ def test_lock_acquisition_failure_raises_and_writes_nothing(tmp_path, monkeypatc
 
     assert path.read_text(encoding="utf-8") == before
     assert (archive.read_text(encoding="utf-8") if archive.is_file() else None) == archive_before
+
+
+def test_record_decision_require_open_rechecks_the_entry_under_the_lock(tmp_path, monkeypatch):
+    """`require_open`'s whole claim is that the predicate and the mutation are ONE
+    critical section. A rival writer that closes the entry BEFORE the call is
+    entered proves nothing about that — any pre-lock read would refuse it too. The
+    window the flag exists for opens after the caller's own open-set snapshot and
+    closes when the lock is taken, so the rival has to land inside that window.
+
+    `close_twin_before_lock`'s idiom is what reaches it without threads: the
+    patched `ledger_lock` flips DW-1 to done and only then yields the real lock, so
+    the mutation runs against a ledger this call has already seen as open and the
+    only read that can catch it is the one under the hold.
+
+    Three claims: False; no `decision:` line on the closed entry; and nothing
+    published at all, so the refusal cannot cost a rewrite of the rival's bytes.
+
+    Ablation, RUN: hoist the check above `with ledger_lock(path):` — read the file
+    and return False there — and this reds on all three, while every other row in
+    this file and in `test_sweep.py` stays green. That is the point: a pre-lock
+    check satisfies every OTHER test of the flag and only this one names the
+    difference."""
+    path = write_ledger(tmp_path)
+    real_lock = deferredwork.ledger_lock
+    writes = []
+    _counting_write(monkeypatch, writes)
+
+    @contextlib.contextmanager
+    def close_entry_before_lock(p):
+        p.write_text(
+            p.read_text(encoding="utf-8").replace("status: open", "status: done 2026-06-01", 1),
+            encoding="utf-8",
+        )
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", close_entry_before_lock)
+
+    assert record_decision(path, "DW-1", "2026-06-11", "close", "moot", require_open=True) is False
+
+    assert writes == []
+    entry = deferredwork._find_entry(path.read_text(encoding="utf-8"), "DW-1")
+    assert entry is not None
+    assert entry.status == "done 2026-06-01"  # the rival's close, untouched
+    assert "decision:" not in entry.body
 
 
 # --------------------------- read-dependent no-ops take no lock (#736)
