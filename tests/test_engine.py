@@ -11897,6 +11897,103 @@ def test_auto_sweep_that_started_then_failed_keeps_the_trigger_spent(project):
     assert calls == ["run-end"]  # refused by the persisted latch
 
 
+def test_auto_sweep_records_a_child_stopped_by_a_ledger_fault_as_finished(project, monkeypatch):
+    """What the PARENT records when its child sweep cannot read the ledger — a
+    record DW-197 changed, and which no row pinned in either direction.
+
+    Before it, the child's own top-of-cycle `read_for_write` raised, `_run_inner`'s
+    nested arm re-raised, and the raise landed in `_maybe_auto_sweep`'s
+    `except (Exception, SystemExit)` arm: the parent recorded `SWEEP_REFUSED_FAILED`,
+    journaled `sweep-auto-failed` and notified. The child now STOPS instead, so the
+    factory returns plainly and the parent takes the `else` arm — trigger spent,
+    `sweep-auto-finished`, no refusal and no notification.
+
+    That is the truthful record, which is why the row asserts it rather than trying
+    to restore the old one: the child finalized its run dir and reported its own stop, with its own
+    repair notice naming the ledger. Repair is followed by a fresh sweep. The cost, named in
+    `docs/FEATURES.md` beside the other auto-sweep residuals, is that the PARENT's
+    journal no longer says anything about the ledger — the stop token lives in the
+    child's run dir. This row is where that trade is written down.
+
+    The child is driven through the real `sweep_factory` seam with a real
+    `SweepEngine`, because a factory that merely returned would be
+    indistinguishable from `..._latches_a_factory_that_never_signalled` above and
+    would grade nothing about DW-197. The fault is armed INSIDE the factory and
+    undone as it returns, so the parent's own run never meets it.
+
+    Ablation: restore the raise at `_loop`'s read (narrow `_read_cycle_ledger` to
+    `except deferredwork.LedgerReadError` alone). The parent goes back to recording
+    a failed child — `sweeps_refused == {"run-end": "failed"}`, `sweep-auto-failed`
+    journaled and `sweep-auto-finished` gone, all three verified under the mutation
+    — but the row reds first on the absent child journal. The real nested lifecycle
+    re-raises the fault before it can journal the refusal or finalize the child."""
+    from bmad_loop.sweep import SweepEngine
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-1": "open"})
+    policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
+    child_dir = project.project / ".bmad-loop" / "runs" / "child-sweep"
+
+    def faulted_child(trigger, *, started):
+        started()  # the child owns a published run dir before it reads anything
+        child_dir.mkdir(parents=True, exist_ok=True)
+        child = SweepEngine(
+            paths=project,
+            policy=Policy(
+                gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(repeat=True)
+            ),
+            adapter=MockAdapter([]),
+            run_dir=child_dir,
+            journal=Journal(child_dir),
+            state=RunState(run_id="child-sweep", project=str(project.project), started_at="now"),
+        )
+        fault_read_text(monkeypatch, project.deferred_work)
+        try:
+            child.run()  # exercise nested finalization as well as the loop return
+        finally:
+            monkeypatch.undo()  # the parent's own run must not meet the fault
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+        sweep_factory=faulted_child,
+    )
+    summary = engine.run()
+
+    # premise: the child really did meet the fault and really did stop on it —
+    # without this the parent's clean record below would pass for the wrong reason
+    child_journal = [
+        json.loads(line)
+        for line in (child_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    [refused] = [e for e in child_journal if e["kind"] == "sweep-cycle-ledger-refused"]
+    assert refused["reason"] == "ledger-inaccessible"
+    [done] = [e for e in child_journal if e["kind"] == "sweep-repeat-done"]
+    assert done["stop_cause"] == "ledger-inaccessible" and done["cycles"] == 0
+    child_state = load_state(child_dir)
+    assert child_state.finished and not child_state.crashed and not child_state.stopped
+    assert any(e["kind"] == "run-complete" for e in child_journal)
+
+    assert summary.done == 1 and engine.state.finished  # parent unaffected, as always
+    saved = load_state(engine.run_dir)
+    assert saved.sweeps_triggered == ["run-end"]  # a child that RAN
+    assert saved.sweeps_refused == {}  # ...and not one that failed
+    journal = (engine.run_dir / "journal.jsonl").read_text(encoding="utf-8")
+    assert "sweep-auto-finished" in journal
+    assert "sweep-auto-failed" not in journal
+    assert "sweep-auto-not-started" not in journal
+    # the parent notifies nothing: the child's own ATTENTION carries the repair
+    parent_attention = engine.run_dir / "ATTENTION"
+    assert "auto sweep failed" not in (
+        parent_attention.read_text(encoding="utf-8") if parent_attention.exists() else ""
+    )
+    assert f"repair {project.deferred_work} by hand" in (
+        (child_dir / "ATTENTION").read_text(encoding="utf-8")
+    )
+
+
 def test_auto_sweep_re_asks_a_trigger_whose_child_never_started(project):
     """The twin, and the narrow thing the reordering actually buys: a trigger the
     factory refused before composing is still askable. Not a retry the product

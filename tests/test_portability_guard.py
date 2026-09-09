@@ -1202,6 +1202,17 @@ JOURNAL_KINDS = frozenset(
         # reason is already a drop field and carries fixed token ledger-unreadable.
         "sweep-bundles-withheld",
         "sweep-cycle",
+        # DW-197. `_loop`'s own repair/write ledger read refused at the top of a
+        # cycle body — undecodable bytes, or an `OSError` from the read itself.
+        # Bare, either ended a `--repeat` run as crashed and threw away the report
+        # for the cycles that had already completed; the row is what says why the
+        # run stopped one cycle short, since the read gates the whole cycle below
+        # it. No new diagnostics routing: `ledger` is already benign, and `reason`
+        # and `error` are both already in `diagnostics._JOURNAL_DROP_FIELDS` —
+        # `reason` is one of the same two fixed tokens the stop carries
+        # (`ledger-unreadable`, `ledger-inaccessible`), never free text, and the
+        # decode or errno detail rides in `error`.
+        "sweep-cycle-ledger-refused",
         "sweep-decision-answer-dropped",
         # DW-167. A stored `close` answer whose ledger effect never landed, applied
         # on resume. The answer is persisted BEFORE `record_decision` runs — the
@@ -1308,23 +1319,27 @@ JOURNAL_KINDS = frozenset(
         "sweep-migrated",
         "sweep-migration-restore-diverged",
         "sweep-nothing-open",
-        # DW-176/DW-182. `_prune_pre_answers` refusing to prune because the
-        # deferred-work ledger could not be read for a write — ABSENT (DW-176), or
-        # holding bytes nobody could decode (DW-182). The open set is the keep list
-        # for a store write, so collapsing either to an empty ledger would read as
+        # DW-176/DW-182/DW-197. `_prune_pre_answers` refusing to prune because the
+        # deferred-work ledger could not be read for a write — ABSENT (DW-176),
+        # holding bytes nobody could decode (DW-182), or refused by the OS
+        # (DW-197). The open set is the keep list
+        # for a store write, so collapsing any of them to an empty ledger would read as
         # "nothing is open" and drop every pre-answer the human recorded — and
         # since DW-160 commit the wipe. Refusal is announced rather than silent so
         # an operator can see why consumed answers are still in the store. `ledger`
         # is already benign and both `reason` and `error` are already in
-        # `diagnostics._JOURNAL_DROP_FIELDS`; the reason is one of TWO fixed tokens
-        # (`ledger-absent`, `ledger-unreadable`), never free text, and the decode
-        # fault rides in `error` instead. The two tokens do NOT stop at this row:
-        # `ledger-unreadable` is also CARRIED to the repeat boundary (DW-182/186),
-        # where it ends a `--repeat` run with `sweep-repeat-done`
-        # `reason="ledger-unreadable"` and WITHOUT the boundary ledger commit —
-        # otherwise the very next act of a repeating run is to publish the bytes
-        # the prune just refused to read. `ledger-absent` stays cycle-local: an
-        # absent ledger ends the next cycle cleanly on `no-open`.
+        # `diagnostics._JOURNAL_DROP_FIELDS`; the reason is one of THREE fixed
+        # tokens (`ledger-absent`, `ledger-unreadable`, `ledger-inaccessible`),
+        # never free text, and the decode or errno fault rides in `error` instead.
+        # Two of the three do NOT stop at this row: `ledger-unreadable` (DW-182/186)
+        # and `ledger-inaccessible` (DW-197) are each CARRIED to the repeat
+        # boundary, where they end a `--repeat` run with `sweep-repeat-done` on the
+        # matching token and WITHOUT the boundary ledger commit — otherwise the very
+        # next act of a repeating run is to publish the bytes the prune just refused
+        # to read. They stay distinct because the operator repair differs (edit the
+        # file, versus fix permissions or storage) and the token is all a scrubbed
+        # dump keeps. `ledger-absent` stays cycle-local: an absent ledger ends the
+        # next cycle cleanly on `no-open`.
         "sweep-preanswer-prune-refused",
         "sweep-remaining-estimate-unreadable",
         "sweep-repeat-done",

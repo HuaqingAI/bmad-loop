@@ -1317,11 +1317,25 @@ class SweepEngine(Engine):
         # below it COMMITS the ledger — a refusal that stays inside the prune
         # publishes bytes nobody could decode and crashes cycle N+1 on them
         # anyway. Persisting it would encode a decision no resume can reach:
-        # `_loop`'s own `read_for_write` raises on the identical bytes at the top
-        # of the cycle body, so a resume of this run never gets far enough to read
-        # the flag. The quarantines above are persisted because their disposition
-        # outlives the frame that made it; this one cannot outlive it at all.
+        # `_loop`'s own read of the identical bytes ends the run at the top of the
+        # cycle body (it degrades through `_read_cycle_ledger` since DW-197, where
+        # it used to raise — the conclusion is the same either way), so a resume of
+        # this run never gets far enough to read the flag. The quarantines above are
+        # persisted because their disposition outlives the frame that made it; this
+        # one cannot outlive it at all.
         self._prune_ledger_unreadable = False
+        # DW-197's sibling latch, carrying the prune's OS-fault refusal to `_loop`
+        # for exactly the reasons the one above carries the undecodable one. A
+        # SECOND flag rather than a widened `_prune_ledger_unreadable`, on two
+        # counts: the two stops report DIFFERENT closed tokens (`ledger-unreadable`
+        # is "bytes nobody could decode", `ledger-inaccessible` is "the OS refused
+        # the read", and `reason`/`error` are both dropped from diagnose dumps, so
+        # the token is the only thing that survives one), and
+        # `test_every_repeat_stop_pairs_its_reason_with_the_same_stop_cause` parses
+        # this module and requires a LITERAL `reason=`/`stop_cause=` pair at every
+        # `sweep-repeat-done` write — one write carrying a variable token would gut
+        # that guard. Instance state, never `state`, for the identical reason.
+        self._prune_ledger_inaccessible = False
         # This cycle's decision-effect verdict. Instance state lets `_cycle` and
         # `_loop` share the latch without changing the decision-phase return tuple.
         # Unlike the prune latch, this also covers faults on decodable bytes.
@@ -1396,6 +1410,121 @@ class SweepEngine(Engine):
 
     # ------------------------------------------------------------ main loop
 
+    def _read_cycle_ledger(
+        self, ledger: Path
+    ) -> tuple[str, Literal["ledger-unreadable", "ledger-inaccessible"] | None]:
+        """`_loop`'s repair/write ledger read, degraded (DW-182/197). Returns
+        `(text, None)` on a good read — absence spelled `or ""`, exact here because
+        `open_ids("")` and `open_ids(<absent>)` say the same thing about a ledger
+        nobody is writing — or `("", token)` after journaling the refusal.
+
+        Both fault classes degrade, and they degrade to DIFFERENT tokens.
+        Undecodable bytes (`LedgerReadError`, a plain `Exception` on purpose, so no
+        `except OSError` upstream would ever see it) mean a human has to edit the
+        file; an `OSError` means the OS refused the read and the repair is
+        permissions or storage. `read_for_write` documents that `OSError`
+        propagates and that contract is UNCHANGED for its callers elsewhere — what
+        changed is that this caller catches it, the same widened shape
+        `_unpublishable` already takes.
+
+        Bare, either fault ended a `--repeat` run as CRASHED at the top of cycle
+        N+1, throwing away the report for cycles 1..N that had already completed.
+        The refusal is announced rather than silent because this read gates the
+        whole write-bearing cycle below it: nothing else in the journal would say
+        why the run stopped one cycle short."""
+        try:
+            # REPAIR/WRITE (DW-146): this text drives migration and the whole
+            # write-bearing cycle below it.
+            return (deferredwork.read_for_write(ledger) or "", None)
+        except deferredwork.LedgerReadError as e:
+            self.journal.append(
+                "sweep-cycle-ledger-refused",
+                ledger=str(ledger),
+                reason="ledger-unreadable",
+                error=str(e),
+            )
+            return ("", "ledger-unreadable")
+        except OSError as e:
+            # The class NAME is kept beside the message because the message alone
+            # ("[Errno 13] Permission denied") does not say what kind of refusal it
+            # was, and this whole field is dropped from a scrubbed dump anyway —
+            # the raw journal is the only reader that ever sees it.
+            self.journal.append(
+                "sweep-cycle-ledger-refused",
+                ledger=str(ledger),
+                reason="ledger-inaccessible",
+                error=f"{e.__class__.__name__}: {e}",
+            )
+            return ("", "ledger-inaccessible")
+
+    def _stop_on_ledger_fault(
+        self,
+        fault: Literal["ledger-unreadable", "ledger-inaccessible"],
+        *,
+        cycles: int,
+        ledger: Path,
+    ) -> None:
+        """End a repeating run on a ledger fault: one `sweep-repeat-done` write per
+        token, then the shared repair notice.
+
+        Spelled as two arms holding LITERAL `reason=`/`stop_cause=` pairs rather
+        than one write passing `fault` through, because
+        `test_every_repeat_stop_pairs_its_reason_with_the_same_stop_cause` parses
+        this module and grades those keywords as constants — a variable token would
+        typecheck, run correctly and leave the guard scanning nothing. Two literal
+        arms satisfy it and still share the notice, which is the part that must not
+        drift (it names a path and a precondition neither guessable nor cheap to
+        get wrong twice).
+
+        Spelled as an EXHAUSTIVE dispatch rather than an `if`/fall-through, for the
+        reason `_unpublishable`'s `family` dispatch is: a THIRD token added to the
+        `Literal` would otherwise typecheck at every call site and be reported
+        silently as `ledger-unreadable` — a stop naming the wrong operator repair,
+        which is the one failure the separate tokens exist to prevent. This reds
+        under pyright the moment the union grows, before any run."""
+        if fault == "ledger-inaccessible":
+            self.journal.append(
+                "sweep-repeat-done",
+                cycles=cycles,
+                reason="ledger-inaccessible",
+                stop_cause="ledger-inaccessible",
+            )
+            self._notify_ledger_repair(
+                ledger, "the deferred-work ledger could not be read mid-sweep"
+            )
+        elif fault == "ledger-unreadable":
+            self.journal.append(
+                "sweep-repeat-done",
+                cycles=cycles,
+                reason="ledger-unreadable",
+                stop_cause="ledger-unreadable",
+            )
+            self._notify_ledger_repair(
+                ledger, "the deferred-work ledger could not be decoded mid-sweep"
+            )
+        else:
+            assert_never(fault)
+
+    def _notify_ledger_repair(self, ledger: Path, headline: str) -> None:
+        """The ledger-repair ATTENTION notice every ledger-fault stop takes.
+
+        The message NAMES the file and the re-run's precondition. Neither is
+        guessable: `implementation_artifacts` is configurable to any absolute path
+        and the ledger may be symlinked out of the project, so "the ledger" names
+        nothing an operator can open; and these stops deliberately leave the file
+        DIRTY, which is exactly what `cmd_sweep`'s `worktree_clean` refusal rejects
+        in the code repo (an external ledger repo is not checked), so an unqualified
+        "re-run `bmad-loop sweep`" sends the human into an exit-1 they were told not
+        to expect. One copy, because a second one would drift from it."""
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            headline,
+            f"repair {ledger} by hand, then commit or stash any changes in "
+            f"{self.paths.repo_root} and re-run `bmad-loop sweep` "
+            "(which requires that worktree to be clean)",
+        )
+
     def _loop(self) -> None:
         ledger = self.workspace.paths.deferred_work
         cycle = max(1, self.state.sweep_cycle)
@@ -1427,9 +1556,14 @@ class SweepEngine(Engine):
             self._check_stop_request()
             self.state.sweep_cycle = cycle
             self._save()
-            # REPAIR/WRITE (DW-146): this text drives migration and the whole
-            # write-bearing cycle below it.
-            text = deferredwork.read_for_write(ledger) or ""
+            text, ledger_fault = self._read_cycle_ledger(ledger)
+            if ledger_fault is not None:
+                # `cycle - 1`: this cycle did no work at all — the read that would
+                # have driven it is the thing that failed — so it reports like the
+                # `legacy-appeared` arm below, not like the prune carry further
+                # down, whose cycle COMPLETED.
+                self._stop_on_ledger_fault(ledger_fault, cycles=cycle - 1, ledger=ledger)
+                return
             if deferredwork.has_legacy(text):
                 if cycle > 1:
                     # freeform text appeared mid-run; _ensure_migration assumes
@@ -1455,8 +1589,13 @@ class SweepEngine(Engine):
                     )
                     return
                 self._ensure_migration(text)
-                # REPAIR/WRITE (DW-146): same cycle, re-read after migration.
-                text = deferredwork.read_for_write(ledger) or ""
+                # Same cycle, re-read after migration — and degraded on the same
+                # terms as the read above, since the migration's own write is a way
+                # for this read to start failing where the first one did not.
+                text, ledger_fault = self._read_cycle_ledger(ledger)
+                if ledger_fault is not None:
+                    self._stop_on_ledger_fault(ledger_fault, cycles=cycle - 1, ledger=ledger)
+                    return
             entries = deferredwork.parse_ledger(text)
             selection = select_entries(
                 entries,
@@ -1508,13 +1647,26 @@ class SweepEngine(Engine):
             progressed = self._cycle(cycle, selected_ids)
             if self.decisions_only or not self.repeat:
                 return
+            if self._prune_ledger_inaccessible:
+                # DW-197's half of the carry, read ABOVE the arm below so the
+                # prune's own last-observed fault wins the report — the same
+                # precedence that arm already applies between
+                # `_prune_ledger_unreadable` and `_ledger_in_doubt`. Everything the
+                # comment below argues holds verbatim: the boundary
+                # `_commit_ledger` publishes the ledger, and cycle N+1 would meet
+                # the same refusal at this loop's own read. `cycles=cycle` because
+                # the cycle COMPLETED — that is what the prune's degrade bought.
+                self._stop_on_ledger_fault("ledger-inaccessible", cycles=cycle, ledger=ledger)
+                return
             if self._prune_ledger_unreadable or self._ledger_in_doubt:
                 # DW-182/186. `_prune_pre_answers` refused to read the ledger
                 # because nothing could decode it, and that refusal has to END a
                 # repeating run rather than stay inside the cycle: the boundary
                 # `_commit_ledger` below PUBLISHES the ledger, so falling through
                 # would commit the undecodable bytes and cycle N+1 would then
-                # crash on them at this loop's own `read_for_write` anyway. Cycle
+                # get no further than this loop's own read of them anyway — which
+                # since DW-197 STOPS that cycle rather than crashing it, a
+                # different mechanism reaching the same place. Cycle
                 # `cycle` COMPLETED — that is what the prune's degrade bought —
                 # so `cycles=cycle`, unlike the `legacy-appeared` arm above, which
                 # fires before its cycle does any work and reports `cycle - 1`.
@@ -1534,26 +1686,19 @@ class SweepEngine(Engine):
                     reason="ledger-unreadable",
                     stop_cause="ledger-unreadable",
                 )
-                # The message NAMES the file and the re-run's precondition. Neither
-                # is guessable: `implementation_artifacts` is configurable to any
-                # absolute path and the ledger may be symlinked out of the project,
-                # so "the ledger" names nothing an operator can open; and this stop
-                # deliberately leaves the file DIRTY, which is exactly what
-                # `cmd_sweep`'s `worktree_clean` refusal rejects in the code repo
-                # (an external ledger repo is not checked), so an unqualified
-                # "re-run `bmad-loop sweep`" sends the
-                # human into an exit-1 they were told not to expect.
-                gates.notify(
-                    self.policy,
-                    self.run_dir,
+                # The notice — which names the ledger path and the clean-worktree
+                # precondition, and why both are load-bearing — lives in
+                # `_notify_ledger_repair`, shared with the DW-197 stops. The
+                # HEADLINE still belongs to this arm: `_prune_ledger_unreadable`
+                # chooses it over `_ledger_in_doubt` for the same reason the
+                # condition is ordered that way.
+                self._notify_ledger_repair(
+                    ledger,
                     (
                         "the deferred-work ledger could not be decoded mid-sweep"
                         if self._prune_ledger_unreadable
                         else "the deferred-work ledger is not fit to publish"
                     ),
-                    f"repair {ledger} by hand, then commit or stash any changes in "
-                    f"{self.paths.repo_root} and re-run `bmad-loop sweep` "
-                    "(which requires that worktree to be clean)",
                 )
                 return
             if not progressed:
@@ -1723,8 +1868,9 @@ class SweepEngine(Engine):
         left the open set. Keeps the store from re-applying a stale answer (and a
         keep-open answer's audit line) on the next sweep.
 
-        BOTH ledger-read faults degrade here rather than propagating: absence
-        (DW-176) and undecodable bytes (DW-182). The case for staying loud is that
+        EVERY ledger-read fault degrades here rather than propagating: absence
+        (DW-176), undecodable bytes (DW-182) and an `OSError` from the read itself
+        (DW-197). The case for staying loud is that
         this read decides a store WRITE, so refusing to guess is right — but the
         refusal IS the refusal to guess. It keeps every answer and prunes nothing,
         so the choice is not "guess vs. crash", it is "keep the store and say so
@@ -1740,25 +1886,34 @@ class SweepEngine(Engine):
         which ends a repeating run there. Without the carry the degrade is a
         half-measure — the boundary `_commit_ledger`'s pathspec IS the ledger, so
         the very next thing a repeating run does is COMMIT the bytes this method
-        just refused to read, and cycle N+1 crashes on them at `_loop`'s own bare
-        read regardless. Absence (DW-176) sets nothing, deliberately: a ledger that
-        is gone ends the next cycle cleanly on `no-open` rather than crashing it.
+        just refused to read, and cycle N+1 gets no further than `_loop`'s own read
+        of them regardless (which ENDS the run there since DW-197, where it used to
+        crash — the carry is what keeps the corrupt bytes out of HEAD either way).
+        Absence (DW-176) sets nothing, deliberately: a ledger that is gone ends the
+        next cycle cleanly on `no-open` rather than stopping it at all.
 
-        `OSError` deliberately still propagates here, as it does at `_loop`'s two
-        bare reads, and it says nothing about what the ledger holds. `_close_resolved`
-        and `_decisions_phase` DO name `OSError` in their catch tuples, but around
-        `mark_done_many` and `record_decision`, which read and take the
-        cross-process lock internally: what they are catching there is the lock's
-        own failure, not this reader's.
+        `OSError` used to propagate here, on the argument that it says nothing
+        about what the ledger holds — but that was never a reason to CRASH over it
+        (DW-197). Every word of the degrade above applies to it verbatim: this is
+        still the last call of the cycle, the refusal still keeps every answer, and
+        an EACCES/EIO here reported a fully completed cycle as crashed. It refuses
+        under the same kind and a THIRD fixed token, `ledger-inaccessible`, kept
+        distinct from `ledger-unreadable` because the operator repair differs
+        (permissions or storage, versus editing the file) and `reason` and `error`
+        are both dropped from a `bmad-loop diagnose` dump, so the token is the only
+        thing that survives one. The triad reads cleanly: `ledger-absent` (not
+        there), `ledger-unreadable` (there, undecodable), `ledger-inaccessible`
+        (there, the OS refused). It CARRIES too, on its own latch, for the reason
+        the undecodable arm carries — with the same asymmetry against absence.
 
-        The ONE direct caller of `read_for_write` that catches it is
-        `_decisions_phase`'s DW-167 re-apply gate, and the asymmetry is the point.
-        What that read buys is a REPAIR — re-applying a stored `close` whose effect
-        an earlier crash lost — so a fault there costs the repair and nothing else:
-        the entry simply stays open, exactly as it was on entry, and a later cycle
-        can try again. This method's read gates a store WRITE whose failure mode is
-        losing the human's answers, so it refuses and carries the refusal to `_loop`
-        rather than degrading quietly.
+        `_close_resolved` and `_decisions_phase` also catch `OSError` around
+        `mark_done_many` and `record_decision`, covering both their internal reads
+        and lock failures. The DW-167 re-apply gate catches its direct read too:
+        a fault prevents repairing a stored close, leaving the entry open for a
+        later cycle. Here the read protects the human's stored answers, so its
+        refusal also carries to `_loop`; `_read_cycle_ledger` instead stops before
+        starting work. `read_for_write` itself remains unchanged and propagates
+        `OSError` to every caller that does not catch it.
         """
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
@@ -1789,6 +1944,28 @@ class SweepEngine(Engine):
             # state, not `state` — see the declaration in `__init__`. The absence
             # arm below sets nothing: an absent ledger ends the next cycle cleanly.
             self._prune_ledger_unreadable = True
+            return
+        except OSError as e:
+            # THE OS REFUSED THE READ (DW-197) — EACCES, EIO, a vanished mount. The
+            # ledger may be perfectly well-formed; nobody here can tell, and that is
+            # precisely the undecodable case's own argument: the open set is the
+            # KEEP list for a store write, so a ledger this process cannot read is
+            # unknown open work, not zero of it. Same kind and same `reason`-is-a-
+            # fixed-token shape as the two arms around it, under a third token,
+            # with the errno text in `error` (a `_JOURNAL_DROP_FIELDS` field). The
+            # class name rides beside the message because "[Errno 13] Permission
+            # denied" alone does not say which refusal it was.
+            self.journal.append(
+                "sweep-preanswer-prune-refused",
+                ledger=str(ledger),
+                reason="ledger-inaccessible",
+                error=f"{e.__class__.__name__}: {e}",
+            )
+            # ...and CARRIED, for the reason the arm above is: the repeat boundary
+            # commits the ledger, and cycle N+1's own read meets the same refusal.
+            # Its own latch rather than the one above, because the two stops report
+            # different closed tokens — see the declaration in `__init__`.
+            self._prune_ledger_inaccessible = True
             return
         # ABSENCE is refused, not collapsed to `""` (DW-176). The `or ""` spelling
         # every observation-shaped caller uses is exact for them because
@@ -3619,9 +3796,11 @@ class SweepEngine(Engine):
         scrubbed dump could not tell the two causes apart. The decode or OS fault
         rides in `error` beside it, which is dropped, and `file` carries the same
         lexical basename the sibling rows do. What this guard does NOT do is
-        rescue the run: `_loop`'s own `read_for_write` still raises on the same
-        undecodable bytes right after the refusal, which is pre-existing behavior.
-        What is gone is the publish that used to precede it.
+        rescue the run: `_loop`'s own ledger read still refuses the same
+        undecodable bytes right after the refusal and ends the run there (it raised
+        until DW-197 degraded it; either way the cycle does not proceed), which is
+        pre-existing behavior. What is gone is the publish that used to precede
+        it.
 
         The guard NARROWS a window it does not close, and the residual is worth
         naming the way `_prune_dropped_pre_answer` names its own: a TRACKED target

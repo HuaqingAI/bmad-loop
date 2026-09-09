@@ -1308,6 +1308,7 @@ def test_remaining_journal_sanitization_contract_reaches_both_public_renders(pro
         "max-cycles",
         "legacy-appeared",
         "ledger-unreadable",
+        "ledger-inaccessible",
         "no-selected",
     ],
 )
@@ -1315,7 +1316,7 @@ def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
     project, render_format, stop_cause, refuse_cause
 ):
     """Each public render independently retains all FOUR publication identities,
-    the six stop slugs, and the dropped fields' presence booleans.
+    the seven stop slugs, and the dropped fields' presence booleans.
 
     The refusal row (DW-199/203/205) carries two surviving fields, not one: `file`
     says WHICH of the two published files went unpublished and `refuse_cause` says
