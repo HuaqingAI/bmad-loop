@@ -446,14 +446,18 @@ def _plan_list(
 
 
 def _plan_mapping(item: Any, where: str, errors: list[str]) -> dict[str, Any] | None:
-    """One object-shaped member of a triage plan's list section, or None when it
-    is not an object (DW-155/DW-158).
+    """One object-shaped member of a triage plan's list section — or of the
+    result.json `mapping` list `validate_migration` walks, its second calling
+    function since DW-190 — or None when it is not an object (DW-155/DW-158).
 
-    Each member loop called `.get` on whatever the list held, so a `null` or a
-    bare string member raised `AttributeError` out of `validate_triage` and every
-    caller of it. `_normalize_bundle_names`, which runs first, already carries
-    exactly this guard on the same members — this is the check the validator was
-    missing, not a new policy.
+    Two unlike faults, one screen. In `validate_triage` each member loop called
+    `.get` on whatever the list held, so a `null` or a bare string member raised
+    `AttributeError` out of that validator and every caller of it; there
+    `_normalize_bundle_names` runs first and already carries exactly this guard
+    on the same members, so this is the check the validator was missing, not a
+    new policy. `validate_migration`'s mapping loop has no such pre-pass and
+    never crashed: it substituted `""` for the member's absent key and
+    mis-diagnosed the shape fault as `mapping invents unknown key ''` (DW-190).
 
     Callers `continue` past a `None` while enumerating the RAW list, so a dropped
     member does not renumber the positions its siblings report. As with
@@ -1077,9 +1081,19 @@ def validate_migration(
     # from need — and `manifest says ..., ledger disagrees` is left alone outright
     # because `source` AND `target` are both non-`None` by the time it is
     # reachable, so its key and its id are both provably genuine.
+    # `_plan_mapping` screens each member FIRST, as every `validate_triage` loop
+    # does — a port of the DW-155/DW-158 guard, not a new policy. Without it
+    # `item.get("key", "") if isinstance(item, dict) else ""` handed a `null` or
+    # bare-string member to `manifest_by_key.get("")`, printing a shape fault as
+    # `mapping invents unknown key ''` (DW-190). The trailing `manifest keys not
+    # mapped:` error a drop provokes is the one the fall-through already
+    # produced: only the first string of that two-element list changes.
     for item_index, item in enumerate(mapping):
-        raw_key = item.get("key", "") if isinstance(item, dict) else ""
-        raw_dw_id = item.get("dw_id", "") if isinstance(item, dict) else ""
+        entry = _plan_mapping(item, f"mapping[{item_index}]", errors)
+        if entry is None:
+            continue
+        raw_key = entry.get("key", "")
+        raw_dw_id = entry.get("dw_id", "")
         key = str(raw_key)
         shown_key = _shown_value(raw_key)
         dw_id, shown_dw_id, _dw_id_label = _plan_identifier(

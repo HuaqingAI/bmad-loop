@@ -2407,6 +2407,77 @@ def test_validate_migration_keeps_todays_wording_for_string_mapping_identifiers(
     assert repeated[1] == f"mapping {real_key} -> DW-77: no such entry in the ledger"
 
 
+@pytest.mark.parametrize(("member", "type_name"), _NON_MAPPING_SHAPES)
+def test_validate_migration_refuses_a_non_object_mapping_member(member, type_name):
+    """The twin of `test_validate_triage_refuses_a_non_object_section_member`,
+    ported to the loop DW-155/DW-158 did not reach: a `null` or a bare-string
+    mapping member is a SHAPE fault and must be diagnosed as one, in a message
+    that reaches the migrate-decision journal record (DW-190).
+
+    ABLATION: restore the `item.get("key", "") if isinstance(item, dict) else ""`
+    fall-through (and drop the `_plan_mapping` guard) and every row collapses to
+    `mapping invents unknown key ''` -- a key-lookup miss reported for a member
+    that had no key at all.
+    SECOND ABLATION: weaken the guard to `item is not None` and the str and int
+    rows redden while the null row stays green, which is why they are here."""
+    manifest = legacy_manifest()
+
+    errors = validate_migration(migrate_result([member]), manifest, {}, migrated_ledger())
+
+    assert errors == [
+        f"mapping[0] not an object: {type_name}",
+        # A dropped member maps nothing, so its manifest key really is unmapped:
+        # the second error is correct and deliberately not suppressed.
+        "manifest keys not mapped: " + ", ".join(sorted(str(m["key"]) for m in manifest)),
+    ]
+
+
+def test_validate_migration_keeps_mapping_positions_when_an_earlier_member_is_dropped():
+    """`enumerate` runs over the RAW mapping list, so dropping `mapping[0]` leaves
+    the next member reporting `mapping[1]` -- the document's position, not the
+    surviving list's -- and a well-formed sibling's own wording is untouched.
+    ABLATION: filter the malformed members out before enumerating and the second
+    shape error moves to `mapping[0]`, naming a member the migration session
+    never wrote there."""
+    manifest = legacy_manifest()
+    real_key = manifest[0]["key"]
+
+    errors = validate_migration(
+        migrate_result([None, "nope", {"key": real_key, "dw_id": "DW-77"}]),
+        manifest,
+        {},
+        migrated_ledger(),
+    )
+
+    assert errors == [
+        "mapping[0] not an object: NoneType",
+        "mapping[1] not an object: str",
+        f"mapping {real_key} -> DW-77: no such entry in the ledger",
+        # The two dropped members mapped nothing, so the manifest key neither
+        # they nor the surviving member covered is genuinely unmapped.
+        f"manifest keys not mapped: {manifest[1]['key']}",
+    ]
+    assert not any("invents unknown key" in e for e in errors)
+
+
+def test_validate_migration_still_invents_unknown_key_for_a_genuine_empty_key():
+    """The diagnosis the shape guard must not steal. `mapping invents unknown key
+    ''` is CORRECT for an object member that really carries `"key": ""` -- an
+    empty key is a key-lookup miss, not a shape fault -- and DW-190 only stops
+    non-objects from being reported that way. This is the control the two rows
+    above are held against.
+    ABLATION: widen the guard to refuse a falsy `key` as a shape fault and this
+    reddens with `mapping[0] not an object: dict`."""
+    manifest = legacy_manifest()
+
+    errors = validate_migration(
+        migrate_result([{"key": "", "dw_id": "DW-1"}]), manifest, {}, migrated_ledger()
+    )
+
+    assert errors[0] == "mapping invents unknown key ''"
+    assert not any("not an object" in e for e in errors)
+
+
 def test_validate_migration_refuses_mapping_legacy_to_a_pre_existing_entry():
     before = pre_gated_ledger()
     manifest = legacy_manifest(before)
