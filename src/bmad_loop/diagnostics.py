@@ -1384,6 +1384,8 @@ def render_markdown(
             for entry in j.entries
             if entry.get("kind")
             in {
+                # Preserve the withheld cycle and count beyond the kind histogram.
+                "sweep-bundles-withheld",
                 "sweep-ledger-commit",
                 "sweep-ledger-commit-clean",
                 "sweep-ledger-commit-refused",

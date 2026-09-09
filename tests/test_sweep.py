@@ -9228,6 +9228,59 @@ def test_an_undecodable_ledger_during_an_attended_decision_degrades_per_decision
     assert "sweep-decision-effect-unavailable" in miss
 
 
+@pytest.mark.parametrize(
+    "fault_last, promises_background",
+    [(False, True), (True, False)],
+    ids=["fault-then-success", "success-then-fault"],
+)
+def test_the_handback_promises_background_work_only_when_bundles_will_run(
+    project, monkeypatch, fault_last, promises_background
+):
+    """The last attempted effect selects repair or background hand-back wording.
+
+    Ablation: select on sticky `any_effect_faulted`; fault-then-success loses its
+    background wording. Removing the halted arm instead breaks success-then-fault."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    good = project.deferred_work.read_bytes()
+    engine, _ = make_sweep(project, [])
+    engine.prompting = True
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}),
+        decisions=(_close_or_keep_decision("DW-1"), _close_or_keep_decision("DW-2")),
+    )
+    prompts = []
+    printed = []
+    _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+
+    def answer(_prompt):
+        # corrupt for exactly one of the two prompts, in the requested order
+        first = not prompts
+        prompts.append(None)
+        corrupt = (not first) if fault_last else first
+        project.deferred_work.write_bytes(_UNDECODABLE_LEDGER if corrupt else good)
+        return "1"
+
+    engine.prompter = DecisionPrompter(input_fn=answer, print_fn=printed.append)
+
+    engine._decisions_phase(plan)  # must not raise
+
+    # premise: exactly one effect faulted either way, so the sticky flag is set on
+    # BOTH legs and cannot be what separates the two lines below
+    assert len(_records(engine, "sweep-decision-effect-unavailable")) == 1
+    assert engine._ledger_in_doubt is fault_last  # ...the last attempt's verdict is
+    [handback] = [line for line in printed if line.startswith("!")]
+    assert ("continues in the background" in handback) is promises_background
+    if promises_background:
+        assert "not every decision reached" in handback  # the miss line, unchanged
+    else:
+        assert "not fit to publish" in handback
+        assert "repair the ledger and re-run" in handback
+        assert "bundles were withheld" not in handback
+    # either way the human is pointed at one grep-able kind and gets no success glyph
+    assert "sweep-decision-effect-unavailable" in handback
+
+
 def test_a_decision_whose_id_the_ledger_lacks_is_not_counted_closed(project, monkeypatch):
     """DW-186. The NON-RAISING half of the same non-write, and the one no `except`
     arm can reach.
@@ -10496,12 +10549,15 @@ def test_a_walk_ending_in_a_fault_commits_nothing_and_says_so(
     assert len(_records(engine, "sweep-returned-after-decisions")) == 1
     # ...and it told the truth about what did and did not land. `print_fn` also
     # renders each prompt, so the claim is over EVERY line: no line anywhere may
-    # say the decisions were recorded, and exactly one reports the ledger miss —
+    # say the decisions were recorded, and exactly one reports the ledger fault —
     # naming the journal kind, and not led by the success glyph.
+    # The last effect faulted, so hand-back reports repair without background work.
     assert [line for line in printed if "decisions recorded" in line] == []
-    [miss] = [line for line in printed if "not every decision reached" in line]
-    assert "sweep-decision-effect-unavailable" in miss
-    assert not miss.startswith("✓")
+    assert [line for line in printed if "not every decision reached" in line] == []
+    [halted] = [line for line in printed if "not fit to publish" in line]
+    assert "sweep-decision-effect-unavailable" in halted
+    assert not halted.startswith("✓")
+    assert "continues in the background" not in halted
 
 
 def test_a_ledger_commit_in_a_non_git_project_keeps_the_write_and_journals(project):
@@ -11235,6 +11291,296 @@ def test_an_undecodable_prune_in_cycle_two_keeps_the_completed_bundle(project):
     assert {entry.id for entry in committed if not entry.open} == {"DW-1", "DW-3"}
     assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER
     assert _ledger_differs_from_head(project)
+
+
+# ------------------- DW-194/202/210: a ledger in doubt gates bundle dispatch
+
+
+def _sweep_with_a_bundle_behind_a_decision(project, fault, **kwargs):
+    """Fault DW-2 at its decision prompt after DW-1 closes, with DW-3 bundled.
+
+    Dev/review effects stay scripted so gate ablations can reach a real commit."""
+    write_ledger(project, {dw_id: "open" for dw_id in ("DW-1", "DW-2", "DW-3")})
+    plan = triage_result(
+        ["DW-1", "DW-2", "DW-3"],
+        already_resolved=[{"id": "DW-1", "evidence": "already guarded at src.txt:1"}],
+        bundles=[{"name": "ledger-fix", "dw_ids": ["DW-3"], "intent": "fix"}],
+        decisions=[
+            _decision(
+                "DW-2",
+                [
+                    {"key": "1", "label": "Close", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "ledger-fix", ["DW-3"]),
+            bundle_review_effect(project, "ledger-fix"),
+        ],
+        prompting=True,
+        **kwargs,
+    )
+
+    def fault_then_answer(_prompt):
+        fault(project.deferred_work)
+        return "1"
+
+    engine.prompter = DecisionPrompter(input_fn=fault_then_answer, print_fn=lambda _line: None)
+    return engine, adapter
+
+
+def test_a_faulted_decision_effect_withholds_the_same_cycles_bundles(project):
+    """An undecodable effect fault stops cleanly before intent creation.
+
+    Ablation: bypass `_cycle`'s ledger-in-doubt guard. Intent creation raises,
+    so the run crashes and creates the bundle task instead of withholding it."""
+    engine, adapter = _sweep_with_a_bundle_behind_a_decision(
+        project,
+        lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER),
+        policy=repeat_policy(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused  # ended reported, not crashed
+    # The effect faulted at the intended decision boundary.
+    [missed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert missed["dw_id"] == "DW-2" and missed["effect"] == "close"
+    assert [spec.role for spec in adapter.sessions] == ["triage"]  # zero bundles ran
+    assert "dw-ledger-fix" not in engine.state.tasks
+    [withheld] = _records(engine, "sweep-bundles-withheld")
+    assert withheld["bundles_not_run"] == 1
+    assert withheld["reason"] == "ledger-unreadable"  # the same FIXED token as the stop
+    [done] = _records(engine, "sweep-repeat-done")  # exactly one, and it is this stop
+    assert done["reason"] == "ledger-unreadable"
+    assert done["stop_cause"] == done["reason"]
+    assert done["cycles"] == 1
+    # THE claim: the bytes nobody can decode never reached HEAD, and stay dirty on
+    # disk for a human to repair.
+    assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER
+    assert _ledger_differs_from_head(project)
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    assert "status: done" in git(project.project, "show", f"HEAD:{rel}")  # DW-1's close
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert f"repair {project.deferred_work} by hand" in attention
+    assert f"commit or stash any changes in {project.repo_root}" in attention
+
+
+def test_a_healthy_decision_phase_still_dispatches_the_cycles_bundles(project):
+    """A healthy phase dispatches every bundle.
+
+    Ablation: make `_cycle`'s ledger-in-doubt guard unconditional; dev/review
+    sessions disappear and a withheld row appears."""
+    engine, adapter = _sweep_with_a_bundle_behind_a_decision(
+        project, lambda _ledger: None, policy=repeat_policy()
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert [spec.role for spec in adapter.sessions] == ["triage", "dev", "review"]
+    assert _records(engine, "sweep-bundles-withheld") == []
+    assert engine.state.tasks["dw-ledger-fix"].phase == Phase.DONE
+    assert "change for dw-ledger-fix" in git(project.project, "show", "HEAD:src.txt")
+    # Everything closed, so cycle 2 stops on `no-open` rather than on the gate.
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == "no-open"
+
+
+def test_a_faulted_cycle_with_no_bundles_writes_no_withheld_row(project):
+    """An empty bundle list still stops, without claiming withheld work.
+
+    Ablation: remove `if bundles:` around the withheld row; a zero-count row appears."""
+    engine, _ = _sweep_with_ledger_fault_at_the_decision_prompt(
+        project,
+        lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER),
+        policy=repeat_policy(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert _records(engine, "sweep-bundles-withheld") == []
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == "ledger-unreadable"
+    assert done["stop_cause"] == done["reason"]
+
+
+def test_a_decodable_decision_fault_withholds_the_bundle_that_would_publish_it(
+    project, monkeypatch
+):
+    """A decodable partial write must not reach HEAD through a bundle commit.
+
+    The pre-answer prune succeeds here, so only the decision-effect latch stops
+    dispatch. Ablation: bypass `_cycle`'s ledger-in-doubt guard. The bundle's
+    `git add -A` publishes the partial answer, failing the first HEAD assertion."""
+    write_ledger(project, {dw_id: "open" for dw_id in ("DW-1", "DW-2", "DW-3")})
+    plan = triage_result(
+        ["DW-1", "DW-2", "DW-3"],
+        already_resolved=[{"id": "DW-1", "evidence": "already guarded at src.txt:1"}],
+        bundles=[{"name": "ledger-fix", "dw_ids": ["DW-3"], "intent": "fix"}],
+        decisions=[
+            _decision(
+                "DW-2",
+                [
+                    {"key": "1", "label": "Close", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "ledger-fix", ["DW-3"]),
+            bundle_review_effect(project, "ledger-fix"),
+        ],
+        prompting=True,
+        policy=repeat_policy(),
+        answers=["1"],
+    )
+
+    def half_record_then_fault(*_args, **_kwargs):
+        # decodable on purpose: the status flip landed, the `decision:` line did
+        # not, and the lock acquisition then failed against a live holder
+        write_ledger(project, {"DW-1": "done", "DW-2": "done", "DW-3": "open"}, commit=False)
+        raise OSError(11, "Resource deadlock avoided")
+
+    # `sweep` holds the MODULE, so patching the attribute here is what it resolves
+    monkeypatch.setattr(deferredwork, "record_decision", half_record_then_fault)
+
+    summary = engine.run()
+
+    # THE claim, first: the half-recorded answer stayed out of HEAD.
+    assert _ledger_differs_from_head(project)
+    assert not summary.crashed and not summary.paused
+    [missed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert missed["dw_id"] == "DW-2" and missed["effect"] == "close"
+    assert [spec.role for spec in adapter.sessions] == ["triage"]  # zero bundles ran
+    assert "dw-ledger-fix" not in engine.state.tasks
+    [withheld] = _records(engine, "sweep-bundles-withheld")
+    assert withheld["bundles_not_run"] == 1 and withheld["reason"] == "ledger-unreadable"
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == "ledger-unreadable" and done["stop_cause"] == done["reason"]
+    # The latch the gate armed is its OWN: the prune read this ledger fine.
+    assert not engine._prune_ledger_unreadable
+    assert _records(engine, "sweep-preanswer-prune-refused") == []
+
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("the deferred-work ledger is not fit to publish:") == 1
+    titles = [line.split("] ", 1)[1].split(": ", 1)[0] for line in attention.splitlines()]
+    assert titles == [
+        "decision needed",
+        "the deferred-work ledger is not fit to publish",
+        "bmad-loop run finished",
+    ]
+    assert "could not be decoded" not in attention
+    assert attention.count(f"repair {project.deferred_work} by hand") == 1
+    assert f"commit or stash any changes in {project.repo_root}" in attention
+    assert "re-run `bmad-loop sweep` (which requires that worktree to be clean)" in attention
+
+
+def test_a_non_repeat_run_withholds_its_bundles_and_still_ends_where_it_always_did(project):
+    """A non-repeat run withholds bundles without a repeat stop or repair notify.
+
+    Ablation: bypass the dispatch gate to crash at intent creation. Remove
+    `_loop`'s non-repeat return to expose the unwanted stop and notification."""
+    engine, adapter = _sweep_with_a_bundle_behind_a_decision(
+        project, lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER)
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    # premise: the effect really faulted and the latch really armed
+    [missed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert missed["dw_id"] == "DW-2" and missed["effect"] == "close"
+    assert engine._ledger_in_doubt
+    # the gate is what withholds, and it does not care that this run is single-cycle
+    assert [spec.role for spec in adapter.sessions] == ["triage"]
+    assert "dw-ledger-fix" not in engine.state.tasks
+    [withheld] = _records(engine, "sweep-bundles-withheld")
+    assert withheld["bundles_not_run"] == 1 and withheld["reason"] == "ledger-unreadable"
+    # ...and `_loop` still returns above the stop arm, so its stop never fires
+    assert _records(engine, "sweep-repeat-done") == []
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    titles = [line.split("] ", 1)[1].split(": ", 1)[0] for line in attention.splitlines()]
+    assert titles == ["decision needed", "bmad-loop run finished"]
+
+
+def test_a_decisions_only_run_returns_ahead_of_the_dispatch_gate(project):
+    """Decisions-only returns before dispatch and owns its withheld count.
+
+    Ablation: disable `_cycle`'s decisions-only return; its journal row disappears
+    and the dispatch gate writes its own. Remove `_loop`'s decisions-only return
+    to expose the unwanted repeat stop and repair notification."""
+    engine, adapter = _sweep_with_a_bundle_behind_a_decision(
+        project,
+        lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER),
+        policy=repeat_policy(),
+        decisions_only=True,
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    # premise: the latch armed here too — the absence below is about WHERE this run
+    # returns, not about the fault failing to happen
+    [missed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert missed["dw_id"] == "DW-2" and missed["effect"] == "close"
+    assert engine._ledger_in_doubt
+    assert [spec.role for spec in adapter.sessions] == ["triage"]
+    # the early return owns this cycle's count; the gate's row is never written
+    [only] = _records(engine, "sweep-decisions-only")
+    assert only["bundles_not_run"] == 1
+    assert _records(engine, "sweep-bundles-withheld") == []
+    assert _records(engine, "sweep-repeat-done") == []
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    titles = [line.split("] ", 1)[1].split(": ", 1)[0] for line in attention.splitlines()]
+    assert titles == ["decision needed", "bmad-loop run finished"]
+
+
+@pytest.mark.parametrize("mode", ["graceful", "hard"])
+def test_a_stop_during_a_faulted_decision_is_honored_before_withholding(project, monkeypatch, mode):
+    """Withheld dispatch still honors a stop requested during the decision prompt.
+
+    Ablation: remove only the withheld branch's `_check_stop_request()` call.
+    Persisted state becomes finished rather than stopped, and run-complete appears.
+    """
+    killed = []
+    monkeypatch.setattr("bmad_loop.engine.kill_session", lambda rid: killed.append(rid))
+
+    def fault_and_stop(ledger):
+        ledger.write_bytes(_UNDECODABLE_LEDGER)
+        _lodge_stop_request(engine.run_dir, mode)
+
+    engine, adapter = _sweep_with_a_bundle_behind_a_decision(
+        project, fault_and_stop, policy=repeat_policy()
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    [missed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert missed["dw_id"] == "DW-2" and engine._ledger_in_doubt
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True and saved.finished is False
+    [stopped] = _records(engine, "run-stop")
+    if mode == "graceful":
+        assert stopped["graceful"] is True
+    else:
+        assert stopped["via"] == "stop-request"
+        assert killed == ["sweep-run"]
+    assert _records(engine, "run-complete") == []
+    assert _records(engine, "sweep-repeat-done") == []
+    assert not (engine.run_dir / runs.STOP_REQUEST_FILE).exists()
+    assert [spec.role for spec in adapter.sessions] == ["triage"]
 
 
 # ------------------- DW-201: every repeat stop keeps its token through a dump
@@ -14361,9 +14707,9 @@ def test_stranded_bundle_task_warns_loudly(project):
 # the in-flight item still runs to completion and the next never starts.
 
 
-def _lodge_stop_request(run_dir: Path) -> None:
+def _lodge_stop_request(run_dir: Path, mode: str = "graceful") -> None:
     (run_dir / runs.STOP_REQUEST_FILE).write_text(
-        '{"requested_at": "2026-07-20T00:00:00", "mode": "graceful"}', encoding="utf-8"
+        json.dumps({"requested_at": "2026-07-20T00:00:00", "mode": mode}), encoding="utf-8"
     )
 
 

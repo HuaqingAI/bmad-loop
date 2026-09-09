@@ -1197,6 +1197,10 @@ JOURNAL_KINDS = frozenset(
         "sweep-bundle-reopened",
         "sweep-bundle-skipped",
         "sweep-bundles-truncated",
+        # DW-194/202/210: decision-effect doubt withheld this cycle's bundles.
+        # No new diagnostics routing: cycle/bundles_not_run are already benign;
+        # reason is already a drop field and carries fixed token ledger-unreadable.
+        "sweep-bundles-withheld",
         "sweep-cycle",
         "sweep-decision-answer-dropped",
         # DW-167. A stored `close` answer whose ledger effect never landed, applied

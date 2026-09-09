@@ -81,12 +81,12 @@ def increment_decimal_digits(value: str) -> str:
     return "".join(digits)
 
 
-# The two lines `_return_after_decisions` shows a human, as whole named constants
-# joined explicitly. Assembling either at the call site out of adjacent string
+# The three lines `_return_after_decisions` shows a human, as whole named constants
+# joined explicitly. Assembling any of them at the call site out of adjacent string
 # literals is what this avoids: a reflow can silently re-bind a trailing literal
 # to one arm of a conditional, and these are the only strings that phase prints.
-# The failure line does not lead with the success glyph — a `✓` in front of a
-# miss reads as success at a glance — and it names the journal kind an operator
+# Neither failure line leads with the success glyph — a `✓` in front of a
+# miss reads as success at a glance — and both name the journal kind an operator
 # greps for, since the answers really are saved and only the ledger is short.
 _HANDBACK_TAIL = "sweep continues in the background"
 _HANDBACK_RECORDED = " ".join(["✓ decisions recorded —", _HANDBACK_TAIL])
@@ -95,6 +95,15 @@ _HANDBACK_LEDGER_MISS = " ".join(
         "! answers saved, but not every decision reached the deferred-work ledger",
         "(see sweep-decision-effect-unavailable in the journal) —",
         _HANDBACK_TAIL,
+    ]
+)
+# A fault on the last attempt requires repair; a later successful effect clears
+# the doubt and retains the existing background hand-back wording.
+_HANDBACK_LEDGER_HALTED = " ".join(
+    [
+        "! answers saved, but the deferred-work ledger is not fit to publish",
+        "(see sweep-decision-effect-unavailable in the journal) —",
+        "repair the ledger and re-run",
     ]
 )
 # The scalars a stored answer's consumers read as strings, split by WHO reads them.
@@ -1313,6 +1322,10 @@ class SweepEngine(Engine):
         # the flag. The quarantines above are persisted because their disposition
         # outlives the frame that made it; this one cannot outlive it at all.
         self._prune_ledger_unreadable = False
+        # This cycle's decision-effect verdict. Instance state lets `_cycle` and
+        # `_loop` share the latch without changing the decision-phase return tuple.
+        # Unlike the prune latch, this also covers faults on decodable bytes.
+        self._ledger_in_doubt = False
         self.state.run_type = "sweep"
 
     def _quarantine(self, ids: list[str], dw_id: str) -> None:
@@ -1495,7 +1508,7 @@ class SweepEngine(Engine):
             progressed = self._cycle(cycle, selected_ids)
             if self.decisions_only or not self.repeat:
                 return
-            if self._prune_ledger_unreadable:
+            if self._prune_ledger_unreadable or self._ledger_in_doubt:
                 # DW-182/186. `_prune_pre_answers` refused to read the ledger
                 # because nothing could decode it, and that refusal has to END a
                 # repeating run rather than stay inside the cycle: the boundary
@@ -1512,6 +1525,9 @@ class SweepEngine(Engine):
                 # and re-running `bmad-loop sweep` is the resume. Deliberately NOT
                 # extended to the DW-176 absence refusal — an absent ledger ends
                 # the next cycle cleanly on `no-open`.
+                # DW-194/202/210 shares this stop: same repair and closed stop-token
+                # contract. Effect faults can leave decodable bytes, so the gate
+                # needs its own latch rather than relying on the prune to refuse.
                 self.journal.append(
                     "sweep-repeat-done",
                     cycles=cycle,
@@ -1530,7 +1546,11 @@ class SweepEngine(Engine):
                 gates.notify(
                     self.policy,
                     self.run_dir,
-                    "the deferred-work ledger could not be decoded mid-sweep",
+                    (
+                        "the deferred-work ledger could not be decoded mid-sweep"
+                        if self._prune_ledger_unreadable
+                        else "the deferred-work ledger is not fit to publish"
+                    ),
                     f"repair {ledger} by hand, then commit or stash any changes in "
                     f"{self.paths.repo_root} and re-run `bmad-loop sweep` "
                     "(which requires that worktree to be clean)",
@@ -1657,17 +1677,31 @@ class SweepEngine(Engine):
             self._emit("post_sweep_cycle", phase=str(cycle))
             return False
         graded_keys: list[str] = []
-        for bundle in bundles:
-            # Item boundary: a request during bundle N lets N finish through
-            # commit; bundle N+1 never starts. A request landing during triage
-            # reaches the first iteration here, so triage completes but zero
-            # bundles run. Mid-cycle stop is resume-safe: sweep_cycle is
-            # persisted, triage.json is cached, closes are idempotent, and
-            # terminal tasks are skipped on re-drive.
+        if self._ledger_in_doubt:
+            # Undecodable bytes would crash intent creation; decodable partial
+            # writes would reach HEAD through a bundle commit's `git add -A`.
+            # Preserve the item-boundary stop check even when dispatch is withheld.
             self._check_stop_request()
-            key = self._run_bundle(bundle, cycle)
-            if key is not None:
-                graded_keys.append(key)
+            if bundles:
+                # Report only bundles actually withheld, with their cycle.
+                self.journal.append(
+                    "sweep-bundles-withheld",
+                    cycle=cycle,
+                    bundles_not_run=len(bundles),
+                    reason="ledger-unreadable",
+                )
+        else:
+            for bundle in bundles:
+                # Item boundary: a request during bundle N lets N finish through
+                # commit; bundle N+1 never starts. A request landing during triage
+                # reaches the first iteration here, so triage completes but zero
+                # bundles run. Mid-cycle stop is resume-safe: sweep_cycle is
+                # persisted, triage.json is cached, closes are idempotent, and
+                # terminal tasks are skipped on re-drive.
+                self._check_stop_request()
+                key = self._run_bundle(bundle, cycle)
+                if key is not None:
+                    graded_keys.append(key)
         # Grade the key each bundle was actually resolved to — the one it ran
         # under, or the terminal one it was skipped as already-finished at,
         # which counts here exactly as it always has. What is never used is a
@@ -1694,11 +1728,11 @@ class SweepEngine(Engine):
         this read decides a store WRITE, so refusing to guess is right — but the
         refusal IS the refusal to guess. It keeps every answer and prunes nothing,
         so the choice is not "guess vs. crash", it is "keep the store and say so
-        vs. crash the sweep". And this call is the LAST in `_cycle`, after every
-        bundle has run: a raise here reports a fully completed cycle as crashed
-        over bookkeeping, where the refusal costs only consumed answers re-offered
-        on the next sweep. Bytes nobody could decode are unknown open work for
-        exactly the reason absence is, so they take the same journal row under a
+        vs. crash the sweep". This is end-of-cycle bookkeeping, including when
+        bundles were withheld or the run is decisions-only: a raise here crashes
+        the cycle over cleanup, where refusal costs only consumed answers
+        re-offered on the next sweep. Bytes nobody could decode are unknown open
+        work for exactly the reason absence is, so they take the same journal row under a
         second fixed `reason` token rather than a kind of their own.
 
         The undecodable refusal is not only journaled, it is CARRIED: it sets
@@ -2931,15 +2965,10 @@ class SweepEngine(Engine):
                         effect="close",
                         error=fault,
                     )
-                # `ledger_in_doubt` is deliberately NOT set. The latch withholds a
-                # commit that would publish bytes an effect could not read, and
-                # nothing can have landed behind a gate that refused before any write
-                # was attempted: this gate runs ahead of every other arm in the phase,
-                # so `any_effect_landed` is still False here and the commit gate below
-                # is already shut on its other conjunct. Setting it would only reach
-                # PAST this refusal to suppress a commit the interactive arm goes on to
-                # earn — and a decision that arm answers and lands is proof the ledger
-                # reads again, which is exactly what the latch means when cleared.
+                # This advisory read refusal attempts no effect, so it leaves the
+                # effect-scoped latch unchanged. A later successful effect can
+                # still earn the commit. With no attempted effect, unreadable-ledger
+                # dispatch remains a pre-existing residual.
                 any_effect_faulted = True
                 reapply = []
             else:
@@ -3136,13 +3165,11 @@ class SweepEngine(Engine):
                     # a later cycle (or a resume) finds the stored `close` over a
                     # still-open entry and applies it, so a ledger that reads again
                     # repairs itself without a new run. For `build`, the bundle
-                    # still materializes and runs off the stored answer — the work
-                    # happens, but the entry carries no `decision:` audit line
-                    # recording who authorized it. That run-anyway trade is
-                    # ACCEPTED for THIS ARM ALONE and stays: an unreadable ledger
-                    # says nothing about whether the entry exists, so withholding
-                    # the bundle would discard a human's build decision over a
-                    # transient read. DW-200's fourth drop lane is scoped to the
+                    # still materializes from the stored answer. Dispatch requires
+                    # the phase's final doubt to clear, for example when a later
+                    # effect succeeds. The saved build is retained because a read
+                    # fault does not prove that its entry is absent.
+                    # DW-200's fourth drop lane is scoped to the
                     # False RETURN below, which is positive proof there is no entry
                     # to build for. Both outcomes are recoverable; crashing the
                     # sweep mid-walk is not, which is the trade this arm makes.
@@ -3275,10 +3302,14 @@ class SweepEngine(Engine):
                 family="ledger",
             )
         if answered_interactively:
-            self._return_after_decisions(every_effect_landed=not any_effect_faulted)
+            self._return_after_decisions(
+                every_effect_landed=not any_effect_faulted, ledger_in_doubt=ledger_in_doubt
+            )
+        # Assign the final verdict so a healthy phase clears any earlier doubt.
+        self._ledger_in_doubt = ledger_in_doubt
         return answers, closed, frozenset(effect_unlanded)
 
-    def _return_after_decisions(self, *, every_effect_landed: bool) -> None:
+    def _return_after_decisions(self, *, every_effect_landed: bool, ledger_in_doubt: bool) -> None:
         """Once the human has answered this cycle's decisions over an attached
         terminal, hand it back so the sweep runs its bundles in the background —
         detach a plain-shell client, switch a tmux client back to its origin. A
@@ -3329,9 +3360,14 @@ class SweepEngine(Engine):
         self.prompting = False
         if outcome is launch.ReturnOutcome.RETURNED:
             self.journal.append("sweep-returned-after-decisions")
-            self.prompter.print_fn(
-                _HANDBACK_RECORDED if every_effect_landed else _HANDBACK_LEDGER_MISS
-            )
+            # Report the final ledger verdict before the sticky partial-miss flag.
+            if ledger_in_doubt:
+                line = _HANDBACK_LEDGER_HALTED
+            elif every_effect_landed:
+                line = _HANDBACK_RECORDED
+            else:
+                line = _HANDBACK_LEDGER_MISS
+            self.prompter.print_fn(line)
         else:
             self.journal.append("sweep-return-no-client")
 

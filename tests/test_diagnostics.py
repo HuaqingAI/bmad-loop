@@ -1403,6 +1403,31 @@ def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
         assert canary not in set(pseudo.legend().values()), "LEAK via legend"
 
 
+def test_a_withheld_bundle_dispatch_keeps_its_count_through_a_dump(project):
+    """Markdown preserves the withheld cycle/count and scrubs the fixed reason.
+
+    Ablation: remove `sweep-bundles-withheld` from the Markdown collected-kind
+    set; the JSON entry block disappears. JSON rendering does not use that set.
+    """
+    run_dir = _seed_run(project.project)
+    journal = Journal(run_dir)
+    journal.append("sweep-bundles-withheld", cycle=3, bundles_not_run=2, reason="ledger-unreadable")
+
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    markdown = diagnostics.render_markdown(diag, pseudo=pseudo)
+    blocks = re.findall(r"```json\n(.*?)\n```", markdown, flags=re.DOTALL)
+    assert len(blocks) == 1
+    entries = json.loads(blocks[0])
+
+    withheld = next(e for e in entries if e["kind"] == "sweep-bundles-withheld")
+    # the point: the identity of the withhold survives, not just its kind
+    assert withheld["bundles_not_run"] == 2
+    assert withheld["cycle"] == 3
+    # ...while the free-text reason collapses exactly as it does on the stop row
+    assert withheld["reason_present"] is True and "reason" not in withheld
+
+
 def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
     """`target` is a BRANCH on the merge kinds and a sprint STATUS on `board-advance-*`.
 
