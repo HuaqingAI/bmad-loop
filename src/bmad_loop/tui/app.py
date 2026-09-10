@@ -993,6 +993,34 @@ class BmadLoopApp(App[None]):
             return
         if self._resolve_blocked_by_liveness(run_id, run_dir):
             return
+        # DW-204/DW-230: the same probe `cli.cmd_resume` and `cli.cmd_resolve` take,
+        # taken here beside the two gates above. The detached child this gesture ends
+        # in would refuse for the same reason, but only AFTER `rearm_escalation` has
+        # spent the escalation, and it would refuse into a pane nobody opens — so the
+        # refusal is raised here, on screen, with the escalation still armed. The
+        # probe answers or declines; this surface owns the channel (a toast, where the
+        # CLI prints to stderr). Note `_do_resume` is deliberately NOT gated: it
+        # mutates nothing before launching, so its child's refusal costs nothing.
+        #
+        # Wrapped for `OSError` because the probe propagates one by contract (a read the
+        # OS refuses is a different fault class from bytes that do not decode, and the
+        # arm for it is DW-234's to add, not this call site's). `main`'s tail routes
+        # that propagation for the CLI; a Textual message-loop callback has no such
+        # tail, so an escape here takes the dashboard down. This is the surface's own
+        # routing of an unrouted fault — it reports and returns unarmed, and must not be
+        # mistaken for the repair arm the probe is forbidden to grow.
+        try:
+            refusal = runs.unreadable_sweep_ledger(self.project, run_dir)
+        except OSError as e:
+            self.notify(
+                f"cannot read the deferred-work ledger to check this sweep can resume "
+                f"({e}) — fix it, then re-arm; the story is still escalated",
+                severity="error",
+            )
+            return
+        if refusal is not None:
+            self.notify(refusal, severity="error")
+            return
         # The LIVE isolation mode, read once and used twice below. `runs.rearm_escalation`
         # requires it: how the re-drive WILL run is a policy question, and the recorded
         # `task.worktree_path` answers only how the escalated attempt ran — the two part
