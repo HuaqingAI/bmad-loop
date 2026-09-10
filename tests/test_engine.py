@@ -5802,25 +5802,19 @@ def test_closes_deferred_external_ledger_is_written_and_journaled(project, tmp_p
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
-@pytest.mark.parametrize("shape", ["dangling", "looping"])
-def test_closes_deferred_in_repo_broken_ledger_link_is_an_outage_not_a_typo(project, shape):
+def test_closes_deferred_in_repo_dangling_ledger_link_is_an_outage_not_a_typo(project):
     """A broken ledger link must read as an outage, not as an empty ledger: an
     empty read classifies every declared id `unknown`, and the story then
     reports a typo (`unmatched`) for a mount that went away.
 
-    Both shapes land in the same answer by different routes: the loop is
-    refused at the read (ELOOP), the dangling link by the symlink check behind
+    A dangling link reaches that answer through the symlink check behind
     `FileNotFoundError` — the link existing at all is the evidence a ledger is
-    expected there."""
+    expected there. The symlink-LOOP shape used to share this row and no longer
+    does; see the row below it."""
     engine = _closes_deferred_run(project, ["DW-1"])
     ledger = project.deferred_work
     ledger.unlink()
-    if shape == "dangling":
-        ledger.symlink_to(project.project / "gone-mount" / "deferred-work.md")
-    else:
-        other = project.project / "ledger-loop"
-        ledger.symlink_to(other)
-        other.symlink_to(ledger)
+    ledger.symlink_to(project.project / "gone-mount" / "deferred-work.md")
 
     summary = engine.run()
 
@@ -5828,6 +5822,77 @@ def test_closes_deferred_in_repo_broken_ledger_link_is_an_outage_not_a_typo(proj
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "deferred-close-ledger-unavailable" in kinds
     assert "deferred-close-unmatched" not in kinds
+    assert "story-deferred-closed" not in kinds
+
+
+def test_closes_deferred_ledger_replaced_by_a_directory_is_an_outage_not_a_typo(project):
+    """`_close_declared_deferred`'s `except (OSError, UnicodeDecodeError)` degrade
+    arm, which is the arm the symlink-LOOP shape used to reach before DW-221 moved
+    ELOOP up to the earlier fail-loud probe. A directory at the ledger's own name
+    still reaches it — `read_text` raises `IsADirectoryError`, an `OSError` — so
+    the arm keeps an entry path and the row that grades it is not the split-out
+    loop row.
+
+    Nothing crashes on the way here: `read_for_write` answers `None` for a
+    non-regular file, so the baseline digest treats it as an absent ledger, and the
+    outage is reported where the ids are actually classified. The claim is the same
+    one the dangling row makes — close nothing and SAY so, rather than read an
+    outage as "no such entries" and blame the author for a typo.
+
+    Ablation: drop `OSError` from that except tuple and this reds with
+    `IsADirectoryError` ending the run instead of the journal row appearing."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    ledger = project.deferred_work
+    ledger.unlink()
+    ledger.mkdir()
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed  # the story still lands
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-ledger-unavailable" in kinds
+    assert "deferred-close-unmatched" not in kinds
+    assert "story-deferred-closed" not in kinds
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_closes_deferred_in_repo_ledger_link_loop_ends_the_run_loudly(project):
+    """The same outage claim, reached EARLIER and louder since DW-221 — this row
+    was the `looping` half of the dangling row above until the ledger's
+    repair/write reader stopped calling a symlink cycle an absence.
+
+    `Path.is_file()` answered False for ELOOP on every interpreter (errno 40 is in
+    `pathlib`'s ignored tuple through 3.13, and 3.14's `os.path.isfile` swallows it
+    too), so the loop used to read as an ABSENT ledger at every `read_for_write`
+    site and was only caught later, at `_close_declared_deferred`'s own direct
+    `read_text`. DW-221's `Path.stat` probe reports the errno instead — a symlink
+    cycle is a path that EXISTS and cannot be read, which is a refusal, not an
+    absence — so the first fail-loud site now meets it: `Engine._ledger_digest`,
+    whose docstring already refuses to guess a proof-of-work equality answer.
+
+    The claim the old row made survives the move: this is still reported as an
+    OUTAGE naming the file, never as a typo. What changed is the severity, which
+    is the conservative direction — a story no longer proceeds to a dev session
+    against a baseline digest taken from a ledger nobody could read.
+
+    Ablation: restore `if not path.is_file(): return None` in
+    `deferredwork.read_for_write` and this reds — the run completes the story."""
+    engine = _closes_deferred_run(project, ["DW-1"])
+    ledger = project.deferred_work
+    ledger.unlink()
+    other = project.project / "ledger-loop"
+    ledger.symlink_to(other)
+    other.symlink_to(ledger)
+
+    summary = engine.run()
+
+    assert engine.adapters["dev"].sessions == []
+    assert summary.crashed and summary.done == 0  # the story does NOT land
+    [crash] = [e for e in engine.journal.entries() if e["kind"] == "run-crash"]
+    assert crash["error"] == "OSError"
+    assert str(ledger) in crash["message"]  # the outage names the file
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "deferred-close-unmatched" not in kinds  # never reported as a typo
     assert "story-deferred-closed" not in kinds
 
 

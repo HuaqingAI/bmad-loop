@@ -521,10 +521,12 @@ def apply_pre_answer(
     broken chain, `RuntimeError` on a symlink loop under 3.11–3.12) takes the same
     refusal arm with cause `target-unreadable` — a target whose path cannot be
     resolved cannot be read well enough to publish — because this module has no
-    journal to route it to and the cause enum is closed by contract. A store the
-    guard finds present but NOT a regular file takes the third token,
-    `target-not-a-file` (DW-211/228): publishing a directory's literal pathspec
-    would stage its descendants recursively under this call's own message.
+    journal to route it to and the cause enum is closed by contract. EITHER
+    family's target found present but NOT a regular file takes the third token,
+    `target-not-a-file` (DW-211/228 for the store, DW-238 for the ledger, which
+    reached it as `target-absent` until then): publishing a directory's literal
+    pathspec would stage its descendants recursively under this call's own
+    message, and a FIFO or socket at the name is refused the same way.
 
     A refusal drops only ITS operand; the survivors still publish, and a refusal
     never raises.

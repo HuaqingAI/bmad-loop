@@ -50,6 +50,10 @@ the classification recorded at the site:
   Absence answers ``None``; ``OSError`` propagates; undecodable bytes raise
   :class:`LedgerReadError` with the ``UnicodeDecodeError`` chained as
   ``__cause__``. A repair write must never proceed from bytes nobody could read.
+  That ``OSError``-propagates half is true on every supported interpreter only
+  since DW-221: the arm's ``is_file()`` probe answered False for a refused
+  metadata call on Python 3.14, reporting a refusal as ABSENCE. It probes with
+  ``Path.stat`` + ``S_ISREG`` now — see the function's own docstring.
 * OBSERVATION — :func:`read_for_observation`. The text informs a report, a hint,
   or a flag, and nothing is written from it. Absence answers ``("", None)``; both
   ``OSError`` and ``UnicodeDecodeError`` degrade to ``("", "<Class>: <msg>")`` so
@@ -94,8 +98,24 @@ degrade arm sitting right there (a retryable outcome, an unavailable pane) that
 undecodable bytes flew straight past; each now catches both. The other two
 inline observation sites, ``Engine._refuse_gated_story`` and
 ``cli._validate_deferred_ledger``, already caught the pair and are unchanged.
-No repair/write site's ``OSError`` behavior changes anywhere: ``read_for_write``
-lets it propagate untouched. :class:`LedgerReadError` derives from ``Exception``
+No repair/write site's ``OSError`` behavior changes anywhere IN DW-146's OWN
+DIFF: ``read_for_write`` lets it propagate untouched. (DW-221 later made that
+propagation actually HAPPEN on Python 3.14, where the ``is_file()`` probe had
+been reporting a refusal as absence. Eleven call sites that read the reader's
+answer directly — ``append_entries_published``'s preimage read and
+``archive_closed``'s two, five in ``sweep``, four in ``engine`` — do newly see a
+raise there, the conservative direction at each and the point of the fix rather
+than a side effect of it. FIVE OTHERS ARE NOT FIXED BY IT, and that limit is
+worth stating rather than discovering: ``_mark_done_many``,
+``mark_seen_again_many``, ``mark_open_many``, ``record_decision`` and
+``archive_closed`` each carry their own bare ``if not path.is_file()`` guard
+both before and under :func:`ledger_lock`, directly above their ``or ""`` read,
+so on 3.14 those guards answer False for a refused ledger and return the
+mutator's no-op value before :func:`read_for_write` is ever reached. Through
+3.13 the same guards RAISE and the caller sees the refusal; above it they still
+report a present-but-refused ledger as "nothing to do". Switching them is
+deferred work, not part of DW-221. The contract sentence above is what did not
+change.) :class:`LedgerReadError` derives from ``Exception``
 rather than ``OSError`` or ``ValueError`` so that neither those two widened
 handlers nor any future ``except OSError`` silently swallows the one fault this
 contract exists to attribute.
@@ -112,6 +132,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date as calendar_date
 from pathlib import Path
+from stat import S_ISREG
 
 from . import sprintstatus
 from .fences import fenced_spans
@@ -135,8 +156,22 @@ def read_for_write(path: Path) -> str | None:
     propagates unchanged. Undecodable bytes become :class:`LedgerReadError`, so a
     site about to publish bytes escalates instead of writing from a text nobody
     could read.
+
+    Use ``Path.stat`` plus ``S_ISREG`` because ``Path.is_file`` suppresses all
+    OS errors on Python 3.14. ENOENT, ENOTDIR and non-regular files remain
+    absence; every other OS error propagates. ELOOP and EBADF deliberately
+    become errors on older interpreters too, where ``is_file`` suppressed them.
+    The regular-file check also prevents blocking on a FIFO.
+
+    Keep the absence classification aligned with ``resolve.build_context``.
+    Its disposition differs: that observation path degrades other OS errors,
+    whereas this repair/write reader must propagate them.
     """
-    if not path.is_file():
+    try:
+        st = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    if not S_ISREG(st.st_mode):
         return None
     try:
         return path.read_text(encoding="utf-8")
@@ -153,13 +188,23 @@ def read_for_observation(path: Path) -> tuple[str, str | None]:
     — attributed, so a caller holding a journal can record WHICH fault it
     degraded on rather than reporting an empty ledger. Never raises.
 
-    The ``is_file()`` probe is INSIDE the guard, unlike the repair/write arm's.
-    Metadata errors that escape ``is_file()`` are attributed here too. On Python
-    3.11–3.13, that includes ``EACCES``; Python 3.14 suppresses all OS errors in
-    ``is_file()``. Both readers preserve the runtime's existing false-probe
-    meaning as absence, including directories and ignored metadata errors. This
-    guard attributes exceptions the probe raises; it cannot recover errors the
-    probe suppresses. See Python's pathlib "Querying file type and status" docs.
+    Both arms now take their probe inside a guard; the remaining asymmetry is
+    WHICH probe. This arm still asks ``is_file()``, whose error behavior splits
+    by interpreter — on Python 3.11–3.13 it raises ``EACCES`` (attributed here,
+    as the guard promises), while Python 3.14 suppresses all OS errors in it and
+    answers False. The repair/write arm switched to ``Path.stat`` + ``S_ISREG``
+    (DW-221) precisely because that probe suppresses nothing on any interpreter,
+    so ITS ``OSError``-propagates contract is now true everywhere. THIS reader
+    preserves the runtime's existing false-probe meaning as absence in full,
+    including directories and every ignored metadata error; the write arm
+    preserves only the directory/non-regular, ENOENT and ENOTDIR half of it,
+    because ELOOP and EBADF deliberately became refusals there. This guard
+    attributes exceptions
+    the probe raises; it cannot recover errors the probe suppresses — so on 3.14
+    a refused ledger still degrades to ``("", None)`` here, which is a narrower
+    claim than the write arm's and is deliberately left standing: switching this
+    probe too would turn a clean empty read into an attributed fault at five
+    observation sites. See Python's pathlib "Querying file type and status" docs.
     """
     try:
         if not path.is_file():

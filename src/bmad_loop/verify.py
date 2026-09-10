@@ -5122,6 +5122,12 @@ def unpublishable_target(
     is a read the writer above already took. A later disappearance or replacement
     can still change what git publishes, as `_commit_ledger` documents.
 
+    A ledger read of `None` means absence or a non-regular file. Re-probe with
+    `stat` to distinguish `target-absent` from `target-not-a-file`; unlike
+    `exists`, it exposes OS refusals on every supported interpreter. Metadata
+    may change between probes, so this second probe must independently fold
+    non-absence errors into `target-unreadable`.
+
     STORE: a regular file must be there, except for the resolved symlink-loop
     entry described below. Nothing is asked about its bytes.
     The writer emits valid UTF-8 JSON, but this guard does not check whether
@@ -5177,7 +5183,11 @@ def unpublishable_target(
     if family == "ledger":
         try:
             if deferredwork.read_for_write(target) is None:
-                return ("target-absent", None)
+                try:
+                    target.stat()
+                except (FileNotFoundError, NotADirectoryError):
+                    return ("target-absent", None)
+                return ("target-not-a-file", None)
         except (deferredwork.LedgerReadError, OSError) as e:
             return ("target-unreadable", str(e))
         return None

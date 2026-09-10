@@ -16004,6 +16004,53 @@ def test_an_inaccessible_prune_keeps_every_stored_answer(project, monkeypatch):
     assert _records(engine, "sweep-ledger-commit") == []
 
 
+def test_a_refused_ledger_metadata_probe_is_journalled_inaccessible_not_absent(
+    project, monkeypatch
+):
+    """DW-253's operator-visible claim, and the only row that pins it. The three
+    ledger-read reporting sites already had `except OSError` arms emitting
+    `ledger-inaccessible` with the errno in `error` — but a refusal on the ledger's
+    own METADATA never reached them on Python 3.14, because `read_for_write`'s
+    `is_file()` probe swallowed it and answered `None`. The prune then took its
+    ABSENCE arm and told the operator `ledger-absent` — a token that carries no
+    `error` at all — about a file sitting right there. DW-221 made the reader raise
+    on every interpreter; the reporting sites are untouched and fire on their own.
+
+    The 3.14 contract is simulated rather than the 3.14 interpreter: `Path.is_file`
+    is pinned False for the ledger while `Path.stat` carries the refusal, so the
+    row grades the reader's choice of probe on any interpreter.
+
+    Ablation: SHARED with the reader change — restore
+    `if not path.is_file(): return None` in `deferredwork.read_for_write` and this
+    reds with `reason="ledger-absent"`, no `error`, and the latch clear. There is
+    no separate gate in `sweep.py` to delete, which is exactly DW-253's finding:
+    it closes at the reader."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [])
+    fault_metadata_probe(monkeypatch, project.deferred_work, "stat")
+    real_is_file = Path.is_file
+    monkeypatch.setattr(
+        Path,
+        "is_file",
+        lambda self, *a, **kw: (
+            False if self == project.deferred_work else real_is_file(self, *a, **kw)
+        ),
+    )
+
+    engine._prune_pre_answers()
+
+    [refused] = _records(engine, "sweep-preanswer-prune-refused")
+    assert refused["reason"] == "ledger-inaccessible"
+    assert refused["error"] == "PermissionError: [Errno 13] Permission denied"
+    assert engine._prune_ledger_inaccessible
+    assert not any(
+        row["reason"] == "ledger-absent"
+        for row in _records(engine, "sweep-preanswer-prune-refused")
+    )
+    assert _records(engine, "decision-preanswers-pruned") == []
+    assert _records(engine, "sweep-ledger-commit") == []
+
+
 def test_an_inaccessible_prune_alone_stops_before_the_boundary_commit(project, monkeypatch):
     """The prune latch must stop a healthy, progressing cycle by itself.
 

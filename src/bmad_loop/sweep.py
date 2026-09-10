@@ -4444,7 +4444,9 @@ class SweepEngine(Engine):
         would be published; before, because a refused publish must spawn no git at
         all — the same property the per-site guards buy. The two families need
         different validation (the seven ledger publishers read through
-        `deferredwork.read_for_write`, the two prunes require a REGULAR FILE), and
+        `deferredwork.read_for_write`, the two prunes probe the type directly —
+        though BOTH families require a REGULAR FILE and both name
+        `target-not-a-file` when they do not get one, since DW-238), and
         the family is a caller's declaration because deriving it from the path
         would be precisely the "chosen by role" test the rule above refuses; a
         required keyword-only argument also makes a NEW call site fail under
@@ -4454,8 +4456,9 @@ class SweepEngine(Engine):
         the other two no-op arms do — never a raise, because the read this guard
         takes is bookkeeping and not the sweep's own read. `refuse_cause` is one of
         THREE fixed tokens (`target-absent`, `target-unreadable`,
-        `target-not-a-file` — a store replaced by a directory or a link to one,
-        whose literal pathspec `git add` would stage recursively) and is minted for
+        `target-not-a-file` — EITHER family's target replaced by a directory (or,
+        for the store, a link to one), whose literal pathspec `git add` would
+        stage recursively; a FIFO or socket at the name takes the same token) and is minted for
         the reason `stop_cause` (DW-201), `drop_cause` and `regen_cause` were: the
         natural spelling is `reason`, which sits in
         `diagnostics._JOURNAL_DROP_FIELDS` and renders as a presence boolean, so a

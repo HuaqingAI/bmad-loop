@@ -5960,6 +5960,146 @@ def test_unpublishable_target_folds_a_ledger_oserror_into_the_refusal(project, m
     assert "Permission denied" in error
 
 
+def test_unpublishable_target_refuses_a_ledger_replaced_by_a_directory(project):
+    """DW-238: ONE on-disk shape, ONE cause, across both families. A directory
+    standing at the ledger's own name is present and the wrong TYPE — exactly what
+    the store arm has reported `target-not-a-file` since DW-211/228 — but the
+    ledger arm collapsed the reader's `None` into `target-absent` and named an
+    operator repair (restore the file) that does not fit a directory sitting right
+    there.
+
+    The reader answers `None` for this non-regular path, as it also does for
+    absence. A refused metadata probe instead raises out of `read_for_write`
+    and folds to `target-unreadable`.
+
+    Ablation: restore the ledger arm's single `return ("target-absent", None)` and
+    this reds with the directory reported as an absence."""
+    write_ledger(project, {"DW-1": "open"})
+    ledger = project.deferred_work
+    ledger.unlink()
+    ledger.mkdir()
+    (ledger / "swept-in.txt").write_text("a descendant `git add` would stage\n")
+
+    assert verify.unpublishable_target(ledger, "ledger") == ("target-not-a-file", None)
+
+
+@pytest.mark.parametrize("failure", [PermissionError, FileNotFoundError, NotADirectoryError])
+def test_unpublishable_target_classifies_second_ledger_probe_independently(
+    project, monkeypatch, failure
+):
+    """A successful first stat cannot guarantee the second probe is readable.
+
+    Simulate 3.14's suppressing exists() independently of the host runtime.
+    Ablation: restore the exists() discriminator; the refusal case reports absence.
+    """
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.mkdir()
+    real_stat = Path.stat
+    real_exists = Path.exists
+    calls = 0
+    fault = failure("metadata changed between probes")
+
+    def changing_stat(self, *args, **kwargs):
+        nonlocal calls
+        if self == ledger:
+            calls += 1
+            if calls > 1:
+                raise fault
+        return real_stat(self, *args, **kwargs)
+
+    def suppressing_exists(self, *args, **kwargs):
+        if self == ledger:
+            try:
+                self.stat()
+            except OSError:
+                return False
+            return True
+        return real_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", changing_stat)
+    monkeypatch.setattr(Path, "exists", suppressing_exists)
+    expected = (
+        ("target-unreadable", str(fault)) if failure is PermissionError else ("target-absent", None)
+    )
+    assert verify.unpublishable_target(ledger, "ledger") == expected
+    assert calls == 2
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX FIFOs")
+def test_unpublishable_target_refuses_a_ledger_replaced_by_a_fifo(project, monkeypatch):
+    """The second of the three shapes DW-238's token actually covers (directory,
+    FIFO, socket), and the one that is not merely a variation: a FIFO is what makes
+    `S_ISREG` load-bearing rather than decorative in the reader below this guard —
+    `read_text` on it would BLOCK forever rather than raise, wedging the publisher.
+    It is present and the wrong type, so it reports the wrong-type cause.
+
+    Ablation: restore the ledger arm's single `return ("target-absent", None)` and
+    this reds with the FIFO reported as an absence."""
+    write_ledger(project, {"DW-1": "open"})
+    ledger = project.deferred_work
+    ledger.unlink()
+    os.mkfifo(ledger)
+
+    real_read = Path.read_text
+
+    def refuse_fifo_read(self, *args, **kwargs):
+        if self == ledger:
+            pytest.fail("publisher attempted to read a FIFO")
+        return real_read(self, *args, **kwargs)
+
+    # Make a missing regular-file guard fail immediately instead of hanging.
+    monkeypatch.setattr(Path, "read_text", refuse_fifo_read)
+    assert verify.unpublishable_target(ledger, "ledger") == ("target-not-a-file", None)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_unpublishable_target_refuses_a_ledger_symlink_loop_as_unreadable(project):
+    """The shape where the two families deliberately DISAGREE, graded so the
+    disagreement is a recorded fact rather than an accident. ELOOP used to be
+    absence for the ledger (errno 40 is in `pathlib`'s ignored tuple, so
+    `is_file()` answered False), and DW-221 made it a refusal — so this arm reports
+    `target-unreadable`, naming the errno, where it once said `target-absent`.
+
+    The identical link at the STORE's name still publishes, through the
+    `is_symlink()` disjunct that exists to preserve the 3.13+ loop's link entry.
+    That is not an oversight DW-238 left behind: DW-238 unified the
+    present-but-wrong-TYPE shapes, and this one is not one of them.
+
+    Ablation: restore `if not path.is_file(): return None` in
+    `deferredwork.read_for_write` and this reds with `target-absent` — the guard
+    reports a path that is right there as gone."""
+    write_ledger(project, {"DW-1": "open"})
+    ledger = project.deferred_work
+    ledger.unlink()
+    other = project.project / "ledger-loop"
+    ledger.symlink_to(other)
+    other.symlink_to(ledger)
+
+    cause, error = verify.unpublishable_target(ledger, "ledger")
+
+    assert cause == "target-unreadable"
+    assert "Too many levels of symbolic links" in error
+
+
+def test_unpublishable_target_folds_a_refused_ledger_metadata_probe(project, monkeypatch):
+    """The arm DW-221 newly routes here. Before it, a ledger whose metadata probe
+    the OS refused answered `None` on Python 3.14 and was refused `target-absent` —
+    a present file reported as gone. `read_for_write` raises `OSError` on every
+    interpreter now, and this guard folds it into `target-unreadable` with the
+    errno text, the same way it already folds a decode fault.
+
+    Ablation: drop `OSError` from the `except` tuple and the `PermissionError`
+    escapes this best-effort guard instead of the tuple coming back."""
+    write_ledger(project, {"DW-1": "open"})
+    fault_metadata_probe(monkeypatch, project.deferred_work, "stat")
+
+    cause, error = verify.unpublishable_target(project.deferred_work, "ledger")
+
+    assert cause == "target-unreadable"
+    assert "Permission denied" in error
+
+
 def test_unpublishable_target_refuses_an_absent_store(project):
     """The store family's absence arm, which is now the arm reached only after BOTH
     type probes answered False and `exists()` agreed nothing is there.
