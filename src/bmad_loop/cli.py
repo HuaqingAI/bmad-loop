@@ -4270,12 +4270,14 @@ def cmd_decisions(args: argparse.Namespace) -> int:
                 outcome += f": {why}"
             if option.effect != "close":
                 outcome += "; your answer was saved to the pre-answer store"
-        # A written operand that could not be published (DW-209/213). Separate from
-        # the non-write above and reportable on TOP of a successful record: the
-        # operand list is already gated on what the call wrote, so a refusal means
-        # an answer that really landed on disk is missing from git history. It is
-        # not an error — the exit code, the walk and the outcome wording above are
-        # all unchanged by it.
+        # A written operand that could not be published, in either of its two
+        # lanes: REFUSED before any git ran (DW-209/213), or FAILED once git ran
+        # and answered `GitError` (DW-225/226 — an operand in no repository, a
+        # gitignored path). Separate from the non-write above and reportable on TOP
+        # of a successful record: the operand list is already gated on what the
+        # call wrote, so either lane means an answer that really landed on disk is
+        # missing from git history. Neither is an error — the exit code, the walk
+        # and the outcome wording above are all unchanged by both.
         note = result.publish_note()
         if note is not None:
             outcome += f"; {note}"

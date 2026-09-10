@@ -1033,6 +1033,54 @@ def test_decisions_names_a_written_answer_it_could_not_publish(
     assert "DW-2: queued" in out
 
 
+def test_decisions_names_a_written_answer_git_could_not_commit(project, capsys, monkeypatch):
+    """DW-226 on this surface — the OTHER unpublished lane. The ledger is
+    GITIGNORED, so `commit_paths`' literal pathspec makes `git add` exit 1 for it;
+    the pre-answer store beside it is publishable. As one commit over both operands
+    that `GitError` took the store down too and `except verify.GitError: pass` told
+    nobody; now each operand commits alone and the failure is named under its own
+    `commit-unavailable` token.
+
+    Reported ON TOP of the ordinary outcome, exactly as a refusal is: the record
+    succeeded, so `queued — the next sweep will build it` still stands, exit 0 is
+    unchanged (a failed publish is a degrade, not a failure), and the walk still
+    advances to DW-2.
+
+    Ablation: drop the `result.publish_note()` append in `cmd_decisions` and this
+    reds on the `not committed to git` assertion while every other one still
+    passes; restore the single `commit_paths(project, ...)` call and it reds on the
+    store reaching HEAD."""
+    install_bmad_config(project)
+    ignore_before_commit(project, "_bmad-output/implementation-artifacts/deferred-work.md")
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    # premise: git really does refuse this operand, which is what makes the row
+    # grade the failure lane rather than a happy publish
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    assert git(project.project, "check-ignore", ledger_rel).strip() == ledger_rel
+    _make_run_with_two_decisions(project)
+    asked = []
+
+    class _StubPrompter:
+        def ask(self, decision):
+            asked.append(decision.id)
+            return decision.option("1")  # build
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+
+    assert asked == ["DW-1", "DW-2"]  # the walk advanced past the failed publish
+    out = capsys.readouterr().out
+    assert "DW-1: queued — the next sweep will build it; not committed to git: " in out
+    assert "deferred-work.md (commit-unavailable: " in out
+    assert "DW-2: queued" in out
+    # the publishable sibling still reached history, on its own
+    assert "chore(decisions): pre-answer DW-1" in git(project.project, "log", "--oneline")
+    assert git(project.project, "show", "--name-only", "--format=", "HEAD").split() == [
+        ".bmad-loop/decisions.json"
+    ]
+
+
 def test_decisions_continues_when_the_non_write_diagnostic_probe_fails(
     project, capsys, monkeypatch
 ):

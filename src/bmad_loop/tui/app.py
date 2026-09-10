@@ -406,12 +406,16 @@ class BmadLoopApp(App[None]):
         a ledger non-write. The toasts distinguish these by wording and severity;
         the caller excludes both from its count and continues the walk.
 
-        A publish REFUSAL (DW-209/213) is a third, orthogonal thing and does not
-        touch the boolean: the operand list `apply_pre_answer` commits is already
-        gated on what that call wrote, so a refusal means an answer that really
-        landed on disk is missing from git history — news worth a `warning` toast,
-        but not a reason to stop counting the answer as answered. It rides on the
-        non-write toast where there is one and raises its own otherwise.
+        An UNPUBLISHED operand is a third, orthogonal thing and does not touch the
+        boolean, in either of its lanes: a publish REFUSED before git ran
+        (DW-209/213), and a publish that reached git and FAILED (DW-225/226 — an
+        operand in no repository, a gitignored path). The operand list
+        `apply_pre_answer` commits is already gated on what that call wrote, so
+        either one means an answer that really landed on disk is missing from git
+        history — news worth a `warning` toast, but not a reason to stop counting
+        the answer as answered. Both arrive as the one `publish_note()` string,
+        which rides on the non-write toast where there is one and raises its own
+        otherwise.
         """
         # decision/option cross the widget boundary as `object`; their runtime types
         # are the Decision/DecisionOption that apply_pre_answer and `.id` expect.

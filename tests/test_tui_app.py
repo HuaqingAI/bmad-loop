@@ -7459,6 +7459,79 @@ async def test_decision_modal_toasts_an_answer_it_could_not_publish(
         assert app.is_running
 
 
+async def test_decision_modal_toasts_an_answer_git_could_not_commit(project, monkeypatch):
+    """DW-226 on this surface — the mirror of the refusal row beside it, for the
+    OTHER unpublished lane. `verify.commit_paths` raises `GitError` (a gitignored
+    operand, a parent in no repository, git absent), which used to be swallowed
+    silently, so an answer written to disk and missing from git history reached
+    neither the CLI nor this dashboard.
+
+    What it must NOT change is the count: the ledger line landed, so the answer is
+    answered and `recorded 2 decision(s)` still fires. The walk advances the same
+    way, and nothing reads as an `error` — a failed publish is a degrade, not a
+    fault of the recording.
+
+    Ablation: drop `_record_decision`'s `if note is not None:` arm and this reds on
+    the toast while `recorded 2 decision(s)` still passes; hand the failure to the
+    `recorded` boolean instead and it reds on the count; restore
+    `except verify.GitError: pass` in `apply_pre_answer` and it reds on both toasts.
+    """
+    # Ablation: remove markup=False from this toast arm; the bracketed git error
+    # then raises MarkupError in the real notification renderer — git's own stderr
+    # is where the brackets come from, so this is the arm that needs it most.
+    from bmad_loop import verify
+
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: first thing\n\norigin: t\nlocation: a.py:1\nreason: t.\nstatus: open\n\n"
+        "### DW-2: second thing\n\norigin: t\nlocation: b.py:1\nreason: t.\nstatus: open\n",
+        encoding="utf-8",
+    )
+    _write_two_triage_decisions(make_run(project.project, "20260101-000000-aaaa", run_type="sweep"))
+    # Multi-line, as git's stderr is: `publish_note` renders on ONE line, so the
+    # collapse is part of what this row grades.
+    error = "git add failed:\n  The following paths are ignored by [red]one[/red] of your .gitignore files"
+
+    def boom(*_a, **_k):
+        raise verify.GitError(error)
+
+    monkeypatch.setattr(verify, "commit_paths", boom)
+    collapsed = " ".join(error.split())
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test(notifications=True) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("d")
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        await pilot.click(await ready(pilot, "#opt-1"))
+        await until(
+            pilot,
+            lambda: any("DW-1: not committed to git" in m for m in notifications(app)),
+        )
+        await until(
+            pilot,
+            lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
+        )
+        await pilot.click(await ready(pilot, "#opt-1"))
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+        toasts = [n for n in app._notifications if "not committed to git" in n.message]
+        assert len(toasts) == 2
+        assert {n.severity for n in toasts} == {"warning"}
+        assert all(
+            f"deferred-work.md (commit-unavailable: {collapsed})" in n.message for n in toasts
+        )
+        assert all(f"decisions.json (commit-unavailable: {collapsed})" in n.message for n in toasts)
+        assert not any("\n" in n.message for n in toasts)  # one line at this surface
+        # The line DID land, so the answer is answered: the failure changes neither
+        # the count nor the walk, and it is not the non-write toast.
+        await until(pilot, lambda: any("recorded 2 decision(s)" in m for m in notifications(app)))
+        assert not any("no decision line was written" in m for m in notifications(app))
+        assert not any("failed to record" in m for m in notifications(app))
+        assert app.is_running
+
+
 async def test_decision_walk_counts_only_the_answer_the_ledger_took(project):
     """A mixed walk records DW-1, then retires DW-2 before its answer is written.
 
