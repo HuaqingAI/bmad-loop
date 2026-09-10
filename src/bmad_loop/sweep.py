@@ -2148,9 +2148,16 @@ class SweepEngine(Engine):
         cycle completed any addressable work — the repeat loop's progress
         predicate. Dropping a recorded decision answer counts (DW-123, widened
         from the keep-open lane to the build lanes by DW-135; DW-200's
-        `effect-unlanded` lane is a later addition that counts on the same
-        footing): the drop releases its id from a stored answer nothing can act
-        on, so a later cycle's fresh triage can address it. It cannot spin the loop —
+        `effect-unlanded` lane and DW-214's `entry-not-open` screen are later
+        additions that count on the same footing): the drop releases its id from a
+        stored answer nothing can act on, so a later cycle's fresh triage can
+        address it. The screen's id is the one exception to that second clause and
+        buys the first alone — it is by construction not open, and `_loop` derives
+        triage's universe from `open_ids`, so no later cycle re-raises it; what its
+        drop wins is that the id stops being bound to an answer nothing can act on,
+        and becomes addressable again through the out-of-band surfaces
+        (`bmad-loop decisions`, the TUI modal) once the entry is re-opened.
+        It cannot spin the loop —
         `_materialize_bundles` bounds each id to one drop per run, and since
         DW-124 that bound is persisted on `state`, so it holds across a
         pause/resume too and the signal fires at most once per id. Caveat: on
@@ -4618,6 +4625,103 @@ class SweepEngine(Engine):
         )
         return None
 
+    def _live_open_ids(self) -> set[str] | None:
+        """The ledger's CURRENT open ids, or `None` when the read refused (DW-214).
+
+        One place owns the read-and-degrade, so the screen in
+        `_materialize_bundles` below reads as a screen rather than as I/O
+        handling.
+
+        REPAIR/WRITE (DW-146), never `read_for_observation`, and this is the
+        decision that can be got backwards: the set does not DESCRIBE the ledger
+        for a reader, it AUTHORIZES spending a dev session on a stored `build`
+        answer. The observation arm answers `("", fault)` on both of its fault
+        classes, and `open_ids("")` is empty — which under that screen reads as
+        "no id is open" and would drop every adopted build answer in the cycle at
+        once. The repair arm keeps absence (`None`) and undecodable bytes
+        (`LedgerReadError`) distinguishable from a genuinely empty ledger, which
+        is what lets the degrade keep every answer instead.
+
+        `None` on all three fault classes, each under its own FIXED `reason`
+        token — the triad `_prune_pre_answers` established: `ledger-absent` (not
+        there), `ledger-unreadable` (there, undecodable), `ledger-inaccessible`
+        (there, the OS refused). The raw journal distinguishes the repairs;
+        `bmad-loop diagnose` reduces both `reason` and `error` to presence flags,
+        so these tokens do not survive that export. Absence carries no `error`:
+        there is no fault text, only the fact.
+
+        A FOURTH refusal, `ledger-in-doubt`, mirrors the one DW-217 gave
+        `_prune_pre_answers` and is the only one of the four taken with the ledger
+        PERFECTLY READABLE. It covers the decodable fault class the three reads
+        cannot see — a `record_decision` or `mark_done_many` that flipped a
+        `status:` and then failed before writing its line — where the bytes read
+        back fine and an id the aborted write retired reads as not-open. Here that
+        would discard a human's recorded `build` answer, notify, and quarantine the
+        id in PERSISTED run state for the rest of the run, so a resume taken after
+        the operator repairs the ledger still skips it: strictly worse than the
+        prune's consequence, off the same unfit bytes. Like its sibling it sits
+        BELOW the read arms — they own the classes they observe, each with its own
+        token — and it carries nothing, because the latch it reads is already
+        `_loop`-bound.
+
+        None of the four sets a repeat-boundary carry of its own, unlike
+        `_prune_pre_answers`' two raising arms. If the cycle reaches that method,
+        its fresh read owns the carry. This helper only guarantees degradation
+        during materialization: a later `_write_intent` read can still raise
+        before pruning runs.
+
+        Arms NO ledger doubt, unlike the DW-167 re-apply gate whose read shape
+        this otherwise copies verbatim. Doubt withholds every bundle in the
+        cycle, far beyond the one screen this refusal is entitled to degrade —
+        and the degrade here is already the conservative direction: a refused
+        read screens NOTHING, so every answer keeps the disposition it had.
+        Writes nothing — not the ledger, not `<run>/decisions.json`, not the
+        project store — and spawns no git.
+        """
+        ledger = self.workspace.paths.deferred_work
+        try:
+            text = deferredwork.read_for_write(ledger)
+        except deferredwork.LedgerReadError as e:
+            # `LedgerReadError` is a plain `Exception` on purpose (DW-146), so it
+            # must be named: no `except OSError` would ever see it.
+            self.journal.append(
+                "sweep-decision-open-set-refused",
+                ledger=str(ledger),
+                reason="ledger-unreadable",
+                error=str(e),
+            )
+            return None
+        except OSError as e:
+            # The class name rides beside the message because "[Errno 13]
+            # Permission denied" alone does not say which refusal it was.
+            self.journal.append(
+                "sweep-decision-open-set-refused",
+                ledger=str(ledger),
+                reason="ledger-inaccessible",
+                error=f"{e.__class__.__name__}: {e}",
+            )
+            return None
+        # `is None`, never falsiness: an empty-but-PRESENT ledger genuinely holds
+        # zero open ids, and every adopted build answer SHOULD be screened out by
+        # it. Only the three refusals above mean "unknown open work".
+        if text is None:
+            self.journal.append(
+                "sweep-decision-open-set-refused", ledger=str(ledger), reason="ledger-absent"
+            )
+            return None
+        # DW-217's refusal, applied to this screen. The read above SUCCEEDED, which
+        # is exactly the case this arm exists for: on the decodable fault class the
+        # ledger reads back perfectly, so none of the three arms above fires, and an
+        # id an aborted write flipped out of the open set would take a human's
+        # recorded `build` answer with it — dropped, announced, and quarantined on
+        # disk for the rest of the run. No `error`: nothing faulted here.
+        if self._ledger_unfit_to_publish():
+            self.journal.append(
+                "sweep-decision-open-set-refused", ledger=str(ledger), reason="ledger-in-doubt"
+            )
+            return None
+        return deferredwork.open_ids(text)
+
     def _materialize_bundles(
         self,
         plan: TriagePlan,
@@ -4626,7 +4730,7 @@ class SweepEngine(Engine):
         effect_unlanded: frozenset[str],
     ) -> tuple[list[Bundle], bool]:
         """This cycle's bundles, and whether ANY recorded answer was dropped by one
-        of the four drop lanes below — `_cycle`'s progress signal.
+        of the five drop lanes below — `_cycle`'s progress signal.
 
         Every drop is progress for the same reason (DW-123, widened to the build
         lanes by DW-135): it quarantines the id in `state.sweep_dropped_decisions`,
@@ -4656,10 +4760,39 @@ class SweepEngine(Engine):
         cycle's triage stopped raising the decision, or the quarantine above already
         skipped it — keeps its verdict until the run ends, which costs a list entry
         and mints nothing.
+
+        The FIFTH lane (DW-214) answers what `effect_unlanded` structurally cannot.
+        That verdict is populated at exactly one site — the interactive
+        `if not recorded:` arm — so it speaks only for an answer THIS run recorded
+        at a prompt, and says nothing about one adopted from the project store or
+        reloaded on a resume. `_ensure_triage`'s cache branch revalidates with
+        `expected_open_ids=None`, so a resumed cycle can legally raise a decision
+        for an id the ledger no longer holds open, adopt its stored `build` answer
+        and spend a whole dev session briefed off a `_write_intent` read that finds
+        no entry. So before a stored answer mints a bundle, the ledger's LIVE open
+        set is read (`_live_open_ids`) and an id it no longer holds open is dropped
+        down this same DW-200 lane — one row, one notify, the same quarantine.
+
+        Lane ORDER is load-bearing in one direction. `effect_unlanded` names a
+        NON-WRITE this run observed; the screen names a ledger FACT read just now.
+        Where both hold, the older and more specific verdict is what the operator
+        should be told, so the screen sits BELOW it and above the `no-intent` lane.
+
+        The read is taken LAZILY and at most ONCE per call — the two locals below
+        `bundles` are that cache and its latch — so a cycle with no adopted `build`
+        answer reaching the screen takes no read at all, and two candidates share
+        one read (and one refusal row, since the fault is cached with it).
         """
         self._emit("pre_materialize_bundles")
         bundles = list(plan.bundles)
         answer_dropped = False
+        # The DW-214 screen's lazy read, cached across the loop: `open_screen` is
+        # the live open set (or `None`, meaning the read refused and the screen is
+        # OFF), and the latch is what distinguishes "not read yet" from "read, and
+        # it refused" — a bare `is None` check would re-read on every candidate and
+        # write a refusal row per candidate for a fault that is one file's.
+        open_screen: set[str] | None = None
+        open_screen_read = False
         for decision in plan.decisions:
             answer = answers.get(decision.id)
             # `isinstance` rather than truthiness: `answers`' annotation is a
@@ -4729,6 +4862,60 @@ class SweepEngine(Engine):
                 self._quarantine(self.state.sweep_dropped_decisions, decision.id)
                 answer_dropped = True  # progress: see this method's docstring
                 continue
+            # DW-214. The lane above claims one class of unlanded build answer: the
+            # ones a `_decisions_phase` in THIS run watched `record_decision` refuse
+            # to write a `decision:` line for. Nothing populates that verdict for an
+            # answer adopted from the project store, or reloaded from
+            # `<run>/decisions.json` on a resume — and the resumed cycle is exactly
+            # where the hazard lives, because `_ensure_triage`'s cache branch
+            # revalidates with `expected_open_ids=None` and will happily re-raise a
+            # decision for an id a rival writer retired since the plan was cached.
+            # Routed on the stored `effect` alone, such an answer built a bundle and
+            # spent a dev session on an entry `_write_intent`'s ledger read cannot
+            # find. So screen the id against the ledger as it stands NOW.
+            #
+            # Read LAZILY and once: the first candidate to reach here pays for it,
+            # a cycle whose answers were all shape-guarded, quarantined or unlanded
+            # above pays nothing, and a second candidate reuses the same answer —
+            # including a refusal, so one bad ledger writes one row and not one per
+            # id. The latch, not `open_screen is None`, is what makes that true.
+            if not open_screen_read:
+                open_screen, open_screen_read = self._live_open_ids(), True
+            # `is not None` GATES the screen: a refused read screens NOTHING and
+            # every answer keeps the disposition it had (see `_live_open_ids` for
+            # why absence and undecodable bytes are unknown open work rather than
+            # zero of it). A resolved-but-EMPTY set is a real answer and screens
+            # everything out.
+            if open_screen is not None and decision.id not in open_screen:
+                # A DROP for the reason the lane above drops: there is no entry to
+                # build against, no `decision:` line here to double-apply, and the
+                # entry (if a rival writer merely retired it) is left exactly as
+                # found. The quarantine is what frees the id — a later cycle's fresh
+                # triage is free to address it, and a replayed cycle neither
+                # re-announces this nor revives the bundle.
+                #
+                # `_prune_dropped_pre_answer` is deliberately NOT called: it is
+                # keep-open-only by design, and `_prune_pre_answers` retires the
+                # store entry at the end of this same cycle anyway, since the id is
+                # no longer open and is therefore consumed. Nothing here arms ledger
+                # doubt either — that would withhold every bundle in the cycle, far
+                # beyond what this refusal is entitled to do.
+                self.journal.append(
+                    "sweep-decision-answer-dropped",
+                    decision=decision.id,
+                    drop_cause="entry-not-open",
+                )
+                gates.notify(
+                    self.policy,
+                    self.run_dir,
+                    f"decision {decision.id}: recorded build decision discarded",
+                    "the ledger does not currently hold that entry open, so "
+                    "there is nothing to build against — it holds either no such "
+                    "entry at all or one that is no longer open",
+                )
+                self._quarantine(self.state.sweep_dropped_decisions, decision.id)
+                answer_dropped = True  # progress: see this method's docstring
+                continue
             # ONE spelling of the key for the whole loop body: the lookup, the
             # mismatch record and the note below must name the same string, and
             # `str(answer.get("key"))` stringified a missing key to the literal
@@ -4771,9 +4958,10 @@ class SweepEngine(Engine):
                 # alone.
                 # The ledger entry is untouched, so the next sweep re-triages and
                 # re-asks it through `_decisions_phase`.
-                # `drop_cause` is a closed four-value enum (`effect-unlanded` above,
-                # `no-intent` here, `name-collision` below, `stale-option` in the
-                # keep-open lane) so the drop lanes are discriminated by an enum
+                # `drop_cause` is a closed FIVE-value enum (`effect-unlanded` and
+                # `entry-not-open` above, `no-intent` here, `name-collision` below,
+                # `stale-option` in the keep-open lane) so the drop lanes are
+                # discriminated by an enum
                 # rather than by free text or by a second journal kind (`reason` is
                 # deliberately not a benign journal field).
                 self.journal.append(

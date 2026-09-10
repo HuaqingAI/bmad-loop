@@ -491,8 +491,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # `diagnostics._JOURNAL_DROP_FIELDS` already reduces to a presence flag.
         "discharged_owed_move",
         # `sweep-decision-answer-dropped`'s discriminator: WHICH drop lane fired, as
-        # a closed four-value enum (`effect-unlanded` | `no-intent` |
-        # `name-collision` | `stale-option`). `stale-option` is the keep-open lane's
+        # a closed five-value enum (`effect-unlanded` | `entry-not-open` |
+        # `no-intent` | `name-collision` | `stale-option`). `stale-option` is the
+        # keep-open lane's
         # (DW-123) and covers both of its failures — a renumbered option and a
         # vanished one — because only the first can also write a
         # `sweep-decision-option-mismatch`, so the cause cannot be named for the
@@ -502,6 +503,15 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # the discipline DW-186 gave the close lane, and it names the NON-WRITE
         # rather than the answer — the answer itself is intact and re-askable, which
         # is why the entry is left alone the way `no-intent`'s is.
+        # `entry-not-open` is DW-214's: the build lane read the ledger's LIVE open
+        # set before minting a bundle and the id is not in it. It names the ledger
+        # FACT — no entry at all, or an entry no longer open — rather than either
+        # cause of it, because the screen cannot tell the two apart and neither
+        # changes what the lane does. Distinct from `effect-unlanded` because that
+        # one names a non-write this run OBSERVED and is populated at the interactive
+        # prompt arm alone, where this one is a fresh read that also covers an answer
+        # adopted from the project store or reloaded on a resume; an id in both is
+        # reported as `effect-unlanded`, the older and more specific verdict.
         # Second producer: `sweep-decision-preanswer-pruned` (DW-143), which carries
         # the cause of the drop it belongs to — the same enum, though only the
         # keep-open lane prunes, so in practice only `stale-option` reaches it.
@@ -1275,6 +1285,22 @@ JOURNAL_KINDS = frozenset(
         # decode or errno detail in `error`. Absence arms nothing and writes no row,
         # keeping DW-176's discipline.
         "sweep-decision-ledger-refused",
+        # DW-214. `_materialize_bundles`' open-set screen could not read the ledger,
+        # so it screened NOTHING this cycle and every adopted `build` answer kept
+        # the disposition it already had. The row is what says a bundle that ran was
+        # never checked against the ledger's live open set — the alternative,
+        # collapsing a fault to an empty open set, would drop every build answer in
+        # the cycle at once. No new diagnostics routing: `ledger` is already benign,
+        # and `reason` and `error` are both already in
+        # `diagnostics._JOURNAL_DROP_FIELDS` — `reason` is one of the same four
+        # fixed tokens `sweep-preanswer-prune-refused` carries (`ledger-absent`,
+        # `ledger-unreadable`, `ledger-inaccessible`, and DW-217's `ledger-in-doubt`
+        # for a ledger that reads perfectly but this cycle already declared unfit to
+        # publish), never free text, with the decode or errno detail in `error` and
+        # no `error` at all on the two that observed no fault. Unlike the two
+        # `*-ledger-refused` kinds beside it this arms no ledger doubt: the refusal
+        # degrades ONE screen, not the cycle's dispatch gate.
+        "sweep-decision-open-set-refused",
         "sweep-decision-option-mismatch",
         # DW-143. The keep-open lane's `stale-option` drop retired the PROJECT-level
         # pre-answer that fed it, so the next run reads no stale answer to re-drop

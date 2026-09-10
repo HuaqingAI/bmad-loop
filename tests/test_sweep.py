@@ -12364,6 +12364,435 @@ def test_a_build_answer_whose_effect_raised_still_materializes_its_bundle(projec
     assert _records(engine, "sweep-decision-answer-dropped") == []
 
 
+def _adopted_build_plan(*dw_ids: str) -> TriagePlan:
+    """A cached triage plan raising each id as a BUILD decision — the shape
+    `_ensure_triage`'s cache branch revalidates with `expected_open_ids=None`, so
+    it keeps raising an id whatever the ledger says about it NOW."""
+    ids = dw_ids or ("DW-9",)
+    return TriagePlan(
+        open_ids=frozenset(ids),
+        decisions=tuple(
+            Decision(
+                id=dw_id,
+                question="q",
+                context="",
+                options=(DecisionOption(key="1", label="Widen", effect="build", intent="widen x"),),
+                recommendation="1",
+            )
+            for dw_id in ids
+        ),
+    )
+
+
+def _adopted_build_answers(*dw_ids: str) -> dict[str, dict[str, str]]:
+    """The stored `build` answers such a plan ADOPTS — a project pre-answer, or a
+    run-local answer reloaded on a resume. Nothing in this run watched them being
+    recorded, so `effect_unlanded` is empty for them by construction: DW-200's
+    verdict is written at the interactive `if not recorded:` arm and nowhere else.
+    That is exactly the hole DW-214's screen covers."""
+    ids = dw_ids or ("DW-9",)
+    return {
+        dw_id: {"key": "1", "label": "Widen", "effect": "build", "intent": "widen x"}
+        for dw_id in ids
+    }
+
+
+@pytest.mark.parametrize("ledger_shape", ["removed", "closed", "archived", "empty"])
+def test_an_adopted_build_answer_for_a_retired_id_builds_no_bundle(project, ledger_shape):
+    """DW-214. The build lane routed a stored `build` answer on the answer alone,
+    and its one ledger-fact refusal (`effect_unlanded`, DW-200) is populated at a
+    single site — the interactive arm that watched `record_decision` report writing
+    no `decision:` line. So it says nothing about an answer adopted from the project
+    store or reloaded on a resume, and `_ensure_triage`'s cache branch revalidates
+    with `expected_open_ids=None`: a resumed cycle could raise a decision for an id
+    the ledger no longer holds open, adopt the stored answer, and spend a whole dev
+    session briefed off a `_write_intent` read that finds no entry.
+
+    The fix is a screen rather than a second verdict: read the ledger's LIVE open
+    set before a stored answer mints a bundle, and drop an id it does not hold.
+    A drop rather than a re-ask for the reason the lane above drops — there is no
+    `decision:` line here to double-apply and the entry (if a rival writer merely
+    retired it) is left exactly as found — and the quarantine is what frees the id
+    for a later cycle's fresh triage.
+
+    Six claims: no bundle carries DW-9; the drop is reported as repeat progress
+    (DW-135); one `sweep-decision-answer-dropped` naming the FIFTH `drop_cause`; the
+    operator is notified on the surface they read; the read SUCCEEDED, so no refusal
+    row rides along; and the id is quarantined ON DISK, which is what makes the drop
+    survive a resume.
+
+    Ablation: delete the screen (the `if open_screen is not None and ...` arm) and
+    this reds with a `decision-dw-9` bundle, no drop row and `dropped` False.
+    Ablation: replace `_live_open_ids`'s `text is None` with `not text`; the
+    empty-present case then admits the retired answer and fails."""
+    statuses = {"DW-1": "open"}
+    if ledger_shape in {"closed", "archived"}:
+        statuses["DW-9"] = "done"
+    write_ledger(project, statuses)
+    if ledger_shape == "archived":
+        project.deferred_work.write_text(
+            "# Deferred Work\n\n### DW-9: item DW-9\n\n"
+            "status: done\narchived: deferred-work-archive.md\n",
+            encoding="utf-8",
+        )
+    elif ledger_shape == "empty":
+        project.deferred_work.write_bytes(b"")
+    ledger_before = project.deferred_work.read_bytes()
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    bundles, dropped = engine._materialize_bundles(
+        _adopted_build_plan(), _adopted_build_answers(), effect_unlanded=frozenset()
+    )
+
+    assert bundles == []  # the entry does not exist to build against
+    assert dropped  # progress: the id is released for a later cycle to re-triage
+    [drop] = _records(engine, "sweep-decision-answer-dropped")
+    assert drop["decision"] == "DW-9" and drop["drop_cause"] == "entry-not-open"
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("recorded build decision discarded") == 1
+    # ...and on THIS lane's body: the headline is shared verbatim by the
+    # `effect-unlanded` and `no-intent` lanes, so it alone would pass for a drop a
+    # different lane made.
+    assert "does not currently hold that entry open" in attention
+    assert _records(engine, "sweep-decision-open-set-refused") == []  # the read worked
+    assert engine.state.sweep_dropped_decisions == ["DW-9"]
+    assert load_state(engine.run_dir).sweep_dropped_decisions == ["DW-9"]
+    assert project.deferred_work.read_bytes() == ledger_before
+
+
+def test_an_entry_not_open_drop_is_neither_re_announced_nor_revived_on_resume(project):
+    """DW-214's durable half. The screen is a fresh READ, so on its own it would
+    re-fire on every replayed cycle: the ledger still does not hold DW-9 open, the
+    stored answer still says `build`, and the operator would be told the same news
+    again while the id sat in no list. `sweep_dropped_decisions` is what carries the
+    disposition across the resume, the same way it does for the four older lanes
+    (DW-124), and the quarantine check sits AHEAD of this lane — deliberately, so an
+    already-announced drop costs neither a second announcement nor a ledger read.
+
+    The resumed call passes an EMPTY `effect_unlanded`, which is the real shape of a
+    resume and also the shape this entry is about: no verdict was ever recorded for
+    an adopted answer, so the quarantine is the only thing standing between the
+    replay and a second announcement.
+
+    Three claims: still no bundle; no second drop row; no second ATTENTION line —
+    and the drop is not re-reported as progress, so a repeating run whose only event
+    was an already-announced drop still stops rather than spinning.
+
+    Ablation, RUN: drop `sweep_dropped_decisions` from `RunState.to_dict` and this
+    reds — the resumed run reads an empty quarantine, re-screens DW-9, and writes a
+    second drop row and a second ATTENTION line."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    engine._materialize_bundles(
+        _adopted_build_plan(), _adopted_build_answers(), effect_unlanded=frozenset()
+    )
+    assert engine.state.sweep_dropped_decisions == ["DW-9"]  # PRECONDITION
+
+    resumed, _ = resume_sweep(project, engine, [])
+    assert resumed.state.sweep_dropped_decisions == ["DW-9"]  # ...read back off disk
+    bundles, dropped_again = resumed._materialize_bundles(
+        _adopted_build_plan(), _adopted_build_answers(), effect_unlanded=frozenset()
+    )
+
+    assert bundles == []
+    assert not dropped_again  # already announced; not progress a second time
+    assert len(_records(resumed, "sweep-decision-answer-dropped")) == 1
+    attention = (resumed.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("recorded build decision discarded") == 1
+
+
+def test_an_adopted_build_answer_for_a_still_open_id_materializes_its_bundle(project):
+    """DW-214's control, and the whole bound on the screen: an id the ledger still
+    lists `open` is untouched. Without this row every assertion above passes for a
+    lane that dropped EVERY adopted build answer, which is the exact failure the
+    `read_for_write` choice exists to prevent.
+
+    Four claims: the bundle materializes under the same fallback name and the
+    stored answer's own intent; no drop row; no refusal row; and no drop is
+    reported as progress.
+
+    Ablation: invert the screen's membership test (`decision.id in open_screen`)
+    and this reds with no bundle and an `entry-not-open` drop row."""
+    write_ledger(project, {"DW-1": "open", "DW-9": "open"})
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    bundles, dropped = engine._materialize_bundles(
+        _adopted_build_plan(), _adopted_build_answers(), effect_unlanded=frozenset()
+    )
+
+    assert [b.name for b in bundles] == ["decision-dw-9"]
+    assert [b.intent for b in bundles] == ["widen x"]
+    assert not dropped
+    # No drop row and no refusal row, asserted as "no journal file at all": on the
+    # clean path this call writes nothing, so the strongest available spelling is
+    # also the simplest one, and `_records` cannot read a file that was never made.
+    assert not (engine.run_dir / "journal.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    "fault,reason",
+    [
+        ("absent", "ledger-absent"),
+        ("undecodable", "ledger-unreadable"),
+        ("inaccessible", "ledger-inaccessible"),
+    ],
+)
+def test_an_unreadable_ledger_screens_nothing_and_refuses_once(project, monkeypatch, fault, reason):
+    """DW-214's degrade, over all three fault classes of the REPAIR/WRITE read.
+
+    The screen AUTHORIZES spending a dev session, so a fault is unknown open work
+    and never zero of it. Routing this read through `read_for_observation` instead
+    would answer `("", fault)` on two of these three rows, and `open_ids("")` is
+    empty — which under this screen reads as "no id is open" and drops every
+    adopted build answer in the cycle at once, on a ledger nobody could read. So a
+    refused read turns the screen OFF: nothing is screened, every answer keeps the
+    disposition it had, and the refusal is a journal row rather than a raise or a
+    ledger-doubt latch (doubt would withhold every bundle in the cycle, far beyond
+    what this refusal is entitled to do).
+
+    TWO candidates deliberately, neither of them open in the seeded ledger, which
+    folds the one-read bound into the same row: the read is taken once and CACHED
+    with its fault, so one bad ledger writes exactly one refusal row rather than one
+    per id an operator would then have to de-duplicate.
+
+    Four claims per fault: both bundles materialize; no drop row; exactly ONE
+    refusal row, naming the ledger and the fixed token for this fault class; and the
+    fault detail rides in `error` on the two raising classes while absence carries
+    none — there is no fault text there, only the fact.
+
+    Ablation: replace the `open_screen_read` latch with `open_screen is None` and
+    the parametrization reds on the row count (two refusals, one per candidate).
+    Deleting the `is not None` gate reds on the bundles instead, with two
+    `entry-not-open` drops off a ledger nobody read."""
+    write_ledger(project, {"DW-1": "open"})  # neither DW-8 nor DW-9 is open in it
+    if fault == "absent":
+        project.deferred_work.unlink()
+    elif fault == "undecodable":
+        project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
+    else:
+        fault_read_text(monkeypatch, project.deferred_work)
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    bundles, dropped = engine._materialize_bundles(
+        _adopted_build_plan("DW-8", "DW-9"),
+        _adopted_build_answers("DW-8", "DW-9"),
+        effect_unlanded=frozenset(),
+    )
+
+    assert [b.name for b in bundles] == ["decision-dw-8", "decision-dw-9"]
+    assert not dropped
+    assert _records(engine, "sweep-decision-answer-dropped") == []
+    [refused] = _records(engine, "sweep-decision-open-set-refused")  # ONE read, ONE row
+    assert refused["ledger"] == str(project.deferred_work)
+    assert refused["reason"] == reason
+    if fault == "absent":
+        assert "error" not in refused  # the fact, not a fault
+    elif fault == "undecodable":
+        assert "not valid UTF-8" in refused["error"]
+    else:
+        assert refused["error"] == "PermissionError: [Errno 13] Permission denied"
+
+
+def test_a_ledger_this_cycle_declared_unfit_to_publish_screens_nothing(project):
+    """DW-214's FOURTH refusal, and the only one taken with the ledger perfectly
+    readable — the DW-217 discipline `_prune_pre_answers` already has.
+
+    The three read arms cover the classes a read can OBSERVE. They cannot see the
+    decodable one: a `record_decision` or `mark_done_many` that flipped a `status:`
+    and then failed before writing its line leaves bytes that decode fine, so the
+    screen would take that half-landed write at face value and read the id as
+    not-open. `_close_resolved` runs ahead of `_materialize_bundles` in `_cycle`, so
+    the latch is armed by the time the screen runs.
+
+    The consequence here is strictly worse than the prune's, which is why the
+    refusal is required rather than tidy: the screen would discard a human's
+    recorded `build` answer, notify, and quarantine the id in PERSISTED run state
+    for the rest of the run — so a resume taken after the operator repairs the
+    ledger still skips it.
+
+    The latch is armed directly; `_close_resolved`'s own arming is graded by the
+    close-phase rows that own it. Three claims: the bundle still materializes; no
+    drop row; and one refusal row carrying the fourth token and no `error` — nothing
+    faulted, so there is no fault text to carry.
+
+    Ablation: delete the `_ledger_unfit_to_publish()` arm and this reds with no
+    bundle and an `entry-not-open` drop row off bytes the cycle already refused to
+    publish."""
+    write_ledger(project, {"DW-1": "open"})  # the half-landed write retired DW-9
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    engine._close_ledger_in_doubt = True  # what `_close_resolved` sets on that class
+    assert engine._ledger_unfit_to_publish()  # PRECONDITION
+
+    bundles, dropped = engine._materialize_bundles(
+        _adopted_build_plan(), _adopted_build_answers(), effect_unlanded=frozenset()
+    )
+
+    assert [b.name for b in bundles] == ["decision-dw-9"]  # the answer keeps its disposition
+    assert not dropped
+    assert _records(engine, "sweep-decision-answer-dropped") == []
+    [refused] = _records(engine, "sweep-decision-open-set-refused")
+    assert refused["ledger"] == str(project.deferred_work)
+    assert refused["reason"] == "ledger-in-doubt"
+    assert "error" not in refused  # the read SUCCEEDED; nothing faulted
+
+
+def test_the_open_set_screen_reads_the_ledger_lazily_and_at_most_once(project, monkeypatch):
+    """DW-214's cost bound, which is what makes the screen safe to put in the
+    materialization path at all. `_materialize_bundles` runs on every cycle of every
+    sweep, and the commonest shape by far — an unattended run whose decisions were
+    all skipped for a human — has no adopted `build` answer at all. A read taken at
+    the top of the method would charge every such cycle for an answer nobody asked
+    for; a read taken per candidate would charge a two-candidate cycle twice and
+    could see two DIFFERENT ledgers, since a rival writer is free to move between
+    them.
+
+    So the read is lazy AND cached: the first candidate to reach the screen pays for
+    it, and every later candidate in the same call is screened against that same
+    snapshot. Note the cache is per CALL, not per engine — a later cycle re-reads,
+    which is the point: the ledger moves between cycles.
+
+    Four scenarios, one engine: an answer the shape guard skips takes no read;
+    a candidate claimed by `effect_unlanded` takes no read; two eligible candidates
+    share one snapshot; and a later eligible call reads the changed ledger again.
+
+    Ablation: hoist the read above the decision loop and scenarios one and two red
+    with one read each. Drop the `open_screen_read` latch (re-reading whenever the
+    cache is `None`) and scenario three still passes — the read SUCCEEDS here, so
+    the cache is not `None` — which is why the fault parametrization above carries
+    the latch's own ablation."""
+    write_ledger(project, {"DW-9": "open", "DW-10": "open"})
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    reads: list[Path] = []
+    real_read = deferredwork.read_for_write
+
+    def counted(path: Path):
+        reads.append(path)
+        return real_read(path)
+
+    monkeypatch.setattr(deferredwork, "read_for_write", counted)
+
+    # (1) not a `build` answer: the shape guard skips it before the screen exists.
+    engine._materialize_bundles(
+        _adopted_build_plan("DW-7"),
+        {"DW-7": {"key": "1", "label": "Widen", "effect": "keep-open"}},
+        effect_unlanded=frozenset(),
+    )
+    assert reads == []
+
+    # (2) claimed by the lane ABOVE, whose `continue` is what the screen sits after.
+    engine._materialize_bundles(
+        _adopted_build_plan("DW-8"),
+        _adopted_build_answers("DW-8"),
+        effect_unlanded=frozenset({"DW-8"}),
+    )
+    assert reads == []
+
+    # (3) two candidates reach the screen and share ONE snapshot of the ledger.
+    bundles, _dropped = engine._materialize_bundles(
+        _adopted_build_plan("DW-9", "DW-10"),
+        _adopted_build_answers("DW-9", "DW-10"),
+        effect_unlanded=frozenset(),
+    )
+
+    assert reads == [project.deferred_work]
+    assert [b.name for b in bundles] == ["decision-dw-9", "decision-dw-10"]
+
+    # (4) A second eligible call must refresh the snapshot after a ledger change.
+    write_ledger(project, {"DW-10": "open"}, commit=False)
+    bundles, dropped = engine._materialize_bundles(
+        _adopted_build_plan("DW-9", "DW-10"),
+        _adopted_build_answers("DW-9", "DW-10"),
+        effect_unlanded=frozenset(),
+    )
+    assert reads == [project.deferred_work, project.deferred_work]
+    assert [b.name for b in bundles] == ["decision-dw-10"]
+    assert dropped
+
+
+@pytest.mark.parametrize("answer_store", ["project", "run-local"])
+def test_a_cycle_spends_no_session_on_a_build_the_ledger_no_longer_holds_open(
+    project, answer_store
+):
+    """DW-214 through `_cycle`, the only `src/` caller of the methods the rows above
+    drive directly. None of them executes `_ensure_triage`'s CACHE branch, and that
+    branch is the entire reachability argument for this entry: it revalidates with
+    `expected_open_ids=None`, so a re-entered cycle keeps raising a decision for an
+    id the ledger has since retired. Nor can a direct call grade the claim the lane
+    exists for — not "the list is empty" but "no dev session was dispatched".
+
+    The mock adapter drives a triage session that raises DW-9 as a build decision
+    and caches `<run>/triage.json`; a rival writer then retires the entry. One case
+    adopts a project answer through `record_pre_answer`; the other resumes a fresh
+    engine with a build answer persisted in `<run>/decisions.json`. Both re-enter
+    the cached cycle with an empty quarantine and no interactive verdict.
+
+    The cycle reports progress without dispatching a dev session or minting a
+    bundle task, and announces the drop once with the fifth cause. It preserves
+    ledger bytes and the run-local answer, while the final prune removes only
+    the retired project answer.
+
+    Ablation, RUN: delete the screen (the `if open_screen is not None and ...` arm)
+    and this reds — a `dw-decision-dw-9` task and a second adapter session, off a
+    `_write_intent` read that finds no entry. Ablation: remove `_cycle`'s final
+    `_prune_pre_answers` call and the project-store case retains DW-9 and fails."""
+    from bmad_loop import decisions
+
+    write_ledger(project, {"DW-1": "open", "DW-9": "open"})
+    triage = triage_result(
+        ["DW-1", "DW-9"],
+        skip=[{"id": "DW-1", "reason": "moot"}],  # accounted for, so the plan validates
+        decisions=[
+            _decision(
+                "DW-9",
+                [
+                    {"key": "1", "label": "Widen", "effect": "build", "intent": "widen x"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, adapter = make_sweep(project, [triage_effect(triage)], prompting=False)
+    engine._ensure_triage({"DW-1", "DW-9"}, 1)  # the real session, cached to triage.json
+    assert (engine.run_dir / "triage.json").is_file()  # PRECONDITION: the cache branch
+    write_ledger(project, {"DW-1": "open"}, commit=False)  # the rival writer
+    ledger_before = project.deferred_work.read_bytes()
+    run_store = engine.run_dir / "decisions.json"
+    if answer_store == "project":
+        for dw_id in ("DW-1", "DW-9"):
+            decisions.record_pre_answer(
+                project.project,
+                dw_id,
+                DecisionOption(key="1", label="Widen", effect="build", intent="widen x"),
+                date="2026-06-12",
+            )
+    else:
+        stored = _adopted_build_answers()
+        stored["DW-9"]["bundle_name"] = ""
+        run_store.write_text(json.dumps(stored), encoding="utf-8")
+        engine._save()
+        engine, adapter = resume_sweep(project, engine, [])
+        assert engine.state.sweep_dropped_decisions == []
+
+    assert engine._cycle(1, {"DW-1"}) is True  # the drop is addressable work
+
+    # The resumed adapter has no triage session; neither path dispatches dev.
+    assert len(adapter.sessions) == (1 if answer_store == "project" else 0)
+    assert project.deferred_work.read_bytes() == ledger_before
+    assert json.loads(run_store.read_text(encoding="utf-8"))["DW-9"]["effect"] == "build"
+    if answer_store == "project":
+        remaining = json.loads(decisions.store_path(project.project).read_text(encoding="utf-8"))
+        assert set(remaining) == {"DW-1"}  # prune only the retired project answer
+    assert [k for k in engine.state.tasks if k.startswith("dw")] == []
+    [drop] = _records(engine, "sweep-decision-answer-dropped")
+    assert drop["decision"] == "DW-9" and drop["drop_cause"] == "entry-not-open"
+
+
 def test_close_resolved_degrades_on_lock_and_state_root_failures(project, monkeypatch):
     """DW-166. The other two arms of `_close_resolved`'s catch tuple, which the
     undecodable-ledger row above cannot reach.
