@@ -7,6 +7,7 @@ import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from conftest import (
@@ -168,13 +169,73 @@ def resume_sweep(project, engine, script, answers=(), prompting=False, **kwargs)
         policy=engine.policy,
         adapter=adapter,
         run_dir=engine.run_dir,
-        journal=engine.journal,
+        # A real resume REOPENS the journal: `cli.cmd_resume` builds a fresh
+        # `Journal(run_dir)` and hands it to `runsetup.compose_resume`, and this
+        # harness must build the same shape (DW-215). Not for the reason that entry
+        # gives — `Journal` keeps no in-memory record list: both objects persist and
+        # reread records from disk. Their log metadata can differ because the shared
+        # object carries `_log_task`/`_log_path`: see the row below.
+        journal=Journal(engine.run_dir),
         state=state,
         prompting=prompting,
         prompter=prompter,
         **kwargs,
     )
     return new_engine, adapter
+
+
+def test_the_resumed_engine_reopens_the_journal_off_disk(project):
+    """The harness's own fidelity: `resume_sweep` builds the journal a REAL resume
+    builds rather than handing the pre-pause engine's object back (DW-215).
+
+    `cli.cmd_resume` constructs `Journal(run_dir)` and passes it to
+    `runsetup.compose_resume`, and a fresh `Journal` starts with
+    `_log_task = None`. Sharing one object carried the PRE-PAUSE session's
+    `set_active_log` binding across the resume boundary, and `Journal.append` stamps
+    `log_task`/`log_pos` onto every entry while that binding is set — so every row a
+    resumed engine writes BEFORE starting its own session (a replay pre-pass, a
+    resume-carry, a cycle row) was stamped with a log from the run before the pause.
+    A real resume writes those rows bare. That divergence is the whole defect the
+    reopen closes.
+
+    DW-215's ledger entry states the mechanism wrongly — "one shared in-memory
+    collector" — and the correction belongs here so the false reading cannot come
+    back. `Journal` holds NO in-memory record list: `append` opens
+    `run_dir/journal.jsonl` and writes one line, `entries()` re-reads that file, and
+    the `journal_text`/`_records` helpers below read it directly. Both shared and
+    reopened objects persist and reread records from disk, although their log metadata
+    can differ. Every "announced exactly once" claim in the resume rows was ALREADY
+    round-tripping through disk. Those claims were never at risk;
+    `_log_task`/`_log_path` are the only mutable state a shared object could leak.
+
+    Graded on the CONSEQUENCE, never on object identity: `resumed.journal is not
+    engine.journal` would be tautological, and it would red for a refactor that
+    changed nothing observable.
+
+    Ablation, performed: revert this helper to `journal=engine.journal` and the FINAL
+    assertion reds — the appended row carries the pre-pause `log_task` and `log_pos`.
+    That one only. The two `first[...]` lines above it are the PREMISE and stay green
+    under both spellings, because they describe the pre-pause row, which is stamped
+    either way; and pytest stops at the first failing statement regardless. The
+    reopen half stays green under the revert too, which is exactly the point above:
+    it is file-backed either way."""
+    engine, _ = make_sweep(project, [])
+    engine.journal.set_active_log("dw-fix")  # stands in for the pre-pause session
+    engine.journal.append("sweep-cycle", cycle=1)
+    save_state(engine.run_dir, engine.state)
+
+    resumed, _ = resume_sweep(project, engine, [])
+
+    # reopened, not re-created: the rows already on disk are still what it reads
+    assert [e["kind"] for e in resumed.journal.entries()] == ["sweep-cycle"]
+    resumed.journal.append("sweep-cycle", cycle=2)
+    first, second = _records(resumed, "sweep-cycle")
+    assert (first["cycle"], second["cycle"]) == (1, 2)  # appended AFTER, same file
+    assert first["log_task"] == "dw-fix"  # premise: the pre-pause row WAS stamped...
+    # ...with BOTH fields, so the conclusion below pins both. `0` is deliberate: it is
+    # `append`'s `except OSError: size = 0` arm, since no pane log exists on disk here.
+    assert first["log_pos"] == 0
+    assert "log_task" not in second and "log_pos" not in second
 
 
 def journal_text(engine) -> str:
@@ -12024,7 +12085,27 @@ def test_the_ledger_commit_rows_name_the_file_they_are_about(project):
     assert "not a git repository" in failed["error"]
 
 
-def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, monkeypatch):
+def _resolve_degrade_target(project, family: Literal["ledger", "store"]) -> tuple[Path, str]:
+    """The file a `family` publisher hands `_commit_ledger`, seeded on disk, and the
+    LEXICAL tail the degrade row must name for it.
+
+    Both tails are code constants at every real caller — `deferred-work.md` from
+    `ProjectPaths.deferred_work`, `decisions.json` from `decisions.STORE_REL` — which
+    is what lets `file` be a benign (undropped) journal field at all. The store is
+    seeded as a REGULAR file so the "the write survives the degrade" claim has bytes
+    to compare; its own validator never runs here, because the resolve fails first."""
+    if family == "ledger":
+        return project.deferred_work, "deferred-work.md"
+    from bmad_loop import decisions as decisions_store
+
+    store = decisions_store.store_path(project.project)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text('{"DW-1": {"key": "1", "effect": "close"}}\n', encoding="utf-8")
+    return store, "decisions.json"
+
+
+@pytest.mark.parametrize("family", ["ledger", "store"])
+def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, monkeypatch, family):
     """DW-192's OTHER degrade arm: the one where `path.resolve()` raises, not git.
 
     `_commit_ledger` catches `OSError`/`RuntimeError` off the resolve — a broken
@@ -12049,39 +12130,65 @@ def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, m
     both class rows assert the identical set. Splitting them would let a regression that
     commits, or moves HEAD, on the `OSError` leg specifically land green.
 
-    Ablations, both performed:
+    Parametrized over both FAMILIES because this arm is family-agnostic BY
+    CONSTRUCTION, so the store leg is regression coverage of the second call SHAPE —
+    the `path=<store>, family="store"` argument pair — and not of a second behavior
+    (DW-212). `root`, `name`, `sha` and `refusal` all bind ahead of the `try`, and
+    nothing between the `try` and this handler consults `family` when the RESOLVE is
+    what failed. Both grading rows previously passed `family="ledger"` only, so on
+    Python 3.13+ no row drove a store path into this arm at all. Below 3.13 one does:
+    `test_a_dangling_store_link_is_an_absence_because_the_probes_see_the_resolved_path`
+    reaches it with `family="store"` through a REAL symlink loop. The two are not
+    duplicates — that row owns the version split as the publisher sees it, this one is
+    version-independent — so do not delete either in favor of the other.
+
+    What the store leg does NOT grade is where the store PATH comes from. This row
+    calls `_commit_ledger` directly and derives the store as
+    `store_path(project.project)`, whereas both real prune sites derive it as
+    `decisions_store.store_path(_project_of_run_dir(self.run_dir))` (`sweep.py:1946`
+    and `:2009`) and are never entered here. Their derivation stays ungraded by this
+    row: a DW-160-style regression that re-anchors it — back to `workspace.root`, say
+    — would still red nothing here.
+
+    Ablations, all performed:
       * move `name = path.name` inside the `try` beside `target` and this reds with
         a `NameError` escaping a method the docstring calls strictly best effort —
         which makes the BINDING POSITION, not merely the field, the graded thing;
       * delete `OSError` ALONE from `_commit_ledger`'s `except` tuple and this reds
-        with the refusal escaping `_commit_ledger`."""
+        with the refusal escaping `_commit_ledger` on BOTH legs;
+      * hardcode `file="deferred-work.md"` in the unavailable journal row and only
+        the STORE legs fail, on the expected `decisions.json` filename. The handler
+        need not branch on `family` for a ledger-specific regression to be detectable."""
+    # shared frame for both legs: on the store leg this ledger is deliberately
+    # ignored — never published, never resolved, never asserted on
     write_ledger(project, {"DW-1": "open"}, commit=False)
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
-    ledger = project.deferred_work
-    before = ledger.read_text(encoding="utf-8")
+    published, tail = _resolve_degrade_target(project, family)
+    before = published.read_text(encoding="utf-8")
     head = git(project.project, "rev-parse", "HEAD")
     # scoped to the published file: everything else in the frame still resolves
-    refuse_to_resolve(monkeypatch, ledger)
+    refuse_to_resolve(monkeypatch, published)
 
     engine._commit_ledger(
-        "chore(sweep): unresolvable", path=ledger, family="ledger"
+        "chore(sweep): unresolvable", path=published, family=family
     )  # must not raise
 
     [failed] = _records(engine, "sweep-ledger-commit-unavailable")
     assert failed["message"] == "chore(sweep): unresolvable"
-    assert failed["file"] == "deferred-work.md"  # bound before the try, so still here
+    assert failed["file"] == tail  # bound before the try, so still here
     # the LEXICAL parent: the resolve that would have replaced it is what failed
-    assert failed["repo"] == str(ledger.parent)
+    assert failed["repo"] == str(published.parent)
     assert UNRESOLVABLE in failed["error"]
-    assert ledger.read_text(encoding="utf-8") == before  # the write survives the degrade
+    assert published.read_text(encoding="utf-8") == before  # the write survives the degrade
     assert git(project.project, "rev-parse", "HEAD") == head  # and nothing was committed
     assert _records(engine, "sweep-ledger-commit") == []  # nothing published...
     assert _records(engine, "sweep-ledger-commit-refused") == []  # ...not a target refusal...
     assert _records(engine, "sweep-ledger-commit-clean") == []  # ...and not a clean skip either
 
 
-def test_the_degrade_row_survives_a_runtime_error_from_the_resolve(project, monkeypatch):
+@pytest.mark.parametrize("family", ["ledger", "store"])
+def test_the_degrade_row_survives_a_runtime_error_from_the_resolve(project, monkeypatch, family):
     """The `RuntimeError` CLASS of the same `except` tuple, driven on its own (DW-195).
 
     A per-CLASS ablation is the only honest one for a multi-class handler: deleting the
@@ -12107,30 +12214,47 @@ def test_the_degrade_row_survives_a_runtime_error_from_the_resolve(project, monk
     immediately after this `except` in `sweep.py`, so their absence is what separates
     "the resolve degraded" from "the target was refused before git ever ran".
 
-    Ablation: delete `RuntimeError` ALONE from `_commit_ledger`'s `except` tuple and
-    this reds with the `RuntimeError` escaping `_commit_ledger`."""
+    Parametrized over both FAMILIES for the reason the sibling row states at length
+    (DW-212): the arm is family-agnostic by construction — `root` and `name` bind
+    ahead of the `try` and no code between the `try` and this handler reads `family`
+    when the resolve is what failed — so the store leg is regression coverage of the
+    second call SHAPE, the `path=<store>, family="store"` argument pair, not of a
+    second behavior. The SHAPE only: the two real prune sites derive their store as
+    `store_path(_project_of_run_dir(self.run_dir))` (`sweep.py:1946`, `:2009`) and are
+    never entered here, so their own path derivation stays ungraded by this row. On
+    3.13+ no other row drives `family="store"` into this arm; the dangling-store row
+    named above does so below 3.13 only, and the two are complements, not duplicates.
+
+    Ablations, both performed:
+      * delete `RuntimeError` ALONE from `_commit_ledger`'s `except` tuple and this
+        reds with the `RuntimeError` escaping `_commit_ledger`, on both legs;
+      * hardcode `file="deferred-work.md"` in the unavailable journal row and only
+        the STORE legs fail, on the expected `decisions.json` filename, even though
+        the handler does not branch on `family`."""
+    # shared frame for both legs: on the store leg this ledger is deliberately
+    # ignored — never published, never resolved, never asserted on
     write_ledger(project, {"DW-1": "open"}, commit=False)
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
-    ledger = project.deferred_work
-    before = ledger.read_text(encoding="utf-8")
+    published, tail = _resolve_degrade_target(project, family)
+    before = published.read_text(encoding="utf-8")
     head = git(project.project, "rev-parse", "HEAD")
     # CPython's own wording, so the injected fault is a faithful stand-in for the real
     # one: pre-3.13 `pathlib` raises `RuntimeError("Symlink loop from %r" % e.filename)`.
-    loop_error = f"Symlink loop from {str(ledger)!r}"
-    refuse_to_resolve(monkeypatch, ledger, error=RuntimeError(loop_error))
+    loop_error = f"Symlink loop from {str(published)!r}"
+    refuse_to_resolve(monkeypatch, published, error=RuntimeError(loop_error))
 
     engine._commit_ledger(
-        "chore(sweep): loop ledger", path=ledger, family="ledger"
+        "chore(sweep): loop target", path=published, family=family
     )  # must not raise
 
     [failed] = _records(engine, "sweep-ledger-commit-unavailable")
-    assert failed["message"] == "chore(sweep): loop ledger"
-    assert failed["file"] == "deferred-work.md"  # bound before the try, so still here
+    assert failed["message"] == "chore(sweep): loop target"
+    assert failed["file"] == tail  # bound before the try, so still here
     # the LEXICAL parent: the resolve that would have replaced it is what failed
-    assert failed["repo"] == str(ledger.parent)
+    assert failed["repo"] == str(published.parent)
     assert loop_error in failed["error"]
-    assert ledger.read_text(encoding="utf-8") == before  # the write survives the degrade
+    assert published.read_text(encoding="utf-8") == before  # the write survives the degrade
     assert git(project.project, "rev-parse", "HEAD") == head  # and nothing was committed
     assert _records(engine, "sweep-ledger-commit") == []  # nothing published...
     assert _records(engine, "sweep-ledger-commit-refused") == []  # ...not a target refusal...
