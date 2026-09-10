@@ -636,9 +636,12 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "refiled",
         "refs",
         # `sweep-ledger-commit-refused` (DW-199/203/205): WHY `_commit_ledger`
-        # declined to publish its target, as a closed THREE-value enum
-        # (`target-absent` | `target-unreadable` | `target-not-a-file`, the last
-        # added by DW-211/228 for a store replaced by a directory), all literals in
+        # declined to publish its target, as a closed FOUR-value enum
+        # (`target-absent` | `target-unreadable` | `target-not-a-file` |
+        # `target-undecodable` — the third added by DW-211/228 for a store replaced
+        # by a directory, the fourth split out of `target-unreadable` by the DW-237
+        # resolution so a ledger's DURABLE decode fault is told apart from a
+        # TRANSIENT OS fault a probe raised), all literals in
         # `verify.unpublishable_target` — lifted out of `sweep.py` by DW-209/213, which
         # gave `decisions.apply_pre_answer`'s out-of-band commit the same guard; that
         # caller has no journal and carries its refusal on its return value instead.
@@ -1059,9 +1062,12 @@ JOURNAL_KINDS = frozenset(
         # between the append and the commit would be staged recursively under a
         # `chore(deferred-work):` message. Family `"ledger"`, declared at the site.
         # It never raises, where this method's `GitError` can — a refusal answers
-        # "not a publishable file", which a replay re-reads and refuses identically,
-        # so there is nothing left to retry. `story_key`, `dw_ids`, `refuse_cause`
-        # and the optional `error` are all already routed or declared.
+        # "not a publishable file", which for the three DURABLE causes a replay
+        # re-reads and refuses identically, so there is nothing left to retry; the
+        # one TRANSIENT cause (`target-unreadable`) is not refused at this site but
+        # handed back to `commit_paths`, so the durable commit latch survives.
+        # `story_key`, `dw_ids`, `refuse_cause` and the optional `error` are all
+        # already routed or declared.
         "harvest-carry-refused",
         "harvest-carry-uncommitted",
         "isolation-flip-orphaned-worktree",
@@ -1376,9 +1382,9 @@ JOURNAL_KINDS = frozenset(
         # after the phase wrote it was published as a DELETION under a
         # `chore(sweep):` message, and a resume whose ledger held undecodable bytes
         # published them and only then raised on them. `refuse_cause` is the new
-        # benign field naming which of THREE fixed tokens fired (`target-absent` |
-        # `target-unreadable` | `target-not-a-file`, all minted in
-        # `verify.unpublishable_target`, which
+        # benign field naming which of FOUR fixed tokens fired (`target-absent` |
+        # `target-unreadable` | `target-not-a-file` | `target-undecodable`, all
+        # minted in `verify.unpublishable_target`, which
         # DW-209/213 lifted out of `sweep.py` so the out-of-band `bmad-loop decisions`
         # publisher shares one guard with these nine); `file` is the same
         # already-benign lexical basename

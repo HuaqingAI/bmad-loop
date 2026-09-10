@@ -609,9 +609,13 @@ def _harvest_row(
     )
 
 
-def _publication_refusal(
-    path: Path, family: Literal["ledger", "store"]
-) -> tuple[Literal["target-absent", "target-unreadable", "target-not-a-file"], str | None] | None:
+def _publication_refusal(path: Path, family: Literal["ledger", "store"]) -> (
+    tuple[
+        Literal["target-absent", "target-unreadable", "target-not-a-file", "target-undecodable"],
+        str | None,
+    ]
+    | None
+):
     """Why the carries below must not publish `path`, or `None` when they may.
 
     The resolve-then-guard half of `decisions.apply_pre_answer`'s GATE TWO, lifted
@@ -628,18 +632,21 @@ def _publication_refusal(
     helper takes it as an argument rather than testing `path == paths.deferred_work`
     and choosing one.
 
-    The three causes it can return are NOT interchangeable to a caller holding a
-    durable retry latch, and `_carry_harvested_deferrals` acts on the difference:
-    `target-absent` and `target-not-a-file` are DURABLE on-disk shapes a replay
-    re-reads and refuses identically, while `target-unreadable` is whatever a probe
-    RAISED — a transient host answer (an EACCES parent, or the WinError 64 a
-    registered-but-not-serving UNC provider gives) that the next pass may well not
-    see. Both of this helper's own faults land on that one cause, the resolve's and
-    the family leg's, which is why the distinction is drawn on the cause rather than
-    on which call produced it.
+    The four causes it can return are NOT interchangeable to a caller holding a
+    durable retry latch, and `_carry_harvested_deferrals` acts on the difference.
+    The rule is DURABLE versus TRANSIENT, and the guard draws it, not the caller
+    (DW-237): `target-absent`, `target-not-a-file` and
+    `target-undecodable` are DURABLE on-disk shapes — nothing there, a directory
+    there, bytes there nobody can decode — that a replay re-reads and refuses
+    identically, while `target-unreadable` is whatever a probe RAISED — a transient
+    host answer (an EACCES parent, or the WinError 64 a registered-but-not-serving
+    UNC provider gives) that the next pass may well not see. This helper's own
+    resolve fault lands on the transient cause too, so a caller reads the cause
+    alone and never asks which call produced it, and never re-reads the ledger or
+    matches fault text to tell an undecodable file from an unreadable one.
 
     Returns the `Literal` cause unchanged so every caller's `refuse_cause` journal
-    field stays the closed three-value enum `tests/test_portability_guard.py`
+    field stays the closed four-value enum `tests/test_portability_guard.py`
     declares benign."""
     try:
         target = path.resolve()
@@ -7362,10 +7369,12 @@ class Engine:
             # A refusal never RAISES, where a `GitError` on a git-ownable ledger
             # does: `may_degrade` asks whether git can own the path, and a refusal
             # answers a different question — the operand is not a publishable file at
-            # all. For the two DURABLE causes a replay re-reads the same shape and
-            # refuses again, so raising would cost the run its `integrate_unit` with
-            # nothing left to retry. `target-unreadable` is the cause that does NOT
-            # share that argument, and it is filtered out just below.
+            # all. Of the four causes, three are DURABLE (`target-absent`,
+            # `target-not-a-file`, `target-undecodable`): a replay re-reads the same
+            # shape and refuses again, so raising would cost the run its
+            # `integrate_unit` with nothing left to retry. `target-unreadable` is the
+            # one TRANSIENT cause, which does NOT share that argument, and it is
+            # filtered out just below.
             refusal = _publication_refusal(ledger, "ledger")
             if refusal is not None and refusal[0] == "target-unreadable":
                 # UNCERTAINTY, not a refusal, and only at THIS site: alone among the
@@ -7374,11 +7383,15 @@ class Engine:
                 # become an advisory success there. That cause is whatever a probe
                 # RAISED — an EACCES parent, or the WinError 64 a
                 # registered-but-not-serving UNC provider gives — so a replay may
-                # find it gone, where a directory or an absence is still there.
-                # Handing it back to `commit_paths` keeps the pre-DW-237 path
-                # exactly: git is asked, it raises, and `may_degrade` decides whether
-                # the run keeps the latch and retries or degrades. The two DURABLE
-                # causes take the refusal arm below, where there is nothing to retry.
+                # find it gone, where a directory, an absence or undecodable bytes
+                # are still there. Handing it back to `commit_paths` keeps the
+                # pre-DW-237 path exactly: git is asked, it raises, and `may_degrade`
+                # decides whether the run keeps the latch and retries or degrades.
+                # The three DURABLE causes take the refusal arm below, where there is
+                # nothing to retry — `target-undecodable` among them, because git
+                # accepts any bytes and the fall-through would otherwise commit the
+                # corrupt ledger (the guard splits that cause from this one for
+                # exactly this site; DW-237).
                 refusal = None
             if refusal is not None:
                 cause, error = refusal

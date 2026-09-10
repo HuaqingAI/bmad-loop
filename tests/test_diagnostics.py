@@ -1300,7 +1300,8 @@ def test_remaining_journal_sanitization_contract_reaches_both_public_renders(pro
 
 @pytest.mark.parametrize("render_format", ["markdown", "json"])
 @pytest.mark.parametrize(
-    "refuse_cause", ["target-absent", "target-unreadable", "target-not-a-file"]
+    "refuse_cause",
+    ["target-absent", "target-unreadable", "target-not-a-file", "target-undecodable"],
 )
 @pytest.mark.parametrize(
     "stop_cause",
@@ -1322,11 +1323,11 @@ def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
 
     The refusal row (DW-199/203/205) carries two surviving fields, not one: `file`
     says WHICH of the two published files went unpublished and `refuse_cause` says
-    WHY, and the two are separate claims — the causes are a closed trio
-    (`target-absent` | `target-unreadable` | `target-not-a-file`) whose natural
-    spelling, `reason`, is dropped, so without the minted field a scrubbed dump
-    could not tell a ledger that vanished from one nobody could decode, nor either
-    of those from a store a directory replaced.
+    WHY, and the two are separate claims — the causes are a closed quartet
+    (`target-absent` | `target-unreadable` | `target-not-a-file` |
+    `target-undecodable`) whose natural spelling, `reason`, is dropped, so without
+    the minted field a scrubbed dump could not tell a ledger that vanished from one
+    nobody could decode, nor either of those from a store a directory replaced.
 
     Ablation: remove Markdown's sweep-entry emission, drop
     `sweep-ledger-commit-refused` from the collected kind set, or add
@@ -1352,7 +1353,11 @@ def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
         message=message_value,
         file="deferred-work.md",
         refuse_cause=refuse_cause,
-        **({"error": error_value} if refuse_cause == "target-unreadable" else {}),
+        **(
+            {"error": error_value}
+            if refuse_cause in ("target-unreadable", "target-undecodable")
+            else {}
+        ),
     )
     journal.append(
         "sweep-ledger-commit", message=message_value, commit="a" * 40, file="deferred-work.md"
@@ -1392,7 +1397,7 @@ def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
     assert published["message_present"] is True and "message" not in published
     assert refused["message_present"] is True and "message" not in refused
     assert "error" not in refused
-    if refuse_cause == "target-unreadable":
+    if refuse_cause in ("target-unreadable", "target-undecodable"):
         assert refused["error_present"] is True
     else:
         assert "error_present" not in refused

@@ -5088,9 +5088,13 @@ def patch_new_files(patch_path: Path) -> set[str]:
     return new_files
 
 
-def unpublishable_target(
-    target: Path, family: Literal["ledger", "store"]
-) -> tuple[Literal["target-absent", "target-unreadable", "target-not-a-file"], str | None] | None:
+def unpublishable_target(target: Path, family: Literal["ledger", "store"]) -> (
+    tuple[
+        Literal["target-absent", "target-unreadable", "target-not-a-file", "target-undecodable"],
+        str | None,
+    ]
+    | None
+):
     """Why `target` must not be published, or `None` when it may be. Returns
     `(refuse_cause, error)` — the two fields a refusal carries beyond the
     caller's own identifying ones.
@@ -5116,10 +5120,29 @@ def unpublishable_target(
     contract (DW-146) already answers both questions in the two shapes this
     guard asks them — `None` for absence, `LedgerReadError` for bytes nobody
     can decode. Its `OSError` normally propagates; here it does not, because
-    both callers are best-effort bookkeeping whose whole degrade discipline
-    exists so a publication fault never aborts the work that wrote the file, so
-    it joins the undecodable cause rather than escaping. No lock is taken: this
-    is a read the writer above already took. A later disappearance or replacement
+    every caller is best-effort bookkeeping whose whole degrade discipline
+    exists so a publication fault never aborts the work that wrote the file. The
+    two faults are NOT folded into one cause, though (DW-237): `LedgerReadError`
+    returns `target-undecodable` and a raised
+    `OSError` returns `target-unreadable`, because they differ in the one way a
+    caller holding a retry obligation has to know about. Undecodable bytes are a
+    DURABLE content shape — a replay re-reads the same file and refuses it
+    identically, exactly like an absence or a directory — while an `OSError` a
+    probe RAISED (an EACCES parent, a WinError 64 from a
+    registered-but-not-serving UNC provider) is a TRANSIENT host answer the next
+    pass may well not see. So the four causes split three DURABLE
+    (`target-absent`, `target-not-a-file`, `target-undecodable`) against one
+    TRANSIENT (`target-unreadable`), and the split is drawn HERE, in the
+    classifier, rather than at a call site re-reading the ledger or matching the
+    fault text. The caller that needs it is `Engine._carry_harvested_deferrals`,
+    the one publisher carrying a durable `harvest_carry_commit_pending` latch
+    (DW-195/#552): it refuses every durable cause outright and hands only the
+    transient one back to `commit_paths`, where a `GitError` keeps the latch for
+    the replay. Before the split, both faults arrived as `target-unreadable`
+    and that fall-through published the undecodable bytes — git accepts any
+    bytes — so the corrupt ledger reached HEAD. The store leg never produces
+    `target-undecodable`: it asks nothing about bytes. No lock is taken: this is
+    a read the writer above already took. A later disappearance or replacement
     can still change what git publishes, as `_commit_ledger` documents.
 
     A ledger read of `None` means absence or a non-regular file. Re-probe with
@@ -5175,7 +5198,7 @@ def unpublishable_target(
     `apply_pre_answer` folds the fault into a `target-unreadable` refusal.
 
     Returns the `refuse_cause` token as a `Literal` rather than a bare `str`,
-    which is what makes the closed three-value claim
+    which is what makes the closed four-value claim
     `tests/test_portability_guard.py` declares `refuse_cause` benign on a
     typechecked property rather than a comment. The union is spelled identically
     in `decisions.PublishRefusal.cause`; pyright rejects producer tokens the
@@ -5188,7 +5211,13 @@ def unpublishable_target(
                 except (FileNotFoundError, NotADirectoryError):
                     return ("target-absent", None)
                 return ("target-not-a-file", None)
-        except (deferredwork.LedgerReadError, OSError) as e:
+        except deferredwork.LedgerReadError as e:
+            # DURABLE: the bytes on disk are what nobody can decode, and a replay
+            # re-reads them identically. Kept apart from the `OSError` arm below so
+            # a latch-holding caller can refuse this and retry only the other.
+            return ("target-undecodable", str(e))
+        except OSError as e:
+            # TRANSIENT: a probe RAISED, which the next pass may not see.
             return ("target-unreadable", str(e))
         return None
     if family == "store":

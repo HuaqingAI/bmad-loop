@@ -990,6 +990,13 @@ def test_decisions_names_an_absent_ledger_rather_than_a_missing_entry(project, c
             {"store": ("target-not-a-file", None)},
             "not committed to git: decisions.json (target-not-a-file)",
         ),
+        # DW-237's token, which ONLY the ledger family can produce (the store leg
+        # asks nothing about bytes): the decode fault rides after the cause.
+        (
+            {"ledger": ("target-undecodable", "deferred-work.md is not valid UTF-8: bad byte")},
+            "not committed to git: deferred-work.md "
+            "(target-undecodable: deferred-work.md is not valid UTF-8: bad byte)",
+        ),
     ],
 )
 def test_decisions_names_a_written_answer_it_could_not_publish(

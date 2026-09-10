@@ -5927,30 +5927,67 @@ def test_unpublishable_target_refuses_an_absent_ledger(project):
 
 
 def test_unpublishable_target_refuses_an_undecodable_ledger_with_the_fault(project):
-    """`target-unreadable`, carrying the decode fault as the second element. The
+    """`target-undecodable`, carrying the decode fault as the second element. The
     ledger's own read contract (DW-146) raises `LedgerReadError` for bytes nobody
     can decode, and that is what this arm folds into a refusal.
 
-    Ablation: drop `deferredwork.LedgerReadError` from the `except` tuple and the
-    call raises instead of answering, reddening the assertion below."""
+    Ablation: drop the `deferredwork.LedgerReadError` arm and the call raises
+    instead of answering, reddening the assertion below."""
     write_ledger(project, {"DW-1": "open"})
     project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
 
     cause, error = verify.unpublishable_target(project.deferred_work, "ledger")
 
-    assert cause == "target-unreadable"
+    assert cause == "target-undecodable"
     assert "not valid UTF-8" in error
+
+
+@pytest.mark.parametrize(
+    "fault,cause,fragment",
+    [
+        ("undecodable", "target-undecodable", "not valid UTF-8"),
+        ("stat-refused", "target-unreadable", "Permission denied"),
+    ],
+)
+def test_unpublishable_target_splits_the_durable_decode_fault_from_the_transient_os_fault(
+    project, monkeypatch, fault, cause, fragment
+):
+    """The DW-237 split, graded on the guard itself: the ledger
+    leg's two faults are two CAUSES, not one. Invalid UTF-8 is a DURABLE content
+    shape — a replay re-reads the same bytes and refuses them identically — and
+    returns `target-undecodable`; a `stat` the OS REFUSED is a TRANSIENT host answer
+    the next pass may not see, and returns `target-unreadable`. The split is drawn
+    here rather than at a call site because `Engine._carry_harvested_deferrals`, the
+    one publisher with a durable commit latch, refuses the first and retries the
+    second — and before the split both arrived as `target-unreadable`, so the
+    undecodable ledger fell through to git, which accepts any bytes, and reached HEAD.
+
+    Ablation: collapse the two `except` arms back into
+    `except (deferredwork.LedgerReadError, OSError)` returning `target-unreadable`
+    and the undecodable row reds on its cause."""
+    write_ledger(project, {"DW-1": "open"})
+    if fault == "undecodable":
+        project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
+    else:
+        fault_metadata_probe(monkeypatch, project.deferred_work, "stat")
+
+    got_cause, error = verify.unpublishable_target(project.deferred_work, "ledger")
+
+    assert got_cause == cause
+    assert fragment in error
 
 
 def test_unpublishable_target_folds_a_ledger_oserror_into_the_refusal(project, monkeypatch):
     """The arm that has to be said out loud: `read_for_write`'s contract lets
     `OSError` PROPAGATE, and here it deliberately does not. Both callers are
     best-effort bookkeeping whose degrade discipline exists so a publication fault
-    never aborts the work that wrote the file, so an unreadable target joins the
-    undecodable cause rather than escaping into a caller with no handler for it.
+    never aborts the work that wrote the file, so an unreadable target is refused
+    `target-unreadable` rather than escaping into a caller with no handler for it —
+    its OWN cause, kept apart from the decode fault's `target-undecodable` since the
+    DW-237 resolution.
 
-    Ablation: drop `OSError` from the `except` tuple and this reds with the
-    `PermissionError` escaping instead of the tuple coming back."""
+    Ablation: drop the `OSError` arm and this reds with the `PermissionError`
+    escaping instead of the tuple coming back."""
     write_ledger(project, {"DW-1": "open"})
     fault_read_text(monkeypatch, project.deferred_work)
 

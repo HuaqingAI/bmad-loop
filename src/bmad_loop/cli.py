@@ -4059,8 +4059,8 @@ def _land_confirmation(
         detail = "" if error is None else f": {' '.join(error.split())}"
         print(
             f"warning: {path} was left out of the {story.story_key} confirm commit "
-            f"({cause}){detail} — the on-disk change is made; commit it by hand "
-            f"once the path is repaired.",
+            f"({cause}){detail} — the confirm's on-disk change landed before the path "
+            f"took this shape; inspect it and commit it by hand once the path is repaired.",
             file=sys.stderr,
         )
     if survivors:

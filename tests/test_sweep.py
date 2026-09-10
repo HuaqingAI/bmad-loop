@@ -3475,6 +3475,7 @@ def test_replayed_bundle_close_leaves_the_open_set_before_the_sweep_loop_reads_i
     "fault,cause,fragment",
     [
         ("not-a-file", "target-not-a-file", None),
+        ("undecodable", "target-undecodable", "not valid UTF-8"),
         ("unreadable", "target-unreadable", "Permission"),
         ("unresolvable", "target-unreadable", UNRESOLVABLE),
     ],
@@ -3498,10 +3499,12 @@ def test_bundle_close_carry_refuses_an_unpublishable_ledger(
     and refuses identically, so there is nothing a raise could buy.
 
     Every cause that can arise at a guarded site is driven: the DW-211/228 wrong
-    TYPE, the DW-227 metadata fault, and a RESOLVE that fails — the last two both
-    landing on `target-unreadable`, which is the only cause carrying `error` beside
-    `refuse_cause` (a wrong type has no exception text, and an empty string would
-    read as one). The resolve row is the one that grades `_publication_refusal`'s own
+    TYPE, the DURABLE decode fault (`target-undecodable`, the ledger replaced by
+    invalid UTF-8 after the write — refused here like every other cause, since this
+    carry holds no latch), the DW-227 metadata fault, and a RESOLVE that fails — the
+    last two both landing on `target-unreadable`. A wrong type has no exception text
+    to carry in `error` (an empty string would read as one); the other three do. The
+    resolve row is the one that grades `_publication_refusal`'s own
     `except (OSError, RuntimeError)` fold: `Path.resolve` is what fails first, before
     the family leg is ever asked, and without the fold a bare `OSError` escapes into
     bookkeeping whose whole degrade discipline exists to prevent that. Both faults
@@ -3527,6 +3530,8 @@ def test_bundle_close_carry_refuses_an_unpublishable_ledger(
             ledger.unlink()
             ledger.mkdir()
             (ledger / "swept-in.txt").write_text("an unrelated tree\n", encoding="utf-8")
+        elif fault == "undecodable":
+            ledger.write_bytes(_UNDECODABLE_LEDGER)
         elif fault == "unresolvable":
             # The #552 shape: a resolve that FAILS rather than answering. It is the
             # first thing the guard does, so the family leg never runs at all.
@@ -16529,7 +16534,7 @@ def test_an_undecodable_ledger_is_refused_at_the_post_recovery_commit(project):
     assert done["reason"] == "ledger-unreadable" and done["cycles"] == 0
     [refused] = _records(engine, "sweep-ledger-commit-refused")
     assert refused["message"] == "chore(sweep): commit ledger after recovering in-flight bundles"
-    assert refused["refuse_cause"] == "target-unreadable"
+    assert refused["refuse_cause"] == "target-undecodable"  # the DURABLE decode cause
     assert refused["file"] == "deferred-work.md"
     assert "not valid UTF-8" in refused["error"]  # the decode fault is attributed
     assert _records(engine, "sweep-ledger-commit") == []
@@ -16543,7 +16548,7 @@ def test_an_undecodable_ledger_is_refused_at_the_post_recovery_commit(project):
     "family,fault,cause,fragment",
     [
         ("ledger", "absent", "target-absent", None),
-        ("ledger", "undecodable", "target-unreadable", "not valid UTF-8"),
+        ("ledger", "undecodable", "target-undecodable", "not valid UTF-8"),
         ("ledger", "unreadable", "target-unreadable", "Permission denied"),
         ("store", "absent", "target-absent", None),
         ("store", "not-a-file", "target-not-a-file", None),
@@ -16553,17 +16558,19 @@ def test_an_undecodable_ledger_is_refused_at_the_post_recovery_commit(project):
 def test_commit_ledger_refuses_an_unpublishable_target_without_reaching_git(
     project, monkeypatch, family, fault, cause, fragment, via_symlink
 ):
-    """Both families and all three causes, graded directly on the helper — including
+    """Both families and all four causes, graded directly on the helper — including
     the arms no behavioral row above can reach: the store family's absence and its
     DW-211/228 wrong-type refusal, and each family's OS fault (the ledger read
     raising `OSError` rather than answering, and the store's own metadata probe
-    doing the same) — the two refusals that carry an `error` beside `refuse_cause`.
+    doing the same) — the refusals that carry an `error` beside `refuse_cause`.
 
     The `OSError` arm is the one that needs saying out loud. `read_for_write`'s
     contract lets `OSError` PROPAGATE, and here it deliberately does not: this is
     best-effort bookkeeping whose whole degrade discipline exists so a publication
-    fault never aborts a sweep, so an unreadable target joins the undecodable cause
-    instead of escaping into a caller that has no handler for it.
+    fault never aborts a sweep, so an unreadable target is refused rather than
+    escaping into a caller that has no handler for it — under its OWN cause,
+    `target-unreadable`, where the ledger's decode fault is `target-undecodable`
+    (the DW-237 resolution split the two; only the ledger leg can name the latter).
 
     "Never reaches git" is graded by making both git helpers raise: a stub that
     merely records would let a regression pass whenever the recorded call happened

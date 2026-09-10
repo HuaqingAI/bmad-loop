@@ -4455,14 +4455,15 @@ class SweepEngine(Engine):
         A refusal journals `sweep-ledger-commit-refused` and returns, exactly as
         the other two no-op arms do — never a raise, because the read this guard
         takes is bookkeeping and not the sweep's own read. `refuse_cause` is one of
-        THREE fixed tokens (`target-absent`, `target-unreadable`,
+        FOUR fixed tokens (`target-absent`; `target-undecodable`, the ledger's own
+        decode fault; `target-unreadable`, a probe that raised;
         `target-not-a-file` — EITHER family's target replaced by a directory (or,
         for the store, a link to one), whose literal pathspec `git add` would
         stage recursively; a FIFO or socket at the name takes the same token) and is minted for
         the reason `stop_cause` (DW-201), `drop_cause` and `regen_cause` were: the
         natural spelling is `reason`, which sits in
         `diagnostics._JOURNAL_DROP_FIELDS` and renders as a presence boolean, so a
-        scrubbed dump could not tell the two causes apart. The decode or OS fault
+        scrubbed dump could not tell the causes apart. The decode or OS fault
         rides in `error` beside it, which is dropped, and `file` carries the same
         lexical basename the sibling rows do. What this guard does NOT do is
         rescue the run: `_loop`'s own ledger read still refuses the same
@@ -5591,17 +5592,22 @@ class SweepEngine(Engine):
         A publication REFUSAL (DW-237) is best effort on strictly stronger terms.
         ``verify.unpublishable_target`` answers a different question from a
         ``GitError`` — not "can git own this path" but "is this operand a publishable
-        file at all". For ``target-absent`` and ``target-not-a-file`` that is answered
-        off a DURABLE on-disk shape, which a replay re-reads and refuses identically,
+        file at all". For the three DURABLE causes — ``target-absent``,
+        ``target-not-a-file`` and ``target-undecodable`` (bytes nobody can decode,
+        split from the OS fault by the guard itself; DW-237) — that
+        is answered off an on-disk shape a replay re-reads and refuses identically,
         so there is nothing for a raise to buy even in principle.
-        ``target-unreadable`` is a probe fault and may well be transient, so that
-        argument does not cover it — but nothing here needs it to: this carry holds
-        no commit latch, its flips are idempotent, and its commit was already best
-        effort, so a refusal costs it exactly what a ``GitError`` already did. It is
-        ``Engine._carry_harvested_deferrals``, the one publisher with a durable latch,
-        that keeps ``target-unreadable`` on its retry path instead of refusing it.
-        The row is journalled beside the ``-uncommitted`` one rather than folded into
-        it: the two name different operator repairs.
+        ``target-unreadable`` is the one TRANSIENT cause, a probe fault the next pass
+        may not see, so that argument does not cover it — but nothing here needs it
+        to: this carry holds no commit latch, its flips are idempotent, and its
+        commit was already best effort, so a refusal costs it exactly what a
+        ``GitError`` already did. It is ``Engine._carry_harvested_deferrals``, the
+        one publisher with a durable latch, that keeps ``target-unreadable`` on its
+        retry path instead of refusing it — and refuses the durable three, the
+        undecodable one included, because git accepts any bytes and a fall-through
+        there commits the corrupt ledger. The row is journalled beside the
+        ``-uncommitted`` one rather than folded into it: the two name different
+        operator repairs.
         """
         super()._carry_isolated_ledger_writes(task)
         if not task.bundle_closes_intended:

@@ -985,9 +985,9 @@ def test_apply_pre_answer_refuses_a_store_a_directory_replaced_while_publishing_
     HEAD, and nothing raises out of a call whose on-disk record is already made.
 
     The token matters as much as the refusal. `target-absent` would send an operator
-    looking for a vanished file and `target-unreadable` for a permission or decode
-    fault; the repair here is "something is sitting at the store's name", which is a
-    third thing.
+    looking for a vanished file, `target-unreadable` for a permission fault and
+    `target-undecodable` (the ledger family only) for a decode fault; the repair
+    here is "something is sitting at the store's name", which is another thing.
 
     Ablation: revert the store leg to its existence-only probe and this reds two
     ways — no refusal is reported, and `git add` stages `swept-in.txt` into the
