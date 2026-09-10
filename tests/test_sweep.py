@@ -20,6 +20,7 @@ from conftest import (
     bundle_review_effect,
     bundle_spec_path,
     crash_at_merge_back,
+    fault_metadata_probe,
     fault_read_text,
     git,
     ignore_before_commit,
@@ -13654,14 +13655,18 @@ def test_an_undecodable_ledger_is_refused_at_the_post_recovery_commit(project):
         ("ledger", "undecodable", "target-unreadable", "not valid UTF-8"),
         ("ledger", "unreadable", "target-unreadable", "Permission denied"),
         ("store", "absent", "target-absent", None),
+        ("store", "not-a-file", "target-not-a-file", None),
+        ("store", "unreadable", "target-unreadable", "Permission denied"),
     ],
 )
 def test_commit_ledger_refuses_an_unpublishable_target_without_reaching_git(
     project, monkeypatch, family, fault, cause, fragment, via_symlink
 ):
-    """Both families and both causes, graded directly on the helper — including the
-    two arms no behavioral row above can reach: the store family's absence, and the
-    ledger read raising `OSError` rather than answering.
+    """Both families and all three causes, graded directly on the helper — including
+    the arms no behavioral row above can reach: the store family's absence and its
+    DW-211/228 wrong-type refusal, and each family's OS fault (the ledger read
+    raising `OSError` rather than answering, and the store's own metadata probe
+    doing the same) — the two refusals that carry an `error` beside `refuse_cause`.
 
     The `OSError` arm is the one that needs saying out loud. `read_for_write`'s
     contract lets `OSError` PROPAGATE, and here it deliberately does not: this is
@@ -13695,8 +13700,22 @@ def test_commit_ledger_refuses_an_unpublishable_target_without_reaching_git(
             pytest.skip(f"symlinks unavailable on this host: {exc}")
     if fault == "absent":
         target.unlink()
+    elif fault == "not-a-file":
+        # The DW-211/228 shape: a DIRECTORY at the published name. Existence alone
+        # called it publishable, and `commit_paths` hands the literal pathspec to
+        # `git add`, which stages descendants recursively.
+        target.unlink()
+        target.mkdir()
+        (target / "swept-in.txt").write_text("a descendant `git add` would stage\n")
     elif fault == "undecodable":
         target.write_bytes(_UNDECODABLE_LEDGER)
+    elif family == "store":
+        # DW-227 at the STORE, whose guard reads no bytes at all: the fault has to
+        # come out of a metadata probe, and it is injected through the seam rather
+        # than through chmod so it holds on every supported version (Python 3.14
+        # suppresses OS errors inside these probes, so a permission bit would make
+        # the row silently pass on part of the CI matrix).
+        fault_metadata_probe(monkeypatch, target, "is_file")
     else:
         fault_read_text(monkeypatch, target)
 
@@ -13721,6 +13740,51 @@ def test_commit_ledger_refuses_an_unpublishable_target_without_reaching_git(
     assert _records(engine, "sweep-ledger-commit") == []
     assert _records(engine, "sweep-ledger-commit-clean") == []
     assert _records(engine, "sweep-ledger-commit-unavailable") == []
+
+
+@pytest.mark.parametrize("tracked", [False, True])
+def test_a_directory_in_place_of_the_store_never_reaches_head(project, tracked):
+    """DW-211/228 end to end, with real git rather than a raising stub: the publisher
+    walks into a DIRECTORY at the store's own name and nothing of it lands.
+
+    The hazard is entirely `commit_paths`' contract meeting `git add`: the operand is
+    a LITERAL pathspec, and `git add -- .bmad-loop/decisions.json` on a directory
+    stages every descendant recursively, so an unrelated tree an operator (or a
+    half-finished restore) left there was published under a `chore(sweep):` message.
+    The existence-only probe called that publishable because it only ever asked
+    whether SOMETHING was there.
+
+    Ablation: revert the store leg to `if not (target.exists() or
+    target.is_symlink())` and this reds on both HEAD assertions — the refusal row
+    vanishes, a `sweep-ledger-commit` row appears, and `swept-in.txt` is in HEAD."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open"})
+    store = decisions_store.store_path(project.project)
+    if tracked:
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text("{}\n", encoding="utf-8")
+        git(project.project, "add", "--", ".bmad-loop/decisions.json")
+        git(project.project, "commit", "-m", "seed tracked store")
+        store_head = git(project.project, "show", "HEAD:.bmad-loop/decisions.json")
+        store.unlink()
+    store.mkdir(parents=True, exist_ok=True)
+    (store / "swept-in.txt").write_text("an unrelated tree\n", encoding="utf-8")
+    head = git(project.project, "rev-parse", "HEAD")
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    engine._commit_ledger("chore(sweep): publish", path=store, family="store")
+
+    [refused] = _records(engine, "sweep-ledger-commit-refused")
+    assert refused["refuse_cause"] == "target-not-a-file"
+    assert refused["file"] == "decisions.json"
+    assert "error" not in refused  # a wrong TYPE has no fault text to attribute
+    assert _records(engine, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert "swept-in.txt" not in git(project.project, "ls-files")
+    if tracked:
+        assert git(project.project, "show", "HEAD:.bmad-loop/decisions.json") == store_head
 
 
 def test_a_dangling_store_link_is_an_absence_because_the_probes_see_the_resolved_path(

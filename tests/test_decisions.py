@@ -4,7 +4,13 @@ import json
 import sys
 
 import pytest
-from conftest import fault_read_text, install_bmad_config, refuse_to_resolve, write_ledger
+from conftest import (
+    fault_metadata_probe,
+    fault_read_text,
+    install_bmad_config,
+    refuse_to_resolve,
+    write_ledger,
+)
 
 from bmad_loop import decisions, deferredwork, platform_util, runs
 from bmad_loop.sweep import DecisionOption
@@ -942,6 +948,80 @@ def test_apply_pre_answer_publishes_the_survivor_when_one_operand_is_refused(
         assert "?? .bmad-loop/decisions.json" in _git(
             project, "status", "--porcelain", "--untracked-files=all"
         )
+
+
+@pytest.mark.parametrize("tracked", [False, True])
+@pytest.mark.parametrize("fault", ["directory", "metadata"])
+def test_apply_pre_answer_refuses_a_store_a_directory_replaced_while_publishing_the_ledger(
+    project, monkeypatch, tracked, fault
+):
+    """DW-211/228 at the OUT-OF-BAND publisher, through the real guard rather than a
+    stubbed one. The store is replaced by a DIRECTORY between the write and the
+    staging — exactly the race this second gate exists for, since the wrote-it gate
+    upstream already proved the write happened — and the refusal must drop only its
+    own operand: the ledger still commits, the directory's descendants never reach
+    HEAD, and nothing raises out of a call whose on-disk record is already made.
+
+    The token matters as much as the refusal. `target-absent` would send an operator
+    looking for a vanished file and `target-unreadable` for a permission or decode
+    fault; the repair here is "something is sitting at the store's name", which is a
+    third thing.
+
+    Ablation: revert the store leg to its existence-only probe and this reds two
+    ways — no refusal is reported, and `git add` stages `swept-in.txt` into the
+    `chore(decisions): pre-answer` commit. Remove the store probe exception
+    handler and metadata rows raise instead of returning a refusal. Tracked rows
+    also pin preservation of the original store blob in HEAD."""
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    store = decisions.store_path(project.project)
+    if tracked:
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text("{}\n", encoding="utf-8")
+        _git(project, "add", "--", ".bmad-loop/decisions.json")
+        _git(project, "commit", "-m", "seed tracked store")
+        store_head = _git(project, "show", "HEAD:.bmad-loop/decisions.json")
+    real_record = decisions.record_pre_answer
+
+    def record_then_replace(*a, **kw):
+        # The write really lands, and only THEN is the target replaced — the guard
+        # is the second gate, and the first one is already satisfied.
+        real_record(*a, **kw)
+        store = decisions.store_path(project.project)
+        if fault == "metadata":
+            fault_metadata_probe(monkeypatch, store.resolve(), "is_file")
+        else:
+            store.unlink()
+            store.mkdir()
+            (store / "swept-in.txt").write_text("an unrelated tree\n", encoding="utf-8")
+
+    monkeypatch.setattr(decisions, "record_pre_answer", record_then_replace)
+    from bmad_loop.sweep import Decision
+
+    opt = DecisionOption(key="1", label="Widen", effect="build", intent="widen field")
+    d = Decision(id="DW-1", question="build it?", context="", options=(opt,), recommendation="1")
+
+    result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
+
+    assert result.recorded is True
+    assert len(result.refusals) == 1
+    refusal = result.refusals[0]
+    assert refusal.file == "decisions.json"
+    if fault == "metadata":
+        assert refusal.cause == "target-unreadable"
+        assert "Permission denied" in refusal.error
+    else:
+        assert refusal.cause == "target-not-a-file"
+        assert refusal.error is None
+        assert result.publish_note() == "not committed to git: decisions.json (target-not-a-file)"
+    # the survivor still publishes, alone
+    assert "chore(decisions): pre-answer DW-1" in _git_log(project)
+    assert _git(project, "show", "--name-only", "--format=", "HEAD").split() == [ledger_rel]
+    assert "decision: 2026-06-13 Widen — widen field" in _git(project, "show", f"HEAD:{ledger_rel}")
+    assert "swept-in.txt" not in _git(project, "ls-files")
+    if tracked:
+        assert _git(project, "show", "HEAD:.bmad-loop/decisions.json") == store_head
 
 
 def test_apply_pre_answer_swallows_a_git_fault_without_refusing_or_raising(project, monkeypatch):

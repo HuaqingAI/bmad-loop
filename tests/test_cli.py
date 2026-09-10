@@ -972,7 +972,27 @@ def test_decisions_names_an_absent_ledger_rather_than_a_missing_entry(project, c
     assert "DW-1: no decision line was written: the ledger file is gone" in out
 
 
-def test_decisions_names_a_written_answer_it_could_not_publish(project, capsys, monkeypatch):
+@pytest.mark.parametrize(
+    "refusals,note",
+    [
+        # Both operands refused — the shape DW-209/213 shipped with.
+        (
+            {"ledger": ("target-absent", None), "store": ("target-absent", None)},
+            "not committed to git: deferred-work.md (target-absent), "
+            "decisions.json (target-absent)",
+        ),
+        # DW-211/228's token, which ONLY the store family can produce (the ledger
+        # leg reads through `read_for_write` and has no wrong-type answer), so the
+        # ledger publishes and the line names the one file that did not.
+        (
+            {"store": ("target-not-a-file", None)},
+            "not committed to git: decisions.json (target-not-a-file)",
+        ),
+    ],
+)
+def test_decisions_names_a_written_answer_it_could_not_publish(
+    project, capsys, monkeypatch, refusals, note
+):
     """DW-209/213 on this surface. The commit's operand list is already gated on
     what the call WROTE, so a publishable-target refusal means an answer that
     really landed on disk is missing from git history — worth telling the human
@@ -1000,20 +1020,16 @@ def test_decisions_names_a_written_answer_it_could_not_publish(project, capsys, 
             asked.append(decision.id)
             return decision.option("1")  # build
 
-    # The race the guard exists for: both written operands go unpublishable
-    # between the write and the staging.
-    monkeypatch.setattr(verify, "unpublishable_target", lambda _t, _f: ("target-absent", None))
+    # The race the guard exists for: a written operand goes unpublishable between
+    # the write and the staging. Which operands is per row.
+    monkeypatch.setattr(verify, "unpublishable_target", lambda _t, family: refusals.get(family))
     monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
 
     assert cli.main(["decisions", "--project", str(project.project)]) == 0
 
     assert asked == ["DW-1", "DW-2"]
     out = capsys.readouterr().out
-    assert (
-        "DW-1: queued — the next sweep will build it; "
-        "not committed to git: deferred-work.md (target-absent), "
-        "decisions.json (target-absent)" in out
-    )
+    assert f"DW-1: queued — the next sweep will build it; {note}" in out
     assert "DW-2: queued" in out
 
 

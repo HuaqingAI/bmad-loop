@@ -7308,6 +7308,7 @@ async def test_decision_modal_toasts_a_ledger_that_took_no_decision_line(
     [
         ("target-absent", None),
         ("target-unreadable", "cannot open /tmp/[/]/[red]/decisions.json"),
+        ("target-not-a-file", None),  # DW-211/228: present, wrong type, no fault text
     ],
 )
 async def test_decision_modal_toast_carries_both_a_non_write_and_a_refusal(
@@ -7384,6 +7385,7 @@ async def test_decision_modal_toast_carries_both_a_non_write_and_a_refusal(
     [
         ("target-absent", None),
         ("target-unreadable", "cannot open /tmp/[/]/[red]/decisions.json"),
+        ("target-not-a-file", None),  # DW-211/228: present, wrong type, no fault text
     ],
 )
 async def test_decision_modal_toasts_an_answer_it_could_not_publish(
