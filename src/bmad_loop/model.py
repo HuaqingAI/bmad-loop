@@ -835,6 +835,21 @@ class RunState:
     # `sweep_dropped_decisions`. An id no later drop announces remains until the
     # run ends; this list never doubles as a second announcement gate.
     sweep_unlanded_decisions: list[str] = field(default_factory=list)
+    # sweep runs only, and the RUN's ledger-publication doubt rather than a
+    # cycle's (DW-218/219). `_ledger_in_doubt` / `_close_ledger_in_doubt` live on
+    # the SweepEngine instance and are cycle-scoped by design; this mirrors them
+    # the moment either is armed, because the window that loses them is between
+    # the arming site and `_cycle`'s dispatch gate reporting: a stop request
+    # observed in the withheld branch, or any crash in the same span, ends the
+    # process with the verdict held only in memory, and the resume then dispatches
+    # the bundles whose `git add -A` sweeps the half-written ledger into HEAD.
+    # Never cleared inside the run: the documented repair is a human editing the
+    # ledger and re-running `bmad-loop sweep`, which is a NEW run with fresh state,
+    # so stickiness costs nothing (`_loop` stops or returns at the boundary of any
+    # cycle that armed, so no later cycle of the SAME run reads it) and its only
+    # observable effect is on a resume — which is the defect. Absent from an older
+    # `state.json`, it reads False: that run had no doubt.
+    sweep_ledger_in_doubt: bool = False
     # auto-sweep triggers already fired this run (e.g. "epic-1", "run-end");
     # guards re-fire on resume
     sweeps_triggered: list[str] = field(default_factory=list)
@@ -929,6 +944,7 @@ class RunState:
             "sweep_skipped_decisions": self.sweep_skipped_decisions,
             "sweep_dropped_decisions": self.sweep_dropped_decisions,
             "sweep_unlanded_decisions": self.sweep_unlanded_decisions,
+            "sweep_ledger_in_doubt": self.sweep_ledger_in_doubt,
             "sweeps_triggered": self.sweeps_triggered,
             "sweeps_refused": self.sweeps_refused,
             "target_branch": self.target_branch,
@@ -966,6 +982,7 @@ class RunState:
             sweep_skipped_decisions=[str(s) for s in d.get("sweep_skipped_decisions", [])],
             sweep_dropped_decisions=[str(s) for s in d.get("sweep_dropped_decisions", [])],
             sweep_unlanded_decisions=[str(s) for s in d.get("sweep_unlanded_decisions", [])],
+            sweep_ledger_in_doubt=bool(d.get("sweep_ledger_in_doubt", False)),
             sweeps_triggered=[str(s) for s in d.get("sweeps_triggered", [])],
             sweeps_refused={str(k): str(v) for k, v in d.get("sweeps_refused", {}).items()},
             target_branch=str(d.get("target_branch", "")),

@@ -13086,11 +13086,452 @@ def test_a_healthy_close_phase_dispatches_its_bundles(project):
 
     assert not summary.crashed and not summary.paused
     assert not engine._close_ledger_in_doubt and not engine._ledger_unfit_to_publish()
+    # ...and the RUN-scoped mirror (DW-218/219) is False in memory AND on disk. The
+    # positive healthy row for the persisted flag: without it, arming the mirror
+    # unconditionally — or leaving `_record_ledger_doubt` ungated at
+    # `_decisions_phase`'s `=` publish, which runs on every cycle — would pass every
+    # withholding row in this file while withholding the whole archive of resumes.
+    assert engine.state.sweep_ledger_in_doubt is False
+    assert load_state(engine.run_dir).sweep_ledger_in_doubt is False
     assert [spec.role for spec in adapter.sessions] == ["triage", "dev", "review"]
     assert _records(engine, "sweep-bundles-withheld") == []
     assert engine.state.tasks["dw-ledger-fix"].phase == Phase.DONE
     [done] = _records(engine, "sweep-repeat-done")
     assert done["reason"] == "no-open"  # everything closed, so cycle 2 stops cleanly
+
+
+# ------------------- DW-218/219: the cycle's verdict has to survive the process
+
+
+def _half_written_ledger(project) -> None:
+    """The DECODABLE fault class, written the way a half-landed atomic replacement
+    leaves it: DW-2 flipped to `done` with no `decision:` line to authorize it, and
+    the DW-1 entry lost entirely to the short write.
+
+    Losing DW-1 is deliberate, and it is what keeps these rows about the flag under
+    test. DW-1 is the id the cached triage plan named already-resolved, so on the
+    resume `_close_resolved` runs `mark_done_many` over an id the ledger no longer
+    carries: it closes nothing, and `_resolved_write_pending`'s per-id positive
+    proof answers False, so DW-193's stranded-close arm takes no publish. Left as
+    `done` instead, that arm would commit the whole ledger file — half-write and
+    all — before `_cycle`'s gate is ever consulted, and no assertion below could
+    tell a working gate from a broken one. (That arm publishing a `done` no
+    completed close ever wrote is a real residual, and a separate question from
+    this one.)"""
+    write_ledger(project, {"DW-2": "done", "DW-3": "open"}, commit=False)
+
+
+def test_a_stop_across_the_armed_gate_still_withholds_after_a_resume(project, monkeypatch):
+    """DW-219. The withheld branch takes `_check_stop_request()` AHEAD of its
+    `sweep-bundles-withheld` row, so a stop lodged while the human was at the
+    prompt ends the process with the cycle's verdict held only in
+    `self._ledger_in_doubt` — instance state, gone with the interpreter.
+
+    The fault class is what makes the resume dangerous rather than merely lossy,
+    and it is DECODABLE on purpose: `record_decision` half-lands a write and then
+    raises, so the bytes left on disk parse perfectly. Every in-memory arm the
+    resumed cycle owns therefore passes — `_loop`'s own top-of-cycle read decodes
+    the ledger, `pending` filters DW-2 out because its answer is already in
+    `<run>/decisions.json`, the DW-167 re-apply walk drops the id because the
+    half-write already flipped it to `done`, and `_decisions_phase`'s end-of-phase
+    probe reads the same good bytes and arms nothing. Bare, the resumed cycle
+    dispatches the bundle behind that decision and `verify.commit_story`'s
+    `git add -A` sweeps the unauthorized flip into HEAD.
+
+    Ablation: drop `self.state.sweep_ledger_in_doubt` from
+    `_ledger_unfit_to_publish()` (or the `_record_ledger_doubt()` call under
+    `_decisions_phase`'s publish). The resumed dev/review sessions appear, the
+    withheld row and the repeat stop both vanish, and `_ledger_differs_from_head`
+    goes False as the bundle commit publishes the half-write."""
+    real_record_decision = deferredwork.record_decision
+
+    def half_write_then_fault(*_args, **_kwargs):
+        _half_written_ledger(project)
+        raise OSError(11, "Resource deadlock avoided")
+
+    monkeypatch.setattr(deferredwork, "record_decision", half_write_then_fault)
+
+    def lodge_stop(_ledger):
+        _lodge_stop_request(engine.run_dir, "graceful")
+
+    engine, adapter = _sweep_with_a_bundle_behind_a_decision(
+        project, lodge_stop, policy=repeat_policy()
+    )
+
+    summary = engine.run()
+
+    # premise: the stop really did land inside the withheld branch, ahead of its row
+    assert not summary.crashed and not summary.paused
+    [missed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert missed["dw_id"] == "DW-2"
+    assert _records(engine, "sweep-bundles-withheld") == []
+    assert _records(engine, "sweep-repeat-done") == []
+    assert [spec.role for spec in adapter.sessions] == ["triage"]
+    saved = load_state(engine.run_dir)
+    assert saved.stopped is True and saved.finished is False
+    # THE claim of the first half: the verdict reached DISK before the stop raised.
+    assert saved.sweep_ledger_in_doubt is True
+    assert _ledger_differs_from_head(project)
+
+    # ...and now the resume, whose own phases all run clean.
+    monkeypatch.setattr(deferredwork, "record_decision", real_record_decision)
+    resumed, resumed_adapter = resume_sweep(
+        project,
+        engine,
+        [
+            bundle_dev_effect(project, "ledger-fix", ["DW-3"]),
+            bundle_review_effect(project, "ledger-fix"),
+        ],
+    )
+
+    resumed_summary = resumed.run()
+
+    # THE claim: the half-write stayed out of HEAD across the process boundary.
+    assert _ledger_differs_from_head(project)
+    assert not resumed_summary.crashed and not resumed_summary.paused
+    # premise: nothing in the resumed cycle armed a latch of its own — the withhold
+    # below is the PERSISTED verdict and nothing else.
+    assert not resumed._ledger_in_doubt and not resumed._close_ledger_in_doubt
+    assert resumed.state.sweep_ledger_in_doubt is True
+    assert [spec.role for spec in resumed_adapter.sessions] == []  # zero bundles ran
+    assert "dw-ledger-fix" not in resumed.state.tasks
+    [withheld] = _records(resumed, "sweep-bundles-withheld")
+    assert withheld["cycle"] == 1
+    assert withheld["bundles_not_run"] == 1
+    assert withheld["reason"] == "ledger-unreadable"
+    [done] = _records(resumed, "sweep-repeat-done")  # the existing stop, no new token
+    assert done["reason"] == "ledger-unreadable"
+    assert done["stop_cause"] == done["reason"]
+    # ...and the prune inherits the persisted verdict through the same helper
+    [prune_refused] = _records(resumed, "sweep-preanswer-prune-refused")
+    assert prune_refused["reason"] == "ledger-in-doubt"
+
+
+def test_a_crash_across_the_armed_gate_still_withholds_after_a_resume(project, monkeypatch):
+    """DW-218, and the other arming site: `_close_resolved`'s degrade, which runs
+    FIRST in the cycle and leaves `_decisions_phase`'s local `ledger_in_doubt`
+    False — so the phase-end publish alone would persist nothing, and only a mirror
+    at the close phase's own arm carries this fault across a crash.
+
+    The crash is the input, not a new outcome: `_materialize_bundles` is made to
+    raise so the run dies in exactly the span DW-218 names — after the close phase
+    armed, before `_cycle`'s gate reported anything.
+
+    The resumed cycle's close and decision phases both run CLEAN, which is what
+    makes the row ablatable: the ledger decodes, DW-1 is gone so `mark_done_many`
+    closes nothing and DW-193's pending probe proves nothing, the plan carries no
+    decisions, and the end-of-phase probe reads the same good bytes. Every latch
+    the resumed process owns is False.
+
+    Ablation: drop `self._record_ledger_doubt()` from `_close_resolved`'s `except`
+    handler (or `self.state.sweep_ledger_in_doubt` from `_ledger_unfit_to_publish`).
+    The resumed bundle's dev/review sessions appear, the withheld row and the stop
+    vanish, and the bundle commit sweeps the half-write into HEAD."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2", "DW-3"],
+        already_resolved=[{"id": "DW-1", "evidence": "already guarded at src.txt:1"}],
+        bundles=[{"name": "ledger-fix", "dw_ids": ["DW-3"], "intent": "fix"}],
+        skip=[{"id": "DW-2", "reason": "not worth doing"}],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "ledger-fix", ["DW-3"]),
+            bundle_review_effect(project, "ledger-fix"),
+        ],
+        policy=repeat_policy(),
+    )
+
+    def half_close_then_fault(*_args, **_kwargs):
+        # An external, incomplete but decodable edit before a refused close — the
+        # real mutator locks before its single atomic replacement.
+        _half_written_ledger(project)
+        raise OSError(11, "Resource deadlock avoided")
+
+    def die_after_the_arm(*_args, **_kwargs):
+        raise RuntimeError("the run dies between the arm and the gate")
+
+    monkeypatch.setattr(deferredwork, "mark_done_many", half_close_then_fault)
+    monkeypatch.setattr(sweep_mod.SweepEngine, "_materialize_bundles", die_after_the_arm)
+
+    summary = engine.run()
+
+    # premise: the fault landed in the CLOSE phase and the run then died, before
+    # the gate could report anything at all.
+    assert summary.crashed
+    [unavailable] = _records(engine, "sweep-resolved-close-unavailable")
+    assert unavailable["dw_ids"] == ["DW-1"]
+    assert _records(engine, "sweep-bundles-withheld") == []
+    assert _records(engine, "sweep-repeat-done") == []
+    assert [spec.role for spec in adapter.sessions] == ["triage"]
+    # THE claim of the first half: the close phase's verdict reached DISK, even
+    # though `_decisions_phase` never published a doubt of its own.
+    assert load_state(engine.run_dir).sweep_ledger_in_doubt is True
+    assert _ledger_differs_from_head(project)
+
+    monkeypatch.undo()
+    resumed, resumed_adapter = resume_sweep(
+        project,
+        engine,
+        [
+            bundle_dev_effect(project, "ledger-fix", ["DW-3"]),
+            bundle_review_effect(project, "ledger-fix"),
+        ],
+    )
+
+    resumed_summary = resumed.run()
+
+    # THE claim: the half-write stayed out of HEAD across the crash.
+    assert _ledger_differs_from_head(project)
+    assert not resumed_summary.crashed and not resumed_summary.paused
+    # premise: the resumed cycle's own phases both ran CLEAN and armed nothing
+    assert not resumed._close_ledger_in_doubt and not resumed._ledger_in_doubt
+    assert len(_records(resumed, "sweep-resolved-close-unavailable")) == 1  # run 1's, only
+    assert _records(resumed, "sweep-decision-ledger-refused") == []
+    assert resumed.state.sweep_ledger_in_doubt is True
+    assert [spec.role for spec in resumed_adapter.sessions] == []  # zero bundles ran
+    assert "dw-ledger-fix" not in resumed.state.tasks
+    assert [r["file"] for r in _records(resumed, "sweep-ledger-commit")] == []
+    [withheld] = _records(resumed, "sweep-bundles-withheld")
+    assert withheld["bundles_not_run"] == 1
+    assert withheld["reason"] == "ledger-unreadable"
+    [done] = _records(resumed, "sweep-repeat-done")
+    assert done["reason"] == "ledger-unreadable"
+    assert done["stop_cause"] == done["reason"]
+
+
+def test_a_crash_at_a_later_prompt_still_withholds_after_a_resume(project, monkeypatch):
+    """DW-218/219's third arming site, and the one the tail publish cannot cover:
+    INSIDE the decision walk.
+
+    `_decisions_phase` arms `ledger_in_doubt` at five in-walk sites and only
+    publishes the verdict onto `self` at the very bottom. The interactive arm's
+    `continue` goes straight back into an iteration that blocks on `prompter.ask`,
+    so the span between an arm and that publish contains a human sitting at a
+    prompt — unbounded, and the easiest place in the whole run for a process to
+    die. Mirrored only at the tail, the verdict never reaches disk at all: the
+    resumed cycle's own phases all run clean over the decodable half-write, the
+    gate opens, and the bundle commit's `git add -A` publishes the unauthorized
+    flip.
+
+    Two decisions, therefore, where the two rows above have one and zero: DW-2's
+    effect faults, and the process dies at DW-4's prompt with DW-2's verdict held
+    only in a local.
+
+    Ablation: drop `self._record_ledger_doubt()` from the interactive arm's fault
+    site (the one whose `continue` re-enters the prompt loop). The flag is False on
+    disk after the crash, the resumed cycle dispatches, dev/review sessions appear,
+    the withheld row and the stop both vanish, and `_ledger_differs_from_head` goes
+    False. The other four in-walk calls do not cover it: none of their arms runs in
+    this scenario."""
+    write_ledger(project, {"DW-2": "open", "DW-4": "open", "DW-3": "open"})
+    plan = triage_result(
+        ["DW-2", "DW-4", "DW-3"],
+        bundles=[{"name": "ledger-fix", "dw_ids": ["DW-3"], "intent": "fix"}],
+        decisions=[
+            _decision(
+                dw_id,
+                [
+                    {"key": "1", "label": "Close it", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+            for dw_id in ("DW-2", "DW-4")
+        ],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "ledger-fix", ["DW-3"]),
+            bundle_review_effect(project, "ledger-fix"),
+        ],
+        prompting=True,
+        policy=repeat_policy(),
+    )
+
+    def half_write_then_fault(*_args, **_kwargs):
+        _half_written_ledger(project)
+        raise OSError(11, "Resource deadlock avoided")
+
+    monkeypatch.setattr(deferredwork, "record_decision", half_write_then_fault)
+
+    asked: list[str] = []
+
+    def answer_then_die(_prompt):
+        asked.append(_prompt)
+        if len(asked) == 1:
+            return "1"  # DW-2: answered, effect faults on a decodable half-write
+        raise RuntimeError("the process dies at the second decision's prompt")
+
+    engine.prompter = DecisionPrompter(input_fn=answer_then_die, print_fn=lambda _line: None)
+
+    summary = engine.run()
+
+    # premise: DW-2's effect faulted and the run then died AT DW-4's prompt, so
+    # `_decisions_phase` never reached its tail publish at all.
+    assert summary.crashed
+    assert len(asked) == 2
+    [missed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert missed["dw_id"] == "DW-2"
+    assert [r["dw_id"] for r in _records(engine, "decision-answered")] == ["DW-2"]
+    assert _records(engine, "sweep-bundles-withheld") == []
+    assert _records(engine, "sweep-repeat-done") == []
+    assert [spec.role for spec in adapter.sessions] == ["triage"]
+    # THE claim of the first half: the in-walk arm reached DISK before the crash.
+    assert load_state(engine.run_dir).sweep_ledger_in_doubt is True
+    assert _ledger_differs_from_head(project)
+
+    monkeypatch.undo()
+    resumed, resumed_adapter = resume_sweep(
+        project,
+        engine,
+        [
+            bundle_dev_effect(project, "ledger-fix", ["DW-3"]),
+            bundle_review_effect(project, "ledger-fix"),
+        ],
+    )
+
+    resumed_summary = resumed.run()
+
+    # THE claim: the half-write stayed out of HEAD across the crash.
+    assert _ledger_differs_from_head(project)
+    assert not resumed_summary.crashed and not resumed_summary.paused
+    # premise: the resumed walk armed nothing of its own — DW-2's answer is stored
+    # so `pending` filters it out, the re-apply walk drops it because the half-write
+    # already flipped it to `done`, and the end-of-phase probe reads good bytes.
+    assert not resumed._ledger_in_doubt and not resumed._close_ledger_in_doubt
+    assert _records(resumed, "sweep-decision-ledger-refused") == []
+    assert resumed.state.sweep_ledger_in_doubt is True
+    assert [spec.role for spec in resumed_adapter.sessions] == []  # zero bundles ran
+    assert "dw-ledger-fix" not in resumed.state.tasks
+    [withheld] = _records(resumed, "sweep-bundles-withheld")
+    assert withheld["bundles_not_run"] == 1
+    assert withheld["reason"] == "ledger-unreadable"
+    [done] = _records(resumed, "sweep-repeat-done")
+    assert done["reason"] == "ledger-unreadable"
+    assert done["stop_cause"] == done["reason"]
+
+
+def test_a_landed_effect_on_a_resume_cannot_release_an_inherited_doubt(project, monkeypatch):
+    """DW-218/219's release, and the one shape it must NOT cover.
+
+    `_release_ledger_doubt` exists so the run mirror is no stickier than the latch
+    it mirrors: an effect that lands proves the ledger reads and writes again, the
+    walk clears its local verdict, and the mirror follows. That reasoning is about
+    THIS process's own last attempt. It says nothing about a verdict a PREVIOUS
+    process formed over bytes still sitting on disk — and letting it carry there
+    re-enters the very defect the entry names, through the release instead of
+    through the missing mirror: run 1 faults decision A's effect and dies before
+    decision B is answered, the resume answers B, B's effect lands, and the mirror
+    is dropped for A's half-write, which the bundle commit then publishes.
+
+    So the resumed walk here does everything right — it asks DW-4, its effect
+    lands, its own `ledger_in_doubt` ends False — and the cycle STILL withholds,
+    because the doubt it is carrying is not one it made. Note the second consumer
+    riding the same verdict: this phase's own commit gate refuses too, so DW-4's
+    perfectly good close is not published either. That is the correct trade — the
+    commit's pathspec IS the ledger, so publishing DW-4's line would carry DW-2's
+    unauthorized flip with it — and the next sweep after the human's repair closes
+    DW-4 from the stored answer.
+
+    Ablation: drop `not self._ledger_doubt_inherited` from `_release_ledger_doubt`.
+    DW-4's landed effect releases the inherited mirror, the phase's commit gate and
+    the dispatch gate both open, the dev/review sessions appear, the withheld row
+    and the stop vanish, and `_ledger_differs_from_head` goes False as DW-2's
+    half-write reaches HEAD."""
+    write_ledger(project, {"DW-2": "open", "DW-4": "open", "DW-3": "open"})
+    plan = triage_result(
+        ["DW-2", "DW-4", "DW-3"],
+        bundles=[{"name": "ledger-fix", "dw_ids": ["DW-3"], "intent": "fix"}],
+        decisions=[
+            _decision(
+                dw_id,
+                [
+                    {"key": "1", "label": "Close it", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+            for dw_id in ("DW-2", "DW-4")
+        ],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "ledger-fix", ["DW-3"]),
+            bundle_review_effect(project, "ledger-fix"),
+        ],
+        prompting=True,
+        policy=repeat_policy(),
+    )
+
+    def half_write_then_fault(*_args, **_kwargs):
+        # DW-2 flipped with no `decision:` line to authorize it. DW-4 is left
+        # untouched — unlike `_half_written_ledger`'s shape — because this row needs
+        # the resumed walk to have a real effect it can land.
+        write_ledger(project, {"DW-2": "done", "DW-4": "open", "DW-3": "open"}, commit=False)
+        raise OSError(11, "Resource deadlock avoided")
+
+    monkeypatch.setattr(deferredwork, "record_decision", half_write_then_fault)
+
+    asked: list[str] = []
+
+    def answer_then_die(_prompt):
+        asked.append(_prompt)
+        if len(asked) == 1:
+            return "1"  # DW-2: answered, effect faults on a decodable half-write
+        raise RuntimeError("the process dies at the second decision's prompt")
+
+    engine.prompter = DecisionPrompter(input_fn=answer_then_die, print_fn=lambda _line: None)
+
+    summary = engine.run()
+
+    # premise: run 1 armed on DW-2's fault and died with DW-4 unanswered
+    assert summary.crashed
+    [missed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert missed["dw_id"] == "DW-2"
+    assert load_state(engine.run_dir).sweep_ledger_in_doubt is True
+
+    # ...and the resume answers DW-4, whose effect LANDS.
+    monkeypatch.undo()
+    resumed, resumed_adapter = resume_sweep(
+        project,
+        engine,
+        [
+            bundle_dev_effect(project, "ledger-fix", ["DW-3"]),
+            bundle_review_effect(project, "ledger-fix"),
+        ],
+        answers=["1"],
+        prompting=True,
+    )
+
+    resumed_summary = resumed.run()
+
+    # THE claim: DW-2's half-write stayed out of HEAD even though this walk landed
+    # an effect over it.
+    assert _ledger_differs_from_head(project)
+    assert not resumed_summary.crashed and not resumed_summary.paused
+    # premise: the resumed effect really landed, and the walk really did clear its
+    # OWN verdict — so only the inherited guard is holding the gate shut.
+    assert [r["dw_id"] for r in _records(resumed, "decision-answered")] == ["DW-2", "DW-4"]
+    assert deferredwork.open_ids(project.deferred_work.read_text(encoding="utf-8")) == {"DW-3"}
+    assert len(_records(resumed, "sweep-decision-effect-unavailable")) == 1  # run 1's, only
+    assert resumed._ledger_in_doubt is False and resumed._close_ledger_in_doubt is False
+    assert resumed.state.sweep_ledger_in_doubt is True
+    assert resumed._ledger_unfit_to_publish()
+    # the phase's own commit gate reads the same verdict, so DW-4's close is held too
+    assert [r["file"] for r in _records(resumed, "sweep-ledger-commit")] == []
+    assert [spec.role for spec in resumed_adapter.sessions] == []  # zero bundles ran
+    assert "dw-ledger-fix" not in resumed.state.tasks
+    [withheld] = _records(resumed, "sweep-bundles-withheld")
+    assert withheld["bundles_not_run"] == 1
+    assert withheld["reason"] == "ledger-unreadable"
+    [done] = _records(resumed, "sweep-repeat-done")
+    assert done["reason"] == "ledger-unreadable"
+    assert done["stop_cause"] == done["reason"]
 
 
 def test_a_landed_effect_cannot_publish_a_faulted_close_phases_half_write(project, monkeypatch):
