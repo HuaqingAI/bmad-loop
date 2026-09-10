@@ -843,12 +843,23 @@ class RunState:
     # observed in the withheld branch, or any crash in the same span, ends the
     # process with the verdict held only in memory, and the resume then dispatches
     # the bundles whose `git add -A` sweeps the half-written ledger into HEAD.
-    # Never cleared inside the run: the documented repair is a human editing the
-    # ledger and re-running `bmad-loop sweep`, which is a NEW run with fresh state,
-    # so stickiness costs nothing (`_loop` stops or returns at the boundary of any
-    # cycle that armed, so no later cycle of the SAME run reads it) and its only
-    # observable effect is on a resume — which is the defect. Absent from an older
-    # `state.json`, it reads False: that run had no doubt.
+    # It follows the latch it mirrors rather than outliving it: a later effect
+    # landing in the same decision walk proves the ledger reads and writes again,
+    # and `_release_ledger_doubt` clears the mirror there — but ONLY for an arm
+    # THIS process made. The mirror is left standing while the close phase's latch
+    # is armed this cycle, and whenever it was inherited from a previous process,
+    # because "the ledger reads and writes again" is a statement about this
+    # process's LAST ATTEMPT and nothing wider — not about a write a different
+    # phase made, nor about bytes a previous process left on disk. Those two wait
+    # for the documented repair: a human edits the ledger
+    # and re-runs `bmad-loop sweep`, which is a NEW run with fresh state, so the
+    # residual stickiness cannot contaminate a later cycle: `_loop` stops or
+    # returns when doubt remains armed at the boundary. A cycle that releases its
+    # doubt can continue repeating with a clear mirror. Absent from an
+    # older `state.json`, it reads False: a compatibility default, so that run
+    # resumes exactly as it does today. Not evidence the run which wrote it was
+    # healthy — it could have armed an instance latch and lost it at the same
+    # interruption this field closes.
     sweep_ledger_in_doubt: bool = False
     # auto-sweep triggers already fired this run (e.g. "epic-1", "run-end");
     # guards re-fire on resume

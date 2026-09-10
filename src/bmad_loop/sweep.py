@@ -1393,10 +1393,13 @@ class SweepEngine(Engine):
         consumers, no second spelling to keep in step.
 
         The persisted term is safe beside the two cycle-scoped ones. `_loop` stops
-        (repeat) or returns (non-repeat, `--decisions-only`) at the boundary of any
-        cycle that armed, so no LATER cycle of the same run ever reads it and it
-        cannot widen a healthy cycle's verdict inside this process. Its only
-        observable effect is on a RESUME — which is the defect it exists for.
+        (repeat) or returns (non-repeat, `--decisions-only`) when doubt remains
+        armed at the cycle boundary, so no later cycle inherits that doubt inside
+        this process. `_release_ledger_doubt` clears the mirror when a later effect
+        lands, but only for an arm THIS process made and while the close phase's
+        latch is clear. A cycle that releases its doubt can continue repeating.
+        Across a RESUME, the inherited mirror preserves a verdict the instance
+        latches lost — the defect it exists for.
         """
         return (
             self.state.sweep_ledger_in_doubt or self._ledger_in_doubt or self._close_ledger_in_doubt
@@ -1438,12 +1441,17 @@ class SweepEngine(Engine):
         `prompter.ask`, so a stop or crash at a LATER decision's prompt ends the
         process with the verdict still only in memory.
 
-        Arming in-walk does NOT make the run-scoped flag stickier than the latch it
-        mirrors: `_decisions_phase`'s commit gate and `_cycle`'s dispatch gate both
-        read the mirror through `_ledger_unfit_to_publish()`, so a mirror that
-        outlived a doubt the walk went on to disprove would withhold a commit and a
-        dispatch that the local latch had already released. `_release_ledger_doubt`
-        is the counterpart, called from the two sites that clear the local latch.
+        Arming in-walk does not make the run-scoped flag stickier than the latch it
+        mirrors — outside the two states `_release_ledger_doubt` refuses to clear,
+        where it is stickier on purpose (see that helper's guard paragraphs).
+        `_decisions_phase`'s commit gate and `_cycle`'s dispatch gate both read the
+        mirror through `_ledger_unfit_to_publish()`, so a mirror that outlived a
+        doubt the walk went on to disprove would withhold a commit and a dispatch
+        that the local latch had already released. `_release_ledger_doubt` is the
+        counterpart, called from the two sites that clear the local latch — and it
+        clears only for an arm THIS process made, refusing while the close phase's
+        latch is armed this cycle or while the mirror was inherited from a previous
+        process.
 
         DW-218's own stated repro — `_prune_pre_answers` letting an `OSError`
         propagate out of the cycle — is no longer reachable, and the entry is kept
@@ -1466,9 +1474,13 @@ class SweepEngine(Engine):
         the resumed cycle sails past every in-memory arm and dispatches — the exact
         resume the prune argument says cannot happen.
 
-        Only on the False->True edge, so the seven call sites cost one `_save()`
-        per run rather than one per arm. Never cleared: the repair is a human edit
-        plus a fresh `bmad-loop sweep`, which is a new run with fresh state.
+        Only on the False->True EDGE, so the seven call sites cost one `_save()`
+        per edge rather than one per arm — an edge, not a run: `_release_ledger_doubt`
+        writing False re-opens it, so a fault/success/fault sequence inside one walk
+        saves here more than once. That helper owns the lifetime from here: it clears
+        the mirror for an arm THIS process made, while an arm inherited across a
+        resume or raised by the close phase stays until a human edits the ledger and
+        starts a fresh `bmad-loop sweep`, which is a new run with fresh state.
         """
         if not self.state.sweep_ledger_in_doubt:
             self.state.sweep_ledger_in_doubt = True
@@ -1476,7 +1488,9 @@ class SweepEngine(Engine):
 
     def _release_ledger_doubt(self) -> None:
         """The counterpart to `_record_ledger_doubt`, and the reason arming at the
-        in-walk sites does not make the mirror STICKIER than the latch it mirrors.
+        in-walk sites does not make the mirror STICKIER than the latch it mirrors —
+        outside the two states the guards below refuse to clear, where it is
+        stickier deliberately.
 
         `_decisions_phase`'s local `ledger_in_doubt` is the LAST attempt's verdict,
         not the walk's: an effect that lands afterwards proves the ledger reads and
@@ -4026,16 +4040,22 @@ class SweepEngine(Engine):
             )
         # Assign the final verdict so a healthy phase clears any earlier doubt.
         self._ledger_in_doubt = ledger_in_doubt
-        # ...and mirror it onto run state when it is a DOUBT (DW-218/219). A
-        # BACKSTOP, not the persister: every site that arms `ledger_in_doubt` above
-        # already mirrored at the arm, because the span between an arm and this line
-        # includes a `prompter.ask` a stop or crash can end the process in. What is
-        # left for this line is the probe-free path where the verdict was reached
-        # without one of those arms ever running. Guarded on True on purpose: the
+        # ...and mirror it onto run state when it is a DOUBT (DW-218/219). In every
+        # REACHABLE state this is a defensive no-op, never the first writer: each of
+        # the five sites that sets `ledger_in_doubt = True` above records at its own
+        # arm, and both sites that set it False go through `_release_ledger_doubt`,
+        # so a True local here implies the mirror is already True. It cannot be the
+        # persister precisely because the span between an arm and this line includes
+        # a `prompter.ask` a stop or crash can end the process in — which is why the
+        # arms own the write and this line only refuses to disagree with them.
+        # Guarded on True on purpose: the
         # `=` above is a CYCLE-local clear, and letting it clear the persisted flag
-        # too would hand the resume the same dispatch this entry exists to refuse —
-        # the run-scoped verdict is sticky, and only a fresh `bmad-loop sweep` after
-        # the human's repair drops it.
+        # too would hand the resume the same dispatch this entry exists to refuse.
+        # This line is not a release path at all: `_release_ledger_doubt` is the
+        # only one, it runs on the POSITIVE proof of a later effect landing, and it
+        # clears the mirror only for an arm THIS process made while the close
+        # phase's latch is clear — never off a `=` that merely recomputed a phase
+        # verdict.
         if ledger_in_doubt:
             self._record_ledger_doubt()
         return answers, closed, frozenset(effect_unlanded)
