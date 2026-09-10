@@ -3086,7 +3086,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
 
 
 def _unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
-    """The refusal `resume` owes a sweep run whose ledger does not currently read.
+    """The refusal `resume` owes a sweep run whose ledger bytes do not decode.
 
     Returns the operator-facing message, or None to decline (DW-204).
 
@@ -3115,18 +3115,19 @@ def _unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
       WRITE the ledger, so it must ask the arm that refuses to publish from a text
       nobody could read.
     * `LedgerReadError` is caught BY NAME. It is a plain `Exception` on purpose
-      (DW-146) so that no `except OSError` can swallow it; the flip side is that
+      (DW-146) so that no OSError handler can swallow it; the flip side is that
       nothing catches it implicitly either.
-    * `OSError` is caught too, in its own arm and with its own repair (permissions
-      or storage, not "edit the bytes") — the same split `_read_cycle_ledger`
-      draws between `ledger-unreadable` and `ledger-inaccessible`. Letting it
-      propagate would have made this change strictly REMOVE a steer: before the
-      gate, an OS-refused ledger armed the run and stopped through that
-      `ledger-inaccessible` arm WITH `_notify_ledger_repair`'s route; bare, it
-      would reach `main`'s tail as a routeless `error: [Errno 13] …`. An
-      OS-refused ledger is a ledger that does not currently read, so this stays
-      inside the recorded decision. `deferredwork.read_for_write` itself is NOT
-      widened — this caller catches, exactly as `_read_cycle_ledger` does.
+    * `OSError` is NOT caught here, and no arm for it may be added.
+      `deferredwork.read_for_write` documents that it propagates, and it keeps
+      propagating from this caller to `main`'s tail as a routeless
+      `error: [Errno 13] …` / `ExitCode.FAILURE`. The steer that propagation loses
+      is real — before this gate, an OS-refused ledger armed the run and stopped
+      through `_read_cycle_ledger`'s `ledger-inaccessible` arm WITH
+      `_notify_ledger_repair`'s route — and it is RECORDED AS A DEFERRAL rather
+      than repaired here: an arm of its own, with its own permissions-or-storage
+      repair, was written and then struck from this change's frozen contract, so
+      restoring one re-opens a settled decision instead of correcting a defect.
+      `deferredwork.read_for_write` itself is not widened either way.
     * Absence is NOT a refusal. `read_for_write` answers None, and `open_ids("")`
       / `parse_ledger("")` answer identically for absent and empty — a resumed
       sweep on an absent ledger ends cleanly at `sweep-nothing-open`.
@@ -3137,15 +3138,33 @@ def _unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
       Widening the gate — and the engine's reads — is DW-146 scope, and the
       deferral naming those reads stands.
 
-    What this gate defers to, precisely — it is additive about two refusals and
-    not about the rest. It declines for a `finished` run and for a
+    Timing — a best-effort ENTRY SNAPSHOT, never a guarantee about the inputs the
+    run actually arms. The probe reads `load_state` / `bmadconfig.load_paths` here
+    in `cmd_resume`, ahead of `_resume_paused_run`'s `state_lock`;
+    `_prepare_resume_locked` re-loads both UNDER that lock and publishes the pid
+    from ITS reads, so a config change landing in that window selects a ledger this
+    probe never saw. That race is ACCEPTED rather than closed, and the reason it
+    can be: its outcome is exactly pre-DW-204 behavior — the run arms and its own
+    read degrades to a `sweep-repeat-done` stop (DW-197) — so an entry snapshot can
+    only improve on what this surface did before, never regress it. **No under-lock
+    re-probe may be added**, and not for cost: `_prepare_resume_locked` /
+    `_resume_paused_run` are also `resolve`'s re-arm path, so a refusal sited there
+    lands after resolve's interactive session has run and its escalation is spent —
+    exactly the failure `cmd_resolve`'s own entry gate exists to prevent. Giving
+    resolve its own entry probe is a separate deferred decision; it is not a licence
+    to move this one down the call chain.
+
+    What this gate defers to, precisely. It declines for a `finished` run and for a
     control-session-alias id, so `_prepare_resume_locked` keeps `already finished`
     and its "recover by hand, then `bmad-loop delete`" verbatim. It PRECEDES
     `_reject_under_floor_git`, `_reject_isolation_conflict`, `_require_base_skills`
     and the under-lock `runs.is_run` -> `no such run`, so a sweep run blocked by one
-    of those AND holding an unreadable ledger is told to fix the ledger first.
-    Reproducing those checks here would mean spawning git from a probe, which is
-    why they are not.
+    of those AND holding an undecodable ledger is told to fix the ledger first. That
+    ordering is deliberate and pinned by a row, not an accident of placement: this
+    refusal is the cheapest to produce and the most actionable of the set, and every
+    refusal it displaces is reachable again on the retry after the repair.
+    Reproducing those checks here would mean spawning git from a probe, which is why
+    they are not.
     """
     try:
         state = load_state(run_dir)
@@ -3153,45 +3172,33 @@ def _unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
     except Exception:
         # Broad on purpose: a missing/corrupt state.json, a missing BMAD config and
         # a run cleanup removed mid-command all already have owners downstream
-        # (`runs.is_run`, `_prepare_resume_locked`, `main`'s tail). This gate is
-        # additive — it may add a refusal, never re-word one.
+        # (`runs.is_run`, `_prepare_resume_locked`, `main`'s tail). The gate hands
+        # control on so the fault's own owner answers for it, instead of reporting a
+        # ledger this probe never managed to locate.
         return None
     if state.run_type != "sweep":
         return None
     if state.finished or runs.run_id_aliases_control_session(run_dir.name):
         return None  # `_prepare_resume_locked` owns these two refusals verbatim
 
-    def refuse(headline: str, repair: str) -> str:
-        # One tail, two faults. The repair differs — bytes a human must edit vs a
-        # read the OS refused — and the route does not. The clean-worktree
-        # precondition rides along because `cmd_sweep` enforces it and these faults
-        # leave the ledger DIRTY, so an unqualified "run `bmad-loop sweep`" sends
-        # the human into an exit-1 nobody warned them about. And this run is still
-        # resumable by construction (the gate declines for finished runs), so the
-        # message says so: following the sweep steer alone would abandon the paused
-        # run's in-flight bundle state, whose recovery includes a ledger restore.
-        return (
-            f"run {run_dir.name}: cannot resume this sweep — {headline}. {repair}, then "
-            f"commit or stash any changes in {paths.repo_root} and run `bmad-loop sweep` "
-            "(which requires that worktree to be clean). This run stays resumable: "
-            "`bmad-loop resume` it again once the ledger reads, which keeps its "
-            "in-flight bundle recovery instead of starting the cycle over"
-        )
-
     ledger = paths.deferred_work
     try:
         deferredwork.read_for_write(ledger)
     except deferredwork.LedgerReadError as e:
-        # `e` already names the file AND the codec fault; repeating either would
-        # only drift from it.
-        return refuse(str(e), "Repair the ledger by hand")
-    except OSError as e:
-        # The class NAME beside the message, as `_read_cycle_ledger` does it: the
-        # message alone ("[Errno 13] Permission denied") does not say what kind of
-        # refusal it was.
-        return refuse(
-            f"{ledger} could not be read ({e.__class__.__name__}: {e})",
-            "The OS refused the read, so the repair is permissions or storage",
+        # `e` already names the file AND the codec fault; repeating either would only
+        # drift from it. The clean-worktree precondition rides along because
+        # `cmd_sweep` enforces it and this fault leaves the ledger DIRTY, so an
+        # unqualified "run `bmad-loop sweep`" sends the human into an exit-1 nobody
+        # warned them about. And this run is still resumable by construction (the
+        # gate declines for finished runs), so the message says so: following the
+        # sweep steer alone would abandon the paused run's in-flight bundle state,
+        # whose recovery includes a ledger restore.
+        return (
+            f"run {run_dir.name}: cannot resume this sweep — {e}. Repair the ledger by "
+            f"hand, then commit or stash any changes in {paths.repo_root} and run "
+            "`bmad-loop sweep` (which requires that worktree to be clean). This run "
+            "stays resumable: `bmad-loop resume` it again once the ledger reads, which "
+            "keeps its in-flight bundle recovery instead of starting the cycle over"
         )
     return None
 
@@ -3222,9 +3229,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
             "resuming could double-drive this run",
             file=sys.stderr,
         )
-    # DW-204: sweep runs only, and only for a ledger that does not currently read
-    # (undecodable bytes, or a read the OS refused). Gated HERE and
-    # not in `_resume_paused_run` for the same reason the liveness block above is:
+    # DW-204: sweep runs only, and only for a ledger whose bytes do not currently
+    # decode (a read the OS refused propagates instead — see the helper). Gated
+    # HERE and not in `_resume_paused_run`, for the same reason the liveness block
+    # above is:
     # that helper is also resolve's re-arm path, which has already run its
     # interactive session and re-armed the escalation by the time it is reached, so
     # a refusal there would be a refusal after the side effects. Deliberately AFTER
