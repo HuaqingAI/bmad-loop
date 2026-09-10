@@ -12834,7 +12834,12 @@ def test_a_decodable_decision_fault_withholds_the_bundle_that_would_publish_it(
     assert done["reason"] == "ledger-unreadable" and done["stop_cause"] == done["reason"]
     # The latch the gate armed is its OWN: the prune read this ledger fine.
     assert not engine._prune_ledger_unreadable
-    assert _records(engine, "sweep-preanswer-prune-refused") == []
+    # ...and since DW-217 the prune refuses anyway, on the FOURTH token — the read
+    # succeeded, so neither of the two read latches armed; what refuses is the
+    # cycle's own verdict. This is the class that arm exists for.
+    [prune_refused] = _records(engine, "sweep-preanswer-prune-refused")
+    assert prune_refused["reason"] == "ledger-in-doubt"
+    assert "error" not in prune_refused  # no fault to quote: the read worked
 
     attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
     assert attention.count("the deferred-work ledger is not fit to publish:") == 1
@@ -12945,6 +12950,616 @@ def test_a_stop_during_a_faulted_decision_is_honored_before_withholding(project,
     assert _records(engine, "sweep-repeat-done") == []
     assert not (engine.run_dir / runs.STOP_REQUEST_FILE).exists()
     assert [spec.role for spec in adapter.sessions] == ["triage"]
+
+
+# ------------------- DW-216/217/220: the arms the dispatch gate was missing
+
+
+def test_a_faulted_close_phase_withholds_the_same_cycles_bundles(project, monkeypatch):
+    """DW-216. `_close_resolved` runs FIRST in the cycle, ahead of the decision
+    phase, and its degrade wrote no latch anybody read — so a batch close that
+    half-landed handed `_cycle`'s gate a False `_ledger_in_doubt` and the bundle
+    behind it published the half-write through `verify.commit_story`'s `git add -A`.
+
+    The fault class is this arm's ALONE, which is what makes the row ablatable: the
+    ledger reads back perfectly afterwards (a simulated external status edit
+    followed by a refused close), so the prune's read arms cannot see it. The
+    close latch suppresses the probe; with that latch ablated, the probe reads
+    the same decodable bytes and arms nothing. Only the close phase saw a fault.
+
+    Ablation: drop `self._close_ledger_in_doubt = True` from `_close_resolved`'s
+    `except` handler. The gate opens, the bundle's dev/review sessions appear, the
+    withheld row and the stop both vanish, `_ledger_differs_from_head` goes False as
+    the bundle commit sweeps the half-write into HEAD, and the prune stops refusing.
+    That last one is a SECOND reader of the same latch, so it is asserted here too:
+    swap `_ledger_unfit_to_publish()` back to `self._ledger_in_doubt` inside
+    `_prune_pre_answers` alone and only the prune assertions red — which is the
+    close-latch-reaches-the-prune claim `_close_resolved`'s own comment makes."""
+    from bmad_loop import decisions as decisions_store
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open", "DW-3": "open"})
+    decisions_store.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(key="2", label="Keep", effect="keep-open"),
+        date="2026-06-12",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "out-of-band pre-answer")
+    store = decisions_store.store_path(project.project)
+    stored_bytes = store.read_bytes()
+    store_rel = store.relative_to(project.project).as_posix()
+    stored_head = git(project.project, "show", f"HEAD:{store_rel}")
+    plan = triage_result(
+        ["DW-1", "DW-3"],
+        already_resolved=[{"id": "DW-1", "evidence": "already guarded at src.txt:1"}],
+        bundles=[{"name": "ledger-fix", "dw_ids": ["DW-3"], "intent": "fix"}],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "ledger-fix", ["DW-3"]),
+            bundle_review_effect(project, "ledger-fix"),
+        ],
+        policy=repeat_policy(),
+    )
+
+    def half_close_then_fault(*_args, **_kwargs):
+        # Simulate an external, incomplete but decodable edit before a refused
+        # close. The real mutator locks before its single atomic replacement.
+        write_ledger(project, {"DW-1": "done", "DW-3": "open"}, commit=False)
+        raise OSError(11, "Resource deadlock avoided")
+
+    monkeypatch.setattr(deferredwork, "mark_done_many", half_close_then_fault)
+
+    summary = engine.run()
+
+    # THE claim, first: the half-landed close stayed out of HEAD.
+    assert _ledger_differs_from_head(project)
+    assert not summary.crashed and not summary.paused  # ended reported, not crashed
+    # premise: the fault really landed in the close phase and nowhere else
+    [unavailable] = _records(engine, "sweep-resolved-close-unavailable")
+    assert unavailable["dw_ids"] == ["DW-1"]
+    assert _records(engine, "sweep-decision-effect-unavailable") == []
+    assert _records(engine, "sweep-decision-ledger-refused") == []  # the close latch suppressed it
+    assert engine._close_ledger_in_doubt and not engine._ledger_in_doubt
+    assert [spec.role for spec in adapter.sessions] == ["triage"]  # zero bundles ran
+    assert "dw-ledger-fix" not in engine.state.tasks
+    [withheld] = _records(engine, "sweep-bundles-withheld")
+    assert withheld["bundles_not_run"] == 1
+    assert withheld["reason"] == "ledger-unreadable"  # the same FIXED token as the stop
+    [done] = _records(engine, "sweep-repeat-done")  # exactly one, and it is this stop
+    assert done["reason"] == "ledger-unreadable"
+    assert done["stop_cause"] == done["reason"]
+    assert done["cycles"] == 1
+    # ...and the PRUNE reads the same close-phase latch: these bytes decode, so its
+    # own three read arms all pass, and the fourth refusal is the only thing keeping
+    # a pre-answer for an id the half-write retired out of the bin.
+    assert set(decisions_store.load_pre_answers(project.project)) == {"DW-1"}
+    assert store.read_bytes() == stored_bytes
+    assert git(project.project, "show", f"HEAD:{store_rel}") == stored_head
+    [prune_refused] = _records(engine, "sweep-preanswer-prune-refused")
+    assert prune_refused["reason"] == "ledger-in-doubt"
+    assert _records(engine, "decision-preanswers-pruned") == []
+    assert [r["file"] for r in _records(engine, "sweep-ledger-commit")] == []
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    # the close phase observed a write it could not land, never bytes it could not
+    # decode, so it takes the generic headline
+    assert attention.count("the deferred-work ledger is not fit to publish:") == 1
+    assert "could not be decoded" not in attention
+    assert f"repair {project.deferred_work} by hand" in attention
+
+
+def test_a_healthy_close_phase_dispatches_its_bundles(project):
+    """The close latch is CYCLE-scoped, so one bad cycle cannot withhold the rest of
+    the run. Nothing faults here, so nothing is ever armed.
+
+    The RESET itself is defense-in-depth, not a property this row can grade, and no
+    row can: `_loop` stops (or returns) at the boundary of any cycle that armed the
+    latch, so no later `_close_resolved` ever re-enters with it set and the
+    "cycle 1 faults, cycle 2 does not" run is unreachable. The latch is already
+    cycle-bound by that stop; the reset is what keeps it so if a future caller ever
+    continues past one. Kept for that reason, asserted for none.
+
+    Ablation: make `_cycle`'s dispatch gate unconditional and every assertion below
+    reds — which is the claim this row actually carries: a healthy close phase arms
+    nothing and withholds nothing."""
+    write_ledger(project, {"DW-1": "open", "DW-3": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-3"],
+        already_resolved=[{"id": "DW-1", "evidence": "already guarded at src.txt:1"}],
+        bundles=[{"name": "ledger-fix", "dw_ids": ["DW-3"], "intent": "fix"}],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "ledger-fix", ["DW-3"]),
+            bundle_review_effect(project, "ledger-fix"),
+        ],
+        policy=repeat_policy(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert not engine._close_ledger_in_doubt and not engine._ledger_unfit_to_publish()
+    assert [spec.role for spec in adapter.sessions] == ["triage", "dev", "review"]
+    assert _records(engine, "sweep-bundles-withheld") == []
+    assert engine.state.tasks["dw-ledger-fix"].phase == Phase.DONE
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == "no-open"  # everything closed, so cycle 2 stops cleanly
+
+
+def test_a_landed_effect_cannot_publish_a_faulted_close_phases_half_write(project, monkeypatch):
+    """DW-216. The decision phase's own commit gate and its hand-back both used to
+    read the PHASE-LOCAL flag alone, so a landed decision effect cleared a doubt it
+    knows nothing about: `_close_resolved` ran first, half-wrote the ledger
+    decodably and raised, and this walk then published exactly those bytes under
+    `chore(sweep): record deferred-work decisions` — while the dispatch gate, the
+    prune and the repeat stop were all correctly refusing them. A landed effect
+    proves the ledger READS; it does not make somebody else's half-write publishable.
+
+    The hand-back is the same verdict told to a human. Reading the local flag alone,
+    it printed the success line — "sweep continues in the background" — for a cycle
+    whose every bundle was about to be withheld and whose run was about to stop for
+    manual repair.
+
+    Ablation: revert both sites to the bare `ledger_in_doubt` local. The
+    `sweep-ledger-commit` assertion reds with a `deferred-work.md` row,
+    `_ledger_differs_from_head` goes False as the bogus `status: done` lands in HEAD,
+    and the printed line becomes the `✓ decisions recorded` one."""
+    _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        already_resolved=[{"id": "DW-1", "evidence": "already guarded at src.txt:1"}],
+        decisions=[
+            _decision(
+                "DW-2",
+                [
+                    {"key": "1", "label": "Close", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(project, [triage_effect(plan)], prompting=True, policy=repeat_policy())
+    printed: list[str] = []
+    answers = iter(["1"])
+    engine.prompter = DecisionPrompter(input_fn=lambda _p: next(answers), print_fn=printed.append)
+
+    def half_close_then_fault(*_args, **_kwargs):
+        # Simulate an external, incomplete but decodable edit before a refused
+        # close. The real mutator locks before its single atomic replacement.
+        write_ledger(project, {"DW-1": "done", "DW-2": "open"}, commit=False)
+        raise OSError(11, "Resource deadlock avoided")
+
+    monkeypatch.setattr(deferredwork, "mark_done_many", half_close_then_fault)
+
+    summary = engine.run()
+
+    # THE claim: the close phase's half-write stayed out of HEAD, published by
+    # nobody — not even the walk that legitimately had a `decision:` line to publish.
+    assert _ledger_differs_from_head(project)
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    assert "status: done" not in git(project.project, "show", f"HEAD:{rel}")
+    assert not any(r["file"] == "deferred-work.md" for r in _records(engine, "sweep-ledger-commit"))
+    assert not summary.crashed and not summary.paused
+    # premise, both halves: the close phase really faulted AND the effect really
+    # landed — without the second, the local flag alone would have withheld anyway
+    [unavailable] = _records(engine, "sweep-resolved-close-unavailable")
+    assert unavailable["dw_ids"] == ["DW-1"]
+    assert [r["dw_id"] for r in _records(engine, "decision-answered")] == ["DW-2"]
+    assert _decision_lines(project.deferred_work.read_text(encoding="utf-8")) == 1
+    assert engine._close_ledger_in_doubt and not engine._ledger_in_doubt
+    # ...and the human is told the truth rather than promised background work
+    assert printed[-1] == (
+        "! answers saved, but the deferred-work ledger is not fit to publish "
+        "(see sweep-resolved-close-unavailable or sweep-decision-effect-unavailable in the journal) — "
+        "repair the ledger and re-run"
+    )
+    assert "sweep continues in the background" not in printed[-1]
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == "ledger-unreadable" and done["stop_cause"] == done["reason"]
+
+
+def test_a_probe_over_an_os_refused_ledger_takes_its_own_token(project, monkeypatch):
+    """The probe's SECOND leg, which has its own fixed token and its own error
+    spelling — the class name riding beside the message, because "[Errno 13]
+    Permission denied" alone does not say which refusal it was.
+
+    Driven at `_decisions_phase` for the reason the absence row is: the probe lives
+    there, and a persistent OS refusal would also stop the run through
+    `_prune_pre_answers`' own `_prune_ledger_inaccessible` carry, which is a
+    different arm's business.
+
+    Ablation: fold the `except OSError` leg into the `LedgerReadError` one and the
+    token reds; drop the class-name prefix and the error spelling reds."""
+    write_ledger(project, {"DW-2": "open"})
+    engine, _ = make_sweep(project, [])  # unattended: the one decision is skipped
+    plan = TriagePlan(open_ids=frozenset({"DW-2"}), decisions=(_reapply_decision("DW-2"),))
+
+    def refuse(_path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(deferredwork, "read_for_write", refuse)
+
+    engine._decisions_phase(plan)
+
+    [refused] = _records(engine, "sweep-decision-ledger-refused")
+    assert refused["ledger"] == str(project.deferred_work)
+    assert refused["reason"] == "ledger-inaccessible"  # NOT the undecodable token
+    assert refused["error"] == "PermissionError: [Errno 13] Permission denied"
+    assert engine._ledger_in_doubt
+
+
+def _fault_the_reapply_gate_read(monkeypatch, engine):
+    """Make the DW-167 re-apply gate's own `read_for_write` raise ONCE, and only
+    there. The fault is TRANSIENT on purpose: every read after it — the bundle
+    intent's, the pre-answer prune's — sees a perfectly readable ledger, so the only
+    thing that ever observed a fault is the gate, and an ablation of the gate's arm
+    reds by DISPATCHING rather than by crashing somewhere else.
+
+    Armed around `_decisions_phase` because the gate is that method's first ledger
+    read; disarmed by the first raise, so nothing else inside it is touched."""
+    real_phase = engine._decisions_phase
+    real_read = deferredwork.read_for_write
+    armed = {"now": False}
+
+    def read_for_write(path):
+        if armed["now"]:
+            armed["now"] = False
+            raise OSError(13, "Permission denied")
+        return real_read(path)
+
+    def decisions_phase(plan):
+        armed["now"] = True
+        try:
+            return real_phase(plan)
+        finally:
+            armed["now"] = False
+
+    monkeypatch.setattr(deferredwork, "read_for_write", read_for_write)
+    monkeypatch.setattr(engine, "_decisions_phase", decisions_phase)
+
+
+def test_a_reapply_gate_read_refusal_withholds_the_same_cycles_bundles(project, monkeypatch):
+    """DW-220. The re-apply gate's own read refusal used to concede the residual in
+    a comment: it attempts no effect, so it left `ledger_in_doubt` alone and the
+    cycle's bundles dispatched over a ledger this process had just failed to read.
+
+    Arming it is not a re-check of anything — the gate OBSERVED the fault, and the
+    class it observed (`LedgerReadError`/`OSError`) is exactly the class that makes
+    `_write_intent`'s bare `read_for_write` raise.
+
+    Ablation: drop `if ledger_read_faulted: ledger_in_doubt = True` from the gate's
+    `except` clause. The withheld row and the stop vanish and the dev/review
+    sessions appear, because the fault was transient and every later read succeeds.
+    """
+    write_ledger(project, {"DW-2": "open", "DW-3": "open"})
+    plan = triage_result(
+        ["DW-2", "DW-3"],
+        bundles=[{"name": "ledger-fix", "dw_ids": ["DW-3"], "intent": "fix"}],
+        decisions=[
+            _decision(
+                "DW-2",
+                [
+                    {"key": "1", "label": "Close it", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "ledger-fix", ["DW-3"]),
+            bundle_review_effect(project, "ledger-fix"),
+        ],
+        policy=repeat_policy(),
+    )
+    # the DW-167 limbo: an answer persisted over an entry the ledger still lists open
+    _seed_run_store(engine, {"DW-2": _stored_close_answer()})
+    _fault_the_reapply_gate_read(monkeypatch, engine)
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    # premise: the gate is what faulted, per candidate, under its existing kind
+    [missed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert missed["dw_id"] == "DW-2" and missed["effect"] == "close"
+    assert "re-apply gate could not read the ledger" in missed["error"]
+    assert _records(engine, "sweep-decision-effect-reapplied") == []
+    assert engine._ledger_in_doubt and not engine._close_ledger_in_doubt
+    assert [spec.role for spec in adapter.sessions] == ["triage"]  # zero bundles ran
+    assert "dw-ledger-fix" not in engine.state.tasks
+    [withheld] = _records(engine, "sweep-bundles-withheld")
+    assert withheld["bundles_not_run"] == 1 and withheld["reason"] == "ledger-unreadable"
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == "ledger-unreadable" and done["stop_cause"] == done["reason"]
+
+
+def test_an_effect_landing_after_the_reapply_gate_refusal_clears_the_doubt(project, monkeypatch):
+    """The gate's arm is the LAST attempt's verdict, exactly like the effect arms
+    beside it: an effect that lands afterwards proves the ledger reads again, clears
+    the doubt, and every bundle dispatches.
+
+    Ablation: make the gate's arm sticky (set a flag the landed-effect clears do not
+    reset) and the dev/review sessions disappear behind a withheld row."""
+    write_ledger(project, {"DW-2": "open", "DW-4": "open", "DW-3": "open"})
+    plan = triage_result(
+        ["DW-2", "DW-4", "DW-3"],
+        bundles=[{"name": "ledger-fix", "dw_ids": ["DW-3"], "intent": "fix"}],
+        decisions=[
+            _decision(
+                dw_id,
+                [
+                    {"key": "1", "label": "Close it", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+            for dw_id in ("DW-2", "DW-4")
+        ],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "ledger-fix", ["DW-3"]),
+            bundle_review_effect(project, "ledger-fix"),
+        ],
+        prompting=True,
+        answers=["1"],  # DW-4, answered live after the gate already refused
+        # single-cycle: the gate leaves DW-2 open, so a repeat cycle would only
+        # re-triage it, and this row is about the dispatch gate inside `_cycle`.
+    )
+    _seed_run_store(engine, {"DW-2": _stored_close_answer()})
+    _fault_the_reapply_gate_read(monkeypatch, engine)
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    # premise: the gate really refused, and the later effect really landed
+    [missed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert missed["dw_id"] == "DW-2"
+    assert [r["dw_id"] for r in _records(engine, "decision-answered")] == ["DW-4"]
+    assert not engine._ledger_unfit_to_publish()
+    assert [spec.role for spec in adapter.sessions] == ["triage", "dev", "review"]
+    assert _records(engine, "sweep-bundles-withheld") == []
+    assert engine.state.tasks["dw-ledger-fix"].phase == Phase.DONE
+    # ...and the phase commit is unchanged: a landed effect earns it
+    assert any(r["file"] == "deferred-work.md" for r in _records(engine, "sweep-ledger-commit"))
+
+
+def _unattended_sweep_attempting_no_effect(project, fault, *, repeat=True):
+    """An unattended cycle whose decision phase attempts NOTHING — the shape every
+    ordinary unattended sweep takes: the one decision is skipped for a human, no
+    stored answer drives a re-apply, and no already-resolved entry gives the close
+    phase a read. `fault` runs inside the triage session, so it lands after `_loop`
+    read the open set and before the decision phase ends.
+
+    No `already_resolved` is deliberate: `_resolved_write_pending`'s empty-`ids` arm
+    means the close phase takes no ledger read at all here, so the close latch
+    cannot be what arms and the probe owns the observation."""
+    write_ledger(project, {"DW-2": "open", "DW-3": "open"})
+    plan = triage_result(
+        ["DW-2", "DW-3"],
+        bundles=[{"name": "ledger-fix", "dw_ids": ["DW-3"], "intent": "fix"}],
+        decisions=[
+            _decision(
+                "DW-2",
+                [
+                    {"key": "1", "label": "Close", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    inner = triage_effect(plan)
+
+    def faulting_triage(spec):
+        result = inner(spec)
+        fault(project.deferred_work)
+        return result
+
+    return make_sweep(
+        project,
+        [
+            faulting_triage,
+            bundle_dev_effect(project, "ledger-fix", ["DW-3"]),
+            bundle_review_effect(project, "ledger-fix"),
+        ],
+        # `repeat=False` for the healthy companions: DW-2 is skipped for a human
+        # either way, so a second cycle would only re-triage it, and the gate these
+        # rows grade runs inside `_cycle`, above `_loop`'s repeat arm.
+        policy=repeat_policy() if repeat else None,
+    )
+
+
+def test_an_unattended_cycle_that_attempts_no_effect_probes_the_ledger(project):
+    """DW-216. A phase with nothing to observe used to publish `False` — the verdict
+    "the ledger is fine" off no evidence whatsoever — and that is the commonest
+    unattended shape there is: every decision skipped for a human. A ledger that
+    went bad mid-cycle then met the first bundle's `_write_intent` and its bare
+    `read_for_write`, crashing the run.
+
+    So the phase takes ONE read it does not otherwise take, and only when it
+    attempted nothing. The row is what says the withhold came from a probe rather
+    than from a fault somebody observed.
+
+    Ablation: drop the probe. The run crashes at intent creation instead of
+    withholding, and both the refusal row and the withheld row disappear."""
+    engine, adapter = _unattended_sweep_attempting_no_effect(
+        project, lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER)
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    # premise: nobody OBSERVED a fault this cycle — the probe is the only witness
+    assert _records(engine, "sweep-decision-effect-unavailable") == []
+    assert _records(engine, "sweep-resolved-close-unavailable") == []
+    assert [r["dw_id"] for r in _records(engine, "decision-skipped-unattended")] == ["DW-2"]
+    [refused] = _records(engine, "sweep-decision-ledger-refused")
+    assert refused["ledger"] == str(project.deferred_work)
+    assert refused["reason"] == "ledger-unreadable"  # a FIXED token, never free text
+    assert "not valid UTF-8" in refused["error"]
+    assert engine._ledger_in_doubt
+    assert [spec.role for spec in adapter.sessions] == ["triage"]  # zero bundles ran
+    assert "dw-ledger-fix" not in engine.state.tasks
+    [withheld] = _records(engine, "sweep-bundles-withheld")
+    assert withheld["bundles_not_run"] == 1 and withheld["reason"] == "ledger-unreadable"
+    [done] = _records(engine, "sweep-repeat-done")
+    assert done["reason"] == "ledger-unreadable" and done["stop_cause"] == done["reason"]
+    assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER
+    assert _ledger_differs_from_head(project)
+
+
+def test_a_healthy_unattended_cycle_writes_no_probe_refusal(project):
+    """The other half of the probe, and the one that keeps it from withholding every
+    bundle of every ordinary unattended sweep: a healthy ledger arms nothing, writes
+    no row, and dispatches.
+
+    Ablation: arm the probe unconditionally on an unattended skip (drop its
+    `try`/`except` and set the latch) and every assertion here reds."""
+    engine, adapter = _unattended_sweep_attempting_no_effect(
+        project, lambda _ledger: None, repeat=False
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert _records(engine, "sweep-decision-ledger-refused") == []
+    assert not engine._ledger_unfit_to_publish()
+    assert [spec.role for spec in adapter.sessions] == ["triage", "dev", "review"]
+    assert _records(engine, "sweep-bundles-withheld") == []
+    assert engine.state.tasks["dw-ledger-fix"].phase == Phase.DONE
+
+
+def test_a_probe_over_an_absent_ledger_arms_nothing(project):
+    """DW-176's discipline reaches the probe: ABSENCE is not one of the two classes
+    it arms on. `_write_intent` spells its read `or ""`, so a missing ledger briefs a
+    thin intent rather than raising, and an absent ledger ends the NEXT cycle cleanly
+    on `no-open` rather than stopping this one.
+
+    Driven at `_decisions_phase` rather than through a run: the probe lives there,
+    and a full run over a vanished ledger fails its bundle's post-review ledger
+    verification for reasons that have nothing to do with this arm.
+
+    Ablation: add an `if text is None` arm to the probe. Both assertions red — a
+    refusal row appears and the latch arms, which withholds every bundle of a sweep
+    whose ledger simply is not there."""
+    write_ledger(project, {"DW-2": "open"})
+    engine, _ = make_sweep(project, [])  # unattended: the one decision is skipped
+    plan = TriagePlan(open_ids=frozenset({"DW-2"}), decisions=(_reapply_decision("DW-2"),))
+    project.deferred_work.unlink()
+
+    engine._decisions_phase(plan)
+
+    # premise: the phase really attempted nothing, which is the probe's condition
+    assert [r["dw_id"] for r in _records(engine, "decision-skipped-unattended")] == ["DW-2"]
+    assert _records(engine, "sweep-decision-ledger-refused") == []
+    assert not engine._ledger_in_doubt and not engine._ledger_unfit_to_publish()
+
+
+def test_a_decodable_fault_keeps_the_pre_answer_it_would_have_pruned(project, monkeypatch):
+    """DW-217. `_prune_pre_answers` derives the store's KEEP list from
+    the ledger — and on the DECODABLE fault class those bytes read back perfectly,
+    so neither the DW-182 undecodable refusal nor the DW-197 OS refusal fires. An id
+    the aborted write already flipped to `done` is no longer open, so the human's
+    pre-answer for it was pruned and the deletion COMMITTED, off a ledger this very
+    cycle had already declared unfit to publish.
+
+    Ablation: drop the `if self._ledger_unfit_to_publish():` refusal from
+    `_prune_pre_answers`. The stored answer disappears, `decision-preanswers-pruned`
+    appears and the store commit is taken — while the DW-176/182/197 rows elsewhere
+    in this file stay green, because none of them reaches a readable ledger."""
+    from bmad_loop import decisions as decisions_store
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-2": "open", "DW-4": "open"})
+    decisions_store.record_pre_answer(
+        project.project,
+        "DW-4",
+        DecisionOption(key="2", label="Keep", effect="keep-open"),
+        date="2026-06-12",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "out-of-band pre-answer")
+    plan = triage_result(
+        ["DW-2", "DW-4"],
+        skip=[{"id": "DW-4", "reason": "later"}],  # stays open, so a healthy prune keeps it
+        decisions=[
+            _decision(
+                "DW-2",
+                [
+                    {"key": "1", "label": "Close", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+            )
+        ],
+    )
+    engine, _ = make_sweep(
+        project, [triage_effect(plan)], prompting=True, answers=["1"], policy=repeat_policy()
+    )
+
+    def half_record_then_fault(*_args, **_kwargs):
+        # Simulate an external edit to DW-4 before the DW-2 decision is refused.
+        # The real mutator cannot half-write an unrelated entry: it locks before
+        # its single atomic replacement. The fault leaves these bytes untrusted.
+        write_ledger(project, {"DW-2": "open", "DW-4": "done"}, commit=False)
+        raise OSError(11, "Resource deadlock avoided")
+
+    monkeypatch.setattr(deferredwork, "record_decision", half_record_then_fault)
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    # premise: the cycle armed the doubt, and the prune's own read then SUCCEEDED —
+    # this arm is the only one that can fire on bytes that decode
+    assert engine._ledger_in_doubt
+    assert not engine._prune_ledger_unreadable and not engine._prune_ledger_inaccessible
+    # THE claim: the human's answer for the id the half-write retired survives
+    assert set(decisions_store.load_pre_answers(project.project)) == {"DW-4"}
+    [refused] = _records(engine, "sweep-preanswer-prune-refused")
+    assert refused["ledger"] == str(project.deferred_work)
+    assert refused["reason"] == "ledger-in-doubt"  # the FOURTH fixed token
+    assert "error" not in refused  # no fault to quote: the read worked
+    assert _records(engine, "decision-preanswers-pruned") == []
+    # ...and no store commit was taken, so the deletion never reached HEAD either
+    assert [r["file"] for r in _records(engine, "sweep-ledger-commit")] == []
+    assert _records(engine, "sweep-ledger-commit-clean") == []
+
+
+def test_an_undecodable_ledger_still_takes_the_dw182_prune_arm(project):
+    """Ordering, stated: the new refusal sits BELOW the three read arms, so a ledger
+    that will not decode still takes DW-182's arm — its own token, its own carry,
+    and the "could not be decoded mid-sweep" headline rather than the generic one —
+    even though `_ledger_in_doubt` is armed here too.
+
+    Ablation: move the `_ledger_unfit_to_publish()` refusal above the read and every
+    assertion below reds; the run would report a decodable ledger it never read."""
+    engine, _ = _sweep_with_ledger_fault_at_the_decision_prompt(
+        project,
+        lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER),
+        policy=repeat_policy(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert engine._ledger_in_doubt  # the new arm's precondition holds...
+    [refused] = _records(engine, "sweep-preanswer-prune-refused")
+    assert refused["reason"] == "ledger-unreadable"  # ...and DW-182 still wins
+    assert "not valid UTF-8" in refused["error"]
+    assert engine._prune_ledger_unreadable  # the carry the new arm does not set
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert attention.count("the deferred-work ledger could not be decoded mid-sweep:") == 1
+    assert "not fit to publish" not in attention
 
 
 # ------------------- DW-201: every repeat stop keeps its token through a dump

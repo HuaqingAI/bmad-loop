@@ -1261,6 +1261,20 @@ JOURNAL_KINDS = frozenset(
         # — a rival writer closed it between the walk's gate and its write, which is
         # not the missing-entry state and must not be reported as one.
         "sweep-decision-effect-unavailable",
+        # DW-216/220. The decision phase's END-OF-PHASE ledger probe refused. It is
+        # taken only by a phase that attempted no effect at all and therefore has no
+        # observation of its own to publish — the unattended all-skipped shape —
+        # where the cycle used to hand `_cycle`'s dispatch gate a False latch over a
+        # ledger that had gone bad mid-cycle, and the first bundle's `_write_intent`
+        # died on its bare `read_for_write`. The row is what says the withhold came
+        # from a probe rather than from a fault anybody observed. No new diagnostics
+        # routing: `ledger` is already benign, and `reason` and `error` are both
+        # already in `diagnostics._JOURNAL_DROP_FIELDS` — `reason` is one of the two
+        # fixed tokens naming the classes that make that read RAISE
+        # (`ledger-unreadable`, `ledger-inaccessible`), never free text, with the
+        # decode or errno detail in `error`. Absence arms nothing and writes no row,
+        # keeping DW-176's discipline.
+        "sweep-decision-ledger-refused",
         "sweep-decision-option-mismatch",
         # DW-143. The keep-open lane's `stale-option` drop retired the PROJECT-level
         # pre-answer that fed it, so the next run reads no stale answer to re-drop
@@ -1348,6 +1362,15 @@ JOURNAL_KINDS = frozenset(
         # file, versus fix permissions or storage) and the token is all a scrubbed
         # dump keeps. `ledger-absent` stays cycle-local: an absent ledger ends the
         # next cycle cleanly on `no-open`.
+        # A FOURTH token since DW-217: `ledger-in-doubt`, and the only one of the
+        # four taken with the ledger READABLE. The read succeeded; what refuses is
+        # that this cycle already declared the ledger unfit to publish
+        # (`sweep._ledger_unfit_to_publish`), so the open set derived from these
+        # bytes is not a KEEP list to trust — the decodable half-write class, where
+        # an id an aborted write flipped to `done` would otherwise take the human's
+        # pre-answer with it. It carries nothing of its own (the latch it read
+        # already reaches `_loop`) and writes no `error`, since there is no fault
+        # text to quote.
         "sweep-preanswer-prune-refused",
         "sweep-remaining-estimate-unreadable",
         "sweep-repeat-done",

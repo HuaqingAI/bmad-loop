@@ -98,12 +98,12 @@ _HANDBACK_LEDGER_MISS = " ".join(
         _HANDBACK_TAIL,
     ]
 )
-# A fault on the last attempt requires repair; a later successful effect clears
-# the doubt and retains the existing background hand-back wording.
+# A fault on the last decision attempt or in the close phase requires repair.
+# A later successful decision clears only the decision phase's doubt.
 _HANDBACK_LEDGER_HALTED = " ".join(
     [
         "! answers saved, but the deferred-work ledger is not fit to publish",
-        "(see sweep-decision-effect-unavailable in the journal) —",
+        "(see sweep-resolved-close-unavailable or sweep-decision-effect-unavailable in the journal) —",
         "repair the ledger and re-run",
     ]
 )
@@ -1355,7 +1355,30 @@ class SweepEngine(Engine):
         # `_loop` share the latch without changing the decision-phase return tuple.
         # Unlike the prune latch, this also covers faults on decodable bytes.
         self._ledger_in_doubt = False
+        # DW-216. `_close_resolved`'s half of the same verdict, on a latch of its
+        # OWN rather than folded into the one above. The reason is the publish
+        # spelling at the bottom of `_decisions_phase`: it assigns
+        # `self._ledger_in_doubt = ledger_in_doubt` with `=`, not `|=`, and
+        # deliberately — a healthy decision phase must CLEAR a doubt an earlier
+        # cycle raised, or one bad cycle would withhold every bundle for the rest
+        # of the run. `_close_resolved` runs AHEAD of that assign in the same
+        # cycle, so an OR at the arming site would simply be overwritten by a
+        # healthy phase and the close-phase fault would vanish. Cycle-scoped like
+        # the verdict it joins: reset at the top of `_close_resolved`, which runs
+        # once per cycle and first. Read only through `_ledger_unfit_to_publish`.
+        self._close_ledger_in_doubt = False
         self.state.run_type = "sweep"
+
+    def _ledger_unfit_to_publish(self) -> bool:
+        """This cycle's verdict from BOTH phases that can raise it (DW-216/217/220).
+
+        The dispatch gate in `_cycle`, `_loop`'s shared stop arm and
+        `_prune_pre_answers`' refusal all read the doubt through here, so a future
+        arming site cannot be wired into one reader and missed by the others —
+        which is precisely how the close phase's fault reached `_write_intent`'s
+        bare `read_for_write` while the gate above it saw a False latch.
+        """
+        return self._ledger_in_doubt or self._close_ledger_in_doubt
 
     def _quarantine(self, ids: list[str], dw_id: str) -> None:
         """Add `dw_id` to one of `state`'s decision quarantines if absent, and
@@ -1685,7 +1708,7 @@ class SweepEngine(Engine):
                 # the cycle COMPLETED — that is what the prune's degrade bought.
                 self._stop_on_ledger_fault("ledger-inaccessible", cycles=cycle, ledger=ledger)
                 return
-            if self._prune_ledger_unreadable or self._ledger_in_doubt:
+            if self._prune_ledger_unreadable or self._ledger_unfit_to_publish():
                 # DW-182/186. `_prune_pre_answers` refused to read the ledger
                 # because nothing could decode it, and that refusal has to END a
                 # repeating run rather than stay inside the cycle: the boundary
@@ -1707,6 +1730,13 @@ class SweepEngine(Engine):
                 # DW-194/202/210 shares this stop: same repair and closed stop-token
                 # contract. Effect faults can leave decodable bytes, so the gate
                 # needs its own latch rather than relying on the prune to refuse.
+                # DW-216/217/220 widen that leg to `_ledger_unfit_to_publish()`,
+                # which adds the CLOSE phase's own latch — `_close_resolved` runs
+                # ahead of the decision phase's `=` publish, so it cannot share the
+                # flag — plus the re-apply gate's read refusal and the end-of-phase
+                # probe, which both feed `_ledger_in_doubt`. All three land on THIS
+                # token and no new stop: the repair is identical (a human editing
+                # the file) and `_REPEAT_STOP_TOKENS` is a closed set.
                 self.journal.append(
                     "sweep-repeat-done",
                     cycles=cycle,
@@ -1718,7 +1748,13 @@ class SweepEngine(Engine):
                 # `_notify_ledger_repair`, shared with the DW-197 stops. The
                 # HEADLINE still belongs to this arm: `_prune_ledger_unreadable`
                 # chooses it over `_ledger_in_doubt` for the same reason the
-                # condition is ordered that way.
+                # condition is ordered that way — it is the only latch that
+                # observed bytes nobody could DECODE, so it is the only one that
+                # may say so. The close-phase leg and the probe both reach the
+                # generic "not fit to publish" wording for the same reason a
+                # decodable effect fault does: what they observed was a write that
+                # could not land or a read that was refused, which says nothing
+                # about the bytes decoding.
                 self._notify_ledger_repair(
                     ledger,
                     (
@@ -1952,9 +1988,12 @@ class SweepEngine(Engine):
             self._emit("post_sweep_cycle", phase=str(cycle))
             return False
         graded_keys: list[str] = []
-        if self._ledger_in_doubt:
+        if self._ledger_unfit_to_publish():
             # Undecodable bytes would crash intent creation; decodable partial
             # writes would reach HEAD through a bundle commit's `git add -A`.
+            # Read through the helper (DW-216/217/220) rather than
+            # `_ledger_in_doubt` directly: the close phase has a latch of its own,
+            # and the helper is the one place that knows about both.
             # Preserve the item-boundary stop check even when dispatch is withheld.
             self._check_stop_request()
             if bundles:
@@ -2036,6 +2075,15 @@ class SweepEngine(Engine):
         (there, the OS refused). It CARRIES too, on its own latch, for the reason
         the undecodable arm carries — with the same asymmetry against absence.
 
+        A FOURTH refusal (DW-217) sits below all three and is the only one taken
+        with the ledger perfectly readable: this cycle already declared the ledger
+        unfit to publish (`_ledger_unfit_to_publish`), so the open set derived from
+        these bytes is not a KEEP list anybody should trust. It covers the decodable
+        fault class the three reads above cannot see — a half-landed write that
+        flipped a status without recording its line — where an id the aborted write
+        retired would otherwise take the human's pre-answer with it, committed. It
+        carries nothing: the latch it read is already `_loop`-bound.
+
         `_close_resolved` and `_decisions_phase` also catch `OSError` around
         `mark_done_many` and `record_decision`, covering both their internal reads
         and lock failures. The DW-167 re-apply gate catches its direct read too:
@@ -2110,6 +2158,27 @@ class SweepEngine(Engine):
         if text is None:
             self.journal.append(
                 "sweep-preanswer-prune-refused", ledger=str(ledger), reason="ledger-absent"
+            )
+            return
+        # DW-217. The read above SUCCEEDED, and that is exactly the case this arm
+        # exists for: on the decodable fault class — a `record_decision` or
+        # `mark_done_many` that flipped a status and then failed before writing the
+        # `decision:` line — the ledger reads back perfectly, so neither the DW-182
+        # undecodable refusal nor the DW-197 OS refusal fires, and the open set
+        # derived from these bytes is the KEEP list for a store write. An id the
+        # aborted write flipped to `done` is no longer open, so the human's
+        # pre-answer for it was pruned and the deletion COMMITTED — off a ledger
+        # this very cycle already declared unfit to publish.
+        #
+        # It sits BELOW the three read arms deliberately: they own the classes they
+        # observe, each with its own fixed token and its own carry, and displacing
+        # them would lose both. This is the FOURTH token and the only one taken with
+        # the ledger READABLE. It sets no carry of its own — the latch it just read
+        # is already on its way to `_loop` — and, like its siblings, it keeps every
+        # stored answer and spawns no git.
+        if self._ledger_unfit_to_publish():
+            self.journal.append(
+                "sweep-preanswer-prune-refused", ledger=str(ledger), reason="ledger-in-doubt"
             )
             return
         # The store lives under the project that owns `run_dir`, never
@@ -2961,6 +3030,11 @@ class SweepEngine(Engine):
     def _close_resolved(self, plan: TriagePlan) -> int:
         self._emit("pre_close_resolved")
         ledger = self.workspace.paths.deferred_work
+        # DW-216: cycle-scoped, so a cycle whose close phase reads and writes fine
+        # cannot inherit the previous cycle's fault. This method runs once per
+        # cycle and FIRST, which is what makes the top of it the reset point — the
+        # same discipline `_decisions_phase` gets from publishing with `=`.
+        self._close_ledger_in_doubt = False
         # ONE locked read->edit->write for the whole batch (#286/#469). The
         # per-entry `mark_done` loop this replaces took the cross-process ledger
         # lock once per id, leaving a rival writer — a live run's harvest, the TUI
@@ -2993,6 +3067,22 @@ class SweepEngine(Engine):
             pending = not closed and self._resolved_write_pending(ledger, ids)
         except (deferredwork.LedgerReadError, OSError, ValueError, StateRootError) as e:
             self.journal.append("sweep-resolved-close-unavailable", dw_ids=ids, error=str(e))
+            # ...and the doubt is LATCHED (DW-216). This batch either could not read
+            # the ledger or could not write it, so this cycle cannot claim the bytes
+            # on disk are fit to publish — and the bundles `_cycle` dispatches after
+            # the decision phase commit through `verify.commit_story` /
+            # `verify.finalize_commit`, both of which open with a whole-tree
+            # `git add -A`. Bare, a `mark_done_many` that half-wrote a decodable
+            # ledger reached HEAD under a bundle's commit message, and an
+            # undecodable one crashed `_write_intent`'s bare `read_for_write`, while
+            # `_cycle`'s gate read a latch nothing here had armed. Its OWN latch and
+            # not `_ledger_in_doubt`: `_decisions_phase` runs after this and
+            # publishes its verdict with `=`, so writing the shared flag here would
+            # be erased by a healthy decision phase — see the declaration in
+            # `__init__`. `_prune_pre_answers` reads it too and refuses its
+            # KEEP-list derivation, so a decodable half-write cannot prune a live
+            # pre-answer either.
+            self._close_ledger_in_doubt = True
             # `post_close_resolved` still fires and 0 is still returned: the phase
             # RAN, it just closed nothing, and a plugin watching the phase boundary
             # must not silently lose its pairing with `pre_close_resolved`.
@@ -3337,10 +3427,15 @@ class SweepEngine(Engine):
             # open". `is None`, never falsiness — an empty-but-PRESENT ledger
             # genuinely has zero open ids and correctly re-applies nothing.
             fault: str | None = None
+            # DW-220 splits the two fault legs apart: `fault` still drives the
+            # per-candidate rows for BOTH, while only a RAISED read arms the doubt
+            # below — see the comment at the arm for why absence is excluded.
+            ledger_read_faulted = False
             try:
                 ledger_text = deferredwork.read_for_write(ledger)
             except (deferredwork.LedgerReadError, OSError) as e:
                 ledger_text, fault = None, f"re-apply gate could not read the ledger: {e}"
+                ledger_read_faulted = True
             else:
                 if ledger_text is None:
                     fault = "re-apply gate could not read the ledger: the ledger file is gone"
@@ -3365,10 +3460,23 @@ class SweepEngine(Engine):
                         effect="close",
                         error=fault,
                     )
-                # This advisory read refusal attempts no effect, so it leaves the
-                # effect-scoped latch unchanged. A later successful effect can
-                # still earn the commit. With no attempted effect, unreadable-ledger
-                # dispatch remains a pre-existing residual.
+                # DW-220: the EXCEPT clause above arms the doubt, the absence leg
+                # does not. This read attempted no effect, but it did OBSERVE the
+                # ledger, and what it observed on that leg is bytes this process
+                # could not decode or an OS that refused the read — the two classes
+                # that make `_write_intent`'s bare `read_for_write` RAISE, which is
+                # what a bundle dispatched later this cycle runs into. ABSENCE stays
+                # out: `_write_intent` spells its read `or ""`, so a missing ledger
+                # briefs a thin intent rather than raising, and DW-176's discipline
+                # is that an absent ledger ends the NEXT cycle cleanly on `no-open`
+                # rather than stopping this one.
+                #
+                # Arming here cannot change this phase's own commit gate below: it
+                # sets the LOCAL `ledger_in_doubt`, which every landed effect clears,
+                # so the gate's set is either cleared by a later land or accompanied
+                # by `any_effect_landed=False` — and that gate requires both.
+                if ledger_read_faulted:
+                    ledger_in_doubt = True
                 any_effect_faulted = True
                 reapply = []
             else:
@@ -3681,10 +3789,72 @@ class SweepEngine(Engine):
                 self._emit("post_decision", story_key=decision.id, decision_action=option.effect)
                 if option.effect == "close":
                     closed += 1
-        if any_effect_landed and not ledger_in_doubt:
-            # TWO conditions, and they are different questions. `ledger_in_doubt`
+        # DW-216. The two arms above publish an OBSERVATION; a phase that attempted
+        # nothing has none to publish, and that is the shape the unattended sweep
+        # takes every time every decision is skipped. Bare, such a cycle handed
+        # `_cycle`'s gate a False latch over a ledger that had gone bad mid-cycle
+        # and the first bundle's `_write_intent` died on it. So when — and only
+        # when — the phase both attempted no effect and observed no fault, take the
+        # ONE read it does not otherwise take. It sits ABOVE the commit gate and
+        # the hand-back so the verdict it computes is published before anything
+        # acts on it, rather than after.
+        #
+        # The condition is what keeps this probe from masking the arms that already
+        # spoke — every one of them, which is why `_close_ledger_in_doubt` is in it
+        # beside the two phase locals: a close phase that faulted has ALREADY made
+        # this cycle's observation, and a probe that re-read on top of it would arm
+        # `_ledger_in_doubt` on the close phase's behalf, making that arm untestable
+        # on any persistent fault class. Scoped, each arm owns a class no other
+        # reaches.
+        #
+        # Arms on the two classes that make `_write_intent`'s bare `read_for_write`
+        # RAISE and on nothing else: ABSENCE keeps DW-176's discipline, since that
+        # read is spelled `or ""` and an absent ledger ends the next cycle on
+        # `no-open`. Fixed `reason` token, fault text in `error` — both already
+        # `diagnostics._JOURNAL_DROP_FIELDS`, so neither needs new routing. The two
+        # tokens land on ONE stop: `_loop`'s shared arm reports `ledger-unreadable`,
+        # and a persistent `OSError` also trips `_prune_pre_answers`' own read,
+        # which sets `_prune_ledger_inaccessible` — read FIRST by `_loop`, so that
+        # precedence reports `ledger-inaccessible` and is unchanged by this probe.
+        if (
+            not ledger_in_doubt
+            and not any_effect_landed
+            and not any_effect_faulted
+            and not self._close_ledger_in_doubt
+        ):
+            probe_ledger = self.workspace.paths.deferred_work
+            try:
+                deferredwork.read_for_write(probe_ledger)
+            except deferredwork.LedgerReadError as e:
+                self.journal.append(
+                    "sweep-decision-ledger-refused",
+                    ledger=str(probe_ledger),
+                    reason="ledger-unreadable",
+                    error=str(e),
+                )
+                ledger_in_doubt = True
+            except OSError as e:
+                self.journal.append(
+                    "sweep-decision-ledger-refused",
+                    ledger=str(probe_ledger),
+                    reason="ledger-inaccessible",
+                    error=f"{e.__class__.__name__}: {e}",
+                )
+                ledger_in_doubt = True
+        if any_effect_landed and not ledger_in_doubt and not self._ledger_unfit_to_publish():
+            # THREE conditions, and they are different questions. `ledger_in_doubt`
             # is the withhold: the last effect faulted, so whatever is on disk is
-            # bytes nobody could read. `any_effect_landed` is the non-empty pass:
+            # bytes nobody could read. `_ledger_unfit_to_publish()` is the CYCLE's
+            # verdict rather than this walk's (DW-216): `_close_resolved` runs ahead
+            # of this phase and can have half-written the ledger decodably, and this
+            # commit's pathspec IS that file — a landed decision effect here proves
+            # the ledger reads, it does not make the close phase's half-write
+            # publishable. Without it the withhold, the dispatch gate and the repeat
+            # stop all held while this one publisher walked the bogus flip into HEAD.
+            # `self._ledger_in_doubt` inside the helper is still the PREVIOUS cycle's
+            # value until the assign below, which is harmless because `_loop` never
+            # starts another cycle after one that armed. `any_effect_landed` is the
+            # non-empty pass:
             # `_apply_decision_effect` is this walk's only ledger write, so a walk
             # that answered nothing (every decision pre-answered, skipped
             # unattended, or dropped) wrote nothing, and no git is spawned
@@ -3702,8 +3872,13 @@ class SweepEngine(Engine):
                 family="ledger",
             )
         if answered_interactively:
+            # ...on the CYCLE's verdict too (DW-216), for the same reason the commit
+            # gate reads it: a hand-back that promised "sweep continues in the
+            # background" while `_cycle` withheld every bundle over a close-phase
+            # fault told the human the opposite of what the run was about to do.
             self._return_after_decisions(
-                every_effect_landed=not any_effect_faulted, ledger_in_doubt=ledger_in_doubt
+                every_effect_landed=not any_effect_faulted,
+                ledger_in_doubt=ledger_in_doubt or self._ledger_unfit_to_publish(),
             )
         # Assign the final verdict so a healthy phase clears any earlier doubt.
         self._ledger_in_doubt = ledger_in_doubt
