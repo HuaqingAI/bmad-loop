@@ -6231,15 +6231,18 @@ def test_unpublishable_target_folds_a_store_metadata_fault_into_the_refusal(
     assert "Permission denied" in error
 
 
-@pytest.mark.parametrize("probe", ["exists", "is_symlink"])
 @pytest.mark.parametrize("staged", [False, True])
-def test_commit_paths_omits_a_candidate_whose_presence_probe_faults(
-    project, monkeypatch, probe, staged
-):
+def test_commit_paths_omits_a_candidate_whose_presence_probe_faults(project, monkeypatch, staged):
     """DW-227 at the other probe site: `commit_paths`' own presence check can raise,
     and that fault takes the SAME per-candidate uncertainty path a failed `resolve()`
     takes — omit this candidate, commit the healthy sibling, never escape as a bare
     `OSError` into a publisher with no handler for it.
+
+    ONE probe, where this was parametrized over `exists`/`is_symlink` until DW-239:
+    both suppress every OS error on Python 3.14, so the fault this row grades could
+    not arrive there at all and the candidate was silently ruled MISSING. `lstat`
+    suppresses nothing on any interpreter, so the row now grades the same handler on
+    every version of the matrix rather than only the older half.
 
     Ablation: remove the `try/except OSError` around the presence probe and this
     reds with the `PermissionError` escaping before the healthy sibling commits."""
@@ -6251,9 +6254,7 @@ def test_commit_paths_omits_a_candidate_whose_presence_probe_faults(
         staged_blob = git(repo, "show", ":src.txt")
     healthy = repo / "healthy.txt"
     healthy.write_text("commit me\n")
-    if probe == "is_symlink":
-        faulted.unlink()  # exists() must answer False to reach the second probe
-    fault_metadata_probe(monkeypatch, faulted, probe)
+    fault_metadata_probe(monkeypatch, faulted, "lstat")
 
     sha = verify.commit_paths(repo, "chore: healthy only", [faulted, healthy])
 
@@ -6266,23 +6267,20 @@ def test_commit_paths_omits_a_candidate_whose_presence_probe_faults(
         assert git(repo, "show", ":src.txt") == staged_blob
 
 
-@pytest.mark.parametrize("probe", ["exists", "is_symlink"])
-def test_commit_paths_raises_when_the_only_candidates_presence_probe_faults(
-    project, monkeypatch, probe
-):
+def test_commit_paths_raises_when_the_only_candidates_presence_probe_faults(project, monkeypatch):
     """The no-survivor half of the same contract: a sole faulted candidate is a typed
     exact-write failure, not a successful no-op — the harvested-deferral carry clears
     its durable commit-pending latch on a clean return, so `None` here would suppress
     the retry forever. The `OSError` rides as `__cause__`, and no `git add` runs.
+
+    On `lstat` for the reason its sibling row above states (DW-239).
 
     Ablation: record no fault for a faulted presence probe (leave the uncertainty
     slot untouched) and this returns `None` instead of raising."""
     repo = project.project.resolve()
     faulted = repo / "src.txt"
     faulted.write_text("uncommitted exact write\n")
-    if probe == "is_symlink":
-        faulted.unlink()  # exists() must answer False to reach the second probe
-    fault_metadata_probe(monkeypatch, faulted, probe)
+    fault_metadata_probe(monkeypatch, faulted, "lstat")
     git_calls: list[tuple[str, ...]] = []
     real_git = verify._git
 
@@ -6297,8 +6295,82 @@ def test_commit_paths_raises_when_the_only_candidates_presence_probe_faults(
 
     assert isinstance(caught.value.__cause__, PermissionError)
     assert not any(args[:1] == ("add",) for args in git_calls)
-    if probe == "exists":
-        assert faulted.read_text() == "uncommitted exact write\n"
+    assert faulted.read_text() == "uncommitted exact write\n"
+
+
+def test_commit_paths_treats_a_symlink_to_nothing_as_present(project):
+    """Half of what the `lstat` probe must PRESERVE (DW-239): a directory entry that
+    is a symlink to nothing is still PRESENT — never offered to `ls-files` as a
+    possible deletion, and staged as the link entry it is. `exists() or is_symlink()`
+    answered True for it on the SECOND disjunct alone, and `lstat` answers the same
+    way because it does not follow the last component.
+
+    The entry has to be a symlink LOOP rather than a plainly dangling link, and that
+    is not a contrivance — it is the only shape that reaches the probe as a link at
+    all. `commit_paths` resolves every operand first, and non-strict `Path.resolve`
+    collapses a dangling link to the plain non-existent path it points at (which then
+    correctly reads MISSING, identically under either probe); a LOOP is the fixed
+    point that survives the resolve as itself, which is exactly the case
+    `verify.unpublishable_target`'s RESOLVED-argument paragraph says the
+    `is_symlink()` disjunct was there to buy. Gated on 3.13 for the same reason its
+    sibling row above is: older `Path.resolve` raises on the loop instead.
+
+    Ablation: swap the probe for a bare `candidate.exists()` and this reds — the link
+    is ruled missing, `ls-files` reports it untracked, the operand is dropped, and
+    `commit_paths` returns `None` with the link uncommitted."""
+    if sys.version_info < (3, 13):
+        pytest.skip("Path.resolve raises on a symlink loop before 3.13")
+    repo = project.project.resolve()
+    loop = repo / "loop.txt"
+    try:
+        loop.symlink_to("loop.txt")
+    except OSError as exc:  # pragma: no cover - win32 without developer mode
+        pytest.skip(f"symlinks unavailable on this host: {exc}")
+    assert loop.resolve() == loop  # premise: the resolve keeps it a link
+    raw_calls: list[tuple[str, ...]] = []
+    real_git_raw = verify._git_raw
+
+    with pytest.MonkeyPatch.context() as mp:
+
+        def spy_raw(r, *args):
+            raw_calls.append(args)
+            return real_git_raw(r, *args)
+
+        mp.setattr(verify, "_git_raw", spy_raw)
+        sha = verify.commit_paths(repo, "chore: link", [loop])
+
+    assert sha is not None
+    assert git(repo, "show", "--format=", "--name-only", sha).splitlines() == ["loop.txt"]
+    # PRESENT, so the deletion probe was never asked about it
+    assert not any(args[:1] == ("ls-files",) for args in raw_calls)
+    # ...and it rode in as a link, not as a deletion
+    assert git(repo, "show", "--format=", "--name-status", sha).split()[0] == "A"
+    assert git(repo, "show", f"{sha}:loop.txt") == "loop.txt"
+    assert verify.worktree_clean(repo)
+
+
+def test_commit_paths_still_stages_an_absent_but_tracked_operands_deletion(project):
+    """The other half of the preserved semantics: `ENOENT` out of `lstat` is the same
+    MISSING the old pair answered False for, so a tracked-but-removed operand still
+    takes the missing-but-tracked arm and its DELETION rides the commit. That is the
+    contract `cli.confirm` depends on for the park record it unlinks (#356).
+
+    Ablation: fold `FileNotFoundError` into the uncertainty `except OSError` and this
+    reds — the operand is omitted, nothing survives, and a `GitError` replaces the
+    deletion commit."""
+    repo = project.project.resolve()
+    doomed = repo / "doomed.txt"
+    doomed.write_text("tracked\n")
+    git(repo, "add", "--", "doomed.txt")
+    git(repo, "commit", "-q", "-m", "track it")
+    doomed.unlink()
+
+    sha = verify.commit_paths(repo, "chore: delete", [doomed])
+
+    assert sha is not None
+    assert git(repo, "show", "--format=", "--name-only", sha).splitlines() == ["doomed.txt"]
+    assert git(repo, "show", "--format=", "--name-status", sha).split()[0] == "D"
+    assert verify.worktree_clean(repo)
 
 
 def test_unpublishable_target_reads_a_present_empty_ledger_as_publishable(project):

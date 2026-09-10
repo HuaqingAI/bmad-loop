@@ -3471,6 +3471,91 @@ def test_replayed_bundle_close_leaves_the_open_set_before_the_sweep_loop_reads_i
     assert ledger_entries(project)["DW-1"].status.startswith("done")
 
 
+@pytest.mark.parametrize(
+    "fault,cause,fragment",
+    [
+        ("not-a-file", "target-not-a-file", None),
+        ("unreadable", "target-unreadable", "Permission"),
+        ("unresolvable", "target-unreadable", UNRESOLVABLE),
+    ],
+)
+def test_bundle_close_carry_refuses_an_unpublishable_ledger(
+    project, monkeypatch, fault, cause, fragment
+):
+    """DW-237 at `SweepEngine._carry_isolated_ledger_writes`, the fourth exact-commit
+    publisher that reached `commit_paths` with no publishable-target guard.
+
+    Staged as a REPLACEMENT because that is the only shape that reaches the commit:
+    the method WRITES the ledger through `mark_done_many_reopenable` a statement
+    earlier, so a directory that was there all along produces no `carried` ids and
+    never enters the `if carried:` block at all. The window between that write and
+    `commit_paths` is what a concurrent operator (or a half-finished restore) can
+    put a directory into, and `git add -- <dir>` stages its descendants RECURSIVELY
+    under this method's own `chore(deferred-work):` message.
+
+    The refusal is best effort on strictly stronger terms than the `GitError` beside
+    it: `unpublishable_target` answers off the on-disk shape, which a replay re-reads
+    and refuses identically, so there is nothing a raise could buy.
+
+    Every cause that can arise at a guarded site is driven: the DW-211/228 wrong
+    TYPE, the DW-227 metadata fault, and a RESOLVE that fails — the last two both
+    landing on `target-unreadable`, which is the only cause carrying `error` beside
+    `refuse_cause` (a wrong type has no exception text, and an empty string would
+    read as one). The resolve row is the one that grades `_publication_refusal`'s own
+    `except (OSError, RuntimeError)` fold: `Path.resolve` is what fails first, before
+    the family leg is ever asked, and without the fold a bare `OSError` escapes into
+    bookkeeping whose whole degrade discipline exists to prevent that. Both faults
+    are injected through their seams rather than with chmod so they hold on every
+    supported interpreter.
+
+    Ablation: delete this site's `refusal` branch and every row reds — the wrong-type
+    row on its HEAD assertions as `swept-in.txt` reaches `git ls-files`, the other
+    two on the fault escaping into a caller with no handler for it. Delete
+    `_publication_refusal`'s `except (OSError, RuntimeError)` and the resolve row
+    reds alone."""
+    write_ledger(project, {"DW-1": "open"})
+    head = git(project.project, "rev-parse", "HEAD")
+    engine, _ = make_sweep(project, [], policy=isolated_seeded_policy(project))
+    task = StoryTask(story_key="dw-fix", epic=0)
+    task.dw_ids = ["DW-1"]
+    task.bundle_closes_intended = ["DW-1"]
+    real_mark = deferredwork.mark_done_many_reopenable
+
+    def mark_then_break(ledger, *a, **kw):
+        ids = real_mark(ledger, *a, **kw)
+        if fault == "not-a-file":
+            ledger.unlink()
+            ledger.mkdir()
+            (ledger / "swept-in.txt").write_text("an unrelated tree\n", encoding="utf-8")
+        elif fault == "unresolvable":
+            # The #552 shape: a resolve that FAILS rather than answering. It is the
+            # first thing the guard does, so the family leg never runs at all.
+            refuse_to_resolve(monkeypatch, ledger)
+        else:
+            # AFTER the write, for the same reason the directory arrives after it:
+            # the guard's own probe is what must meet the fault, and a ledger
+            # unreadable from the start never produces a close to carry.
+            fault_metadata_probe(monkeypatch, ledger.resolve(), "stat")
+        return ids
+
+    monkeypatch.setattr(deferredwork, "mark_done_many_reopenable", mark_then_break)
+
+    engine._carry_isolated_ledger_writes(task)
+
+    [refused] = _records(engine, "sweep-bundle-close-carry-refused")
+    assert refused["refuse_cause"] == cause and refused["dw_ids"] == ["DW-1"]
+    if fragment is None:
+        assert "error" not in refused  # a wrong TYPE has no fault text to attribute
+    else:
+        assert fragment in refused["error"]  # ...where a probe fault has, and carries it
+    assert _records(engine, "sweep-bundle-close-carry-uncommitted") == []
+    # no git ran for the operand
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert "swept-in.txt" not in git(project.project, "ls-files")
+    # the `-carried` row still lands: the flips are on disk, only the commit is not
+    assert [e["dw_ids"] for e in _records(engine, "sweep-bundle-close-carried")] == [["DW-1"]]
+
+
 def test_bundle_close_carry_is_a_no_op_when_no_close_was_recorded(project):
     """`bundle_closes_intended` IS the guard, and it is keyed on the record rather
     than on `task.dw_ids`: only `_close_bundle_ledger_when_spec_status` writes it,

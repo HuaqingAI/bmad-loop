@@ -11526,6 +11526,132 @@ def test_reverify_walks_every_command_when_they_all_pass(tmp_path, capsys):
     assert "verify commands passed" in capsys.readouterr().out
 
 
+def test_confirm_drops_a_record_path_replaced_by_a_directory(project, capsys, monkeypatch):
+    """DW-237 at `_land_confirmation`, which reached `commit_paths` with three
+    operands and no publishable-target guard on any of them.
+
+    `commit_paths` forces every operand LITERAL, so `git add -- .bmad-loop/operator`
+    on a DIRECTORY at the record's name stages its descendants RECURSIVELY — an
+    unrelated tree published under a `chore(operator):` message. The drop is PER
+    OPERAND, like `decisions.apply_pre_answer`'s GATE TWO and like the `board_ignored`
+    drop beside it: the spec and the board still commit, and the confirmation still
+    exits 0, because the on-disk state is the value and git history is best effort.
+
+    Ablation: delete `_land_confirmation`'s per-operand guard loop and this reds —
+    `swept-in.txt` lands in `git ls-files` (or, where `git add` refuses the set,
+    the spec and board commit vanishes with it)."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    sp = _park_story(project)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park")
+    head = git(project.project, "rev-parse", "HEAD")
+    record = operatoractions.record_path(project.project, "1-1-a")
+    real_drop = operatoractions.drop
+
+    def drop_then_replace(*a, **kw):
+        # The drop unlinks the record; a directory arriving at its name afterwards is
+        # the window this guard closes. Staged through the seam because the drop is
+        # what creates the absence the #356 contract otherwise keeps as a deletion.
+        result = real_drop(*a, **kw)
+        record.mkdir(parents=True, exist_ok=True)
+        (record / "swept-in.txt").write_text("an unrelated tree\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(cli.operatoractions, "drop", drop_then_replace)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+
+    out = capsys.readouterr()
+    assert "target-not-a-file" in out.err and "✓ 1-1-a confirmed" in out.out
+    # the surviving operands still moved into history together...
+    assert git(project.project, "rev-parse", "HEAD") != head
+    changed = git(project.project, "show", "--name-only", "--format=", "HEAD").splitlines()
+    assert sp.relative_to(project.project).as_posix() in changed
+    # ...and not one descendant of the directory rode in with them
+    assert "swept-in.txt" not in git(project.project, "ls-files")
+    assert not any(name.endswith("swept-in.txt") for name in changed)
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    # the dropped operand is dropped WHOLE: the record's own deletion does not ride
+    # this commit either, which is the honest cost of refusing its path — the
+    # `chore(operator):` commit is not the place to guess what belongs at a name a
+    # directory is sitting on, and HEAD still carries the record for the operator to
+    # reconcile by hand.
+    assert ".bmad-loop/operator/1-1-a.json" not in changed
+    assert git(project.project, "ls-files", "--", ".bmad-loop/operator/1-1-a.json").strip()
+
+
+@pytest.mark.parametrize("refused", ["record", "all"])
+def test_confirm_drops_operands_it_cannot_resolve(project, capsys, monkeypatch, refused):
+    """The OTHER cause `_land_confirmation`'s per-operand guard can return, and the
+    arm that grades `_publication_refusal`'s `except (OSError, RuntimeError)` fold:
+    `Path.resolve` fails before the family leg is ever asked, so without the fold a
+    bare `OSError` escapes into a publish that is best effort by construction.
+
+    The `all` row is the empty-survivors arm, and it is graded on the CALL rather
+    than on HEAD: `commit_paths` happens to no-op on an empty operand list, so a HEAD
+    assertion alone would pass whether or not the branch exists. What the branch
+    buys is that git is not entered at all — no `commit_paths`, and therefore none of
+    the `status`/`add` machinery inside it — rather than an empty list being handed
+    over and the function left to decide what that means. The confirmation still
+    exits 0 either way, because the spec's flip and the board's advance are already
+    on disk and git history is best effort here exactly as it is in `decisions`.
+
+    The refusal is installed through the `drop` seam for the reason its sibling row
+    above states: the operands are read and written by the statements ahead of the
+    guard, and only the window between the drop and the commit is this guard's.
+
+    Ablation: delete `_publication_refusal`'s `except (OSError, RuntimeError)` and
+    both rows red with the stubbed `OSError` escaping `cli.main`. Delete the
+    `if survivors:` test and the `all` row reds on its `commit_paths` call count."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    sp = _park_story(project)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park")
+    head = git(project.project, "rev-parse", "HEAD")
+    record = operatoractions.record_path(project.project, "1-1-a")
+    targets = [record] if refused == "record" else [sp, project.sprint_status, record]
+    real_drop = operatoractions.drop
+
+    def drop_then_refuse(*a, **kw):
+        result = real_drop(*a, **kw)
+        refuse_to_resolve(monkeypatch, *targets)
+        return result
+
+    monkeypatch.setattr(cli.operatoractions, "drop", drop_then_refuse)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+    published: list[list] = []
+    real_commit = cli.verify.commit_paths
+
+    def spy_commit(repo, message, paths):
+        published.append(list(paths))
+        return real_commit(repo, message, paths)
+
+    monkeypatch.setattr(cli.verify, "commit_paths", spy_commit)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+
+    out = capsys.readouterr()
+    assert out.err.count("target-unreadable") == len(targets)
+    assert UNRESOLVABLE in out.err  # the fault text rides the warning
+    assert "✓ 1-1-a confirmed" in out.out
+    # the on-disk confirmation happened either way — git history is what varies
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert operatoractions.load(project.project) == {}
+    if refused == "all":
+        assert published == []  # git was never entered, not entered with nothing
+        assert git(project.project, "rev-parse", "HEAD") == head
+    else:
+        assert [len(paths) for paths in published] == [2]  # spec + board, not the record
+        changed = git(project.project, "show", "--name-only", "--format=", "HEAD").splitlines()
+        assert sp.relative_to(project.project).as_posix() in changed
+        assert ".bmad-loop/operator/1-1-a.json" not in changed  # the dropped operand
+
+
 def test_confirm_survives_a_non_git_project(project, capsys, monkeypatch):
     """The files are the state; git history is the record of it. A commit failure
     must not undo a confirmation that already happened on disk."""

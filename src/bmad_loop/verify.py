@@ -5231,14 +5231,40 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     contract for healthy siblings. If no usable operand survives that uncertainty,
     the call raises instead of reporting a successful no-op. TWO things can make a
     candidate uncertain and both take that one path: its `resolve()` can fail, and
-    so can the presence probe below it — on Python 3.11–3.13
-    `Path.exists()`/`is_symlink()` absorb only the `ENOENT`/`ENOTDIR`/`ELOOP`
-    class of errnos and RAISE the rest, so an `EACCES` under one operand used to
-    escape as a bare `OSError` into best-effort publishers that have no handler
-    for it (DW-227). Python 3.14 suppresses all OS errors inside those probes, so
-    there the fault never arrives: both answer False and the candidate is simply
-    ruled MISSING, taking the missing-but-tracked arm below. The guard handles
-    what a probe raises, not what it suppresses."""
+    so can the presence probe below it, which is a direct `Path.lstat()` for
+    exactly that reason (DW-239). `Path.exists()`/`is_symlink()` stood here until
+    a truthful probe was needed on every interpreter: on Python 3.11–3.13 they
+    absorb only `pathlib`'s ignored errnos (`ENOENT`/`ENOTDIR`/`EBADF`/`ELOOP`,
+    plus the `ERROR_NOT_READY`/`ERROR_INVALID_NAME`/`ERROR_CANT_RESOLVE_FILENAME`
+    winerrors) and RAISE the rest, so an `EACCES` under one operand escaped as a
+    bare `OSError` into best-effort publishers that have no handler for it
+    (DW-227); Python 3.14 suppresses ALL OS errors inside them, so there the same
+    fault never arrived at all — both probes answered False and a TRACKED candidate
+    under an unsearchable parent was ruled MISSING, taking the missing-but-tracked
+    arm below and offering its DELETION to `git add`. `lstat` suppresses nothing on
+    any interpreter: `EACCES`, an `ELOOP` on an intermediate component and
+    `ENAMETOOLONG` all REPORT into the uncertainty slot instead of answering False,
+    so that slot is now reachable everywhere. So does every errno the pair absorbed
+    but `ENOENT`/`ENOTDIR` — `EBADF` and those three winerrors included — and that
+    is a deliberate widening rather than a side effect: an operand a Windows host
+    calls not-ready or unspellable is a path this cannot say anything about, and
+    saying so is the whole of DW-239. The cost is disclosed: as a SOLE operand such
+    a path used to be a clean no-op and now raises `GitError`, which the best-effort
+    publishers above already handle and which is the honest answer.
+
+    It otherwise answers the same PRESENCE question the pair answered — success for
+    every directory entry that exists, and `ENOENT`/`ENOTDIR` for the absence the
+    pair reported as False. That equivalence includes the one entry the
+    `is_symlink()` disjunct was actually there to buy, and it is not the dangling
+    link the spelling suggests: every operand here is `resolve()`d first, and
+    non-strict resolve collapses a dangling link to the plain non-existent path it
+    points at, so `lstat` raises `FileNotFoundError` for it exactly as both probes
+    answered False. What survives the resolve AS a link is a symlink LOOP, which
+    Python 3.13+ resolves to the link itself — `exists()` False, `is_symlink()`
+    True — and `lstat` succeeds on it because it does not follow the last component.
+    `unpublishable_target`'s RESOLVED-argument paragraph makes the same distinction
+    for the same reason. The guard still handles what a probe raises, not what it
+    suppresses; there is simply nothing left here that suppresses."""
     rels: list[str] = []
     # The single per-candidate uncertainty slot, shared by BOTH sources (a failed
     # `resolve()` and a failed presence probe) because they have one contract: omit
@@ -5277,11 +5303,22 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     for r in rels:
         candidate = repo_root / r
         try:
-            present = candidate.exists() or candidate.is_symlink()
+            # `lstat` DIRECTLY, never `exists()`/`is_symlink()`: those suppress every
+            # OS error on Python 3.14, so an EACCES parent ruled a TRACKED candidate
+            # MISSING and staged its deletion (DW-239). It does not follow the last
+            # component, which keeps the one entry the `is_symlink()` disjunct bought
+            # — a symlink LOOP, the only link that survives the resolve above as a
+            # link — PRESENT; `ENOENT`/`ENOTDIR` are the absence the pair answered
+            # False for, a resolved-away dangling link among them.
+            candidate.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            present = False
         except OSError as e:
             if candidate_fault is None:
                 candidate_fault = (candidate, e, "a presence probe")
             continue
+        else:
+            present = True
         survivors.append(r)
         if not present:
             missing.append(r)

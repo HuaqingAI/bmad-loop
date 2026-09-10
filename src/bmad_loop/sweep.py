@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, assert_never
 
 from . import deferredwork, gates, verify
-from .engine import Engine, RunPaused, _ArmedClose, _LedgerAnchor
+from .engine import Engine, RunPaused, _ArmedClose, _LedgerAnchor, _publication_refusal
 from .escalation import critical_session_reason, env_fault_pause_reason, session_failure_reason
 from .model import PAUSE_STORY_GATE, Phase, StoryTask, result_mapping
 from .platform_util import (
@@ -5587,6 +5587,21 @@ class SweepEngine(Engine):
         would cost the run its ``integrate_unit`` over bookkeeping whose real work is
         already done. The flips themselves are unguarded: losing them is the hazard
         this exists to prevent.
+
+        A publication REFUSAL (DW-237) is best effort on strictly stronger terms.
+        ``verify.unpublishable_target`` answers a different question from a
+        ``GitError`` — not "can git own this path" but "is this operand a publishable
+        file at all". For ``target-absent`` and ``target-not-a-file`` that is answered
+        off a DURABLE on-disk shape, which a replay re-reads and refuses identically,
+        so there is nothing for a raise to buy even in principle.
+        ``target-unreadable`` is a probe fault and may well be transient, so that
+        argument does not cover it — but nothing here needs it to: this carry holds
+        no commit latch, its flips are idempotent, and its commit was already best
+        effort, so a refusal costs it exactly what a ``GitError`` already did. It is
+        ``Engine._carry_harvested_deferrals``, the one publisher with a durable latch,
+        that keeps ``target-unreadable`` on its retry path instead of refusing it.
+        The row is journalled beside the ``-uncommitted`` one rather than folded into
+        it: the two name different operator repairs.
         """
         super()._carry_isolated_ledger_writes(task)
         if not task.bundle_closes_intended:
@@ -5600,19 +5615,36 @@ class SweepEngine(Engine):
             self._bundle_close_operation_id(task),
         )
         if carried:
-            try:
-                verify.commit_paths(
-                    self.paths.repo_root,
-                    f"chore(deferred-work): close {task.story_key}'s bundle ids",
-                    [ledger],
-                )
-            except verify.GitError as e:
+            # The DW-237 publishable-target guard, before any git runs: `commit_paths`
+            # forces every operand LITERAL, so a ledger replaced by a DIRECTORY is
+            # handed to `git add` as a pathspec and staged RECURSIVELY under this
+            # `chore(deferred-work):` message. Refused, never raised, on every cause
+            # — see the docstring's best-effort argument, which covers this arm too.
+            refusal = _publication_refusal(ledger, "ledger")
+            if refusal is not None:
+                cause, error = refusal
+                extra = {} if error is None else {"error": error}
                 self.journal.append(
-                    "sweep-bundle-close-carry-uncommitted",
+                    "sweep-bundle-close-carry-refused",
                     story_key=task.story_key,
                     dw_ids=carried,
-                    error=str(e),
+                    refuse_cause=cause,
+                    **extra,
                 )
+            else:
+                try:
+                    verify.commit_paths(
+                        self.paths.repo_root,
+                        f"chore(deferred-work): close {task.story_key}'s bundle ids",
+                        [ledger],
+                    )
+                except verify.GitError as e:
+                    self.journal.append(
+                        "sweep-bundle-close-carry-uncommitted",
+                        story_key=task.story_key,
+                        dw_ids=carried,
+                        error=str(e),
+                    )
         self.journal.append("sweep-bundle-close-carried", story_key=task.story_key, dw_ids=carried)
 
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):

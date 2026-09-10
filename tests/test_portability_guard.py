@@ -409,6 +409,7 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     "board-advance-carried": frozenset({"target"}),
     "board-advance-carry-failed": frozenset({"target"}),
     "board-advance-carry-foreign-dirt": frozenset({"target"}),
+    "board-advance-carry-refused": frozenset({"target"}),
     "board-advance-carry-uncommitted": frozenset({"target"}),
     # The stale-restore record carries SHA strings under this name and is routed;
     # this recovery notice carries only the already-derived integer count.
@@ -1024,6 +1025,17 @@ JOURNAL_KINDS = frozenset(
         "board-advance-carried",
         "board-advance-carry-failed",
         "board-advance-carry-foreign-dirt",
+        # DW-237. The REFUSAL arm of the board carry: `_carry_board_advance` asked
+        # `verify.unpublishable_target` whether the board was still a publishable
+        # regular file (family `"store"`) and it was not, so the commit was skipped
+        # before `verify.commit_paths` could hand the literal pathspec to `git add` —
+        # which stages a DIRECTORY's descendants RECURSIVELY, publishing an unrelated
+        # tree under a `chore(sprint-status):` message. Reachable through the window
+        # the method's own `is_file()` pre-check leaves open (#686). `refuse_cause`
+        # and the optional `error` are already declared (see `sweep-ledger-commit-
+        # refused`); `target` is this producer's usual sprint STATUS, declared beside
+        # its four siblings in `JOURNAL_KIND_BENIGN_FIELDS` rather than by name.
+        "board-advance-carry-refused",
         "board-advance-carry-uncommitted",
         "console-ctrl-ignored",
         "defer-ledger-restore-diverged",
@@ -1042,6 +1054,15 @@ JOURNAL_KINDS = frozenset(
         "fix-decision",
         "fix-harvest-failed",
         "harvest-carried",
+        # DW-237. The REFUSAL arm of the harvested-deferral carry, minted for the
+        # same hazard as its board sibling above: a ledger replaced by a DIRECTORY
+        # between the append and the commit would be staged recursively under a
+        # `chore(deferred-work):` message. Family `"ledger"`, declared at the site.
+        # It never raises, where this method's `GitError` can — a refusal answers
+        # "not a publishable file", which a replay re-reads and refuses identically,
+        # so there is nothing left to retry. `story_key`, `dw_ids`, `refuse_cause`
+        # and the optional `error` are all already routed or declared.
+        "harvest-carry-refused",
         "harvest-carry-uncommitted",
         "isolation-flip-orphaned-worktree",
         "ledger-baseline-probe-failed",
@@ -1098,6 +1119,12 @@ JOURNAL_KINDS = frozenset(
         "story-awaiting-operator",
         "story-deferred",
         "story-deferred-close-carried",
+        # DW-237. The REFUSAL arm of the declared-close carry (#458), the same guard
+        # and the same `"ledger"` family as `harvest-carry-refused` above, on the
+        # publisher whose commit was already best effort. Journalled beside the
+        # `-uncommitted` row rather than folded into it: "git could not own this
+        # path" and "this operand is not a publishable file" name different repairs.
+        "story-deferred-close-carry-refused",
         "story-deferred-close-carry-uncommitted",
         "story-deferred-closed",
         "story-done",
@@ -1195,6 +1222,12 @@ JOURNAL_KINDS = frozenset(
         "migrate-decision",
         "migrate-duplicate-ids",
         "sweep-bundle-close-carried",
+        # DW-237. The REFUSAL arm of the bundle-close carry — the sweep's own copy of
+        # `story-deferred-close-carry-refused`, on `SweepEngine`'s override. Last of
+        # the five `verify.commit_paths` callers that reached git with no
+        # publishable-target guard; every exact-commit publisher now proves its
+        # target before spawning any git for it.
+        "sweep-bundle-close-carry-refused",
         "sweep-bundle-close-carry-uncommitted",
         "sweep-bundle-closed",
         # DW-144. A reset in-flight bundle task adopting the ids of the bundle now

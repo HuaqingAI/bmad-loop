@@ -22,7 +22,7 @@ import traceback
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, NamedTuple, NoReturn, Protocol, Sequence
+from typing import TYPE_CHECKING, Callable, Literal, NamedTuple, NoReturn, Protocol, Sequence
 
 from . import deferredwork, devcontract, envvars, gates, operatoractions, verify
 from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec, SpecSnapshot
@@ -607,6 +607,45 @@ def _harvest_row(
         finding.location or None,
         finding.severity or None,
     )
+
+
+def _publication_refusal(
+    path: Path, family: Literal["ledger", "store"]
+) -> tuple[Literal["target-absent", "target-unreadable", "target-not-a-file"], str | None] | None:
+    """Why the carries below must not publish `path`, or `None` when they may.
+
+    The resolve-then-guard half of `decisions.apply_pre_answer`'s GATE TWO, lifted
+    here because FIVE best-effort publishers — three in this module,
+    `SweepEngine._carry_isolated_ledger_writes`, and `cli._land_confirmation`'s
+    per-operand loop — ask it in the same shape (DW-237). The RESOLVED target is what
+    `verify.commit_paths` publishes and therefore what the guard must be asked about;
+    a resolve that FAILS is folded into `target-unreadable`, exactly as
+    `apply_pre_answer` folds its own, because a carry that cannot name its operand
+    has no more business reaching git than one whose operand is a directory.
+
+    The FAMILY is DECLARED by each caller and never derived from the path — the
+    rule `verify.unpublishable_target` states for itself, and the reason this
+    helper takes it as an argument rather than testing `path == paths.deferred_work`
+    and choosing one.
+
+    The three causes it can return are NOT interchangeable to a caller holding a
+    durable retry latch, and `_carry_harvested_deferrals` acts on the difference:
+    `target-absent` and `target-not-a-file` are DURABLE on-disk shapes a replay
+    re-reads and refuses identically, while `target-unreadable` is whatever a probe
+    RAISED — a transient host answer (an EACCES parent, or the WinError 64 a
+    registered-but-not-serving UNC provider gives) that the next pass may well not
+    see. Both of this helper's own faults land on that one cause, the resolve's and
+    the family leg's, which is why the distinction is drawn on the cause rather than
+    on which call produced it.
+
+    Returns the `Literal` cause unchanged so every caller's `refuse_cause` journal
+    field stays the closed three-value enum `tests/test_portability_guard.py`
+    declares benign."""
+    try:
+        target = path.resolve()
+    except (OSError, RuntimeError) as e:
+        return ("target-unreadable", str(e))
+    return verify.unpublishable_target(target, family)
 
 
 class Engine:
@@ -7318,22 +7357,61 @@ class Engine:
             # The pre-append latch also covers every git observation/write below.
             # A failed add/status/commit can leave the row staged or dirty; replay
             # must retry even when the provenance scan dedupes it to `carried == []`.
-            may_degrade = self._harvest_carry_commit_may_degrade(ledger)
-            try:
-                verify.commit_paths(
-                    self.paths.repo_root,
-                    f"chore(deferred-work): carry harvested findings from {task.story_key}",
-                    [ledger],
-                )
-            except verify.GitError as e:
-                if not may_degrade:
-                    raise
+            # THE PUBLISHABLE-TARGET GUARD (DW-237), ahead of `may_degrade` because
+            # that probe spawns git of its own and a refused publish must spawn NONE.
+            # A refusal never RAISES, where a `GitError` on a git-ownable ledger
+            # does: `may_degrade` asks whether git can own the path, and a refusal
+            # answers a different question — the operand is not a publishable file at
+            # all. For the two DURABLE causes a replay re-reads the same shape and
+            # refuses again, so raising would cost the run its `integrate_unit` with
+            # nothing left to retry. `target-unreadable` is the cause that does NOT
+            # share that argument, and it is filtered out just below.
+            refusal = _publication_refusal(ledger, "ledger")
+            if refusal is not None and refusal[0] == "target-unreadable":
+                # UNCERTAINTY, not a refusal, and only at THIS site: alone among the
+                # five publishers this one carries a durable commit latch, and
+                # DW-195/#552 pinned the rule that an unreadable ledger must not
+                # become an advisory success there. That cause is whatever a probe
+                # RAISED — an EACCES parent, or the WinError 64 a
+                # registered-but-not-serving UNC provider gives — so a replay may
+                # find it gone, where a directory or an absence is still there.
+                # Handing it back to `commit_paths` keeps the pre-DW-237 path
+                # exactly: git is asked, it raises, and `may_degrade` decides whether
+                # the run keeps the latch and retries or degrades. The two DURABLE
+                # causes take the refusal arm below, where there is nothing to retry.
+                refusal = None
+            if refusal is not None:
+                cause, error = refusal
+                # `error` only where the refusal HAS fault text to attribute; an
+                # absent operand has none, and an empty string would read as one.
+                extra = {} if error is None else {"error": error}
                 self.journal.append(
-                    "harvest-carry-uncommitted",
+                    "harvest-carry-refused",
                     story_key=task.story_key,
                     dw_ids=carried,
-                    error=str(e),
+                    refuse_cause=cause,
+                    **extra,
                 )
+            else:
+                may_degrade = self._harvest_carry_commit_may_degrade(ledger)
+                try:
+                    verify.commit_paths(
+                        self.paths.repo_root,
+                        f"chore(deferred-work): carry harvested findings from {task.story_key}",
+                        [ledger],
+                    )
+                except verify.GitError as e:
+                    if not may_degrade:
+                        raise
+                    self.journal.append(
+                        "harvest-carry-uncommitted",
+                        story_key=task.story_key,
+                        dw_ids=carried,
+                        error=str(e),
+                    )
+            # Unchanged by a refusal: the latch it clears covers a COMMIT
+            # obligation, and there is no commit left owing for an operand no
+            # replay of this frame would publish either.
             task.harvest_carry_commit_pending = False
             self._save()
         self.journal.append("harvest-carried", story_key=task.story_key, dw_ids=carried)
@@ -7397,19 +7475,38 @@ class Engine:
             self._story_close_operation_id(task),
         )
         if carried:
-            try:
-                verify.commit_paths(
-                    self.paths.repo_root,
-                    f"chore(deferred-work): close {task.story_key}'s declared ids",
-                    [ledger],
-                )
-            except verify.GitError as e:
+            # The DW-237 guard, before any git: `commit_paths` hands its operand to
+            # `git add` as a LITERAL pathspec, so a ledger replaced by a directory
+            # would be staged RECURSIVELY under this `chore(deferred-work):` message.
+            # Every cause refuses here, `target-unreadable` included: this carry holds
+            # no commit latch (its flips are idempotent and its commit was already
+            # best effort), so it has no retry to protect the way
+            # `_carry_harvested_deferrals` does.
+            refusal = _publication_refusal(ledger, "ledger")
+            if refusal is not None:
+                cause, error = refusal
+                extra = {} if error is None else {"error": error}
                 self.journal.append(
-                    "story-deferred-close-carry-uncommitted",
+                    "story-deferred-close-carry-refused",
                     story_key=task.story_key,
                     dw_ids=carried,
-                    error=str(e),
+                    refuse_cause=cause,
+                    **extra,
                 )
+            else:
+                try:
+                    verify.commit_paths(
+                        self.paths.repo_root,
+                        f"chore(deferred-work): close {task.story_key}'s declared ids",
+                        [ledger],
+                    )
+                except verify.GitError as e:
+                    self.journal.append(
+                        "story-deferred-close-carry-uncommitted",
+                        story_key=task.story_key,
+                        dw_ids=carried,
+                        error=str(e),
+                    )
         self.journal.append(
             "story-deferred-close-carried", story_key=task.story_key, dw_ids=carried
         )
@@ -7721,19 +7818,38 @@ class Engine:
                 status=landed,
             )
         else:
-            try:
-                verify.commit_paths(
-                    self.paths.repo_root,
-                    f"chore(sprint-status): carry {task.story_key} to {target}",
-                    [board],
-                )
-            except verify.GitError as e:
+            # The DW-237 guard on the BOARD, declared `"store"` — the family names
+            # the validation POLICY, not the file's role: `"ledger"` is the leg that
+            # additionally asks `deferredwork.read_for_write`, and a board wants only
+            # "a regular file is there". A third family would mint a second spelling
+            # for one policy and weaken `unpublishable_target`'s `assert_never`.
+            # Every cause refuses here for the reason the story-close carry gives:
+            # no latch, so no retry to keep alive for a transient `target-unreadable`.
+            refusal = _publication_refusal(board, "store")
+            if refusal is not None:
+                cause, error = refusal
+                extra = {} if error is None else {"error": error}
                 self.journal.append(
-                    "board-advance-carry-uncommitted",
+                    "board-advance-carry-refused",
                     story_key=task.story_key,
                     target=target,
-                    error=str(e),
+                    refuse_cause=cause,
+                    **extra,
                 )
+            else:
+                try:
+                    verify.commit_paths(
+                        self.paths.repo_root,
+                        f"chore(sprint-status): carry {task.story_key} to {target}",
+                        [board],
+                    )
+                except verify.GitError as e:
+                    self.journal.append(
+                        "board-advance-carry-uncommitted",
+                        story_key=task.story_key,
+                        target=target,
+                        error=str(e),
+                    )
         self.journal.append(
             "board-advance-carried",
             story_key=task.story_key,

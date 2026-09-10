@@ -23,6 +23,7 @@ from conftest import (
     _touch_run,
     attach_profile,
     crash_at_merge_back,
+    fault_metadata_probe,
     git,
     ignore_before_commit,
     install_build_auto_skill,
@@ -1843,6 +1844,13 @@ def _harvest_carry_events(engine):
     return [entry for entry in engine.journal.entries() if entry["kind"] == "harvest-carried"]
 
 
+def _rows(engine, kind: str) -> list[dict]:
+    """Every journal row of one kind. The negative form (`== []`) is half of what the
+    DW-237 refusal rows below assert: the refusal REPLACES the publish, so both the
+    commit row and the `-uncommitted` degrade row must be absent, not merely joined."""
+    return [entry for entry in engine.journal.entries() if entry["kind"] == kind]
+
+
 def test_deferred_isolated_unit_carries_harvest_before_terminal_save(project):
     """A dropped failed worktree cannot be the only durable home of its finding."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
@@ -2190,6 +2198,161 @@ def test_carry_harvest_files_fresh_against_a_cross_spec_closed_twin(project):
     assert deferredwork.field_line_present(entries[1].body, "source_spec", record["source_spec"])
     (carried,) = _harvest_carry_events(engine)
     assert carried["dw_ids"] == ["DW-2"]
+
+
+def _replace_with_a_directory(path: Path) -> None:
+    """Swap a just-written operand for a DIRECTORY holding one tracked-looking file.
+
+    The shape DW-237 guards against, and the window it has to be staged in. Every
+    carry below WRITES its operand a statement or two before publishing it, so a
+    directory that was there all along never reaches the commit at all — the write
+    would have failed, or (for the board) `_carry_board_advance`'s own `is_file()`
+    pre-check would have refused first. What is reachable is the REPLACEMENT: an
+    operator, or a half-finished restore, putting a directory at the name inside the
+    window between the write and `commit_paths` — the same TOCTOU
+    `_carry_board_advance`'s docstring already names as #686. Each row opens that
+    window deterministically by wrapping the writer.
+
+    The descendant is what makes the hazard visible: `commit_paths` forces every
+    operand LITERAL, and `git add -- <dir>` stages a directory's descendants
+    RECURSIVELY, so an unrelated tree would be published under the carry's own
+    `chore(...)` message."""
+    path.unlink()
+    path.mkdir()
+    (path / "swept-in.txt").write_text("an unrelated tree\n", encoding="utf-8")
+
+
+def test_carry_harvest_refuses_a_ledger_replaced_by_a_directory(project, monkeypatch):
+    """DW-237 at `_carry_harvested_deferrals`: the publishable-target guard its
+    sibling publishers already take, on the operand this one hands to `git add`.
+
+    The refusal never RAISES, where this method's `GitError` can: `may_degrade` asks
+    whether git can own the ledger, and a refusal answers a different question — the
+    operand is not a publishable file at all — which a replay re-reads and refuses
+    identically, so raising would cost the run its `integrate_unit` with nothing left
+    to retry. Every other statement in the frame is untouched: the latch clears and
+    `harvest-carried` is still journaled.
+
+    Ablation: delete the `refusal = _publication_refusal(...)` branch here and this
+    reds on both HEAD assertions — `swept-in.txt` lands in `git ls-files` under a
+    `chore(deferred-work):` message."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    # after the ledger write above: this helper's own `add -A` is what tracks it
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head = git(project.project, "rev-parse", "HEAD")
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[_harvest_record()])
+    engine.state.tasks[task.story_key] = task
+    real_append = deferredwork.append_entries
+
+    def append_then_replace(ledger, specs):
+        ids = real_append(ledger, specs)
+        _replace_with_a_directory(ledger)
+        return ids
+
+    monkeypatch.setattr(deferredwork, "append_entries", append_then_replace)
+
+    engine._carry_harvested_deferrals(task)
+
+    [refused] = _rows(engine, "harvest-carry-refused")
+    assert refused["refuse_cause"] == "target-not-a-file"
+    assert refused["dw_ids"] == ["DW-1"]
+    assert "error" not in refused  # a wrong TYPE has no fault text to attribute
+    assert _rows(engine, "harvest-carry-uncommitted") == []
+    # no git ran for the operand: HEAD is untouched and nothing under it is tracked
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert "swept-in.txt" not in git(project.project, "ls-files")
+    # ...and the frame's own bookkeeping is unchanged by the refusal
+    assert [e["dw_ids"] for e in _harvest_carry_events(engine)] == [["DW-1"]]
+    assert task.harvest_carry_commit_pending is False
+
+
+def test_carry_harvest_keeps_its_latch_when_the_ledger_becomes_unreadable(project, monkeypatch):
+    """The cause the DW-237 guard must NOT short-circuit at this site.
+
+    `target-absent` and `target-not-a-file` are durable on-disk shapes a replay reads
+    again and refuses again, so refusing them costs nothing. `target-unreadable` is
+    whatever a probe RAISED — an EACCES parent here, a WinError 64 from a
+    registered-but-not-serving UNC provider on the original DW-195/#552 report — and
+    the next pass may well not see it. This publisher alone carries a durable
+    `harvest_carry_commit_pending` latch, so turning that cause into a refusal would
+    journal an advisory success and clear the commit obligation forever. It falls
+    through to `may_degrade`/`commit_paths` instead, exactly as it did before the
+    guard landed: a TRACKED ledger may not degrade, so the `GitError` is re-raised
+    and the latch survives for the replay.
+
+    Both probes are faulted because a real unsearchable parent faults both: `stat` is
+    what `unpublishable_target`'s `"ledger"` leg reaches through
+    `deferredwork.read_for_write`, and `lstat` is `commit_paths`' own presence probe
+    since DW-239. Injected AFTER the append for the reason
+    `_replace_with_a_directory` states — a ledger unreadable from the start never
+    produces a carry to publish.
+
+    Ablation: delete the `refusal[0] == "target-unreadable"` filter at this site and
+    this reds on every assertion — the call returns cleanly, journals
+    `harvest-carry-refused`, and `harvest_carry_commit_pending` comes back False with
+    the commit obligation gone."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    # after the ledger write above: this helper's own `add -A` is what tracks it
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    assert verify.path_tracked(project.project, ledger_rel)  # so it may NOT degrade
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[_harvest_record()])
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+    real_append = deferredwork.append_entries
+
+    def append_then_fault(ledger, specs):
+        ids = real_append(ledger, specs)
+        for probe in ("stat", "lstat"):
+            fault_metadata_probe(monkeypatch, ledger.resolve(), probe)
+        return ids
+
+    monkeypatch.setattr(deferredwork, "append_entries", append_then_fault)
+
+    with pytest.raises(verify.GitError, match="no exact commit operand remains"):
+        engine._carry_harvested_deferrals(task)
+
+    assert load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending
+    assert "harvest-carry-refused" not in journal_kinds(engine)
+    assert "harvest-carried" not in journal_kinds(engine)
+
+
+def test_carry_story_deferred_closes_refuses_a_ledger_replaced_by_a_directory(project, monkeypatch):
+    """The same guard at `_carry_story_deferred_closes`, whose commit was already
+    best effort — a refusal joins the `-uncommitted` row rather than replacing it,
+    because the two name different operator repairs.
+
+    Ablation: delete this site's `refusal` branch and `swept-in.txt` reaches
+    `git ls-files` under a `chore(deferred-work):` message."""
+    write_ledger(project, {"DW-1": "open"})
+    # after the ledger write above: this helper's own `add -A` is what tracks it
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head = git(project.project, "rev-parse", "HEAD")
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, story_closes_intended=["DW-1"])
+    engine.state.tasks[task.story_key] = task
+    real_mark = deferredwork.mark_done_many_reopenable
+
+    def mark_then_replace(ledger, *a, **kw):
+        ids = real_mark(ledger, *a, **kw)
+        _replace_with_a_directory(ledger)
+        return ids
+
+    monkeypatch.setattr(deferredwork, "mark_done_many_reopenable", mark_then_replace)
+
+    engine._carry_story_deferred_closes(task)
+
+    [refused] = _rows(engine, "story-deferred-close-carry-refused")
+    assert refused["refuse_cause"] == "target-not-a-file" and refused["dw_ids"] == ["DW-1"]
+    assert _rows(engine, "story-deferred-close-carry-uncommitted") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert "swept-in.txt" not in git(project.project, "ls-files")
+    # the `-carried` row still lands: the flips are on disk, only the commit is not
+    assert [e["dw_ids"] for e in _rows(engine, "story-deferred-close-carried")] == [["DW-1"]]
 
 
 def _in_place_policy(*, limits: LimitsPolicy | None = None):
@@ -6766,6 +6929,49 @@ def test_awaiting_operator_isolated_unit_carries_its_board_advance(project):
     assert [(e["target"], e["status"]) for e in _board_carry_events(engine)] == [
         ("awaiting-operator", "awaiting-operator")
     ]
+
+
+def test_board_carry_refuses_a_board_replaced_by_a_directory(project, monkeypatch):
+    """DW-237 at `_carry_board_advance`, the one guarded site whose family is
+    `"store"` rather than `"ledger"`: the family names the validation POLICY, not the
+    file's role — `"ledger"` is the leg that additionally asks
+    `deferredwork.read_for_write`, and a board wants only "a regular file is there".
+
+    Staged as a REPLACEMENT for the reason `_replace_with_a_directory` states, and
+    here the code says so itself: the method's own `is_file()` pre-check refuses a
+    board that was a directory all along, so what remains is the window that check
+    leaves open — the #686 TOCTOU its comment names. The `target` field rides the row
+    beside `refuse_cause`, as it does on all four of this method's sibling records.
+
+    Ablation: delete this site's `refusal` branch and this reds on both HEAD
+    assertions — `swept-in.txt` lands under a `chore(sprint-status):` message."""
+    from bmad_loop import engine as engine_module
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    head = git(project.project, "rev-parse", "HEAD")
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, board_advance_intended="done")
+    engine.state.tasks[task.story_key] = task
+    real_advance = engine_module.sprint_advance
+
+    def advance_then_replace(board, *a, **kw):
+        landed = real_advance(board, *a, **kw)
+        _replace_with_a_directory(board)
+        return landed
+
+    monkeypatch.setattr(engine_module, "sprint_advance", advance_then_replace)
+
+    engine._carry_board_advance(task)
+
+    [refused] = _rows(engine, "board-advance-carry-refused")
+    assert refused["refuse_cause"] == "target-not-a-file" and refused["target"] == "done"
+    assert "error" not in refused
+    assert _rows(engine, "board-advance-carry-uncommitted") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert "swept-in.txt" not in git(project.project, "ls-files")
+    assert _sprint_carry_commits(project) == []
+    # the advance itself happened and is still reported: only the commit was withheld
+    assert [(e["target"], e["status"]) for e in _board_carry_events(engine)] == [("done", "done")]
 
 
 def test_tracked_board_carry_is_a_no_op_that_still_reports_itself(project):
