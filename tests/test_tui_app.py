@@ -4504,18 +4504,19 @@ async def test_tui_rearm_live_refusal_wins_over_the_ledger_gate(project, monkeyp
         assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
 
 
-async def test_tui_rearm_routes_an_os_refused_ledger_read_instead_of_crashing(project, monkeypatch):
-    """`unreadable_sweep_ledger` propagates `OSError` by contract — a fault class whose
-    repair arm is DW-234's to add, not this call site's. The CLI has `main`'s tail to
-    route that propagation; a Textual message-loop callback has none, so an escape here
-    takes the whole dashboard down mid-gesture. `_do_rearm` therefore routes it itself:
-    an error toast naming the fault, and a return with the escalation still armed.
+async def test_tui_rearm_refuses_an_os_refused_ledger_read_with_the_probe_route(
+    project, monkeypatch
+):
+    """The DW-234 row on the TUI surface. `runs.unreadable_sweep_ledger` now refuses an
+    OS-refused read itself, with the permissions-or-storage repair and the
+    `bmad-loop sweep` route, so `_do_rearm`'s stopgap `except OSError` (which toasted
+    the bare fault "rather than waiting for DW-234") is gone: the probe's refusal
+    reaches the error toast through the same `refusal is not None` arm the decode
+    refusal takes, and nothing is re-armed or launched.
 
-    This is ROUTING, not the struck repair arm — the toast carries no `bmad-loop sweep`
-    steer, because this surface still has no route for a permissions-or-storage fault.
-
-    Ablation: drop the `except OSError` around the probe call and the row fails on the
-    PermissionError escaping `_do_rearm`."""
+    Ablation: delete the probe's `except OSError` arm and the row fails on the
+    PermissionError escaping `_do_rearm` — there is no local catch left to absorb it,
+    which is the point: one arm, in the shared helper, for all three entry points."""
     from bmad_loop import deferredwork, runs
     from bmad_loop.journal import load_state
 
@@ -4546,8 +4547,11 @@ async def test_tui_rearm_routes_an_os_refused_ledger_read_instead_of_crashing(pr
             (m, s) for m, s in notifications_with_severity(app) if "Errno 13" in m
         )
         assert severity == "error"
-        assert "still escalated" in toast
-        assert "bmad-loop sweep" not in toast  # routing, not DW-234's repair arm
+        # The probe's own refusal, route included — not a locally-worded toast.
+        assert str(project.deferred_work) in toast
+        assert "permissions or storage" in toast
+        assert "bmad-loop sweep" in toast
+        assert "stays resumable" in toast
         assert rearms == []
         assert resumes == []
         assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED

@@ -7545,10 +7545,10 @@ def test_resume_refuses_live_run(tmp_path, monkeypatch, capsys):
 # row) and only then meet a ledger it could not read, while every repair steer in
 # the product points at `bmad-loop sweep`. These rows pin the refusal and its
 # precedence, the scope on either side of it (rows that fail loudly if the gate is
-# ever widened past "sweep run, ledger does not decode"), the two declines the gate
-# makes so that `_prepare_resume_locked` keeps its own messages verbatim, and the
-# two boundaries the contract froze as behavior: the OSError propagation this gate
-# must NOT catch, and the accepted probe-to-lock race.
+# ever widened past "sweep run, ledger cannot be read"), the two declines the gate
+# makes so that `_prepare_resume_locked` keeps its own messages verbatim, the
+# accepted probe-to-lock race, and — since DW-234 reversed the frozen exclusion —
+# the OSError refusal with its own permissions-or-storage repair.
 
 
 def _resume_gate_run(
@@ -7650,10 +7650,11 @@ def test_resume_sweep_ledger_refusal_follows_the_unknown_warning(project, monkey
 
 
 def test_resume_story_run_ignores_undecodable_ledger(project, monkeypatch):
-    # Same corrupt ledger, `run_type` "story" (the default). Not because a story
-    # run is safe over it — the base Engine reads the ledger through the same
-    # `read_for_write` and catches nothing — but because the recorded decision
-    # scopes this gate to sweeps and leaves those reads to DW-146.
+    # Same corrupt ledger, `run_type` "story" (the default). The gate is scoped to
+    # sweeps by the recorded decision, and since DW-231 that decline is SAFE rather
+    # than merely decided: the base Engine routes its own `read_for_write` sites —
+    # observation reads degrade, the two publish reads pause the run with a repair
+    # notice — so a story run over these bytes no longer arms and crashes.
     reached = _resume_gate_run(
         project, monkeypatch, run_type="story", ledger_bytes=UNDECODABLE_LEDGER
     )
@@ -7769,27 +7770,26 @@ def test_resume_control_alias_sweep_keeps_its_own_refusal_over_ledger(project, m
     assert "`bmad-loop sweep`" not in err
 
 
-def test_resume_sweep_os_refused_ledger_propagates_to_mains_tail(project, monkeypatch, capsys):
-    """`read_for_write`'s documented `OSError` propagation is preserved, not caught.
+def test_resume_sweep_os_refused_ledger_is_refused_with_the_storage_repair(
+    project, monkeypatch, capsys
+):
+    """The DW-234 row, replacing `..._os_refused_ledger_propagates_to_mains_tail`.
 
-    An `except OSError` arm carrying its own permissions-or-storage repair was
-    written for this surface and then struck from the frozen contract, so this row
-    guards the EXCLUSION rather than the excluded message: the bare propagation to
-    `main`'s tail, plus the absence of every clause that arm would have printed.
-    The steer that propagation loses is real and is recorded as a deferral.
+    An OS-refused ledger read used to reach `main`'s tail as a routeless
+    `error: [Errno 13] …` — the `except OSError` arm was written, struck by the
+    DW-204 resolution on scope grounds, and pinned OUT by the row this replaces.
+    DW-234 carries the accepted decision to add it back: the gate now refuses with
+    the permissions-or-storage repair `sweep._notify_ledger_repair` gives the sweep
+    run for the same fault, plus every clause `_assert_ledger_refusal` pins.
 
-    What propagation DOES surface is the errno line and the ledger's own path — a
-    real `OSError` out of the reader carries `filename`, so the stub is raised with
-    it too rather than pinning an absence production would violate. What it does
-    not surface is a route: no `bmad-loop sweep` steer, no repair, no resumability
-    note. Ablation: restore an `except OSError` arm returning a refusal and this
-    row fails on the `error:` surface and on those absences.
+    The errno text and the path still surface (they are the fault), and the run is
+    never armed. Ablation: delete the `except OSError` arm in
+    `runs.unreadable_sweep_ledger` and this row fails on `error: [Errno 13]`
+    returning to stderr with none of the route.
 
-    The ledger on disk is DECODABLE, so the refused read is the only fault in play
-    — seeding undecodable bytes under a stub that always raises would describe a
-    file that is two faults at once and prove nothing about either. Monkeypatched
-    rather than chmod'd: a real mode bit does not hold as root and does not exist
-    on Windows, so the row would silently stop testing anything."""
+    The ledger on disk is DECODABLE, so the refused read is the only fault in play.
+    Monkeypatched rather than chmod'd: a real mode bit does not hold as root and
+    does not exist on Windows, so the row would silently stop testing anything."""
     from bmad_loop import deferredwork
 
     reached = _resume_gate_run(project, monkeypatch, run_type="sweep", ledger_bytes=READABLE_LEDGER)
@@ -7801,16 +7801,12 @@ def test_resume_sweep_os_refused_ledger_propagates_to_mains_tail(project, monkey
     rc = cli.main(["resume", "--project", str(project.project), "r1"])
     assert rc == cli.ExitCode.FAILURE
     err = capsys.readouterr().err
-    assert "error: [Errno 13]" in err  # `main`'s tail, routeless by decision
-    # `OSError.__str__` quotes `filename` through `repr`, so on Windows the
-    # backslashes in the tail are doubled; compare the same rendering.
-    assert repr(str(project.deferred_work)) in err  # the errno's own filename, not a refusal
-    # None of the struck arm's wording: no route, no repair, no resumability note.
-    assert "`bmad-loop sweep`" not in err
-    assert "permissions or storage" not in err
-    assert "Repair the ledger by hand" not in err
-    assert "stays resumable" not in err
-    assert reached == []  # propagation still stops short of arming the run
+    _assert_ledger_refusal(err, project)
+    assert "PermissionError: [Errno 13]" in err  # the OS fault, attributed by class
+    assert "permissions or storage" in err  # the OS repair, not the bytes one
+    assert "Repair the ledger by hand" not in err  # the decode refusal's wording stays its own
+    assert "error: [Errno 13]" not in err  # no longer `main`'s routeless tail
+    assert reached == []  # never armed the run
 
 
 def test_resume_sweep_ledger_refusal_displaces_the_base_skills_refusal(
@@ -7985,7 +7981,8 @@ def test_resolve_refuses_sweep_run_on_undecodable_ledger(project, monkeypatch, c
 
 def test_resolve_story_run_ignores_undecodable_ledger(project, monkeypatch, capsys):
     # Scope is the same on this call site as on `resume`'s: sweeps only. A story run
-    # over the same corrupt ledger is DW-146 scope, not this gate's.
+    # over the same corrupt ledger is safe to decline since DW-231: the engine routes
+    # its own `read_for_write` sites, so the decline no longer hands it to a crash.
     _run_dir, rearms = _resolve_gate_run(
         project, monkeypatch, run_type="story", ledger_bytes=UNDECODABLE_LEDGER
     )
@@ -8062,10 +8059,15 @@ def test_resolve_ledger_gate_declines_when_it_cannot_answer(project, monkeypatch
     assert "`bmad-loop sweep`" not in err
 
 
-def test_resolve_sweep_os_refused_ledger_propagates(project, monkeypatch, capsys):
-    # The `OSError` exclusion holds at this call site too: `read_for_write` propagates
-    # to `main`'s tail rather than being converted into the ledger refusal, and nothing
-    # is re-armed on the way out.
+def test_resolve_sweep_os_refused_ledger_is_refused_with_the_storage_repair(
+    project, monkeypatch, capsys
+):
+    """The DW-234 row at the `resolve` call site, replacing
+    `test_resolve_sweep_os_refused_ledger_propagates`: the same `OSError` arm
+    answers here, so an OS-refused ledger names its repair instead of reaching
+    `main`'s tail, and nothing is re-armed on the way out — the escalation stays
+    resolvable. Ablation: delete the arm and `error: [Errno 13]` returns with no
+    `bmad-loop sweep` route."""
     from bmad_loop import deferredwork
     from bmad_loop.journal import load_state
 
@@ -8080,9 +8082,10 @@ def test_resolve_sweep_os_refused_ledger_propagates(project, monkeypatch, capsys
     monkeypatch.setattr(deferredwork, "read_for_write", _refused)
     assert cli.main(["resolve", "--project", str(project.project), "r1"]) == cli.ExitCode.FAILURE
     err = capsys.readouterr().err
-    assert "error: [Errno 13]" in err
-    assert "`bmad-loop sweep`" not in err
-    assert "Repair the ledger by hand" not in err
+    _assert_ledger_refusal(err, project)
+    assert "PermissionError: [Errno 13]" in err
+    assert "permissions or storage" in err
+    assert "error: [Errno 13]" not in err
     assert rearms == []
     _assert_escalation_intact(run_dir, before)
 

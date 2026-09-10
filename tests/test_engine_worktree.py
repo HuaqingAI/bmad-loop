@@ -2079,6 +2079,106 @@ def test_done_isolated_unit_carries_gitignored_harvests_from_every_successful_pa
     assert [event["dw_ids"] for event in _harvest_carry_events(engine)] == [["DW-1", "DW-2"]]
 
 
+def test_carry_harvest_over_undecodable_main_ledger_pauses_before_the_latch(project):
+    """The PUBLISH arm at the isolated carry (DW-231). The main ledger the unit's
+    findings are to be re-filed into cannot be read, so the carry pauses the run
+    for repair — `RunPaused` at `escalation`, `ledger-read-refused` site
+    `harvest-carry`, an `ACTION REQUIRED` notice naming the ledger — and does so
+    BEFORE `harvest_carry_commit_pending` is latched: nothing records a commit
+    obligation this call never took on, nothing is written, and the phase is
+    untouched, so the `defer_reason` re-entry or `_replay_unlatched_ledger_carries`
+    re-runs the carry on resume.
+
+    Ablation: delete the `except LedgerReadError` around the carry's
+    `read_for_write` and this reds with `LedgerReadError` escaping the call."""
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.model import PAUSE_ESCALATION
+
+    bad = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(bad)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[_harvest_record()])
+    engine.state.tasks[task.story_key] = task
+
+    with pytest.raises(RunPaused) as excinfo:
+        engine._carry_harvested_deferrals(task)
+
+    assert excinfo.value.stage == PAUSE_ESCALATION
+    assert excinfo.value.story_key == "1-1-a"
+    assert task.harvest_carry_commit_pending is False  # paused BEFORE the latch
+    assert project.deferred_work.read_bytes() == bad  # nothing written
+    assert _harvest_carry_events(engine) == []
+    (refused,) = _rows(engine, "ledger-read-refused")
+    assert refused["site"] == "harvest-carry"
+    assert refused["ledger"] == str(project.deferred_work) and "not valid UTF-8" in refused["error"]
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention and str(project.deferred_work) in attention
+    assert "`bmad-loop resume test-run`" in attention
+
+
+def test_done_unit_carry_over_undecodable_main_ledger_pauses_and_resume_recarries(project):
+    """The carry pause on a FULL isolated run, and the recovery it is shaped for
+    (DW-231). The unit's dev session records a finding and files it in the unit's
+    own gitignored ledger; after the session, MAIN's ledger turns undecodable. The
+    merge lands, the carry cannot read main's ledger and pauses the run — task
+    `DONE`, `isolated_ledger_carried` still False, `ledger-read-refused` site
+    `harvest-carry`, no `harvest-carried`, main's bytes untouched. After the
+    repair, resume finds the merged-but-uncarried unit in
+    `_replay_unlatched_ledger_carries`, re-runs the carry (`resume-ledger-carry`,
+    then `harvest-carried`), files the entry into main and latches the carry —
+    with ZERO sessions re-run.
+
+    Ablation: delete the `except LedgerReadError` around the carry's
+    `read_for_write` and the first half reds with `run-crash`."""
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    bad = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
+    dev = wt_dev_effect(project, "1-1-a", followup_review=False, deferred=[_HARVEST_CARRY])
+
+    def dev_then_corrupt_main(spec):
+        result = dev(spec)
+        project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+        project.deferred_work.write_bytes(bad)
+        return result
+
+    engine, _ = make_engine(project, [dev_then_corrupt_main])
+
+    summary = engine.run()
+
+    task = engine.state.tasks["1-1-a"]
+    assert summary.paused and not summary.crashed
+    assert task.phase == Phase.DONE and task.isolated_ledger_carried is False
+    assert [item["title"] for item in task.harvested_deferrals] == [_HARVEST_CARRY["summary"]]
+    (refused,) = _rows(engine, "ledger-read-refused")
+    assert refused["site"] == "harvest-carry" and refused["story_key"] == "1-1-a"
+    assert _harvest_carry_events(engine) == []
+    assert "run-crash" not in journal_kinds(engine)
+    assert project.deferred_work.read_bytes() == bad
+
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    state = load_state(engine.run_dir)
+    state.clear_pause()
+    adapter = MockAdapter([])
+    resumed = Engine(
+        paths=project,
+        policy=engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=state,
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    kinds = journal_kinds(resumed)
+    assert "resume-ledger-carry" in kinds and "harvest-carried" in kinds
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+    assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried is True
+
+
 def test_carry_harvest_dedupe_stays_status_agnostic(project):
     """A finding the sweep has since CLOSED must not be re-filed by the carry.
 

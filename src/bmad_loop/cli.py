@@ -3111,10 +3111,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
             "resuming could double-drive this run",
             file=sys.stderr,
         )
-    # DW-204: sweep runs only, and only for a ledger whose bytes do not currently
-    # decode (a read the OS refused propagates instead — see the helper). Gated
-    # HERE and not in `_resume_paused_run`, for the same reason the liveness block
-    # above is:
+    # DW-204: sweep runs only, for a ledger that cannot currently be read — bytes
+    # that do not decode, or (since DW-234) a read the OS refused; each names its
+    # own repair (see the helper). Gated HERE and not in `_resume_paused_run`, for
+    # the same reason the liveness block above is:
     # that helper is also resolve's re-arm path, which has already run its
     # interactive session and re-armed the escalation by the time it is reached, so
     # a refusal there would be a refusal after the side effects. Deliberately AFTER

@@ -57,6 +57,7 @@ from bmad_loop.engine import (
     _notice_reason,
     _run_depth,
     _session_task_id,
+    _UndecodableLedger,
 )
 from bmad_loop.journal import LOGS_DIR, VERIFY_DIR, Journal, load_state
 from bmad_loop.model import (
@@ -15455,7 +15456,7 @@ def test_ledger_baseline_text_normalizes_committed_crlf(project):
     )
     # The point of the normalization: the anchor must equal what the ONLY thing
     # it is ever compared against reads back off those same bytes.
-    assert expected == engine._ledger_text()
+    assert expected == engine._ledger_text(site="test")
 
 
 def test_ledger_baseline_text_reports_absence_at_baseline(project):
@@ -15828,6 +15829,285 @@ def test_restore_still_retracts_the_engines_own_harvest(project):
     ] == []
 
 
+# ------------------------------------------------- DW-231 engine ledger read faults
+#
+# The base Engine reads the ledger through `deferredwork.read_for_write` at four
+# sites and used to catch `LedgerReadError` at none of them, so a story run over
+# undecodable bytes armed, ran its session and died as `run-crash`. Each site now
+# routes the fault in the direction its consumer can survive: the observation
+# reads degrade to a typed answer nothing can write back (`ledger-read-degraded`),
+# and the two publish reads pause the run for repair with the phase untouched
+# (`ledger-read-refused`), so `bmad-loop resume` replays the recorded session
+# result and retries the write instead of re-running a session.
+
+UNDECODABLE_LEDGER_BYTES = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
+
+
+def _degraded_sites(engine) -> list[str]:
+    return [e["site"] for e in engine.journal.entries() if e["kind"] == "ledger-read-degraded"]
+
+
+def _corrupting_ledger(effect, ledger: Path):
+    """Run a scripted session, then leave the ledger UNDECODABLE behind it.
+
+    The bytes go bad DURING the session, not before the run: the hard-gate check
+    (`_refuse_gated_story`) already refuses to START a story over a ledger it
+    cannot read, so a ledger corrupt from the outset never reaches the engine's
+    own reads. What does reach them is exactly this shape — a session, a rival
+    writer or a failing disk turning the file undecodable after dispatch — and it
+    is the shape DW-231 is about: the reads that follow a completed session."""
+
+    def run(spec):
+        result = effect(spec)
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_bytes(UNDECODABLE_LEDGER_BYTES)
+        return result
+
+    return run
+
+
+def test_harvest_over_undecodable_ledger_pauses_and_resume_replays_the_session(project):
+    """The PUBLISH arm at the spec-deferral harvest, and the recovery it is shaped
+    for. The dev session completes and records findings; the harvest cannot read
+    the ledger it is about to append to, so the run PAUSES at `escalation` with an
+    `ACTION REQUIRED` notice naming the ledger and the resume command — not
+    `run-crash`, and not `_escalate` (the task stays `DEV_VERIFY`, never
+    `ESCALATED`, so no `bmad-loop resolve` session and no clean rebuild is owed
+    over a fault that is not the story's). The observation reads ahead of it
+    (`_ledger_digest`, the pre-harvest snapshot) degraded and were journaled.
+
+    After the repair, `resume` finds the recorded dev result through
+    `_resumable_session`, replays it into `_dev_phase`, and the harvest files the
+    entry against the readable ledger: the story lands `DONE` and the resumed
+    adapter ran ZERO sessions.
+
+    Ablation: delete the `except LedgerReadError` around the harvest's
+    `read_for_write` and the first half reds with `run-crash` (`LedgerReadError`)
+    instead of the pause."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    engine, adapter = make_engine(
+        project,
+        [
+            _corrupting_ledger(
+                dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A]),
+                ledger,
+            )
+        ],
+        policy=_harvest_policy(),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed and summary.done == 0
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert engine.state.paused_story_key == "1-1-a"
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEV_VERIFY  # left where it was: not ESCALATED
+    assert len(adapter.sessions) == 1  # the session ran once and its result is durable
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-crash" not in kinds and "story-escalated" not in kinds
+    assert {"ledger-digest", "pre-harvest-snapshot"} <= set(_degraded_sites(engine))
+    (refused,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-read-refused"]
+    assert refused["site"] == "spec-deferrals-harvest"
+    assert refused["story_key"] == "1-1-a" and refused["ledger"] == str(ledger)
+    assert "not valid UTF-8" in refused["error"]
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention
+    assert str(ledger) in attention and "`bmad-loop resume test-run`" in attention
+    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES  # nothing written over them
+    # The snapshot was left UNARMED over the typed answer, so no later restore
+    # can put back "text" nobody could read.
+    assert task.pre_harvest_ledger_captured is False and task.post_engine_ledger_digest is None
+
+    # Resume WITHOUT the repair first — the shape DW-231's entry names: a resumed
+    # story run over undecodable bytes. It replays the recorded result and pauses
+    # again at the same site, with no session and no crash.
+    unrepaired, unrepaired_adapter = resume_engine(project, engine, [])
+    summary = unrepaired.run()
+    assert summary.paused and not summary.crashed and summary.done == 0
+    assert unrepaired_adapter.sessions == []
+    assert unrepaired.state.tasks["1-1-a"].phase == Phase.DEV_VERIFY
+    assert [
+        e["site"] for e in unrepaired.journal.entries() if e["kind"] == "ledger-read-refused"
+    ] == [
+        "spec-deferrals-harvest",
+        "spec-deferrals-harvest",
+    ]
+
+    # Repair, then resume: the recorded result is replayed, no session re-runs.
+    ledger.write_text("# Deferred Work\n", encoding="utf-8")
+    resumed, resumed_adapter = resume_engine(project, unrepaired, [])
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert resumed_adapter.sessions == []  # ZERO sessions: the harvest was retried, not the dev
+    assert resumed.state.tasks["1-1-a"].phase == Phase.DONE
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-verify" in kinds
+    (entry,) = _harvest_entries(project)
+    assert entry.title == HARVEST_A["summary"] and entry.open
+    assert [e["site"] for e in resumed.journal.entries() if e["kind"] == "ledger-read-refused"] == [
+        "spec-deferrals-harvest",
+        "spec-deferrals-harvest",
+    ]  # the two pauses' own rows, and no third one
+
+
+def test_story_over_undecodable_ledger_completes_when_the_spec_records_no_findings(project):
+    """The OBSERVATION arm on a full run. With no `deferred:` findings the harvest
+    never reads the ledger, so every read this run makes after the session is an
+    observation — `_ledger_digest` after the session, the pre-harvest snapshot —
+    and each degrades: one `ledger-read-degraded` row per read, the story lands
+    `DONE`, and the bytes are exactly as they were. Before DW-231 the FIRST of
+    those reads crashed the run with the completed session's work on disk.
+
+    Ablation: delete the `except LedgerReadError` in `_ledger_text` and this reds
+    with `run-crash` (`LedgerReadError`) and zero sessions."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    engine, adapter = make_engine(
+        project,
+        [_corrupting_ledger(dev_effect(project, "1-1-a", followup_review=False), ledger)],
+        policy=_harvest_policy(),
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 1
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-crash" not in kinds and "ledger-read-refused" not in kinds
+    sites = _degraded_sites(engine)
+    assert {"ledger-digest", "pre-harvest-snapshot"} <= set(sites)
+    assert all(
+        e["ledger"] == str(ledger) and e["story_key"] == "1-1-a" and "not valid UTF-8" in e["error"]
+        for e in engine.journal.entries()
+        if e["kind"] == "ledger-read-degraded"
+    )
+    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES
+
+
+def test_in_place_defer_over_undecodable_ledger_degrades_the_snapshot(project):
+    """The OBSERVATION arm at `_defer`'s in-place snapshot: the review never
+    converges, the defer resets the tree, and the snapshot that would feed
+    `_restore_defer_ledger` cannot be read. It degrades to NO snapshot
+    (`ledger-read-degraded`, site `defer-snapshot`) so the restore is skipped —
+    nothing is merged from, or republished over, bytes nobody could read — and
+    the defer records normally. Ablation: delete the `except LedgerReadError`
+    around the snapshot read and this reds with `run-crash` after the reset."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    engine, _ = make_engine(
+        project,
+        [_corrupting_ledger(dev_effect(project, "1-1-a"), ledger)]
+        + [
+            review_effect(project, "1-1-a", clean=False, patched=1, finalized=False)
+            for _ in range(3)
+        ],
+    )
+
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.crashed and not summary.paused
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-deferred" in kinds and "run-crash" not in kinds
+    assert "defer-ledger-restore-diverged" not in kinds  # the restore never ran
+    assert "defer-snapshot" in _degraded_sites(engine)
+    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES
+    assert (project.project / "src.txt").read_text() == "original\n"  # the reset still ran
+
+
+def test_restore_ledger_skips_a_ledger_that_became_undecodable(project):
+    """`_restore_ledger` over a ledger that turned undecodable AFTER the snapshot
+    was armed. `_ledger_text` answers the typed `_UndecodableLedger`, which equals
+    no snapshot and is never digested as "ours", so the locked read takes the
+    `diverged` arm explicitly: no write, no unlink, `ledger-restore-skipped-
+    diverged` beside the degraded-read rows. A str sentinel could have been
+    digested, matched and written back — the type is what makes this a skip.
+
+    Ablation: delete the `except LedgerReadError` in `_ledger_text` and the raise
+    escapes this direct call."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = "# Deferred Work\n\n## DW-1 pre-existing\n"
+    task.post_engine_ledger_digest = _digest_of(snapshot + "\n## DW-2 our harvest row\n")
+    ledger.write_bytes(UNDECODABLE_LEDGER_BYTES)
+
+    engine._restore_ledger(task, snapshot)
+
+    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES  # no write
+    (event,) = [
+        e for e in engine.journal.entries() if e["kind"] == "ledger-restore-skipped-diverged"
+    ]
+    assert event["story_key"] == "1-1-a" and event["ledger"] == str(ledger)
+    assert _degraded_sites(engine) == ["ledger-restore", "ledger-restore-locked"]
+
+    # The None-snapshot arm is the one that could UNLINK; the typed answer never
+    # reaches it either.
+    engine._restore_ledger(task, None)
+    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES
+
+
+def test_restore_defer_ledger_never_merges_onto_an_undecodable_ledger(project):
+    """`_restore_defer_ledger` over a TRACKED ledger that turned undecodable after
+    the defer snapshot was taken. The locked read answers the typed
+    `_UndecodableLedger`; the baseline anchor cannot match it, and the
+    `isinstance(current, str)` guard keeps it out of `_merge_snapshot_entries`,
+    so the site falls through to `defer-ledger-restore-diverged` with nothing
+    merged and nothing written — the same arm a rival's deletion takes.
+
+    Ablation: revert that guard to `current is not None` and the typed answer
+    reaches `_merge_snapshot_entries`, which raises `TypeError` under the lock."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track deferred-work")
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = rev_parse_head(project.project)
+    task.baseline_untracked = []
+    snapshot = (
+        "# Deferred Work\n\n### DW-1: review found this\n\n"
+        "origin: review, 2026-08-26\nlocation: src.txt\nreason: needs a look.\nstatus: open\n"
+    )
+    ledger = project.deferred_work
+    ledger.write_bytes(UNDECODABLE_LEDGER_BYTES)
+
+    engine._restore_defer_ledger(task, snapshot)
+
+    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES  # no write
+    (event,) = [e for e in engine.journal.entries() if e["kind"] == "defer-ledger-restore-diverged"]
+    assert event["dw_ids"] == [] and event["ledger"] == str(ledger)
+    assert _degraded_sites(engine) == ["defer-ledger-restore", "defer-ledger-restore-locked"]
+
+
+def test_ledger_text_answers_a_typed_digest_of_the_raw_bytes(project):
+    """`_ledger_text`'s degraded answer carries the sha256 of the RAW bytes and the
+    attributed fault, so `_ledger_digest` keeps its equality contract exactly: no
+    `_digest_of` answer (always a valid UTF-8 encoding) can collide with it, and
+    two reads of the same undecodable bytes agree."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_bytes(UNDECODABLE_LEDGER_BYTES)
+
+    answer = engine._ledger_text(site="probe", story_key="1-1-a")
+
+    assert isinstance(answer, _UndecodableLedger)
+    assert answer.digest == hashlib.sha256(UNDECODABLE_LEDGER_BYTES).hexdigest()
+    assert "not valid UTF-8" in answer.error
+    assert answer != UNDECODABLE_LEDGER_BYTES.decode("utf-8", "replace") and answer is not None
+    assert engine._ledger_digest(task) == answer.digest
+    assert engine._ledger_digest(task) != _digest_of(UNDECODABLE_LEDGER_BYTES.decode("latin-1"))
+    row, *_ = [e for e in engine.journal.entries() if e["kind"] == "ledger-read-degraded"]
+    assert row["site"] == "probe" and row["story_key"] == "1-1-a"
+
+
 def test_harvest_digest_is_on_disk_before_the_attempt_decision(project, monkeypatch):
     """Probe the refresh's own save before any later ambient save can mask it.
 
@@ -15849,7 +16129,7 @@ def test_harvest_digest_is_on_disk_before_the_attempt_decision(project, monkeypa
     def probing_append(kind, **fields):
         if kind == "spec-deferrals-harvested" and not seen:
             saved = load_state(engine.run_dir).tasks["1-1-a"]
-            seen.append((saved.post_engine_ledger_digest, engine._ledger_text()))
+            seen.append((saved.post_engine_ledger_digest, engine._ledger_text(site="test")))
         real_append(kind, **fields)
 
     monkeypatch.setattr(engine.journal, "append", probing_append)

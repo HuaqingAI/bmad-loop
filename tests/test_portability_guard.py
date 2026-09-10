@@ -1072,6 +1072,18 @@ JOURNAL_KINDS = frozenset(
         "harvest-carry-uncommitted",
         "isolation-flip-orphaned-worktree",
         "ledger-baseline-probe-failed",
+        # DW-231. The two routes a ledger read fault takes inside the base
+        # `Engine`. `ledger-read-degraded` is the OBSERVATION arm — `_ledger_text`
+        # (behind `_ledger_digest`, the pre-harvest snapshot and the two restores)
+        # and `_defer`'s in-place snapshot answered a typed `_UndecodableLedger` or
+        # `None` that nothing can write back, and the run went on. `ledger-read-
+        # refused` is the PUBLISH arm — the spec-deferral harvest or the isolated
+        # carry was about to write from the text and paused the run for repair
+        # instead (`_pause_for_ledger_repair`, no phase change). Both carry only
+        # already-declared fields: `story_key` (routed), `site` (benign), `ledger`
+        # (benign) and `error` (dropped).
+        "ledger-read-degraded",
+        "ledger-read-refused",
         "ledger-restore-failed",
         "ledger-restore-skipped-diverged",
         "ledger-scope-probe-failed",
