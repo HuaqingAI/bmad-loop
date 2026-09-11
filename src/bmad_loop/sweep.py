@@ -3248,7 +3248,24 @@ class SweepEngine(Engine):
             if plan is not None:
                 advance(task, Phase.DONE)
                 self._save()
-                triage_path.write_text(json.dumps(result.result_json, indent=2), encoding="utf-8")
+                # Cache write failure must not discard this validated plan (DW-247).
+                # Use a WRITE kind: `sweep-triage-reload-failed` means an existing
+                # cache could not be read, not that a healthy triage could not save.
+                # With no usable cache, resume re-triages this cycle;
+                # `_publish_stranded_close` cannot recover its close at the no-open
+                # exit, and `bmad-loop decisions` cannot reconstruct its decisions.
+                # A refused overwrite may instead leave an older cache to replay;
+                # this best-effort write does not invalidate existing cache bytes.
+                # A directory also reaches this catch: its write raises
+                # `IsADirectoryError` on POSIX or `PermissionError` on Windows.
+                try:
+                    triage_path.write_text(
+                        json.dumps(result.result_json, indent=2), encoding="utf-8"
+                    )
+                except OSError as exc:
+                    self.journal.append(
+                        "sweep-triage-cache-write-failed", errors=[f"unwritable: {exc}"]
+                    )
                 self.journal.append(
                     "sweep-triage-result",
                     bundles=len(plan.bundles),
@@ -3602,7 +3619,24 @@ class SweepEngine(Engine):
         answers: dict[str, dict[str, Any]] = {}
         unusable: dict[str, Any] = {}
         malformed: list[str] = []
-        if decisions_path.is_file():
+        # `stat()` + `S_ISREG`, not `is_file()` (DW-248, the DW-224 shape). The
+        # convenience probe splits by RUNTIME on a metadata fault: 3.11-3.13
+        # re-raise a `PermissionError` out of this bookkeeping read — aborting the
+        # sweep before its saved answers can be consumed — while 3.14
+        # swallows it and answers False. The explicit call makes the degrade the
+        # comment above promises UNIFORM: absence and a non-directory path
+        # component stay SILENT, as `is_file()`'s False was, and only a real
+        # metadata fault earns the row — the same `sweep-decisions-reload-failed`
+        # the content faults below write, since either way the store on disk
+        # could not be used.
+        try:
+            store_mode = decisions_path.stat().st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            store_mode = None
+        except OSError as exc:
+            self.journal.append("sweep-decisions-reload-failed", errors=[f"unreadable: {exc}"])
+            store_mode = None
+        if store_mode is not None and stat.S_ISREG(store_mode):
             try:
                 stored = _read_json(decisions_path)
             except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:

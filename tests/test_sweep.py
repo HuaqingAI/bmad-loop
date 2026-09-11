@@ -10969,13 +10969,81 @@ def test_a_triage_cache_metadata_fault_degrades_to_a_fresh_triage(project, monke
     assert _records(engine, "sweep-resolved-closed") == []  # the cache's plan was NOT replayed
 
 
-@pytest.mark.parametrize(
-    "shape, crashes",
-    [("directory", True), ("stat-not-a-directory", False)],
-)
-def test_a_triage_cache_that_is_not_a_regular_file_re_triages_silently(
-    project, monkeypatch, shape, crashes
-):
+def test_a_triage_cache_write_fault_degrades_and_keeps_the_plan(project, monkeypatch):
+    """`_ensure_triage`'s cache WRITE-BACK degrades to `sweep-triage-cache-write-failed`
+    and still returns the validated plan, so an OS refusal of `triage{suffix}.json`
+    costs the run its durable record and nothing else (DW-247).
+
+    The DW-224 row above proves the READ side of the cache degrades; before this
+    change the write side did not — a fresh triage that validated, was advanced to
+    DONE and had its effects ready to apply raised out of `_ensure_triage` at
+    `write_text` and the run reported `crashed`. The write is the OTHER bookkeeping
+    site on this path and it gets its OWN kind: `sweep-triage-reload-failed` is a
+    reader's row and every consumer reads it as "the cache on disk could not be
+    used", which is the opposite of what happened here.
+
+    Premise before outcome (docs/testing.md): the ledger is valid, the adapter carries
+    exactly one triage effect whose plan validates, and the fault is a SELECTIVE
+    `Path.write_text` monkeypatch keyed on the cache path alone (chmod is a no-op for
+    root and carries no write bit on Windows), so every other write this run makes —
+    state, journal, sandbox ledger — still lands. The plan contains one close and
+    one `wontfix` skip: the sandbox ledger must record the close while leaving the
+    skipped entry open, proving the plan reached its downstream effects.
+
+    Ablation: restore the bare `triage_path.write_text(...)` and this reds on
+    `crashed` — the `PermissionError` propagates out of `_ensure_triage`. Delete only
+    the journal write inside the `except OSError` arm and the row assertion reds while
+    the run stays healthy; reuse `sweep-triage-reload-failed` there instead and the
+    new-kind assertion reds the same way. Clear `plan.already_resolved` in the
+    failure arm and the sandbox ledger closure assertion reds."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(
+                triage_result(
+                    ["DW-1", "DW-2"],
+                    skip=[{"id": "DW-1", "reason": "wontfix"}],
+                    already_resolved=[{"id": "DW-2", "evidence": "fixed in abc123"}],
+                )
+            )
+        ],
+    )
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    cache = engine.run_dir / "triage.json"
+    assert not cache.exists()  # premise: the fresh triage is what would write it
+
+    original = Path.write_text
+
+    def refused(path, *args, **kwargs):
+        if path == cache:
+            raise PermissionError(13, "Permission denied", str(path))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", refused)
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused  # degrades, never raises
+    [failed] = _records(engine, "sweep-triage-cache-write-failed")
+    assert failed["errors"] and failed["errors"][0].startswith("unwritable: ")
+    assert "Permission denied" in failed["errors"][0]
+    kinds = journal_kinds(engine)
+    # the degrade is journaled BEFORE the result the run continued on
+    assert kinds.index("sweep-triage-cache-write-failed") < kinds.index("sweep-triage-result")
+    assert _records(engine, "sweep-triage-reload-failed") == []  # a WRITE fault, not a read
+    assert not cache.exists()  # nothing durable records this cycle's triage
+    assert len(adapter.sessions) == 1  # exactly the one fresh triage ran
+    # The result describes the plan; the sandbox ledger proves its effect landed.
+    [result] = _records(engine, "sweep-triage-result")
+    assert result["skip"] == 1 and result["bundles"] == 0
+    entries = ledger_entries(project)
+    assert entries["DW-1"].open
+    assert entries["DW-2"].status.startswith("done")
+    assert "already resolved: fixed in abc123" in project.deferred_work.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("shape", ["directory", "stat-not-a-directory"])
+def test_a_triage_cache_that_is_not_a_regular_file_re_triages_silently(project, monkeypatch, shape):
     """`_ensure_triage`'s guard answers "no cache" for a path that is not a regular
     FILE, and does it SILENTLY — the other half of DW-224's swap.
 
@@ -10989,13 +11057,16 @@ def test_a_triage_cache_that_is_not_a_regular_file_re_triages_silently(
     its own row.
 
     What this row grades is the GUARD, which is why the outcome asserted is the
-    journal's silence plus a fresh session — not the run's health. The `directory`
-    shape ends the run CRASHED, and that is pre-existing and untouched here: past the
-    guard, a fresh triage writes its plan back to that same path
-    (`triage_path.write_text`), which raises `IsADirectoryError` on a directory
-    whichever guard stood in front of it. `crashes` states that per shape rather than
-    leaving it unsaid; widening the write-back is a different site and outside this
-    change.
+    journal's silence plus a fresh session. Past the guard, the `directory` shape
+    reaches the write-back: a fresh triage writes its plan back to that same path
+    (`triage_path.write_text`), which `open` refuses on a directory whichever guard
+    stood in front of it (`IsADirectoryError` on POSIX, `PermissionError` on
+    Windows — the row asserts the path both carry, not the message). Since DW-247
+    that write DEGRADES to
+    `sweep-triage-cache-write-failed` rather than crashing the run, so both shapes
+    now end healthy; the `directory` row asserts that write-side row on top of the
+    guard's silence, and the `stat-not-a-directory` shape (whose refusal is only on
+    `stat`, so the write lands) asserts its absence.
 
     Premise before outcome (docs/testing.md): the shape is asserted on disk (or the
     refusal is installed) before the run, and the adapter carries exactly one triage
@@ -11003,11 +11074,10 @@ def test_a_triage_cache_that_is_not_a_regular_file_re_triages_silently(
 
     Ablation: delete `stat.S_ISREG(cache_mode)` from the guard and the `directory` row
     reds on the silence assertion — `_read_json` raises `IsADirectoryError`, which the
-    cache handler reports as `sweep-triage-reload-failed` (both the ablated and the
-    unablated run end crashed at the write-back, so the journal row, not `crashed`, is
-    what discriminates). Drop `NotADirectoryError` from the silent catch tuple and the
-    `stat-not-a-directory` row reds the same way, since that class is an `OSError` and
-    the new `except OSError` arm journals it."""
+    cache handler reports as `sweep-triage-reload-failed`. Drop `NotADirectoryError`
+    from the silent catch tuple and the `stat-not-a-directory` row reds the same way,
+    since that class is an `OSError` and the `except OSError` arm journals it. Restore
+    the bare write-back and the `directory` row reds on `crashed`."""
     write_ledger(project, {"DW-1": "open"})
     engine, adapter = make_sweep(
         project,
@@ -11033,8 +11103,18 @@ def test_a_triage_cache_that_is_not_a_regular_file_re_triages_silently(
     # SILENT: neither shape is a cache this run wrote, so neither is a reload fault
     assert _records(engine, "sweep-triage-reload-failed") == []
     assert len(adapter.sessions) == 1  # ...and a fresh triage ran in its place
-    assert summary.crashed is crashes  # stated, not ignored: see the docstring
-    assert not summary.paused
+    assert not summary.crashed and not summary.paused  # DW-247: the write-back degrades
+    write_failed = _records(engine, "sweep-triage-cache-write-failed")
+    if shape == "directory":
+        [failed] = write_failed  # the planted directory refuses the fresh plan's write-back
+        assert failed["errors"][0].startswith("unwritable: ")
+        # the path, not the message: POSIX raises `IsADirectoryError`, Windows a
+        # `PermissionError` from the same `open`, and both carry the filename
+        assert str(cache) in failed["errors"][0]
+    else:
+        assert write_failed == []  # only `stat` was refused; the write landed
+        # read, not `is_file()`: the refused `stat` is still installed on this path
+        assert json.loads(cache.read_text(encoding="utf-8"))["open_ids"] == ["DW-1"]
 
 
 @pytest.mark.parametrize("fault", ["os", "decode"])
@@ -17105,6 +17185,130 @@ def test_oserror_reading_stored_answers_degrades_to_none(project, monkeypatch):
     assert answers == {} and closed == 0
     [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
     assert reload_failed["errors"][0].startswith("unreadable: ")
+    assert [r["dw_id"] for r in _records(engine, "decision-skipped-unattended")] == ["DW-1"]
+
+
+def test_a_metadata_fault_on_the_stored_answers_degrades_to_none(project, monkeypatch):
+    """`_decisions_phase`'s store guard is `stat()` + `S_ISREG`, not `is_file()`, so
+    an OS refusal of `<run>/decisions.json`'s METADATA journals and takes the same
+    pending path the content faults do, instead of aborting the sweep (DW-248).
+
+    The DW-134 rows above grade the READ and the two content arms; this one grades
+    the probe in FRONT of them, which `is_file()` left bare. On 3.11-3.13 that probe
+    re-raises a `PermissionError`, aborting the sweep over a bookkeeping read and
+    dropping every answer the human already gave — the exact abort the comment above
+    the guard promised to degrade. Same guard shape as DW-224's, repeated rather
+    than shared: the two sites stay separate regions.
+
+    Premise before outcome (docs/testing.md): a VALID, usable store is planted first
+    — its one answer would have BUILT DW-1's bundle — so the only reason no answer is
+    adopted is the refusal; `fault_metadata_probe` keys the fault on the store's path
+    alone, so every other `stat` this phase makes (the ledger's, the state file's)
+    still answers.
+
+    Ablation: restore `if decisions_path.is_file():` and this reds on 3.11-3.13 with
+    the `PermissionError` out of `_decisions_phase`. On 3.14 it reds by a different
+    mechanism: `is_file()` there delegates to `os.path.isfile`, which BYPASSES the
+    `Path.stat` monkeypatch entirely (see `fault_metadata_probe`'s last paragraph),
+    so the ablated guard answers True, the planted usable answer is adopted, and the
+    row reds on `answers == {}`. Widening the silent catch tuple to `OSError` reds
+    on the absent row on every runtime."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    store = engine.run_dir / "decisions.json"
+    usable = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
+    store.write_text(json.dumps({"DW-1": usable}), encoding="utf-8")
+    # premise: the stored answer WOULD have been adopted
+    assert sweep_mod.unusable_answer_reason(usable, allow_close=True) is None
+    fault_metadata_probe(monkeypatch, store, "stat")
+
+    answers, closed, _unlanded = engine._decisions_phase(plan)
+
+    assert answers == {} and closed == 0  # degrades, never raises
+    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
+    assert reload_failed["errors"][0].startswith("unreadable: ")
+    assert "Permission denied" in reload_failed["errors"][0]
+    assert [r["dw_id"] for r in _records(engine, "decision-skipped-unattended")] == ["DW-1"]
+
+
+def test_a_metadata_fault_on_the_stored_answers_does_not_abort_the_sweep(project, monkeypatch):
+    """DW-248 at the surface the ledger entry names: the SWEEP no longer aborts over a
+    refused metadata probe of `<run>/decisions.json`. Before the guard swap, a
+    `PermissionError` out of `is_file()` on 3.11-3.13 ended the whole run — and with
+    it every answer the human had already given — at a bookkeeping read.
+
+    The method-level row above is the ablation-precise twin: it grades the guard's
+    arms one by one at `_decisions_phase`. This one runs `engine.run()` end to end
+    so the assertion is on the run's health and the ledger's state, which is what
+    the entry's harm is about. Same premise: a valid, usable `build` answer is
+    planted, so the only reason DW-1 takes the unattended skip path is the refusal.
+
+    Ablation: restore `if decisions_path.is_file():` and this reds on `crashed` on
+    3.11-3.13."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(triage_result(["DW-1"], decisions=[_decision("DW-1", _widen_or_keep)]))],
+    )
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    store = engine.run_dir / "decisions.json"
+    usable = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
+    store.write_text(json.dumps({"DW-1": usable}), encoding="utf-8")
+    fault_metadata_probe(monkeypatch, store, "stat")
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused  # degrades, never aborts
+    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
+    assert reload_failed["errors"][0].startswith("unreadable: ")
+    assert [r["dw_id"] for r in _records(engine, "decision-skipped-unattended")] == ["DW-1"]
+    assert ledger_entries(project)["DW-1"].open  # no answer adopted, so nothing built
+
+
+@pytest.mark.parametrize("shape", ["absent", "directory", "stat-not-a-directory"])
+def test_a_stored_answers_path_that_is_not_a_file_stays_silent(project, monkeypatch, shape):
+    """The OTHER half of DW-248's swap: the shapes that reach `stat()` without a
+    metadata FAULT answer "no store" SILENTLY, exactly as `is_file()`'s False did.
+
+    An absent `<run>/decisions.json` is the ordinary first cycle of every run, a
+    DIRECTORY at the path passes `stat()` and fails only the `S_ISREG` term, and a
+    `NotADirectoryError` from a non-directory path component is the same "this run
+    holds no store here" answer — reporting any of them as a reload fault would
+    misattribute an ordinary unanswered decision. The metadata-fault row above pins
+    that a REFUSED `stat()` earns the row; this one pins that these three do not.
+
+    Ablation: drop `stat.S_ISREG(store_mode)` from the guard and the `directory` row
+    reds — `_read_json` raises `IsADirectoryError`, which the content handler
+    journals as `sweep-decisions-reload-failed`. Drop `NotADirectoryError` from the
+    silent catch tuple and the `stat-not-a-directory` row reds the same way, since
+    that class is an `OSError` and the journalling arm takes it. Drop
+    `FileNotFoundError` and the `absent` row reds the same way."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    store = engine.run_dir / "decisions.json"
+    if shape == "absent":
+        assert not store.exists()  # premise: nothing to read, nothing to fault
+    elif shape == "directory":
+        store.mkdir()
+        assert store.is_dir()  # premise: present, but not a FILE
+    else:
+        original = Path.stat
+
+        def refused(path, *args, **kwargs):
+            if path == store:
+                raise NotADirectoryError(20, "Not a directory", str(path))
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", refused)
+
+    answers, closed, _unlanded = engine._decisions_phase(plan)
+
+    assert answers == {} and closed == 0
+    assert _records(engine, "sweep-decisions-reload-failed") == []  # SILENT
     assert [r["dw_id"] for r in _records(engine, "decision-skipped-unattended")] == ["DW-1"]
 
 

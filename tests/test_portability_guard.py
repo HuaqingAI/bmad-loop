@@ -694,12 +694,13 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "stdout_captured_bytes",
         "stdout_truncated",
         # `sweep-repeat-done`'s stop discriminator (DW-201): WHICH of the repeat
-        # loop's five stops fired, as a closed five-value enum (`no-open` |
-        # `no-progress` | `max-cycles` | `legacy-appeared` | `ledger-unreadable`),
-        # every one of them a literal in `sweep.py`. Minted for the reason
-        # `drop_cause` and `regen_cause` above were: the natural spelling is
-        # `reason`, which sits in `diagnostics._JOURNAL_DROP_FIELDS` and ships as a
-        # presence boolean, collapsing all five stops into one indistinguishable
+        # loop's seven stops fired, as a closed seven-value enum (`no-open` |
+        # `no-progress` | `max-cycles` | `legacy-appeared` | `ledger-unreadable` |
+        # `ledger-inaccessible` | `no-selected`), every one of them a literal in
+        # `sweep.py`. Minted for the reason `drop_cause` and `regen_cause` above
+        # were: the natural spelling is `reason`, which sits in
+        # `diagnostics._JOURNAL_DROP_FIELDS` and ships as a presence boolean,
+        # collapsing all seven stops into one indistinguishable
         # row. `reason` is still written beside it, unchanged, carrying the same
         # token — this field adds a surviving copy, it does not replace one.
         "stop_cause",
@@ -1488,6 +1489,15 @@ JOURNAL_KINDS = frozenset(
         "sweep-selection-empty",
         "sweep-selection-excluded",
         "sweep-selection-missing-severity",
+        # DW-247. `_ensure_triage`'s cache WRITE-BACK refused by the OS: the fresh
+        # triage validated and its plan is acted on, but `triage{suffix}.json`
+        # never landed, so a resume re-triages, `_publish_stranded_close` finds no
+        # cache and `bmad-loop decisions` cannot see this cycle's decisions. Its own
+        # kind rather than `sweep-triage-reload-failed`, which is a READER's row —
+        # overloading it would report a healthy triage as a corrupt cache. `errors`
+        # carries the exception text only, already a benign field
+        # (`JOURNAL_BENIGN_FIELDS`), so no `diagnostics` routing row is needed.
+        "sweep-triage-cache-write-failed",
         "sweep-triage-reload-failed",
         "sweep-triage-result",
         "triage-decision",
