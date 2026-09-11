@@ -6098,10 +6098,12 @@ def test_unpublishable_target_refuses_a_ledger_symlink_loop_as_unreadable(projec
     `is_file()` answered False), and DW-221 made it a refusal — so this arm reports
     `target-unreadable`, naming the errno, where it once said `target-absent`.
 
-    The identical link at the STORE's name still publishes, through the
-    `is_symlink()` disjunct that exists to preserve the 3.13+ loop's link entry.
-    That is not an oversight DW-238 left behind: DW-238 unified the
-    present-but-wrong-TYPE shapes, and this one is not one of them.
+    The identical link at the STORE's name still publishes, through the store
+    leg's `S_ISLNK` arm (the old `is_symlink()` disjunct, since DW-257 answered
+    from one `lstat`) that exists to preserve the 3.13+ loop's link entry — see
+    `test_unpublishable_target_publishes_a_store_symlink_loop`. That is not an
+    oversight DW-238 left behind: DW-238 unified the present-but-wrong-TYPE
+    shapes, and this one is not one of them.
 
     Ablation: restore `if not path.is_file(): return None` in
     `deferredwork.read_for_write` and this reds with `target-absent` — the guard
@@ -6137,13 +6139,21 @@ def test_unpublishable_target_folds_a_refused_ledger_metadata_probe(project, mon
     assert "Permission denied" in error
 
 
-def test_unpublishable_target_refuses_an_absent_store(project):
-    """The store family's absence arm, which is now the arm reached only after BOTH
-    type probes answered False and `exists()` agreed nothing is there.
+@pytest.mark.parametrize("shape", ["enoent", "enotdir-parent"])
+def test_unpublishable_target_refuses_an_absent_store(project, shape):
+    """The store family's absence arm: `lstat` raised `FileNotFoundError`, or
+    `NotADirectoryError` for a regular file standing where `.bmad-loop/` should
+    be — the two shapes the leg absorbs as absence (DW-257), matching the
+    reader classification `deferredwork.read_for_write` makes.
 
-    Ablation: return `None` unconditionally from the store arm and this reds."""
+    Ablation: return `None` unconditionally from the store arm and both rows red;
+    drop `NotADirectoryError` from the absorbed tuple and `enotdir-parent` reds
+    with `target-unreadable`."""
     store = project.project / ".bmad-loop" / "decisions.json"
-    store.parent.mkdir(parents=True, exist_ok=True)
+    if shape == "enoent":
+        store.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        store.parent.write_text("a regular file where a directory is expected\n")
 
     assert verify.unpublishable_target(store, "store") == ("target-absent", None)
 
@@ -6172,9 +6182,9 @@ def test_unpublishable_target_refuses_a_store_replaced_by_a_directory(project):
     wrong TYPE is neither absent nor unreadable, so it gets its own token and names
     its own operator repair.
 
-    Ablation: drop `is_file()` from the store leg's first arm (leaving bare
-    `exists()`), or drop the `target-not-a-file` arm entirely, and this reds — the
-    directory publishes, or is misreported as an absence."""
+    Ablation: widen the store leg's publish test from `S_ISREG or S_ISLNK` to
+    "anything `lstat` reports", or drop the `target-not-a-file` arm entirely, and
+    this reds — the directory publishes, or is misreported as an absence."""
     store = project.project / ".bmad-loop" / "decisions.json"
     store.mkdir(parents=True)
     (store / "swept-in.txt").write_text("a descendant `git add` would stage\n")
@@ -6185,20 +6195,20 @@ def test_unpublishable_target_refuses_a_store_replaced_by_a_directory(project):
 def test_unpublishable_target_refuses_a_store_symlinked_to_a_directory(project):
     """The same refusal reached the other way — and the row that pins WHICH path the
     type test is taken on. Callers hand this guard the RESOLVED target (DW-188), and
-    a link to a directory resolves to that directory: `is_file()` False,
-    `is_symlink()` False, `exists()` True, so it lands on `target-not-a-file`. `git
-    add` on the operand would otherwise stage that directory's descendants exactly
-    as a directory in place of the store does.
+    a link to a directory resolves to that directory: `lstat` reports a directory,
+    neither `S_ISREG` nor `S_ISLNK`, so it lands on `target-not-a-file`. `git add`
+    on the operand would otherwise stage that directory's descendants exactly as a
+    directory in place of the store does.
 
     The second half is the property that keeps the tightening from over-refusing:
-    `is_file()` FOLLOWS symlinks, so a store symlinked to a regular file publishes
-    whether the guard sees the link or its target.
+    a store symlinked to a regular file publishes whether the guard sees the link
+    (the `S_ISLNK` arm) or its resolved target (the `S_ISREG` arm).
 
-    Ablation: drop `is_file()` from the first arm (leaving bare `exists()`) and the
-    resolved directory publishes again; make the first arm `is_file()` alone,
-    dropping the `is_symlink()` disjunct, and the link-to-a-regular-file half still
-    passes while the 3.13+ loop row above it reds — the two disjuncts answer
-    different questions."""
+    Ablation: widen the publish test to "anything `lstat` reports" and the
+    resolved directory publishes again; drop the `S_ISLNK` arm and the
+    link-to-a-regular-file half still passes on its resolved read while the
+    unresolved read and the 3.13+ loop row red — the two arms answer different
+    questions."""
     root = project.project / ".bmad-loop"
     root.mkdir(parents=True, exist_ok=True)
     elsewhere = root / "operator-chosen-dir"
@@ -6222,37 +6232,58 @@ def test_unpublishable_target_refuses_a_store_symlinked_to_a_directory(project):
     regular.write_text("{}", encoding="utf-8")
     store.unlink()
     store.symlink_to(regular)
-    assert verify.unpublishable_target(store, "store") is None  # is_file() follows
-    assert verify.unpublishable_target(store.resolve(), "store") is None
+    assert verify.unpublishable_target(store, "store") is None  # the `S_ISLNK` arm
+    assert verify.unpublishable_target(store.resolve(), "store") is None  # `S_ISREG`
 
 
-@pytest.mark.parametrize(
-    "probe,kind",
-    [
-        ("is_file", "file"),  # faults on the very first probe
-        ("is_symlink", "dir"),  # `is_file()` answers False first, then this raises
-        ("exists", "dir"),  # both type probes answer False, then this raises
-    ],
-)
+def test_unpublishable_target_publishes_a_store_symlink_loop(project):
+    """The one entry the old `is_symlink()` disjunct bought, kept by DW-257's
+    `S_ISLNK` arm: on Python 3.13+ a symlink LOOP at the store's name resolves to
+    the link ITSELF, and `lstat` — declining to follow the last component —
+    reports a link where `stat` would raise `ELOOP`. The store leg publishes it,
+    where its own ledger leg (`test_unpublishable_target_refuses_a_ledger_symlink_loop_as_unreadable`)
+    refuses the same shape `target-unreadable`; the families deliberately still
+    disagree here, and this row is what makes that a recorded fact.
+
+    Python 3.11–3.12 raise out of `resolve()` itself, which each caller handles
+    before this guard runs — so the row hands the guard the UNRESOLVED link, the
+    shape 3.13+'s resolve hands over, and asks nothing of `resolve()`.
+
+    Ablation: drop the `S_ISLNK` arm (publish on `S_ISREG` alone) and this reds
+    with `target-not-a-file`; probe with `stat()` instead of `lstat()` and it
+    reds with `target-unreadable` naming ELOOP."""
+    root = project.project / ".bmad-loop"
+    root.mkdir(parents=True, exist_ok=True)
+    store = root / "decisions.json"
+    other = root / "store-loop"
+    try:
+        store.symlink_to(other)
+        other.symlink_to(store)
+    except OSError as exc:  # pragma: no cover - win32 without developer mode
+        pytest.skip(f"symlinks unavailable on this host: {exc}")
+
+    assert verify.unpublishable_target(store, "store") is None
+
+
+@pytest.mark.parametrize("kind", ["file", "dir"])
 def test_unpublishable_target_folds_a_store_metadata_fault_into_the_refusal(
-    project, monkeypatch, probe, kind
+    project, monkeypatch, kind
 ):
-    """DW-227: each store probe can FAIL rather than answer. On Python 3.11–3.13
-    `Path.exists()`, `is_file()` and `is_symlink()` absorb only the
-    `ENOENT`/`ENOTDIR`/`ELOOP` class of errnos and RAISE the rest, so an `EACCES`
-    arriving after a successful write escaped this best-effort guard — aborting
-    `bmad-loop decisions`' walk or undercounting a TUI answer. Python 3.14
-    suppresses all OS errors in those probes, where the same store instead answers
-    `target-absent`; the fault is INJECTED here, so the handler is graded on every
-    version rather than only where the runtime can raise it on its own.
+    """DW-227: the store probe can FAIL rather than answer. On Python 3.11–3.13
+    the `Path.exists()`/`is_file()`/`is_symlink()` probes this leg used until
+    DW-257 absorbed only the `ENOENT`/`ENOTDIR`/`ELOOP` class of errnos and RAISED
+    the rest, so an `EACCES` arriving after a successful write escaped this
+    best-effort guard — aborting `bmad-loop decisions`' walk or undercounting a
+    TUI answer. The fault is INJECTED on `lstat`, the one probe the leg takes now,
+    which reports the refusal on every interpreter rather than only where the old
+    probes raised it on their own.
 
-    All three probes sit inside ONE `try`, so these rows do not ablate three
-    guards. What the per-probe parametrization grades is each ENTRY PATH into that
-    one guard: `is_file()` is reached first, `is_symlink()` only once it answered
-    False, and `exists()` only once both did — so every reachable arm is proved to
-    be inside the `try` rather than just the first.
+    ONE probe, so `kind` does not grade separate entry paths into the guard the
+    way the pre-DW-257 per-probe rows did; it pins that the fold is taken BEFORE
+    the type test, so a present regular file and a present directory fold the same
+    way when neither can be examined.
 
-    Ablation: delete the store leg's `except OSError` and every row reds with the
+    Ablation: delete the store leg's `except OSError` and both rows red with the
     `PermissionError` escaping instead of the tuple coming back."""
     store = project.project / ".bmad-loop" / "decisions.json"
     store.parent.mkdir(parents=True, exist_ok=True)
@@ -6260,12 +6291,48 @@ def test_unpublishable_target_folds_a_store_metadata_fault_into_the_refusal(
         store.write_text("{}", encoding="utf-8")
     else:
         store.mkdir()
-    fault_metadata_probe(monkeypatch, store, probe)
+    fault_metadata_probe(monkeypatch, store, "lstat")
 
     cause, error = verify.unpublishable_target(store, "store")
 
     assert cause == "target-unreadable"
     assert "Permission denied" in error
+
+
+def test_unpublishable_target_folds_a_refused_store_metadata_probe_on_every_interpreter(
+    project, monkeypatch
+):
+    """DW-257. The store leg asked `is_file() or is_symlink()`, then `exists()`,
+    and Python 3.14 suppresses every OS error inside all three, so a refused
+    store degraded to `target-absent` there — a present file reported as gone,
+    where this guard's own ledger leg says `target-unreadable` for the same
+    refusal (DW-221). The leg answers from one `lstat()` now, which reports the
+    refusal on every interpreter, and DW-227's fold catches it everywhere.
+
+    The 3.14 CONTRACT is simulated rather than the 3.14 interpreter: the three
+    convenience probes are pinned to answer False for the store — what 3.14 does
+    with a refusal — while `lstat` carries it. That is what makes the ablation
+    real on the 3.13 dev interpreter and not merely on one CI leg.
+
+    Ablation: restore the old `if target.is_file() or target.is_symlink(): return
+    None` / `if target.exists(): return ("target-not-a-file", None)` shape and
+    this reds with `target-absent`."""
+    store = project.project / ".bmad-loop" / "decisions.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text("{}", encoding="utf-8")
+    for probe in ("is_file", "is_symlink", "exists"):
+        real = getattr(Path, probe)
+        monkeypatch.setattr(
+            Path,
+            probe,
+            lambda self, *a, _real=real, **kw: False if self == store else _real(self, *a, **kw),
+        )
+    fault_metadata_probe(monkeypatch, store, "lstat")
+
+    cause, error = verify.unpublishable_target(store, "store")
+
+    assert cause == "target-unreadable"
+    assert error is not None and "Permission denied" in error
 
 
 @pytest.mark.parametrize("staged", [False, True])
@@ -6348,8 +6415,9 @@ def test_commit_paths_treats_a_symlink_to_nothing_as_present(project):
     collapses a dangling link to the plain non-existent path it points at (which then
     correctly reads MISSING, identically under either probe); a LOOP is the fixed
     point that survives the resolve as itself, which is exactly the case
-    `verify.unpublishable_target`'s RESOLVED-argument paragraph says the
-    `is_symlink()` disjunct was there to buy. Gated on 3.13 for the same reason its
+    `verify.unpublishable_target`'s RESOLVED-argument paragraph says the store
+    leg's `S_ISLNK` arm (once an `is_symlink()` disjunct) is there to buy. Gated
+    on 3.13 for the same reason its
     sibling row above is: older `Path.resolve` raises on the loop instead.
 
     Ablation: swap the probe for a bare `candidate.exists()` and this reds — the link
@@ -6423,22 +6491,23 @@ def test_unpublishable_target_reads_a_present_empty_ledger_as_publishable(projec
 
 
 def test_a_dangling_link_resolves_to_an_absence_before_the_probes_run(project):
-    """The probes are taken on the RESOLVED argument, and that is what decides what
-    the `is_symlink()` disjunct actually buys — not the spelling. A DANGLING link
-    does not survive the resolve as a link: non-strict `Path.resolve` collapses it
-    to the plain non-existent path it points at, so both probes answer False and
-    the store is refused `target-absent`. That is the right answer for it —
+    """The probe is taken on the RESOLVED argument, and that is what decides what
+    the store leg's `S_ISLNK` arm (the old `is_symlink()` disjunct, DW-257)
+    actually buys — not the spelling. A DANGLING link does not survive the
+    resolve as a link: non-strict `Path.resolve` collapses it to the plain
+    non-existent path it points at, so `lstat` raises `ENOENT` and the store is
+    refused `target-absent`. That is the right answer for it —
     `atomic_write_text_confined` REFUSES to write through a link at the store's
     own name, so a dangling one holds no write of ours to publish — but it is the
     opposite of what "keeps a dangling link publishable" would mean.
 
-    On Python 3.13+ the disjunct keeps a symlink LOOP publishable: it resolves to
-    the link ITSELF (`exists()` False, `is_symlink()` True). Python 3.11-3.12
+    On Python 3.13+ the arm keeps a symlink LOOP publishable: it resolves to the
+    link ITSELF, which `lstat` reports as a link (`S_ISLNK`). Python 3.11-3.12
     raise during resolve, which each caller handles on its own.
 
-    Ablation: on Python 3.13+, drop `or target.is_symlink()` and the loop case
-    starts refusing too. Reverse the arm to `if target.exists():` and the dangling
-    case stops being refused on every version."""
+    Ablation: on Python 3.13+, drop the `S_ISLNK` arm and the loop case starts
+    refusing too. Publish on anything `lstat` reports and the dangling case is
+    still refused (ENOENT), but the directory rows above stop being."""
     store = project.project / ".bmad-loop" / "decisions.json"
     store.parent.mkdir(parents=True, exist_ok=True)
     try:

@@ -1373,19 +1373,29 @@ def test_status_drops_the_decision_line_for_an_unreadable_ledger(
     nothing pinned it in either direction.
 
     Both legs of the guard are graded. `undecodable` was already degraded by DW-146's
-    `read_for_observation` conversion. `metadata` is the leg moving `is_file()` inside
-    that helper's try created: an `EACCES`-class fault on the probe used to escape the
-    helper entirely and reach `main`'s backstop as exit 1, so this row is the only
-    thing that would notice it silently becoming exit 0.
+    `read_for_observation` conversion. `metadata` is the leg the helper's probe
+    guard created: an `EACCES`-class fault on the probe used to escape the helper
+    entirely and reach `main`'s backstop as exit 1, so this row is the only thing
+    that would notice it silently becoming exit 0. Since DW-254 that probe is
+    `stat` + `S_ISREG`, so the fault is injected on `stat` with `is_file` pinned
+    False (the simulated-3.14 shape) — injected on `is_file`, as it was before
+    DW-254, it would never fire and the row would grade nothing.
 
-    Ablation: hoisting `read_for_observation`'s `is_file()` back above its `try`
-    reddens the `metadata` row alone, on the exit code (1, from `main`'s backstop) —
-    the leg isolated to this build. Reverting
+    What this row CANNOT tell apart, stated so nobody expects it to: a refused
+    ledger degraded to `("", None)` (the pre-DW-254 3.14 reading) and one
+    degraded to an attributed fault both leave `pending_missed_decisions` with no
+    open ids and no decision line, so restoring the helper's `is_file()` probe
+    leaves this row green — that switch is pinned at the helper by
+    `test_read_for_observation_degrades_on_a_metadata_fault`. This row pins the
+    surface: status exits 0 and drops the line, never exit 1.
+
+    Ablation: hoisting `read_for_observation`'s `stat` probe above its `try`
+    reddens the `metadata` row alone, on the exit code (1, from `main`'s backstop)
+    — the leg isolated to this build. Reverting
     `decisions.pending_missed_decisions`' read to
-    `ledger.read_text(encoding="utf-8") if ledger.is_file() else ""` reddens BOTH
-    rows, since that bare read re-exposes the codec error and the bare `is_file()`
-    beside it re-exposes the metadata fault; verified in both directions."""
-    from conftest import write_ledger, write_sprint
+    `ledger.read_text(encoding="utf-8") if ledger.is_file() else ""` reddens the
+    `undecodable` row, since that bare read re-exposes the codec error."""
+    from conftest import fault_metadata_probe, write_ledger, write_sprint
 
     install_bmad_config(project)
     write_sprint(project, {})
@@ -1395,13 +1405,12 @@ def test_status_drops_the_decision_line_for_an_unreadable_ledger(
         project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
     else:
         ledger, real = project.deferred_work, Path.is_file
-
-        def boom(self, *a, **kw):
-            if self == ledger:
-                raise PermissionError(13, "Permission denied")
-            return real(self, *a, **kw)
-
-        monkeypatch.setattr(Path, "is_file", boom)
+        monkeypatch.setattr(
+            Path,
+            "is_file",
+            lambda self, *a, **kw: False if self == ledger else real(self, *a, **kw),
+        )
+        fault_metadata_probe(monkeypatch, ledger, "stat")
 
     assert cli.main(["status", "--project", str(project.project)]) == 0
 

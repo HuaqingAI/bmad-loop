@@ -55,6 +55,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISREG
 from typing import Literal
 
 from . import bmadconfig, deferredwork, runs, verify
@@ -93,11 +94,20 @@ def load_pre_answers(project: Path) -> dict[str, dict]:
     codebase refuses. Readers that consume a value screen it themselves with
     `sweep.unusable_answer_reason`."""
     path = store_path(project)
-    if not path.is_file():
-        return {}
     try:
+        # `stat()` + `S_ISREG` INSIDE the `try`, never a bare `is_file()` outside
+        # it (DW-261): on Python 3.11–3.13 `is_file()` re-raises a metadata
+        # refusal, which escaped this "total" helper out of `_decisions_phase`
+        # and every other caller; on 3.14 it suppresses the refusal instead. The
+        # explicit probe folds the refusal into the same `{}` every other fault
+        # class already answers, on every interpreter. Absence — ENOENT, ENOTDIR,
+        # a directory at the store's name — stays a silent `{}` as before.
+        if not S_ISREG(path.stat().st_mode):
+            return {}
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError):
+        # `ValueError`: `Path.stat` raises it for a non-encodable path (embedded
+        # NUL), which the old bare `is_file()` absorbed; total means `{}` here too.
         return {}
     return data if isinstance(data, dict) else {}
 

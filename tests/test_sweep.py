@@ -11652,7 +11652,7 @@ def test_a_false_effect_return_does_not_withhold_an_earlier_decisions_commit(pro
 
     The withhold means "the bytes on disk are the ones an effect could not read",
     and a False return is not evidence of that — DW-2 never read anything, it
-    returned at `record_decision`'s `is_file()` probe. Withholding on it would leave
+    returned at `record_decision`'s presence guard. Withholding on it would leave
     DW-1's authorized line dirty in the worktree immediately ahead of this cycle's
     bundles, which need a clean baseline, and without `--repeat` there is no later
     cycle to pick it up.
@@ -13764,7 +13764,7 @@ def test_a_ledger_deleted_inside_the_cycle_refuses_the_prune_on_the_real_path(pr
 
     This row also covers the NO-LEDGER half of the DW-186 False return, which it
     reaches for free: the unlink lands before DW-1's answer is returned, so DW-1's
-    own `record_decision` answers False at its `is_file()` probe without reading
+    own `record_decision` answers False at its presence guard without reading
     anything. Before DW-186 that walk claimed the close; the assertions below now
     hold it to reporting the miss and claiming nothing, so the half is pinned here
     rather than merely exercised.
@@ -16842,10 +16842,10 @@ def test_commit_ledger_refuses_an_unpublishable_target_without_reaching_git(
     elif family == "store":
         # DW-227 at the STORE, whose guard reads no bytes at all: the fault has to
         # come out of a metadata probe, and it is injected through the seam rather
-        # than through chmod so it holds on every supported version (Python 3.14
-        # suppresses OS errors inside these probes, so a permission bit would make
-        # the row silently pass on part of the CI matrix).
-        fault_metadata_probe(monkeypatch, target, "is_file")
+        # than through chmod so it holds on every supported version. `lstat` is
+        # the one probe the store leg takes since DW-257 — on `is_file` the
+        # injection would never fire and the row would silently stop faulting.
+        fault_metadata_probe(monkeypatch, target, "lstat")
     else:
         fault_read_text(monkeypatch, target)
 

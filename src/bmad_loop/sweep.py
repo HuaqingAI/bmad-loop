@@ -4169,10 +4169,12 @@ class SweepEngine(Engine):
                 # `ledger_in_doubt` is deliberately left ALONE — neither set nor
                 # cleared. The latch means "the bytes on disk are ones nobody could
                 # read", and a False return says nothing either way about that:
-                # `record_decision` answers False from `if not path.is_file()`
-                # BEFORE it reads anything, so a vanished ledger reaches here having
-                # read nothing at all, while a missing entry reaches here off a
-                # perfectly good read. So the latch keeps meaning what it meant —
+                # `record_decision` answers False from its presence guard
+                # (`_ledger_present`, DW-255) for a vanished ledger BEFORE it reads
+                # anything — a REFUSED ledger raises there instead — so a vanished
+                # ledger reaches here having read nothing at all, while a missing
+                # entry reaches here off a perfectly good read. So the latch keeps
+                # meaning what it meant —
                 # the verdict of the last attempt that actually READ — and this arm
                 # neither withholds a commit that may carry an earlier decision's
                 # authorized line nor clears a doubt it cannot speak to.
