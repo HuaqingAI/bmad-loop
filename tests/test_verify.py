@@ -1,4 +1,5 @@
 import dataclasses
+import errno
 import hashlib
 import inspect
 import io
@@ -6143,11 +6144,13 @@ def test_unpublishable_target_folds_a_refused_ledger_metadata_probe(project, mon
 def test_unpublishable_target_refuses_an_absent_store(project, shape):
     """The store family's absence arm: `lstat` raised `FileNotFoundError`, or
     `NotADirectoryError` for a regular file standing where `.bmad-loop/` should
-    be — the two shapes the leg absorbs as absence (DW-257), matching the
-    reader classification `deferredwork.read_for_write` makes.
+    be — the two errno shapes the leg absorbs as absence (DW-257), through the
+    same `deferredwork.probe_absence` the reader asks (DW-268; the winerror and
+    NUL shapes it also absorbs are
+    `test_unpublishable_target_absorbs_pathlibs_ignored_store_probe_faults`).
 
     Ablation: return `None` unconditionally from the store arm and both rows red;
-    drop `NotADirectoryError` from the absorbed tuple and `enotdir-parent` reds
+    drop `NotADirectoryError` from `probe_absence` and `enotdir-parent` reds
     with `target-unreadable`."""
     store = project.project / ".bmad-loop" / "decisions.json"
     if shape == "enoent":
@@ -6333,6 +6336,83 @@ def test_unpublishable_target_folds_a_refused_store_metadata_probe_on_every_inte
 
     assert cause == "target-unreadable"
     assert error is not None and "Permission denied" in error
+
+
+ABSORBED_PROBE_FAULTS = ["winerror-21", "winerror-123", "winerror-1921", "nul-path"]
+"""The four probe-fault shapes `deferredwork.probe_absence` absorbs beyond
+`ENOENT`/`ENOTDIR` (DW-256/DW-268) — pathlib's `_IGNORED_WINERRORS` and the
+`ValueError` a non-encodable path raises; the twin of the table in
+`tests/test_deferredwork.py`."""
+
+
+def _absorb_probe_fault(monkeypatch, target: Path, shape: str, probe: str) -> Path:
+    """Install shape `shape` at `target`'s `probe` and return the path to hand the
+    guard. Winerrors are simulated the `tests/test_install.py` way — an
+    `OSError(errno.EIO)` with `.winerror` set, for this path only, on every
+    platform; `nul-path` swaps the target for a sibling with a REAL embedded NUL,
+    which the probe refuses with `ValueError` everywhere, so nothing is patched."""
+    if shape == "nul-path":
+        return Path(str(target.parent) + "/bad\0" + target.name)
+    fault = OSError(errno.EIO, "metadata refused", str(target))
+    fault.winerror = int(shape.removeprefix("winerror-"))
+    real = getattr(Path, probe)
+
+    def faulting(self, *a, **kw):
+        if self == target:
+            raise fault
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, probe, faulting)
+    return target
+
+
+@pytest.mark.parametrize("shape", ABSORBED_PROBE_FAULTS)
+def test_unpublishable_target_absorbs_pathlibs_ignored_store_probe_faults(
+    project, monkeypatch, shape
+):
+    """DW-268 at the store leg. DW-257's one `lstat()` kept only
+    `FileNotFoundError`/`NotADirectoryError` as absence, but the
+    `is_file()`/`is_symlink()`/`exists()` probes it replaced had also absorbed
+    pathlib's `_IGNORED_WINERRORS` (21/123/1921) and the `ValueError` a
+    non-encodable path raises — so a store on a disconnected mapped drive folded
+    to `target-unreadable` where the old probes said absent, and a NUL in the
+    store path ESCAPED as a `ValueError` past every caller's `except OSError`.
+    The leg asks `deferredwork.probe_absence` now, the same classification the
+    ledger's reader makes, so all four shapes are `target-absent`; `EACCES` is
+    still `target-unreadable`
+    (`test_unpublishable_target_folds_a_refused_store_metadata_probe_on_every_interpreter`).
+
+    Ablation: restore `except (FileNotFoundError, NotADirectoryError)` (with the
+    `except OSError` fold below it) at the store leg and the winerror rows red
+    with `target-unreadable`, the `nul-path` row with `ValueError` escaping."""
+    store = project.project / ".bmad-loop" / "decisions.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text("{}", encoding="utf-8")
+    target = _absorb_probe_fault(monkeypatch, store, shape, "lstat")
+
+    assert verify.unpublishable_target(target, "store") == ("target-absent", None)
+
+
+@pytest.mark.parametrize("shape", ABSORBED_PROBE_FAULTS)
+def test_unpublishable_target_absorbs_pathlibs_ignored_ledger_probe_faults(
+    project, monkeypatch, shape
+):
+    """DW-256/DW-268 at the ledger leg. The reader answers `None` for these four
+    shapes now (`test_read_for_write_absorbs_pathlibs_ignored_probe_faults`), and
+    the leg's `stat()` re-probe — which discriminates `target-absent` from
+    `target-not-a-file` — asks the SAME `probe_absence`, so the answer is
+    `target-absent`, inherited, and never an escaping `ValueError`: the enclosing
+    `except OSError` would not catch one, and this is a best-effort publisher.
+
+    Ablation: restore `except (FileNotFoundError, NotADirectoryError)` at the
+    re-probe alone and the winerror rows red with `target-unreadable` (the
+    re-raised `OSError` lands in the fold), the `nul-path` row with `ValueError`
+    escaping; restore it at `read_for_write` instead and every row reds the
+    same way one step earlier."""
+    write_ledger(project, {"DW-1": "open"})
+    target = _absorb_probe_fault(monkeypatch, project.deferred_work, shape, "stat")
+
+    assert verify.unpublishable_target(target, "ledger") == ("target-absent", None)
 
 
 @pytest.mark.parametrize("staged", [False, True])

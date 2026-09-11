@@ -107,7 +107,10 @@ def load_pre_answers(project: Path) -> dict[str, dict]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError):
         # `ValueError`: `Path.stat` raises it for a non-encodable path (embedded
-        # NUL), which the old bare `is_file()` absorbed; total means `{}` here too.
+        # NUL), which the old bare `is_file()` absorbed and which
+        # `deferredwork.probe_absence` now classifies as absence at the ledger's
+        # write arm and the publish guard (DW-256/DW-268); this loader never asks
+        # the helper — total means `{}` for that class and every other alike.
         return {}
     return data if isinstance(data, dict) else {}
 

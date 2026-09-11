@@ -5185,11 +5185,22 @@ def unpublishable_target(target: Path, family: Literal["ledger", "store"]) -> (
     `EACCES` never reached the `except` at all: every probe answered False and
     the store degraded to `target-absent` — a present file reported as gone,
     where this guard's own ledger leg said `target-unreadable`. `lstat`
-    suppresses nothing, so `FileNotFoundError`/`NotADirectoryError` are the
-    absence the old probes answered False for, and every other `OSError` — the
-    refusal included — folds into `target-unreadable` on 3.11 through 3.14
-    alike. The fold is DW-227's; the probe that lets it fire everywhere is
-    DW-257's.
+    suppresses nothing, so what its fault MEANS is decided by
+    `deferredwork.probe_absence`, the one classification the ledger's
+    repair/write reader and this guard's ledger leg also ask (DW-256/DW-268):
+    `FileNotFoundError`/`NotADirectoryError`, pathlib's ignored winerrors
+    (`deferredwork.ABSENCE_WINERRORS` — 21/123/1921, a disconnected mapped
+    drive or a lexically invalid Windows path) and the `ValueError` a
+    non-encodable path raises are the absence the old probes answered False
+    for, and every other `OSError` — the refusal included — folds into
+    `target-unreadable` on 3.11 through 3.14 alike. The `ValueError` half
+    matters because this GUARD's callers hold only an `except OSError` around
+    it: absorbed here, it cannot escape the guard. (The publishers' own
+    `resolve()` arms, which run first, are unchanged and still raise the same
+    `ValueError` for a NUL on POSIX, where `realpath` does not tolerate it —
+    pre-existing and outside DW-268.) The fold is
+    DW-227's; the probe that lets it fire everywhere is DW-257's; the absorbed
+    set is the one `is_file()` had before DW-221 and is owned by the helper.
 
     The probe is taken on the RESOLVED argument, which is what decides what the
     `S_ISLNK` arm actually buys — the same entry the old `is_symlink()`
@@ -5217,10 +5228,18 @@ def unpublishable_target(target: Path, family: Literal["ledger", "store"]) -> (
     if family == "ledger":
         try:
             if deferredwork.read_for_write(target) is None:
+                # The re-probe asks the SAME classification the reader just
+                # answered `None` for (DW-256/DW-268), so a fault the reader
+                # absorbed is `target-absent` here. A fault the helper refuses
+                # folds to `target-unreadable` IN PLACE rather than re-raising:
+                # the enclosing `except OSError` would not catch a refused
+                # `ValueError`, and nothing out of this re-probe may escape.
                 try:
                     target.stat()
-                except (FileNotFoundError, NotADirectoryError):
-                    return ("target-absent", None)
+                except (OSError, ValueError) as e:
+                    if deferredwork.probe_absence(e):
+                        return ("target-absent", None)
+                    return ("target-unreadable", str(e))
                 return ("target-not-a-file", None)
         except deferredwork.LedgerReadError as e:
             # DURABLE: the bytes on disk are what nobody can decode, and a replay
@@ -5238,11 +5257,16 @@ def unpublishable_target(target: Path, family: Literal["ledger", "store"]) -> (
         # and, declining to follow the last component, keeps the one entry the
         # old `is_symlink()` disjunct bought — the 3.13+ symlink LOOP, which
         # survives the caller's resolve as a link — publishable through `S_ISLNK`.
+        # What a fault out of it MEANS is `deferredwork.probe_absence`'s call
+        # (DW-256/DW-268): absence for the reader's absorbed set, `target-
+        # unreadable` for everything else — a `ValueError` included in the
+        # tuple so a non-encodable store path can never escape this best-effort
+        # guard.
         try:
             st = target.lstat()
-        except (FileNotFoundError, NotADirectoryError):
-            return ("target-absent", None)
-        except OSError as e:
+        except (OSError, ValueError) as e:
+            if deferredwork.probe_absence(e):
+                return ("target-absent", None)
             return ("target-unreadable", str(e))
         if S_ISREG(st.st_mode) or S_ISLNK(st.st_mode):
             return None

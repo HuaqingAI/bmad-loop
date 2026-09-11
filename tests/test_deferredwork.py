@@ -4791,8 +4791,11 @@ def test_a_refused_ledger_raises_out_of_every_mutator(tmp_path, monkeypatch, nam
 @pytest.mark.parametrize("name", sorted(WRITING_MUTATORS))
 def test_a_directory_at_the_ledger_is_absence_for_every_mutator(tmp_path, monkeypatch, name, shape):
     """The absence half of the DW-255 classification, kept exactly — the two
-    shapes `_ledger_present` must keep answering False for, since the helper
-    carries its own copy of the reader's absorbed tuple. `directory`: a DIRECTORY
+    shapes `_ledger_present` must keep answering False for. The helper shares
+    `probe_absence` with the reader by construction since DW-256, so these rows
+    pin the classification itself, not the guard's agreement with the reader —
+    the winerror and NUL shapes are
+    `test_an_absorbed_probe_fault_is_absence_for_every_mutator`. `directory`: a DIRECTORY
     standing at the ledger's name is a present target of the wrong TYPE, which
     `is_file()` answered False for and `S_ISREG` answers False for too.
     `enotdir-parent`: a regular file where the ledger's parent directory should
@@ -4802,8 +4805,8 @@ def test_a_directory_at_the_ledger_is_absence_for_every_mutator(tmp_path, monkey
     Ablations: make `_ledger_present` answer `True` for anything `stat` reports
     and the `directory` rows red — the spy fires, and the row that reaches the
     locked read raises where a no-op value was expected; drop
-    `NotADirectoryError` from the helper's absorbed tuple and the
-    `enotdir-parent` rows red with it escaping."""
+    `NotADirectoryError` from `probe_absence` and the `enotdir-parent` rows red
+    with it escaping."""
     seed, call, noop = WRITING_MUTATORS[name]
     if shape == "directory":
         path = tmp_path / "deferred-work.md"
@@ -4821,6 +4824,97 @@ def test_a_directory_at_the_ledger_is_absence_for_every_mutator(tmp_path, monkey
         assert path.is_dir() and not any(path.iterdir())
     else:
         assert (tmp_path / "not-a-dir").read_text(encoding="utf-8") == "x"
+
+
+ABSORBED_PROBE_FAULTS = ["winerror-21", "winerror-123", "winerror-1921", "nul-path"]
+"""The four probe-fault shapes `deferredwork.probe_absence` absorbs beyond
+`ENOENT`/`ENOTDIR` (DW-256/DW-268): pathlib's `_IGNORED_WINERRORS` — 21
+`ERROR_NOT_READY`, 123 `ERROR_INVALID_NAME`, 1921 `ERROR_CANT_RESOLVE_FILENAME`
+— and the `ValueError` a non-encodable path raises. Exactly what `is_file()`
+absorbed before DW-221 replaced it with `stat()` + `S_ISREG`."""
+
+
+def _absorbed_probe_fault(
+    monkeypatch, tmp_path: Path, shape: str, probe: str = "stat", *, seed=None
+) -> Path:
+    """Install shape `shape` at a ledger path and return that path.
+
+    The winerror shapes are Windows-only in the wild and simulated here the
+    `tests/test_install.py` way: `Path.<probe>` raises an `OSError(errno.EIO)` with
+    `.winerror` set, for this path only, on every platform. The `nul-path` shape
+    is a REAL embedded NUL, which `Path.stat`/`lstat` refuse with `ValueError` on
+    every platform, so nothing is patched for it."""
+    if shape == "nul-path":
+        return Path(str(tmp_path) + "/bad\0name.md")
+    path = write_ledger(tmp_path)
+    if seed is not None:
+        seed(path)
+    fault = OSError(errno.EIO, "metadata refused", str(path))
+    fault.winerror = int(shape.removeprefix("winerror-"))
+    real = getattr(Path, probe)
+
+    def faulting(self, *a, **kw):
+        if self == path:
+            raise fault
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, probe, faulting)
+    return path
+
+
+@pytest.mark.parametrize("shape", ABSORBED_PROBE_FAULTS)
+def test_ledger_present_answers_false_for_an_absorbed_probe_fault(tmp_path, monkeypatch, shape):
+    """`_ledger_present` itself, not inferred through a mutator: the four shapes
+    `probe_absence` absorbs (DW-256/DW-268) are False here, where the narrow
+    tuple DW-255 shipped let them raise.
+    Ablation: restore `except (FileNotFoundError, NotADirectoryError)` in
+    `_ledger_present` and every row reds with the fault escaping."""
+    path = _absorbed_probe_fault(monkeypatch, tmp_path, shape)
+
+    assert deferredwork._ledger_present(path) is False
+
+
+def test_ledger_present_raises_a_refused_probe(tmp_path, monkeypatch):
+    """The fault side of the same guard, asserted directly: `EACCES` raises the
+    injected instance out of `_ledger_present` (the mutator-level twin is
+    `test_a_refused_ledger_raises_out_of_every_mutator`).
+    Ablation: make `probe_absence` answer True for any `OSError` and this reds."""
+    path = write_ledger(tmp_path)
+    fault = _refuse_metadata_like_3_14(monkeypatch, path)
+
+    with pytest.raises(OSError) as raised:
+        deferredwork._ledger_present(path)
+    assert raised.value is fault
+
+
+@pytest.mark.parametrize("shape", ABSORBED_PROBE_FAULTS)
+@pytest.mark.parametrize("name", sorted(WRITING_MUTATORS))
+def test_an_absorbed_probe_fault_is_absence_for_every_mutator(tmp_path, monkeypatch, name, shape):
+    """DW-256/DW-268 at the mutators' pre-lock guard. `_ledger_present` asks
+    `probe_absence`, the same classification `read_for_write` answers `None` for,
+    so a ledger on a disconnected mapped drive (winerror 21), at a lexically
+    invalid Windows path (123 / 1921), or at a path the OS cannot encode (an
+    embedded NUL) takes each mutator's no-op return with no lock acquired and
+    nothing written — where the narrow `(FileNotFoundError, NotADirectoryError)`
+    tuple DW-255 shipped let the `OSError`/`ValueError` escape every mutator.
+
+    The winerror rows seed a VALID ledger whose entry WOULD write, so the no-op
+    value can only be coming from the guard; the `nul-path` row cannot seed
+    (no such file can exist) and pins the `ValueError` arm alone.
+
+    Ablation: restore `except (FileNotFoundError, NotADirectoryError)` in
+    `_ledger_present` and every row reds with the injected `OSError` (or the
+    `ValueError`) escaping where the no-op value was expected."""
+    seed, call, noop = WRITING_MUTATORS[name]
+    path = _absorbed_probe_fault(monkeypatch, tmp_path, shape, seed=seed)
+    acquisitions, writes = [], []
+    _counting_write(monkeypatch, writes)
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert call(path) == noop
+
+    assert acquisitions == []
+    assert writes == []
 
 
 @pytest.mark.parametrize("name", sorted(NOOP_MUTATORS))
@@ -5051,6 +5145,91 @@ def test_read_for_write_propagates_a_refused_metadata_probe(tmp_path, monkeypatc
     with pytest.raises(OSError) as raised:
         deferredwork.read_for_write(path)
     assert raised.value is fault
+
+
+@pytest.mark.parametrize("shape", ABSORBED_PROBE_FAULTS)
+def test_read_for_write_absorbs_pathlibs_ignored_probe_faults(tmp_path, monkeypatch, shape):
+    """DW-256 (the 2026-09-10 decision) and DW-268. DW-221 swapped `is_file()` for
+    `stat()` + `S_ISREG` and kept only `ENOENT`/`ENOTDIR` as absence, but
+    `is_file()` had also absorbed pathlib's `_IGNORED_WINERRORS` (21 NOT_READY,
+    123 INVALID_NAME, 1921 CANT_RESOLVE_FILENAME) and the `ValueError` a
+    non-encodable path raises — so a ledger on a disconnected mapped drive or at
+    a lexically invalid Windows path crashed `Engine._ledger_digest`, `runs`'
+    resume entry gate and every write-bearing mutator. `probe_absence` restores
+    exactly that set, and nothing wider: `EACCES`/`EIO`/`ESTALE`/`EBADF` still
+    raise (`test_read_for_write_propagates_a_refused_metadata_probe`), and so
+    does winerror 5 (`test_read_for_write_propagates_an_unabsorbed_winerror`).
+
+    Ablation: restore `except (FileNotFoundError, NotADirectoryError)` in
+    `read_for_write` and every row reds with the fault escaping."""
+    path = _absorbed_probe_fault(monkeypatch, tmp_path, shape)
+
+    assert deferredwork.read_for_write(path) is None
+
+
+def test_read_for_write_propagates_an_unabsorbed_winerror(tmp_path, monkeypatch):
+    """The winerror set `probe_absence` absorbs is EXACTLY pathlib's three; an
+    `OSError` carrying any other `winerror` — 5, `ERROR_ACCESS_DENIED` — is a
+    refusal that raises unchanged, the same instance, like a POSIX `EACCES`.
+    Ablation: make `probe_absence` answer True for any `OSError` with a `winerror`
+    attribute and this reds with `None` returned where a raise was expected."""
+    path = write_ledger(tmp_path)
+    fault = OSError(errno.EACCES, "metadata refused", str(path))
+    fault.winerror = 5
+    real_stat = Path.stat
+
+    def refused_stat(self, *a, **kw):
+        if self == path:
+            raise fault
+        return real_stat(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "stat", refused_stat)
+
+    with pytest.raises(OSError) as raised:
+        deferredwork.read_for_write(path)
+    assert raised.value is fault
+
+
+def _winerror(exc: OSError, winerror: int) -> OSError:
+    """Set `.winerror` on an already-built `OSError` so the attribute exists before
+    parametrization — the errno subclass is whatever CPython's errmap would pick."""
+    exc.winerror = winerror
+    return exc
+
+
+@pytest.mark.parametrize(
+    "exc, expected",
+    [
+        (FileNotFoundError(errno.ENOENT, "gone"), True),
+        (NotADirectoryError(errno.ENOTDIR, "file in the way"), True),
+        (PermissionError(errno.EACCES, "refused"), False),
+        (OSError(errno.EIO, "io"), False),
+        (OSError(errno.ELOOP, "loop"), False),
+        (OSError(errno.EBADF, "bad fd"), False),
+        # CPython's errmap: winerror 21 arrives as a `PermissionError`, 123/1921 as
+        # `EINVAL` — the test is on `.winerror` alone, the subclass is irrelevant.
+        (_winerror(PermissionError(errno.EACCES, "not ready"), 21), True),
+        (_winerror(OSError(errno.EINVAL, "invalid name"), 123), True),
+        (_winerror(OSError(errno.EINVAL, "cannot resolve"), 1921), True),
+        (_winerror(OSError(errno.EACCES, "access denied"), 5), False),
+        (ValueError("embedded null byte"), True),
+        (UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogates not allowed"), True),
+        (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), False),
+        (RuntimeError("not a probe fault"), False),
+    ],
+)
+def test_probe_absence_classifies_exactly_the_is_file_set(exc, expected):
+    """The helper's table, one row per class it must decide: `ENOENT`/`ENOTDIR`,
+    pathlib's three winerrors regardless of errno subclass, a plain `ValueError`
+    (embedded NUL) and a `UnicodeEncodeError` (a lone-surrogate path — the other
+    non-encodable shape `is_file()` absorbed) are absence; every refusal errno,
+    `ELOOP`/`EBADF` (DW-221's call, unchanged), winerror 5 and a
+    `UnicodeDecodeError` — a `ValueError` too, but `read_text`'s fault and not
+    the probe's, which must stay `LedgerReadError` — are not.
+
+    Ablation: exclude `UnicodeError` instead of `UnicodeDecodeError` and the
+    `UnicodeEncodeError` row reds."""
+    assert deferredwork.probe_absence(exc) is expected
 
 
 @pytest.mark.parametrize("present", [True, False])

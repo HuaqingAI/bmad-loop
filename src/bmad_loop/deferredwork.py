@@ -151,6 +151,53 @@ class LedgerReadError(Exception):
     """
 
 
+ABSENCE_WINERRORS: tuple[int, ...] = (21, 123, 1921)
+"""Windows error codes a metadata probe reports for a target that is as good as
+absent — ``ERROR_NOT_READY`` (a disconnected mapped drive), ``ERROR_INVALID_NAME``
+(a lexically invalid path) and ``ERROR_CANT_RESOLVE_FILENAME``. This is EXACTLY
+pathlib's ``_IGNORED_WINERRORS`` (CPython ``pathlib._abc`` on 3.13, ``pathlib`` on
+3.11–3.12), the set ``Path.is_file()`` absorbed before DW-221 replaced it with
+``stat()`` + ``S_ISREG`` at the ledger's readers. ``install._ABSENCE_WINERRORS``
+is the identical tuple, deliberately NOT shared across the layering: the errno
+half of that classification differs (``install._ABSENCE_ERRNOS`` also absorbs
+``EBADF``/``ELOOP``, which stay faults here), so the two stay independent."""
+
+
+def probe_absence(exc: BaseException) -> bool:
+    """Does this fault out of a ``stat()``/``lstat()`` PROBE mean absence?
+
+    The ONE classification behind :func:`read_for_write`, :func:`_ledger_present`
+    and both legs of ``verify.unpublishable_target`` (DW-256/DW-268), so the
+    absorbed set cannot drift between the reader and the guard. True for:
+
+    - ``FileNotFoundError`` / ``NotADirectoryError`` — ``ENOENT``/``ENOTDIR``,
+      the absence DW-221 kept;
+    - an ``OSError`` whose ``winerror`` is in :data:`ABSENCE_WINERRORS` — the
+      test is on ``.winerror`` alone and the subclass is irrelevant (CPython's
+      errmap makes 21 a ``PermissionError`` and 123/1921 ``EINVAL``), which is
+      why this takes the exception rather than being a class tuple: no tuple
+      can select it;
+    - any ``ValueError`` except ``UnicodeDecodeError`` — ``Path.stat`` raises a
+      plain ``ValueError`` for an embedded NUL and a ``UnicodeEncodeError`` for
+      a lone surrogate, both paths the OS cannot encode, which ``is_file()``
+      answered False for on every interpreter.
+
+    Everything else stays a FAULT: ``EACCES``, ``EIO``, ``ESTALE``, ``EBADF``,
+    ``ELOOP`` and an ``OSError`` carrying any other ``winerror`` (5, say) — DW-221's
+    deliberate call for ``EBADF``/``ELOOP``, unchanged. PROBE faults only: a
+    ``UnicodeDecodeError`` out of ``read_text`` is itself a ``ValueError`` and
+    is the ONE ``ValueError`` deliberately NOT absence, so the write arm's
+    decode arm stays :class:`LedgerReadError`. Classification, not disposition — the observation
+    arm and ``decisions.load_pre_answers`` never call this: they attribute or
+    degrade the same ``ValueError`` as a fault, which is their contract.
+    """
+    if isinstance(exc, (FileNotFoundError, NotADirectoryError)):
+        return True
+    if isinstance(exc, OSError):
+        return getattr(exc, "winerror", None) in ABSENCE_WINERRORS
+    return isinstance(exc, ValueError) and not isinstance(exc, UnicodeDecodeError)
+
+
 def read_for_write(path: Path) -> str | None:
     """REPAIR/WRITE arm of the ledger-read contract (DW-146).
 
@@ -162,19 +209,30 @@ def read_for_write(path: Path) -> str | None:
     could read.
 
     Use ``Path.stat`` plus ``S_ISREG`` because ``Path.is_file`` suppresses all
-    OS errors on Python 3.14. ENOENT, ENOTDIR and non-regular files remain
-    absence; every other OS error propagates. ELOOP and EBADF deliberately
-    become errors on older interpreters too, where ``is_file`` suppressed them.
-    The regular-file check also prevents blocking on a FIFO.
+    OS errors on Python 3.14. What the probe's fault MEANS is decided by
+    :func:`probe_absence`, the classification shared with :func:`_ledger_present`
+    and ``verify.unpublishable_target`` (DW-256/DW-268): ENOENT, ENOTDIR,
+    non-regular files, pathlib's ignored winerrors (:data:`ABSENCE_WINERRORS` —
+    21/123/1921, CPython ``pathlib._abc`` on 3.13, ``pathlib`` on 3.11–3.12) and
+    the ``ValueError`` a non-encodable path raises are absence — the set
+    ``is_file()`` absorbed before DW-221 — and every other OS error propagates.
+    ELOOP and EBADF deliberately become errors on older interpreters too, where
+    ``is_file`` suppressed them. The regular-file check also prevents blocking
+    on a FIFO.
 
-    Keep the absence classification aligned with ``resolve.build_context``.
-    Its disposition differs: that observation path degrades other OS errors,
-    whereas this repair/write reader must propagate them.
+    ``resolve.build_context`` shares the errno/``S_ISREG`` half of this
+    classification (``ENOENT``/``ENOTDIR``/non-regular are absence there too)
+    and keeps the narrow tuple: the winerror/``ValueError`` widening is the
+    ledger readers' own. Its disposition differs as well: that observation path
+    degrades other OS errors, whereas this repair/write reader must propagate
+    them.
     """
     try:
         st = path.stat()
-    except (FileNotFoundError, NotADirectoryError):
-        return None
+    except (OSError, ValueError) as e:
+        if probe_absence(e):
+            return None
+        raise
     if not S_ISREG(st.st_mode):
         return None
     try:
@@ -192,11 +250,15 @@ def read_for_observation(path: Path) -> tuple[str, str | None]:
     — attributed, so a caller holding a journal can record WHICH fault it
     degraded on rather than reporting an empty ledger. Never raises.
 
-    Both arms share ONE classification and differ only in DISPOSITION. The
-    probe is ``Path.stat`` + ``S_ISREG``, the same as :func:`read_for_write`'s
-    (DW-221 there, DW-254 here): ``FileNotFoundError``/``NotADirectoryError``
-    and a present non-regular file are absence, and every other ``OSError`` is a
-    fault. The write arm RAISES that fault; this arm attributes and degrades it.
+    Both arms share the ``ENOENT``/``ENOTDIR``/non-regular classification and
+    differ in DISPOSITION. The probe is ``Path.stat`` + ``S_ISREG``, the same as
+    :func:`read_for_write`'s (DW-221 there, DW-254 here):
+    ``FileNotFoundError``/``NotADirectoryError`` and a present non-regular file
+    are absence at both. Since DW-256 the write arm ADDITIONALLY absorbs
+    :func:`probe_absence`'s wider set — pathlib's ignored winerrors and a
+    non-encodable path — as absence; this arm keeps attributing those as faults,
+    and every other ``OSError`` is a fault at both. The write arm RAISES its
+    faults; this arm attributes and degrades them.
     Until DW-254 this arm probed with ``is_file()``, which raises ``EACCES`` on
     Python 3.11–3.13 (attributed here, as promised) but suppresses every OS
     error on 3.14 and answers False — so a refused ledger degraded to
@@ -220,18 +282,22 @@ def read_for_observation(path: Path) -> tuple[str, str | None]:
         return path.read_text(encoding="utf-8"), None
     except (OSError, UnicodeDecodeError, ValueError) as e:
         # `ValueError`: `Path.stat` raises it for a path the OS cannot encode (an
-        # embedded NUL), which `is_file()` absorbed; never-raises keeps it a fault.
+        # embedded NUL). `probe_absence` ABSORBS that class as absence at the
+        # write arm (DW-256); this arm never calls it — never-raises keeps the
+        # `ValueError` an attributed fault rather than classifying it as absence.
         return "", f"{e.__class__.__name__}: {e}"
 
 
 def _ledger_present(path: Path) -> bool:
     """Pre-lock presence guard shared by the five write-bearing mutators (DW-255).
 
-    True for a regular file at ``path``; False for absence — ``ENOENT``,
-    ``ENOTDIR``, or a present non-regular file (a directory, a FIFO) — which is
-    exactly the classification :func:`read_for_write` answers ``None`` for.
-    Every other ``OSError`` PROPAGATES: a refused ledger is a fault the caller
-    must see, never "nothing to do".
+    True for a regular file at ``path``; False for absence — whatever
+    :func:`probe_absence` says the probe's fault means (``ENOENT``, ``ENOTDIR``,
+    pathlib's ignored winerrors, a non-encodable path), or a present non-regular
+    file (a directory, a FIFO) — which is exactly the classification
+    :func:`read_for_write` answers ``None`` for. Every other ``OSError``
+    PROPAGATES: a refused ledger is a fault the caller must see, never "nothing
+    to do".
 
     ``Path.is_file()`` was the wrong probe here for the reason it was the wrong
     probe in the reader: on Python 3.14 its body is ``os.path.isfile``, which
@@ -243,18 +309,19 @@ def _ledger_present(path: Path) -> bool:
     DW-221 made: a path that exists and cannot be read is not an absent one.
 
     Only the PRE-LOCK guard uses this; under the lock each mutator branches on
-    the reader's own ``None``. This helper carries its own copy of the absorbed
-    tuple, so the shared classification is pinned by
-    ``test_a_directory_at_the_ledger_is_absence_for_every_mutator`` rather than
-    guaranteed by construction. A ``ValueError`` for a non-encodable path and
-    pathlib's Windows-only absorbed winerrors (21/123/1921) now raise out of
-    this guard exactly as they do out of :func:`read_for_write` — the class
-    DW-256 already records as a pending decision for the reader.
+    the reader's own ``None``. The classification is SHARED with the reader by
+    construction — both ask :func:`probe_absence` (DW-256/DW-268) — so the guard
+    cannot drift from the reader: a ``ValueError`` for a non-encodable path and
+    pathlib's Windows-only absorbed winerrors (21/123/1921) are absence here
+    exactly as they are at :func:`read_for_write`. Until DW-256 this helper
+    carried its own copy of the narrow tuple and both raised out of it.
     """
     try:
         st = path.stat()
-    except (FileNotFoundError, NotADirectoryError):
-        return False
+    except (OSError, ValueError) as e:
+        if probe_absence(e):
+            return False
+        raise
     return S_ISREG(st.st_mode)
 
 
