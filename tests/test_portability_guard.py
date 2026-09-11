@@ -1415,6 +1415,19 @@ JOURNAL_KINDS = frozenset(
         # routed out of diagnostics dumps — `repo` as an absolute host path, `error`
         # as free text quoting git's own stderr — so it needs no new field row.
         "sweep-ledger-commit-unavailable",
+        # DW-246. A ledger publish the RUN declined to attempt because it already
+        # held the ledger unfit to publish (`_ledger_unfit_to_publish()`, the
+        # persisted DW-218/219 doubt included) — written by
+        # `sweep._withhold_ledger_publish` at the three resume-time publishers that
+        # run AHEAD of `_cycle`'s dispatch gate (`_close_resolved`'s two arms and
+        # `_loop`'s post-recovery publisher). Its own kind rather than a fifth
+        # `refuse_cause`: no target was probed and no git was spawned, so it is not
+        # a `verify.unpublishable_target` verdict. No new diagnostics routing:
+        # `message` and `reason` are already in `_JOURNAL_DROP_FIELDS` (`reason`
+        # carries the fixed DW-217 token `ledger-in-doubt` and renders as a
+        # presence boolean), and `file` is the same already-benign lexical
+        # basename the sibling rows carry.
+        "sweep-ledger-commit-withheld",
         "sweep-migrated",
         "sweep-migration-restore-diverged",
         "sweep-nothing-open",

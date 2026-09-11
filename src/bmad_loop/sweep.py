@@ -103,7 +103,8 @@ _HANDBACK_LEDGER_MISS = " ".join(
 _HANDBACK_LEDGER_HALTED = " ".join(
     [
         "! answers saved, but the deferred-work ledger is not fit to publish",
-        "(see sweep-resolved-close-unavailable or sweep-decision-effect-unavailable in the journal) —",
+        "(see sweep-resolved-close-unavailable, sweep-decision-effect-unavailable",
+        "or sweep-ledger-commit-refused in the journal) —",
         "repair the ledger and re-run",
     ]
 )
@@ -1384,13 +1385,19 @@ class SweepEngine(Engine):
         """This cycle's verdict from BOTH phases that can raise it (DW-216/217/220),
         OR the RUN's persisted one (DW-218/219).
 
-        The dispatch gate in `_cycle`, `_loop`'s shared stop arm and
-        `_prune_pre_answers`' refusal all read the doubt through here, so a future
-        arming site cannot be wired into one reader and missed by the others —
-        which is precisely how the close phase's fault reached `_write_intent`'s
-        bare `read_for_write` while the gate above it saw a False latch. The
-        persisted term is added HERE for the same reason: one reader, five
-        consumers, no second spelling to keep in step.
+        The dispatch gate in `_cycle`, `_loop`'s shared stop arm,
+        `_prune_pre_answers`' refusal, `_decisions_phase`'s tail publish,
+        `_publish_stranded_close`'s decision term, the three resume-time publish
+        gates (DW-246: `_close_resolved`'s two arms and `_loop`'s post-recovery
+        publisher) and `_loop`'s no-open repair notice (DW-251) all read the doubt
+        through here, so a future arming site cannot be wired into one reader and
+        missed by the others — which is precisely how the close phase's fault
+        reached `_write_intent`'s bare `read_for_write` while the gate above it saw
+        a False latch. The persisted term is added HERE for the same reason: one
+        reader, however many consumers, no second spelling to keep in step. The
+        list above is not a count to keep exact; the invariant is that nothing
+        reads `state.sweep_ledger_in_doubt`, `_ledger_in_doubt` or
+        `_close_ledger_in_doubt` except through this method.
 
         The persisted term is safe beside the two cycle-scoped ones. `_loop` stops
         (repeat) or returns (non-repeat, `--decisions-only`) when doubt remains
@@ -1474,7 +1481,10 @@ class SweepEngine(Engine):
         the resumed cycle sails past every in-memory arm and dispatches — the exact
         resume the prune argument says cannot happen.
 
-        Only on the False->True EDGE, so the seven call sites cost one `_save()`
+        Only on the False->True EDGE, so the eight call sites (the close phase's
+        degrade, the five arms inside the decision phase, that phase's tail
+        publish, and — since DW-244 — `_commit_ledger`'s ledger-family refusal
+        arm) cost one `_save()`
         per edge rather than one per arm — an edge, not a run: `_release_ledger_doubt`
         writing False re-opens it, so a fault/success/fault sequence inside one walk
         saves here more than once. That helper owns the lifetime from here: it clears
@@ -1713,11 +1723,26 @@ class SweepEngine(Engine):
             # every one of the seven publishers: `self.paths.deferred_work` is a
             # DIFFERENT file under worktree isolation, and only the workspace's
             # copy is the one a publisher just wrote.
-            self._commit_ledger(
-                "chore(sweep): commit ledger after recovering in-flight bundles",
-                path=self.workspace.paths.deferred_work,
-                family="ledger",
-            )
+            # ...and WITHHELD when the run already knows the ledger is unfit
+            # (DW-246). This publisher runs on a RESUME, ahead of `_cycle`'s
+            # dispatch gate, and the recovered bundle's ledger restore can leave a
+            # decodable half-write dirty beside the bundle's own edit — so a run
+            # carrying persisted doubt (DW-218/219) published the whole file, the
+            # half-write included, before the gate that exists to withhold it was
+            # ever consulted. Read through `_ledger_unfit_to_publish()`, the one
+            # reader; the gate sits AT the call site because `_commit_ledger` has
+            # publishers that deliberately stay ungated (see `_close_resolved`'s
+            # inventory). The recovery pass itself is unchanged, and so is the loop
+            # below: only the publish is withheld.
+            recovery_message = "chore(sweep): commit ledger after recovering in-flight bundles"
+            if self._ledger_unfit_to_publish():
+                self._withhold_ledger_publish(recovery_message)
+            else:
+                self._commit_ledger(
+                    recovery_message,
+                    path=self.workspace.paths.deferred_work,
+                    family="ledger",
+                )
         while True:
             # First statement of the loop body: covers the boundary right after
             # _finish_inflight_bundles on resume and between repeat cycles. A
@@ -1797,6 +1822,31 @@ class SweepEngine(Engine):
                         cycles=cycle - 1,
                         reason="no-open",
                         stop_cause="no-open",
+                    )
+                # DW-251: a run that reaches this exit with the doubt armed
+                # withheld every publish it was offered — the stranded-close
+                # republish above refuses its decision term on the same verdict —
+                # and then ended on `no-open` with no repair instruction at all.
+                # Not because an earlier notice was lost: `gates.notify` APPENDS
+                # to `<run>/ATTENTION`, which a resume shares. The gap is that the
+                # class that ARMS the doubt never wrote one — the arms do not
+                # notify, the withheld branch's stop check exits ahead of its row,
+                # and a non-repeat run has no stop notice — so the process that
+                # withheld said nothing. That holds for a resume inheriting the
+                # DW-218/219 mirror and for a same-process arm alike (a refused
+                # `_publish_stranded_close` or migration publish under DW-244
+                # lands here in a fresh process too). So the shared notice is
+                # written here, with the same headline the repeat boundary's
+                # unfit stop uses, guarded on the one reader. AFTER the
+                # exit's own row and BEFORE its `return`, in both arms: the rows,
+                # their fields and the `return` are unchanged, no stop token is
+                # added, and the notice is deliberately NOT conditional on whether
+                # `_publish_stranded_close` published anything — the doubt is the
+                # run's verdict, and a human repair plus a fresh `bmad-loop sweep`
+                # is the only thing that clears an inherited one.
+                if self._ledger_unfit_to_publish():
+                    self._notify_ledger_repair(
+                        ledger, "the deferred-work ledger is not fit to publish"
                     )
                 return
             selected_ids = {entry.id for entry in selection.selected}
@@ -3358,6 +3408,43 @@ class SweepEngine(Engine):
             #     bytes changing. The boundary publisher stays BELOW `_loop`'s
             #     ledger-fault / unfit-to-publish stops, which still return without
             #     publishing.
+            # The RUN'S DOUBT (`_ledger_unfit_to_publish()`, the one reader of the
+            # two cycle latches and the persisted DW-218/219 mirror) is a SECOND,
+            # non-uniform gate laid over the nine, and which sites read it is the
+            # other trap to read as uniform:
+            #   * THREE read it at the call site and journal
+            #     `sweep-ledger-commit-withheld` instead of publishing: this site's
+            #     TWO arms and `_loop`'s post-recovery publisher (DW-246 — all three
+            #     run on a resume AHEAD of `_cycle`'s dispatch gate, so a run that
+            #     KNEW its ledger was unfit published the whole file, half-write
+            #     included, before the gate was ever consulted).
+            #   * `_decisions_phase`'s tail publish already gated on the same
+            #     reader, silently: its withhold is part of the walk's own verdict
+            #     and is reported by `sweep-bundles-withheld` and the repeat stop,
+            #     so it writes no row of its own.
+            #   * `_loop`'s boundary publisher needs no gate of its own: it sits
+            #     BELOW the unfit-to-publish stop, which returns first.
+            #   * `_publish_stranded_close` reads it on its DECISION term only and
+            #     deliberately NOT on its already-resolved term — DW-246 named it,
+            #     but gating it narrows a preserved recovery arm, and that change
+            #     belongs to DW-250's recorded decision, not here.
+            #   * `_ensure_migration`'s publisher does not read it at all: a
+            #     migration rewrite over a doubted ledger is a different question
+            #     nobody has decided.
+            #   * Both store prunes are about a different file and never read it.
+            # Reading is one direction; ARMING is the other, and since DW-244 it
+            # IS uniform across the ledger family: every LEDGER-family site — the
+            # migration publisher and `_publish_stranded_close` included, whether
+            # or not it reads the doubt — arms the mirror on a refusal inside
+            # `_commit_ledger`, while the store prunes neither read nor arm it.
+            # A refusal at the boundary publisher, which sits BELOW the unfit
+            # stop, is therefore honoured one cycle LATER: cycle N+1 withholds its
+            # bundles and ends on the unfit stop, unless one of its own effects
+            # lands and releases the arm.
+            # A withheld publish is NOT a refusal: no target was probed and no git
+            # was spawned, so it carries `reason="ledger-in-doubt"` (DW-217's token
+            # for a ledger that READS but is unfit) rather than a fifth
+            # `refuse_cause`.
             # Beneath all nine are TWO uniform floors, in this order:
             #   * the TARGET VALIDATION (DW-199/203/205), which asks whether the
             #     declared `family`'s file is still there and still readable before
@@ -3372,11 +3459,25 @@ class SweepEngine(Engine):
             # nothing from reaching git at all.
             #
             # the ledger file: `mark_done_many` above wrote the ledger
-            self._commit_ledger(
-                "chore(sweep): close resolved deferred-work entries",
-                path=self.workspace.paths.deferred_work,
-                family="ledger",
-            )
+            # ...withheld on the run's doubt (DW-246): on a resume this arm runs
+            # ahead of `_cycle`'s dispatch gate, so it must read the same verdict
+            # that gate reads. The close itself LANDED and its row above stands;
+            # only the publish is withheld. It reaches HEAD through the human's
+            # own commit (the notice's clean-worktree precondition) or through a
+            # publisher in the fresh `bmad-loop sweep` that follows the repair —
+            # never through this run: an inherited mirror is not released
+            # in-process, and a repeating run with the doubt armed returns at the
+            # unfit stop BEFORE the boundary publisher. Gate AT the call site, not inside
+            # `_commit_ledger`: see the inventory above for the sites that stay
+            # ungated on purpose.
+            if self._ledger_unfit_to_publish():
+                self._withhold_ledger_publish("chore(sweep): close resolved deferred-work entries")
+            else:
+                self._commit_ledger(
+                    "chore(sweep): close resolved deferred-work entries",
+                    path=self.workspace.paths.deferred_work,
+                    family="ledger",
+                )
         elif pending:
             # These ids read `done` on disk while this pass flipped none of them —
             # the shape a crash between a previous pass's write and its commit
@@ -3389,11 +3490,21 @@ class SweepEngine(Engine):
             # message above describes it exactly; a distinct one would fork the two
             # publishers for no reader's benefit. `_commit_ledger`'s `path_clean`
             # makes this a no-op when the write already reached HEAD.
-            self._commit_ledger(
-                "chore(sweep): close resolved deferred-work entries",
-                path=self.workspace.paths.deferred_work,
-                family="ledger",
-            )
+            # ...and withheld on the run's doubt (DW-246), for the same reason as
+            # the `closed` arm and with more at stake: this arm is REACHED ONLY on
+            # a resume, which is exactly when the persisted mirror is the verdict
+            # in force, and the stranded `done` it would publish sits in the same
+            # file as whatever half-write armed that doubt. Kept as its own
+            # `if`/`else` rather than folded with the arm above so each arm's gate
+            # can be ablated on its own.
+            if self._ledger_unfit_to_publish():
+                self._withhold_ledger_publish("chore(sweep): close resolved deferred-work entries")
+            else:
+                self._commit_ledger(
+                    "chore(sweep): close resolved deferred-work entries",
+                    path=self.workspace.paths.deferred_work,
+                    family="ledger",
+                )
         self._emit("post_close_resolved")
         return len(closed)
 
@@ -4423,7 +4534,10 @@ class SweepEngine(Engine):
         so both are caught alongside Git failures. `verify.commit_paths` and
         `verify.last_commit_for` guard their own resolves against the same pair.
         Best effort applies to Git publication and resolution only: journal I/O
-        failures propagate, as they do for other journal writes.
+        failures propagate, as they do for other journal writes, and so does the
+        refusal arm's `state.json` write (`_record_ledger_doubt()` → `_save()`,
+        DW-244) — a repair write must raise, the doctrine every other arming
+        site follows.
 
         `path` is a REQUIRED keyword argument with no default, replacing the old
         `root=None` arm and its runtime raise. That is strictly louder, not
@@ -4470,7 +4584,13 @@ class SweepEngine(Engine):
         undecodable bytes right after the refusal and ends the run there (it raised
         until DW-197 degraded it; either way the cycle does not proceed), which is
         pre-existing behavior. What is gone is the publish that used to precede
-        it.
+        it. A LEDGER-family refusal also ARMS the run's doubt through
+        `_record_ledger_doubt()` after its row (DW-244): the refusal says the
+        ledger the run wrote cannot be published, which is the very fact
+        `_cycle`'s dispatch gate withholds on — without the arm a refusal after a
+        landed decision effect left the gate clear and the cycle's bundles reached
+        `_write_intent`'s bare `read_for_write` on the same ledger. A store
+        refusal says nothing about the ledger and arms nothing.
 
         The guard NARROWS a window it does not close, and the residual is worth
         naming the way `_prune_dropped_pre_answer` names its own: a TRACKED target
@@ -4561,6 +4681,39 @@ class SweepEngine(Engine):
                 refuse_cause=cause,
                 **extra,
             )
+            # DW-244: the refusal is the run's evidence that the ledger it wrote
+            # cannot be published, so it ARMS the doubt `_cycle`'s dispatch gate
+            # reads. Bare, a ledger refusal after a landed decision effect
+            # (`_decisions_phase`'s tail publish) left every latch clear — the
+            # effect landed, so the walk's own verdict was False — and the cycle's
+            # bundles went on to `_write_intent`, whose bare `read_for_write`
+            # crashed on the same ledger the refusal had just declined. Every one
+            # of the four `refuse_cause` tokens arms: each is the same fact for the
+            # gate's purposes — including `target-absent`, on which that crash
+            # cannot happen (`read_for_write` answers `None` and `_write_intent`
+            # degrades to `or ""`): a bundle dispatched over an absent TRACKED
+            # ledger commits with a whole-tree `git add -A`, which would stage the
+            # ledger's DELETION under the bundle's message — the DW-199 hazard by
+            # another route — so absence is withheld on too, at the cost that the
+            # no-open notice then names a file to RESTORE rather than repair.
+            # Where the refusal fires matters for WHEN it is honoured: at the
+            # boundary publisher, which sits BELOW `_loop`'s unfit stop, the arm
+            # lands after that stop already passed, so cycle N+1 withholds its
+            # bundles and ends on the unfit stop — unless one of its own effects
+            # lands and releases the arm. LEDGER family only — a store refusal is about
+            # `decisions.json` and says nothing about the ledger. AFTER the row,
+            # the announce-then-persist order `_quarantine` documents, and through
+            # `_record_ledger_doubt()` (mutate-then-`_save()`, so it survives a
+            # crash) rather than a bare assignment. Neither cycle latch is touched:
+            # `_ledger_in_doubt` is `_decisions_phase`'s `=`-published verdict and
+            # `_close_ledger_in_doubt` the close phase's, and the mirror is what the
+            # one reader consults. A same-process arm, so it is released on the
+            # resolved contract — a LATER landed effect while the close latch is
+            # clear (`_release_ledger_doubt`) — which is intended: that is positive
+            # proof the ledger reads and writes again, the same proof the walk's
+            # own arms rest on.
+            if family == "ledger":
+                self._record_ledger_doubt()
             return
         if sha is None:
             # Already clean/ignored, or raced clean between the two calls. Absence
@@ -4571,6 +4724,38 @@ class SweepEngine(Engine):
             self.journal.append("sweep-ledger-commit-clean", message=message, file=name)
             return
         self.journal.append("sweep-ledger-commit", message=message, commit=sha, file=name)
+
+    def _withhold_ledger_publish(self, message: str) -> None:
+        """Journal a ledger publish the RUN declined to attempt because it already
+        holds the ledger unfit to publish (DW-246) — `sweep-ledger-commit-withheld`
+        with the `message` the publish would have carried, the LEXICAL basename in
+        `file` (`deferred-work.md`, as every sibling `_commit_ledger` row spells
+        it — DW-192) and `reason="ledger-in-doubt"`.
+
+        A row of its OWN rather than a fifth `refuse_cause` on
+        `sweep-ledger-commit-refused`: a refusal is `verify.unpublishable_target`'s
+        verdict about the target's BYTES, and here no target was probed and no git
+        was spawned — the verdict is the run's, formed earlier by whichever arm
+        raised the doubt, and `_ledger_unfit_to_publish()` is the only thing this
+        row reports on. Widening `refuse_cause` would also widen a `Literal` that
+        `Engine._carry_harvested_deferrals` dispatches on exhaustively.
+        `ledger-in-doubt` rather than the dispatch gate's `ledger-unreadable`:
+        that gate chose the repeat stop's token because it ends on that stop; a
+        withheld publish happens over a ledger that READS, which is exactly the
+        state DW-217 minted `ledger-in-doubt` for at the pre-answer prune.
+
+        This helper writes the row and nothing else. It never wraps the
+        `_commit_ledger` call it stands in for: each gate sits AT its call site so
+        `test_every_sweep_ledger_commit_names_its_own_tree` still counts every
+        publisher, and so the publishers that deliberately stay ungated (see
+        `_close_resolved`'s inventory) can. DW-250 is expected to reuse it for
+        `_publish_stranded_close`, adding the `dw_ids` that arm can name."""
+        self.journal.append(
+            "sweep-ledger-commit-withheld",
+            message=message,
+            file=self.workspace.paths.deferred_work.name,
+            reason="ledger-in-doubt",
+        )
 
     # ---------------------------------------------------------- bundles
 

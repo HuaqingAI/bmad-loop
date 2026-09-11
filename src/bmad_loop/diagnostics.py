@@ -1390,6 +1390,9 @@ def render_markdown(
                 "sweep-ledger-commit-clean",
                 "sweep-ledger-commit-refused",
                 "sweep-ledger-commit-unavailable",
+                # DW-246: a publish the run declined over its own ledger doubt;
+                # `file` names which file, `reason` collapses to presence.
+                "sweep-ledger-commit-withheld",
                 "sweep-repeat-done",
             }
         ]

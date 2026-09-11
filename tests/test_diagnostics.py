@@ -1437,6 +1437,40 @@ def test_a_withheld_bundle_dispatch_keeps_its_count_through_a_dump(project):
     assert withheld["reason_present"] is True and "reason" not in withheld
 
 
+def test_a_withheld_ledger_publish_keeps_its_file_through_a_dump(project):
+    """DW-246: `sweep-ledger-commit-withheld` — a publish the run declined over
+    its own ledger doubt — is collected into the Markdown dump beside its
+    `_commit_ledger` siblings, with `file` verbatim (the already-benign lexical
+    basename) and `message`/`reason` collapsed to presence booleans.
+
+    Ablation: remove `sweep-ledger-commit-withheld` from the Markdown
+    collected-kind set; the JSON entry block disappears. Add `file` to
+    `_JOURNAL_DROP_FIELDS` and the `file` assertion fails.
+    """
+    run_dir = _seed_run(project.project)
+    message_value = "chore(sweep): close resolved deferred-work entries"
+    journal = Journal(run_dir)
+    journal.append(
+        "sweep-ledger-commit-withheld",
+        message=message_value,
+        file="deferred-work.md",
+        reason="ledger-in-doubt",
+    )
+
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    markdown = diagnostics.render_markdown(diag, pseudo=pseudo)
+    blocks = re.findall(r"```json\n(.*?)\n```", markdown, flags=re.DOTALL)
+    assert len(blocks) == 1
+    entries = json.loads(blocks[0])
+
+    withheld = next(e for e in entries if e["kind"] == "sweep-ledger-commit-withheld")
+    assert withheld["file"] == "deferred-work.md"
+    assert withheld["message_present"] is True and "message" not in withheld
+    assert withheld["reason_present"] is True and "reason" not in withheld
+    assert message_value not in markdown
+
+
 def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
     """`target` is a BRANCH on the merge kinds and a sprint STATUS on `board-advance-*`.
 
