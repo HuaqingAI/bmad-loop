@@ -704,7 +704,9 @@ class BmadLoopApp(App[None]):
 
     def _review_gate(self, run_id: str, run_dir: Path, state: RunState) -> None:
         label = widgets.pause_label(state.paused_stage or "")[0] or "gate"
-        spec_path, spec_text, readable = self._paused_spec(state)
+        spec_path, spec_text, readable = (
+            (None, "", True) if state.paused_stage == PAUSE_STORY_GATE else self._paused_spec(state)
+        )
 
         def done(verb: str | None) -> None:
             if verb == "resume":
@@ -714,6 +716,11 @@ class BmadLoopApp(App[None]):
             # Spec-less gates: story-gate fires before the story is registered in
             # state.tasks (deliberate, so a resume re-picks and re-asks the ledger)
             # and epic-boundary has no story key. The pause reason is the payload.
+            # A story gate is ALWAYS about the ledger, never a spec, so it takes
+            # this arm even when the task carries a spec_file (DW-243: a sweep
+            # bundle re-armed after a dev escalation keeps its spec_file, and its
+            # intent-regeneration refusal pauses at this stage) — the repair steer
+            # is in the reason, which the spec viewer would hide.
             subtitle = (
                 self._story_subtitle(state)
                 if state.paused_story_key

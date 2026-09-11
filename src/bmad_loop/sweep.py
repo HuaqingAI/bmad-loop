@@ -17,7 +17,7 @@ import stat
 import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, assert_never
+from typing import Any, Callable, Iterable, Literal, NoReturn, assert_never
 
 from . import deferredwork, gates, verify
 from .engine import Engine, RunPaused, _ArmedClose, _LedgerAnchor, _publication_refusal
@@ -53,22 +53,6 @@ class MissingLedgerEntriesError(Exception):
     def __init__(self, ids: tuple[str, ...]) -> None:
         self.ids = ids
         super().__init__(f"no ledger entry for {', '.join(ids)}")
-
-
-class _InflightLedgerFault(Exception):
-    """`_ensure_bundle_intent`'s regeneration read refused (DW-243), carried to
-    `_loop` as an exception so the run ends through `_stop_on_ledger_fault` on
-    the existing token pair instead of crashing.
-
-    An exception rather than a return value because `_finish_inflight_bundles`
-    returns an `int` that tests monkeypatch (`lambda: real() or 1`), and the fault
-    must stop the recovery pass mid-loop, before the ledger publisher below it;
-    `RunPaused` already crosses the same frames the same way. Private: nothing
-    outside `_loop` may catch it."""
-
-    def __init__(self, fault: Literal["ledger-unreadable", "ledger-inaccessible"]) -> None:
-        self.fault: Literal["ledger-unreadable", "ledger-inaccessible"] = fault
-        super().__init__(fault)
 
 
 TRIAGE_KEY = "sweep-triage"
@@ -1744,25 +1728,9 @@ class SweepEngine(Engine):
     def _loop(self) -> None:
         ledger = self.workspace.paths.deferred_work
         cycle = max(1, self.state.sweep_cycle)
-        try:
-            recovered = self._finish_inflight_bundles()
-        except _InflightLedgerFault as e:
-            # DW-243: an in-flight bundle's intent document was gone and the
-            # ledger read that would have regenerated it refused. A FAULT STOP,
-            # not a doubt-latch gate — the recovery pass itself stays ungated —
-            # routed to the same two-token stop `_read_cycle_ledger`'s refusal
-            # takes, so no new stop token and no new `sweep-repeat-done` write.
-            # `cycle - 1` for the reason that arm gives: this cycle did no work at
-            # all. The task the refusal caught is still non-terminal (persisted by
-            # `_ensure_bundle_intent` before the raise), so the resume after the
-            # repair re-drives it through this same pass. Deliberately, the stop
-            # returns ABOVE the post-recovery ledger publisher and before the
-            # remaining in-flight bundles are re-driven: a ledger a bundle earlier
-            # in this pass restored or closed stays dirty for the operator's
-            # commit-or-stash step (the notice names it), and every other in-flight
-            # bundle waits for the resume after the repair.
-            self._stop_on_ledger_fault(e.fault, cycles=cycle - 1, ledger=ledger)
-            return
+        # A regeneration refusal (DW-243/252) PAUSES from `_ensure_bundle_intent`
+        # and propagates here as `RunPaused`, exactly like the migrate gate below.
+        recovered = self._finish_inflight_bundles()
         if recovered:
             # a recovered bundle's ledger restore can leave the LEDGER dirty, and
             # triage plus the first bundle baseline read it, so it is published
@@ -2241,14 +2209,18 @@ class SweepEngine(Engine):
         unit's close dies with its unmerged worktree. The existing failed_ids filter
         then drops the fresh plan's overlapping bundle.
 
-        Two refusals sit between the recovery and the dispatch (DW-243/252), both
-        in `_ensure_bundle_intent`: a ledger read that faults raises
-        `_InflightLedgerFault` straight through this frame to `_loop`'s stop, and a
-        readable ledger lacking an entry for one of the task's ids answers `False`,
-        on which the dispatch is SKIPPED — the task is saved as it stands
-        (non-terminal) and the loop moves to the next bundle, leaving
-        `_warn_stranded_bundles` to keep the survivor loud every cycle until a
-        resume after the ledger is repaired regenerates and re-drives it."""
+        One refusal sits between the recovery and the dispatch (DW-243/252), in
+        `_ensure_bundle_intent`: a regeneration the ledger cannot serve — a read
+        that faults, an absent file, or a readable ledger lacking an entry for one
+        of the task's ids — PAUSES the run at the story gate on that task, and the
+        `RunPaused` propagates straight through this frame to `Engine._run_inner`.
+        The pass does not continue: no later in-flight bundle is re-driven and no
+        cycle (hence no fresh triage) runs beside the refused task, so nothing can
+        overwrite its name or re-adopt its ids while it waits. The task stays
+        PENDING with its name, ids and attempt intact, the run stays un-finished,
+        and `bmad-loop resume` after the repair re-enters this pass, recovers the
+        same task, regenerates and re-drives it. Every refusal raises; a `True`
+        return from `_ensure_bundle_intent` is the only way out."""
         recovered = 0
         for task in list(self.state.tasks.values()):
             if task.terminal or not BUNDLE_KEY_RE.match(task.story_key):
@@ -2262,9 +2234,7 @@ class SweepEngine(Engine):
             )
             if self._recover_inflight_bundle(task):
                 continue
-            if not self._ensure_bundle_intent(task):
-                self._save()
-                continue
+            self._ensure_bundle_intent(task)  # every refusal raises RunPaused
             self._save()
             self._emit("pre_bundle", task)
             self._run_story(task)
@@ -5775,6 +5745,41 @@ class SweepEngine(Engine):
             return None if found == set(task.dw_ids) else "dw-ids-mismatch"
         return "dw-ids-mismatch"
 
+    def _pause_on_intent_refusal(
+        self, task: StoryTask, reason: str, headline: str, detail: str
+    ) -> NoReturn:
+        """The tail every regeneration-site refusal in `_ensure_bundle_intent`
+        ends in (DW-243/252): notify with the RESUME route, clear the task's
+        baseline pair, save, and raise `RunPaused` at the story gate on the task.
+        The arm's journal row is written by the arm, before this. The
+        `_ensure_migration` duplicate-ids pause is the template.
+
+        `gates.notify` directly, never `_notify_ledger_repair`: that helper steers
+        to a fresh `bmad-loop sweep`, which is the wrong route for a run that is
+        paused and resumable — following it abandons this run's in-flight task.
+
+        Clearing the baseline pair is safe and necessary: the recovery pass has
+        already rolled the attempt back before regeneration ran (or the task never
+        held one), so nothing of ours is outstanding, and a stale baseline left
+        behind would name the PRE-repair tree — the next env-fault's `_safe_reset`
+        would rewind to it and destroy the operator's repair commit (see the
+        `_ensure_migration` invariant comment). The next dispatch re-stamps HEAD.
+
+        PAUSE_STORY_GATE, not PAUSE_ESCALATION: the task stays PENDING, and every
+        escalation action requires Phase.ESCALATED, so an escalation stage would
+        offer only actions that must fail. The gate stage's single action is
+        "resume", which is the whole remedy once the ledger is repaired."""
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            headline,
+            f"{detail} — then `bmad-loop resume {self.state.run_id}`",
+        )
+        task.baseline_commit = None
+        task.baseline_untracked = None
+        self._save()
+        raise RunPaused(reason, PAUSE_STORY_GATE, task.story_key)
+
     def _ensure_bundle_intent(self, task: StoryTask) -> bool:
         """Guarantee a recovered bundle has the intent file its dev prompt points
         at, and that the file it points at is the one for THIS task's ids. The
@@ -5793,11 +5798,16 @@ class SweepEngine(Engine):
         `OSError` from the intent file's own `mkdir`/`atomic_write_text` still
         propagates as before. Undecodable bytes (`LedgerReadError`) and an
         `OSError` from the read journal `sweep-intent-ledger-refused` under the
-        existing pair of tokens, persist the task — non-terminal, so the next
-        resume re-drives it — and raise `_InflightLedgerFault` for `_loop` to
-        route to `_stop_on_ledger_fault`. Bare, the read crashed the resume at
-        this exact site, ahead of any cycle gate. A FAULT STOP, deliberately not a
-        doubt latch: `_finish_inflight_bundles` stays ungated.
+        existing pair of tokens (`ledger-unreadable`, `ledger-inaccessible`) and
+        then PAUSE the run through `_pause_on_intent_refusal`. Bare, the read
+        crashed the resume at this exact site, ahead of any cycle gate. A pause,
+        deliberately not a stop and not a doubt latch: `_finish_inflight_bundles`
+        stays ungated, and a stop can never keep the "re-driven on the next
+        resume" promise — `Engine._run_inner` persists `_loop`'s return as
+        `finished`, which `bmad-loop resume` refuses outright. `RunPaused` leaves
+        the run un-finished with `paused_*` set, which is exactly what
+        `cmd_resume` accepts once `runs.unreadable_sweep_ledger` reads the
+        repaired ledger.
 
         A READABLE ledger that lacks an entry for one of the task's ids is the
         other refusal (DW-252): `_write_intent` raises `MissingLedgerEntriesError`
@@ -5805,13 +5815,13 @@ class SweepEngine(Engine):
         `sweep-intent-regen-refused` (`reason="entry-missing"`; an ABSENT ledger
         takes the same kind under `reason="ledger-absent"`, naming the task's
         ids, so the operator is told to restore the file rather than entries in
-        a file that is not there), notifies, and answers `False` with
-        `task.bundle_file` and the phase exactly as they were — non-terminal, so
-        the caller skips the dispatch, `_warn_stranded_bundles` keeps the task
-        loud every cycle, and a resume after the entry is restored regenerates
-        and re-drives it. Announce-and-strand rather than a stop: the ledger is
-        readable, so neither existing stop token would be truthful, and a seventh
-        would widen the closed set."""
+        a file that is not there) and pauses the same way, with `task.bundle_file`
+        and the phase exactly as they were. Pause rather than announce-and-strand:
+        a stranded task beside a recovery pass that went on into fresh triage
+        could have its name overwritten by a same-name bundle and its ids
+        re-adopted; pausing ends the pass, so no name-reservation or ownership
+        rule is needed. Every refusal raises; a `True` return is the only way
+        out."""
         reason = self._bundle_intent_reason(task)
         if reason is None:
             return True
@@ -5845,8 +5855,15 @@ class SweepEngine(Engine):
                 reason="ledger-unreadable",
                 error=str(e),
             )
-            self._save()  # the recovery's PENDING reset persists; still non-terminal
-            raise _InflightLedgerFault("ledger-unreadable") from e
+            self._pause_on_intent_refusal(
+                task,
+                f"bundle {task.story_key}: its intent document must be regenerated "
+                f"off the deferred-work ledger, and {ledger} could not be decoded "
+                f"({e}); repair the ledger by hand and COMMIT the fix, then resume",
+                f"bundle {task.story_key}: intent document not regenerated",
+                f"the deferred-work ledger {ledger} could not be decoded ({e}); "
+                "repair it by hand and COMMIT the fix",
+            )
         except OSError as e:
             # The class NAME rides beside the message: "[Errno 13] Permission
             # denied" alone does not say which refusal it was.
@@ -5857,8 +5874,16 @@ class SweepEngine(Engine):
                 reason="ledger-inaccessible",
                 error=f"{e.__class__.__name__}: {e}",
             )
-            self._save()
-            raise _InflightLedgerFault("ledger-inaccessible") from e
+            self._pause_on_intent_refusal(
+                task,
+                f"bundle {task.story_key}: its intent document must be regenerated "
+                f"off the deferred-work ledger, and {ledger} could not be read "
+                f"({e.__class__.__name__}: {e}); repair the ledger by hand and COMMIT "
+                "the fix, then resume",
+                f"bundle {task.story_key}: intent document not regenerated",
+                f"the deferred-work ledger {ledger} could not be read "
+                f"({e.__class__.__name__}: {e}); repair it by hand and COMMIT the fix",
+            )
         if text is None:
             # ABSENT, kept apart from "every entry missing": `or ""` here would
             # name each of the task's ids as missing and tell the operator to
@@ -5870,15 +5895,16 @@ class SweepEngine(Engine):
                 dw_ids=list(task.dw_ids),
                 reason="ledger-absent",
             )
-            gates.notify(
-                self.policy,
-                self.run_dir,
+            self._pause_on_intent_refusal(
+                task,
+                f"bundle {task.story_key}: its intent document must be regenerated "
+                f"off the deferred-work ledger, and the ledger is absent at {ledger}; "
+                "restore the file and COMMIT the fix, then resume",
                 f"bundle {task.story_key}: intent document not regenerated",
                 f"the deferred-work ledger is absent at {ledger}, so the bundle is "
-                "left in flight and not dispatched; restore the ledger and resume "
-                "to re-drive it",
+                "left in flight and not dispatched; restore the file and COMMIT the "
+                "fix to re-drive it",
             )
-            return False
         try:
             task.bundle_file = str(self._write_intent(bundle, dirname, text=text))
         except MissingLedgerEntriesError as e:
@@ -5888,16 +5914,17 @@ class SweepEngine(Engine):
                 dw_ids=list(e.ids),
                 reason="entry-missing",
             )
-            gates.notify(
-                self.policy,
-                self.run_dir,
+            missing = ", ".join(e.ids)
+            self._pause_on_intent_refusal(
+                task,
+                f"bundle {task.story_key}: its intent document must be regenerated "
+                f"off the deferred-work ledger, which holds no entry for {missing}; "
+                "restore the entries and COMMIT the fix, then resume",
                 f"bundle {task.story_key}: intent document not regenerated",
-                "the deferred-work ledger holds no entry for "
-                + ", ".join(e.ids)
-                + ", so the bundle is left in flight and not dispatched; restore "
-                "the entries and resume to re-drive it",
+                f"the deferred-work ledger holds no entry for {missing}, so the "
+                "bundle is left in flight and not dispatched; restore the entries "
+                "and COMMIT the fix to re-drive it",
             )
-            return False
         self.journal.append(
             "sweep-intent-regenerated",
             story_key=task.story_key,

@@ -6600,14 +6600,34 @@ _GATE_REASON = (
         # sweep's ledger-migration gate (sweep.py): the task IS registered, it just
         # has no spec_file — the other arm of _paused_spec's (None, "") return
         ("sweep-migrate", {"sweep-migrate": StoryTask(story_key="sweep-migrate", epic=0)}),
+        # DW-243: a sweep bundle re-armed after a dev escalation KEEPS its spec_file,
+        # and its intent-regeneration refusal pauses at the story gate. The gate is
+        # about the ledger, never the spec, so the reason (with its repair steer)
+        # must show — not the spec viewer's "Approve & resume". Ablation: drop the
+        # story-gate shortcut before `_paused_spec` in `_review_gate`
+        # and this case attempts the forbidden spec read.
+        ("dw-fix", {"dw-fix": "with-spec-file"}),
     ],
-    ids=["task-unregistered", "task-without-spec-file"],
+    ids=["task-unregistered", "task-without-spec-file", "task-with-spec-file"],
 )
 async def test_story_gate_pause_shows_reason_and_resumes(project, monkeypatch, story_key, tasks):
+    spec_reads: list[bool] = []
+
+    def unused_spec_read(*args):
+        spec_reads.append(True)
+        return None, "", True
+
+    monkeypatch.setattr(BmadLoopApp, "_paused_spec", unused_spec_read)
     calls: list[str] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    if tasks.get("dw-fix") == "with-spec-file":
+        spec = project.implementation_artifacts / "spec-dw-fix.md"
+        spec.write_text("# spec-dw-fix\n", encoding="utf-8")
+        tasks = {
+            "dw-fix": StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"], spec_file=str(spec))
+        }
     make_run(
         project.project,
         "20260611-100000-aaaa",
@@ -6619,6 +6639,7 @@ async def test_story_gate_pause_shows_reason_and_resumes(project, monkeypatch, s
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, PauseReasonModal)  # routed away from the spec viewer
+        assert spec_reads == [], "a story-gate reason viewer must not read the unused spec"
         await ready(pilot, "#reason Static")
         body = render(app.screen.query_one("#reason Static", Static).content)
         assert "gated by unlanded deferred work" in body

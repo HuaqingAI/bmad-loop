@@ -3069,9 +3069,11 @@ def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
     `state.finished = True` on that return, so DW-204's own literal end state is
     persisted finished and is refused by `_prepare_resume_locked`'s `already
     finished`, which this gate declines to re-word. What is left, and what this
-    gate is for, is the UN-finished sweep runs — paused at an escalation or the
-    migrate gate, operator-stopped, or crashed — whose ledger is unreadable at the
-    moment someone resumes them.
+    gate is for, is the UN-finished sweep runs — paused at an escalation, the
+    migrate gate or an in-flight bundle's intent-regeneration refusal (DW-243: the
+    recovery pass pauses at the story gate rather than stopping, precisely so the
+    task is re-driven by a resume this gate fronts), operator-stopped, or crashed
+    — whose ledger is unreadable at the moment someone resumes them.
 
     Scope, all deliberate:
 
@@ -3103,7 +3105,10 @@ def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
       stopgap was dead code.
     * Absence is NOT a refusal. `read_for_write` answers None, and `open_ids("")`
       / `parse_ledger("")` answer identically for absent and empty — a resumed
-      sweep on an absent ledger ends cleanly at `sweep-nothing-open`.
+      sweep on an absent ledger ends cleanly at `sweep-nothing-open`, unless it
+      holds an in-flight bundle whose intent document must be regenerated: that
+      run re-pauses at the story gate under `sweep-intent-regen-refused`
+      `reason="ledger-absent"` (DW-243/252) before any cycle runs.
     * Story runs are out of scope, and since DW-231 that is SAFE rather than
       merely decided at the engine's four direct `read_for_write` sites. Its
       observation reads (`_ledger_digest`, the pre-harvest and defer snapshots,

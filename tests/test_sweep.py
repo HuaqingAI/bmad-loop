@@ -19978,38 +19978,75 @@ def _resume_with_lost_intent(project):
     return engine, intent
 
 
+def _gate_pauses(engine) -> list[dict]:
+    return [e for e in _records(engine, "run-paused") if e["stage"] == PAUSE_STORY_GATE]
+
+
+def _assert_regeneration_pause(resumed, summary, task_key="dw-fix"):
+    """The DW-243/252 pause shape, shared by every regeneration-site refusal:
+    `run-paused` at the story gate on the task, no `sweep-repeat-done` (not a
+    stop), the run un-finished on disk (what `cmd_resume` accepts), and the task
+    PENDING with its bookkeeping intact and its baseline pair cleared."""
+    assert summary.paused and not summary.crashed
+    assert resumed.state.paused_stage == PAUSE_STORY_GATE
+    assert resumed.state.paused_story_key == task_key
+    # the row of THIS pause; an escalation recipe carries an earlier `run-paused`
+    [paused] = _gate_pauses(resumed)
+    assert paused["story_key"] == task_key
+    assert task_key in paused["reason"] and paused["reason"] == summary.paused_reason
+    assert _records(resumed, "sweep-repeat-done") == []
+    assert _records(resumed, "sweep-intent-regenerated") == []
+    on_disk = load_state(resumed.run_dir)
+    assert not on_disk.finished and on_disk.paused_stage == PAUSE_STORY_GATE
+    for task in (resumed.state.tasks[task_key], on_disk.tasks[task_key]):
+        assert task.phase == Phase.PENDING
+        assert task.baseline_commit is None and task.baseline_untracked is None
+    attention = (resumed.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert f"then `bmad-loop resume {resumed.state.run_id}`" in attention
+    assert "COMMIT the fix" in attention  # an uncommitted repair is what a later reset rewinds
+    assert "re-run `bmad-loop sweep`" not in attention  # the fresh-sweep route is wrong here
+    return attention
+
+
 @pytest.mark.parametrize("fault", ["os", "decode", "intent-write"])
-def test_a_refused_ledger_stops_the_resume_at_intent_regeneration(project, monkeypatch, fault):
+def test_a_refused_ledger_pauses_the_resume_at_intent_regeneration(project, monkeypatch, fault):
     """DW-243. `_finish_inflight_bundles` re-drives an in-flight bundle BEFORE any
     cycle gate, and a bundle whose intent document is gone regenerates it off a
     ledger read that was bare: `_write_intent`'s `read_for_write(ledger) or ""`.
     An OS refusal or undecodable bytes there crashed the resume at that exact site
-    — no stop row, no repair notice, and the task left however the recovery had
-    reset it.
+    — no row, no repair notice, and the task left however the recovery had reset
+    it.
 
-    A FAULT STOP, not a doubt latch: the recovery pass stays ungated, and the read's
-    two fault classes route to the SAME two-token stop `_loop`'s own read takes
-    (`ledger-inaccessible` for the OS refusal, `ledger-unreadable` for the decode
-    fault) through a private exception `_loop` catches around the recovery call —
-    no new stop token, no new `sweep-repeat-done` write (the AST guard still counts
-    seven). `cycles` is `sweep_cycle - 1`, the `legacy-appeared` convention: this
-    cycle did no work. The task is persisted NON-terminal before the raise, so the
-    resume after the repair re-drives it through this same pass.
+    A PAUSE, not a stop and not a doubt latch: the recovery pass stays ungated, and
+    the read's two fault classes journal `sweep-intent-ledger-refused` on the same
+    two tokens `_loop`'s own read uses (`ledger-inaccessible` for the OS refusal,
+    `ledger-unreadable` for the decode fault), then raise `RunPaused` at
+    `PAUSE_STORY_GATE` on the task — no `sweep-repeat-done` write (the AST guard
+    still counts seven), no new stop token. The first round routed this to
+    `_stop_on_ledger_fault` + return, which `Engine._run_inner` persists as
+    `finished` and `cmd_resume` then refuses with `already finished` — a stop can
+    never keep the "re-driven on the next resume" promise. The pause leaves the run
+    un-finished and the task PENDING with its baseline pair cleared, and the notice
+    routes to `bmad-loop resume <run_id>`, never to a fresh `bmad-loop sweep`.
 
     Only the LEDGER read is caught: `_read_intent_ledger` is split out of
     `_write_intent` so the intent file's own `mkdir`/`atomic_write_text` faults still
     propagate — the `intent-write` case, which refuses the regenerated document's
-    own write and asserts the run CRASHES with no refusal row, no stop and no
-    "repair the ledger" notice: a run-dir write refusal reported as
-    `ledger-inaccessible` would send the operator to repair a ledger that reads
-    perfectly.
+    own write and asserts the run CRASHES with no refusal row, no pause and no
+    "by hand" notice: a run-dir write refusal reported as `ledger-inaccessible`
+    would send the operator to repair a ledger that reads perfectly.
 
-    Ablation: drop the `except _InflightLedgerFault` arm in `_loop` and the two
-    ledger cases red on `crashed` with no `sweep-repeat-done` row. Narrow
-    `_ensure_bundle_intent`'s catch to one class and the other case reds the same
-    way; swap the two tokens and the `reason` assertions red. Merge the two `try`
-    blocks so `except OSError` also covers `_write_intent` and the `intent-write`
-    case reds on every one of its assertions."""
+    Ablation: change `_pause_on_intent_refusal`'s `raise RunPaused` to `return`
+    (and the arms to `return False`) and the two ledger cases red on `paused` and
+    on the `run-paused` row. Narrow `_ensure_bundle_intent`'s catch to one class and
+    the other case reds on `crashed`; swap the two tokens and the `reason`
+    assertions red. Merge the two `try` blocks so `except OSError` also covers
+    `_write_intent` and the `intent-write` case reds on every one of its
+    assertions. Drop the baseline-clearing pair from the tail and the
+    `baseline_commit is None` assertion reds for the re-armed escalation, whose
+    recovery had just re-stamped one. Zero the attempt, generation or review
+    bookkeeping in the refusal tail and the pre-resume snapshot assertions
+    below fail, even if the same reset value is saved to disk."""
     engine, intent = _resume_with_lost_intent(project)
     if fault == "os":
         fault_read_text(monkeypatch, project.deferred_work)
@@ -20019,20 +20056,41 @@ def test_a_refused_ledger_stops_the_resume_at_intent_regeneration(project, monke
         _fault_cache_write(monkeypatch, intent)  # selective on the regenerated document
     resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
 
+    # Nonzero budgets make an accidental reset observable; the re-armed task
+    # already has a generation. Compare against the input, not another output.
+    incoming = resumed.state.tasks["dw-fix"]
+    incoming.attempt = 2
+    incoming.review_cycle = 1
+    incoming.followup_reviews_spent = 1
+    incoming.followup_review_recommended = True
+    assert incoming.generation > 0
+    preserved = {
+        field: getattr(incoming, field)
+        for field in (
+            "attempt",
+            "generation",
+            "review_cycle",
+            "followup_reviews_spent",
+            "followup_review_recommended",
+        )
+    }
+
     summary = resumed.run()
 
     if fault == "intent-write":
         # the intent file's OWN fault is not a ledger fault: it propagates
         assert summary.crashed and "Permission denied" in summary.crash_error
+        assert not summary.paused
         assert adapter.sessions == []
         assert _records(resumed, "sweep-intent-ledger-refused") == []
         assert _records(resumed, "sweep-repeat-done") == []
+        assert _gate_pauses(resumed) == []
         attention = resumed.run_dir / "ATTENTION"
         assert "by hand" not in (
             attention.read_text(encoding="utf-8") if attention.exists() else ""
         )
         return
-    assert not summary.crashed and not summary.paused  # a stop, never a raise
+    attention = _assert_regeneration_pause(resumed, summary)
     assert adapter.sessions == []  # no dev session was spent on the refused read
     assert not intent.exists()  # nothing was regenerated
     [refused] = _records(resumed, "sweep-intent-ledger-refused")
@@ -20044,49 +20102,60 @@ def test_a_refused_ledger_stops_the_resume_at_intent_regeneration(project, monke
     else:
         assert refused["reason"] == "ledger-unreadable"
         assert "not valid UTF-8" in refused["error"]
-    [done] = _records(resumed, "sweep-repeat-done")
-    assert done["reason"] == refused["reason"]
-    assert done["stop_cause"] == done["reason"]
-    assert done["cycles"] == resumed.state.sweep_cycle - 1 == 0  # this cycle did nothing
-    attention = (resumed.run_dir / "ATTENTION").read_text(encoding="utf-8")
-    assert f"repair {project.deferred_work} by hand" in attention
-    headline = "could not be decoded" if fault == "decode" else "could not be read"
-    assert f"the deferred-work ledger {headline} mid-sweep" in attention
-    # the task is still IN FLIGHT — in memory and on disk — so the next resume
-    # re-drives it; the stop did not retire the bundle the refusal caught
-    assert not resumed.state.tasks["dw-fix"].terminal
-    assert not load_state(resumed.run_dir).tasks["dw-fix"].terminal
-    assert _records(resumed, "sweep-intent-regenerated") == []
+    assert str(project.deferred_work) in attention
+    assert "by hand and COMMIT the fix" in attention
+    assert ("could not be decoded" if fault == "decode" else "could not be read") in attention
+    [paused] = _gate_pauses(resumed)
+    assert str(project.deferred_work) in paused["reason"]
+    # the task's bookkeeping survives the pause: name, ids, attempt, document path
+    task = resumed.state.tasks["dw-fix"]
+    assert task.dw_ids == ["DW-1"] and task.bundle_file == str(intent)
+    for survivor in (task, load_state(resumed.run_dir).tasks["dw-fix"]):
+        assert {field: getattr(survivor, field) for field in preserved} == preserved
 
 
-def test_intent_regeneration_refuses_when_the_ledger_lacks_an_entry(project):
+def _pending_bundle_with_lost_intent(project, key="fix", dw_ids=("DW-1",)):
+    """The DW-252 shape: a bundle task persisted PENDING by `_run_bundle`'s save
+    and lost before its dispatch stamped a baseline, so the resume's recovery has
+    nothing to roll back — a re-armed escalation would not do: its `rollback-auto`
+    resets the tree to the attempt baseline, which restores the ledger and the
+    entry with it. Returns the engine, the task and its (absent) intent path;
+    the caller saves after adding any further tasks."""
+    engine, _ = make_sweep(project, [])
+    task = _bundle_task(engine, f"dw-{key}", list(dw_ids), phase=Phase.PENDING)
+    intent = engine.run_dir / "bundles" / key / "intent.md"
+    task.bundle_file = str(intent)  # `_run_bundle`'s save; the document did not survive
+    return engine, task, intent
+
+
+def test_intent_regeneration_pauses_when_the_ledger_lacks_an_entry(project):
     """DW-252 at the regeneration site. A READABLE ledger that holds no entry for
     one of the task's ids used to regenerate an intent document whose "Ledger
     entries (verbatim)" section was empty for that id, and the dev session was
     dispatched on it anyway — briefed on nothing. `_write_intent` now refuses with
     `MissingLedgerEntriesError` before creating anything, and the regeneration path
-    ANNOUNCES and STRANDS rather than stopping: the ledger is readable, so neither
-    existing stop token would be truthful and a seventh would widen the closed set.
-    `_warn_stranded_bundles` is the standing loud signal for the survivor, and a
-    resume after the entry is restored regenerates and re-drives it.
+    PAUSES the run at the story gate on the task. The first round announced and
+    stranded instead — the recovery pass went on past the refusal into the other
+    bundles and a fresh triage, beside a stranded task whose name a same-name bundle
+    could overwrite and whose ids the new plan could re-adopt, and the run then
+    finished, which `cmd_resume` refuses. Pausing ends the pass, so neither a
+    name-reservation nor an ownership rule is needed: the second in-flight bundle
+    behind the refused one is NOT dispatched, no triage session runs, and the
+    `sweep-inflight-stranded` warning is never reached.
 
-    The shape is a bundle task persisted PENDING by `_run_bundle`'s save and lost
-    before its dispatch stamped a baseline, so the resume's recovery has nothing to
-    roll back — a re-armed escalation would not do: its `rollback-auto` resets the
-    tree to the attempt baseline, which restores the ledger and the entry with it.
-    A rival writer then retired the entry while the run was down.
+    A rival writer retired the entry while the run was down.
 
-    Ablation: drop the `except MissingLedgerEntriesError` arm in
-    `_ensure_bundle_intent` and this reds on `crashed`. Make `_write_intent` emit the
-    empty section again (the old `if i in entries` filter, no raise) and it reds on
-    the session count — a dev session dispatched off a document naming no entry."""
+    Ablation: change `_pause_on_intent_refusal`'s `raise RunPaused` to `return`
+    (the arm to `return False`) and this reds on `paused`, then on the session
+    list (`dw-other`'s dev session dispatched in the same pass). Drop the
+    `except MissingLedgerEntriesError` arm in `_ensure_bundle_intent` and it reds
+    on `crashed`. Make `_write_intent` emit the empty section again (the old
+    `if i in entries` filter, no raise) and it reds on the session count — a dev
+    session dispatched off a document naming no entry."""
     write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
-    engine, _ = make_sweep(project, [])
-    task = _bundle_task(engine, "dw-fix", ["DW-1"], phase=Phase.PENDING)
-    intent = engine.run_dir / "bundles" / "fix" / "intent.md"
-    task.bundle_file = str(intent)  # `_run_bundle`'s save; the document did not survive
-    # A SECOND in-flight bundle behind it, with an intact document: the refusal
-    # must skip `dw-fix` and go on to re-drive this one, not end the pass.
+    engine, task, intent = _pending_bundle_with_lost_intent(project)
+    # A SECOND in-flight bundle behind it, with an intact document: the pause
+    # must end the pass BEFORE this one is re-driven.
     other = _bundle_task(engine, "dw-other", ["DW-2"], phase=Phase.PENDING)
     other.bundle_file = str(
         engine._write_intent(Bundle(name="other", dw_ids=("DW-2",), intent="x"), "other")
@@ -20096,7 +20165,8 @@ def test_intent_regeneration_refuses_when_the_ledger_lacks_an_entry(project):
     # the entry the task is about is GONE from a ledger that reads perfectly
     write_ledger(project, {"DW-2": "open", "DW-3": "open"})
     assert "DW-1" not in ledger_entries(project)  # premise
-    # exactly one triage effect: the loop goes ON past the refusal to cycle 1
+    # a script for the pass the OLD shape ran: `dw-other`'s re-drive and a triage.
+    # None of it may be consumed.
     resumed, adapter = resume_sweep(
         project,
         engine,
@@ -20109,64 +20179,204 @@ def test_intent_regeneration_refuses_when_the_ledger_lacks_an_entry(project):
 
     summary = resumed.run()
 
-    assert not summary.crashed and not summary.paused  # announce and skip, never raise
-    # the other bundle was re-driven and the cycle ran; no dev session was spent
-    # on a document naming no entry
-    assert [spec.role for spec in adapter.sessions] == ["dev", "review", "triage"]
-    assert resumed.state.tasks["dw-other"].phase == Phase.DONE
+    attention = _assert_regeneration_pause(resumed, summary)
+    assert adapter.sessions == []  # neither the other bundle nor a triage was dispatched
+    assert resumed.state.tasks["dw-other"].phase == Phase.PENDING  # untouched, waits for the resume
     assert not intent.exists() and not intent.parent.exists()  # refused BEFORE any side effect
     [refused] = _records(resumed, "sweep-intent-regen-refused")
     assert refused["story_key"] == "dw-fix" and refused["dw_ids"] == ["DW-1"]
     assert refused["reason"] == "entry-missing"
-    assert _records(resumed, "sweep-intent-regenerated") == []
     assert _records(resumed, "sweep-intent-ledger-refused") == []  # the read WORKED
-    assert _records(resumed, "sweep-repeat-done") == []  # not a stop: the loop went on
-    attention = (resumed.run_dir / "ATTENTION").read_text(encoding="utf-8")
     assert "bundle dw-fix: intent document not regenerated" in attention
     assert "no entry for DW-1" in attention
-    # left in flight, in memory and on disk, and the standing signal names it
+    [paused] = _gate_pauses(resumed)
+    assert "DW-1" in paused["reason"]
+    # the pass ended at the refusal: no cycle, no triage, no stranded-survivor scan
+    assert "sweep-inflight-stranded" not in journal_kinds(resumed)
+    assert "sweep-cycle" not in journal_kinds(resumed)
     survivor = resumed.state.tasks["dw-fix"]
-    assert not survivor.terminal and survivor.bundle_file == str(intent)
-    assert not load_state(resumed.run_dir).tasks["dw-fix"].terminal
-    [stranded] = _records(resumed, "sweep-inflight-stranded")
-    assert stranded["story_keys"] == ["dw-fix"]  # only the refused one
+    assert survivor.bundle_file == str(intent) and survivor.dw_ids == ["DW-1"]
 
 
-def test_intent_regeneration_refuses_when_the_ledger_is_absent(project):
+def test_intent_regeneration_pauses_when_the_ledger_is_absent(project):
     """The absence twin of the row above. `_read_intent_ledger` answers `None` for
     a missing file, and spelling that `or ""` at the regeneration site would report
     every one of the task's ids as MISSING and tell the operator to restore entries
     in a file that does not exist. Every other ledger-read site keeps
     `ledger-absent` distinct, so this one does too: the same kind, its own `reason`
-    token, the task's ids in `dw_ids`, and a notice naming the FILE. No session for
-    the task, and the run is not crashed — with the ledger absent `_loop` then exits
-    on `sweep-nothing-open`.
+    token, the task's ids in `dw_ids`, and a notice naming the FILE. The run pauses
+    at the story gate on the task before the loop ever reaches a cycle — so no
+    `sweep-nothing-open`, which the old strand-and-continue shape ended on.
 
     Ablation: restore `or ""` in `_read_intent_ledger` (dropping the absence arm)
-    and the `reason` and notice assertions red."""
-    write_ledger(project, {"DW-1": "open"})
-    engine, _ = make_sweep(project, [])
-    task = _bundle_task(engine, "dw-fix", ["DW-1"], phase=Phase.PENDING)
-    intent = engine.run_dir / "bundles" / "fix" / "intent.md"
-    task.bundle_file = str(intent)
+    and the `reason` and notice assertions red; replace the absence arm's pause
+    call with `return True` and the pause assertions red. The second in-flight
+    bundle has a usable intent and a consumable script, so it is real work the
+    pause must keep from dispatching."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _, intent = _pending_bundle_with_lost_intent(project)
+    other = _bundle_task(engine, "dw-other", ["DW-2"], phase=Phase.PENDING)
+    other.bundle_file = str(
+        engine._write_intent(Bundle(name="other", dw_ids=("DW-2",), intent="x"), "other")
+    )
     engine._save()
     project.deferred_work.unlink()
-    resumed, adapter = resume_sweep(project, engine, [])
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [bundle_dev_effect(project, "other", ["DW-2"]), bundle_review_effect(project, "other")],
+    )
 
     summary = resumed.run()
 
-    assert not summary.crashed and not summary.paused
+    attention = _assert_regeneration_pause(resumed, summary)
     assert adapter.sessions == []
     assert not intent.exists() and not intent.parent.exists()
     [refused] = _records(resumed, "sweep-intent-regen-refused")
     assert refused["story_key"] == "dw-fix" and refused["dw_ids"] == ["DW-1"]
     assert refused["reason"] == "ledger-absent"
-    attention = (resumed.run_dir / "ATTENTION").read_text(encoding="utf-8")
     assert "bundle dw-fix: intent document not regenerated" in attention
     assert f"the deferred-work ledger is absent at {project.deferred_work}" in attention
-    assert "restore the ledger and resume to re-drive it" in attention
-    assert not resumed.state.tasks["dw-fix"].terminal
-    assert "sweep-nothing-open" in journal_kinds(resumed)
+    assert "restore the file and COMMIT the fix" in attention
+    [paused] = _gate_pauses(resumed)
+    assert f"absent at {project.deferred_work}" in paused["reason"]
+    assert "sweep-nothing-open" not in journal_kinds(resumed)  # the loop never reached a cycle
+    assert resumed.state.tasks["dw-other"].phase == Phase.PENDING
+
+
+def _public_resume_harness(project, monkeypatch, script):
+    """`test_cli`'s `_paused_run_for_resume` idiom for a sweep run: a real
+    `.bmad-loop/policy.toml`, `install_bmad_config` + `install_base_skills` so the
+    resume's preflight passes, `runs.kill_session` / `runs.write_pid` stubbed, and
+    `cli._make_adapters` answering one shared `MockAdapter` for every role so
+    `compose_resume`'s dev/review/triage adapters read one script. Returns the
+    adapter. Call BEFORE `write_ledger`: `install_bmad_config` refuses an existing
+    config dir, and the policy file must be committed with the sandbox's baseline
+    so the sweep's clean-tree reads are not tripped by it."""
+    from conftest import install_base_skills
+
+    from bmad_loop import cli
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    (project.project / ".bmad-loop").mkdir(parents=True, exist_ok=True)
+    (project.project / ".bmad-loop" / "policy.toml").write_text(
+        '[gates]\nmode = "none"\n\n[notify]\ndesktop = false\n\n'
+        "[scm]\nrollback_on_failure = true\n",
+        encoding="utf-8",
+    )
+    adapter = MockAdapter(script)
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    monkeypatch.setattr(runs, "write_pid", lambda _run_dir: None)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: adapter for r in cli.ROLES})
+    return adapter
+
+
+def _public_resume(project, run_id: str) -> int:
+    from bmad_loop import cli
+
+    return cli.main(["resume", run_id, "--project", str(project.project)])
+
+
+def _assert_redriven_to_done(project, engine, adapter, intent, repair: str) -> None:
+    """The re-drive the pause promised, observed after a PUBLIC resume: the SAME
+    task key regenerated its document, spent its dev session on it, closed its
+    id, and the operator's repair commit is still an ancestor of HEAD."""
+    final = load_state(engine.run_dir)
+    assert final.finished and not final.paused_stage
+    assert final.tasks["dw-fix"].phase == Phase.DONE  # the SAME task key
+    assert [spec.role for spec in adapter.sessions] == ["dev", "review"]
+    assert str(intent) in adapter.sessions[0].prompt  # the dev session got the rebuilt file
+    assert intent.exists()
+    regen = [
+        e for e in Journal(engine.run_dir).entries() if e["kind"] == "sweep-intent-regenerated"
+    ]
+    assert [e["story_key"] for e in regen] == ["dw-fix"]
+    assert not ledger_entries(project)["DW-1"].open  # the re-driven bundle closed it
+    # the repair commit is still an ancestor of HEAD: no rollback rewound past it
+    git(project.project, "merge-base", "--is-ancestor", repair, "HEAD")
+
+
+def test_a_repaired_ledger_resumes_the_paused_regeneration_publicly(project, monkeypatch):
+    """The promise the pause exists to keep (DW-243/252): after the operator
+    restores the ledger and commits, the PUBLIC `bmad-loop resume <run_id>` accepts
+    the run, the SAME task key regenerates its intent document and spends its dev
+    session to DONE, and the repair commit survives. Driven through `cli.main` on
+    purpose — `_prepare_resume_locked`'s `already finished` refusal and
+    `runs.unreadable_sweep_ledger`'s gate are what the in-engine rows cannot see,
+    and the first round's stop shape passed every in-engine assertion while the
+    public resume it promised was refused.
+
+    Ablation: change `_pause_on_intent_refusal`'s `raise RunPaused` to `return`
+    and the first run FINISHES — this reds at its premise, and with that premise
+    relaxed the public resume reds on rc 1 (`run sweep-run already finished`).
+    Drop the baseline-clearing pair from the tail and this row stays green — the
+    DW-252 shape never held a baseline — which is why the re-armed-escalation rows
+    pin that half."""
+    adapter = _public_resume_harness(project, monkeypatch, _redrive_script(project))
+    write_ledger(project, {"DW-1": "open"})
+    engine, _, intent = _pending_bundle_with_lost_intent(project)
+    engine._save()
+    write_ledger(project, {})  # the entry retired while the run was down
+    paused_engine, first = resume_sweep(project, engine, [])
+    assert paused_engine.run().paused
+    assert first.sessions == []
+    [refused] = _records(paused_engine, "sweep-intent-regen-refused")
+    assert refused["reason"] == "entry-missing"
+
+    # the operator's repair: the entry restored and COMMITTED
+    write_ledger(project, {"DW-1": "open"})
+    repair = git(project.project, "rev-parse", "HEAD").strip()
+
+    assert _public_resume(project, engine.state.run_id) == 0
+    _assert_redriven_to_done(project, engine, adapter, intent, repair)
+
+
+def test_a_refused_ledger_pause_is_refused_publicly_until_the_ledger_is_repaired(
+    project, monkeypatch
+):
+    """The DW-243 shape end to end through the PUBLIC surface: the re-armed
+    escalation (`_resume_with_lost_intent`) whose regeneration read met undecodable
+    bytes. Two things the in-engine row cannot observe. First,
+    `runs.unreadable_sweep_ledger` FRONTS the pause: `bmad-loop resume` while the
+    ledger is still undecodable is refused with `ExitCode.FAILURE` and the run is
+    left exactly as the pause persisted it — paused at the story gate, not finished,
+    not armed. Second, the baseline-holding shape's repair survives: this task's
+    recovery re-stamped a baseline before the refusal, the tail cleared it, and the
+    resume after the repair re-drives `dw-fix` to DONE with the repair commit still
+    an ancestor of HEAD.
+
+    Ablation: change `_pause_on_intent_refusal`'s `raise RunPaused` to `return`
+    and the first run FINISHES — this reds at its premise, and with that premise
+    relaxed the pre-repair resume still reds (the ledger gate declines finished
+    runs to `already finished`, rc 1 either way) and so does the post-repair one.
+    Drop the baseline-clearing pair from the tail and the on-disk
+    `baseline_commit is None` assertion reds."""
+    from bmad_loop import cli
+
+    adapter = _public_resume_harness(project, monkeypatch, _redrive_script(project))
+    engine, intent = _resume_with_lost_intent(project)
+    project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
+    paused_engine, first = resume_sweep(project, engine, [])
+    assert paused_engine.run().paused
+    assert first.sessions == []
+    [refused] = _records(paused_engine, "sweep-intent-ledger-refused")
+    assert refused["reason"] == "ledger-unreadable"
+    assert load_state(engine.run_dir).tasks["dw-fix"].baseline_commit is None
+
+    # before the repair: the entry gate refuses, and the run is left as paused
+    assert _public_resume(project, engine.state.run_id) == cli.ExitCode.FAILURE
+    gated = load_state(engine.run_dir)
+    assert gated.paused_stage == PAUSE_STORY_GATE and gated.paused_story_key == "dw-fix"
+    assert not gated.finished
+    assert adapter.sessions == []  # never armed
+
+    # the operator's repair: readable bytes, COMMITTED
+    write_ledger(project, {"DW-1": "open"})
+    repair = git(project.project, "rev-parse", "HEAD").strip()
+
+    assert _public_resume(project, engine.state.run_id) == 0
+    _assert_redriven_to_done(project, engine, adapter, intent, repair)
 
 
 def test_stranded_bundle_task_warns_loudly(project):

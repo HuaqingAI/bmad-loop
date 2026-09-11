@@ -1377,21 +1377,25 @@ JOURNAL_KINDS = frozenset(
         # DW-243. `_ensure_bundle_intent`'s regeneration read of the ledger
         # refused on a resume — undecodable bytes, or an `OSError` from the read
         # itself. Bare, it crashed the resume at that site, ahead of any cycle
-        # gate; now it routes to the same two-token `sweep-repeat-done` stop
-        # `_loop`'s own read takes, and this row is what names the in-flight
-        # bundle the refusal caught. No new diagnostics routing: `story_key` is an
-        # alias, `ledger` is benign, and `reason`/`error` are both already in
-        # `diagnostics._JOURNAL_DROP_FIELDS` — `reason` is one of the same two
-        # fixed tokens (`ledger-unreadable`, `ledger-inaccessible`), never free
-        # text, and the decode or errno detail rides in `error`.
+        # gate; now this row names the in-flight bundle the refusal caught and
+        # the run PAUSES at the story gate on that task (`run-paused`, no
+        # `sweep-repeat-done`), un-finished and PENDING, so `bmad-loop resume`
+        # after the repair re-enters the recovery pass and re-drives it. No new
+        # diagnostics routing: `story_key` is an alias, `ledger` is benign, and
+        # `reason`/`error` are both already in `diagnostics._JOURNAL_DROP_FIELDS`
+        # — `reason` is one of the same two fixed tokens (`ledger-unreadable`,
+        # `ledger-inaccessible`), never free text, and the decode or errno detail
+        # rides in `error`.
         "sweep-intent-ledger-refused",
         # DW-252. An in-flight bundle's intent document was NOT regenerated, for
         # one of two reasons under a closed two-token `reason`: `entry-missing`
         # (the readable ledger holds no entry for one of the task's ids — the
         # document would have briefed a dev session on an empty "Ledger entries
         # (verbatim)" section; `dw_ids` names the MISSING ids) or `ledger-absent`
-        # (no ledger file at all; `dw_ids` names the task's ids). The task is left
-        # in flight and not dispatched; `sweep-inflight-stranded` keeps it loud.
+        # (no ledger file at all; `dw_ids` names the task's ids). The run then
+        # pauses at the story gate on the task, the same way the DW-243 row
+        # above does, so no later bundle or fresh triage runs beside it; a resume
+        # after the ledger is restored regenerates and re-drives it.
         # `dw_ids` is routed by name in `diagnostics._JOURNAL_KEYLIST_FIELDS`,
         # `story_key` is an alias, and `reason` is already a drop field.
         "sweep-intent-regen-refused",
