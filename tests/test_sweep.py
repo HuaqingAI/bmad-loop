@@ -10792,12 +10792,13 @@ def test_decision_recovery_respects_persisted_doubt_after_a_crash(
 
 
 _CLOSE_COMMIT = "chore(sweep): close resolved deferred-work entries"
-# The attended hand-back's HALTED line, asserted verbatim by the DW-216 row and the
-# DW-244 row: the parenthetical names every kind that can put the run in this state.
+# The attended hand-back's HALTED line, asserted verbatim by the DW-216 row, the
+# DW-244 row and the DW-260 row: the parenthetical names every kind that can put the
+# run in this state (`sweep-ledger-commit-unavailable` only from its resolve arm).
 _HALTED_HANDBACK = (
     "! answers saved, but the deferred-work ledger is not fit to publish "
-    "(see sweep-resolved-close-unavailable, sweep-decision-effect-unavailable "
-    "or sweep-ledger-commit-refused in the journal) — "
+    "(see sweep-resolved-close-unavailable, sweep-decision-effect-unavailable, "
+    "sweep-ledger-commit-refused or sweep-ledger-commit-unavailable in the journal) — "
     "repair the ledger and re-run"
 )
 # The BOUNDARY publisher's message, defined here beside its sibling because the rows
@@ -13648,10 +13649,19 @@ def test_a_ledger_commit_in_a_non_git_project_keeps_the_write_and_journals(proje
     owner-of-the-file rule is graded on both families rather than asserted in prose.
 
     Ablation: drop the `except verify.GitError` arm in `_commit_ledger` and this reds
-    with the `GitError` escaping `_close_resolved`."""
+    with the `GitError` escaping `_close_resolved`.
+
+    The git arm does NOT arm the run's doubt (DW-260), and the two trailing
+    assertions pin that: git declining to publish a file it could reach says
+    nothing about whether the ledger reads, so `sweep_ledger_in_doubt` stays False
+    in memory and on disk — where the RESOLVE arm beside it arms (see the two
+    degrade rows under DW-192/195). Ablation: add
+    `if family == "ledger": self._record_ledger_doubt()` to the git arm too and
+    both trailing assertions red. Executed."""
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
+    engine._save()  # a state file to read the un-armed verdict back from
     plan = TriagePlan(
         open_ids=frozenset({"DW-1", "DW-2"}),
         already_resolved=(ResolvedEntry("DW-1", "fixed by a1b2c3d"),),
@@ -13669,6 +13679,10 @@ def test_a_ledger_commit_in_a_non_git_project_keeps_the_write_and_journals(proje
     assert failed["repo"] != str(project.project)  # ...not the project, which owns no part
     assert failed["file"] == "deferred-work.md"  # the OTHER family's constant (DW-192)
     assert "not a git repository" in failed["error"]
+    # DW-260: a git fault after a successful resolve is not evidence about the
+    # ledger's readability, so the doubt stays un-armed in memory and on disk
+    assert not engine._ledger_unfit_to_publish()
+    assert load_state(engine.run_dir).sweep_ledger_in_doubt is False
 
 
 # ------------------- DW-191/DW-192: the ledger commit rows keep their identity
@@ -13902,12 +13916,18 @@ def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, m
     not fail for any reason, which makes it a false guard rather than a claim; it was
     dropped, and no post-write fault exists on this path to drive in its place.
 
-    Parametrized over both FAMILIES because this arm is family-agnostic BY
-    CONSTRUCTION, so the store leg is regression coverage of the second call SHAPE —
-    the `path=<store>, family="store"` argument pair — and not of a second behavior
-    (DW-212). `root`, `name`, `sha` and `refusal` all bind ahead of the `try`, and
-    nothing between the `try` and this handler consults `family` when the RESOLVE is
-    what failed. Both grading rows previously passed `family="ledger"` only, so on
+    Parametrized over both FAMILIES. The ROW is family-agnostic BY CONSTRUCTION —
+    `root`, `name`, `sha` and `refusal` all bind ahead of the resolve `try`, and
+    nothing between that `try` and this handler consults `family` in composing the
+    row — so
+    for the row the store leg is regression coverage of the second call SHAPE, the
+    `path=<store>, family="store"` argument pair, and not of a second behavior
+    (DW-212). The arm's DOUBT half is not family-agnostic (DW-260): a refused ledger
+    resolve is the run's evidence that `_write_intent`'s `read_for_write` will meet
+    the same component, so the ledger leg arms `sweep_ledger_in_doubt` in memory and
+    on disk, and the store leg arms nothing — a store path says nothing about the
+    ledger. The parametrization therefore grades a real discriminant, not just a
+    shape. Both grading rows previously passed `family="ledger"` only, so on
     Python 3.13+ no row drove a store path into this arm at all. Below 3.13 one does:
     `test_a_dangling_store_link_is_an_absence_because_the_probes_see_the_resolved_path`
     reaches it with `family="store"` through a REAL symlink loop. The two are not
@@ -13926,16 +13946,23 @@ def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, m
       * move `name = path.name` inside the `try` beside `target` and this reds with
         a `NameError` escaping a method the docstring calls strictly best effort —
         which makes the BINDING POSITION, not merely the field, the graded thing;
-      * delete `OSError` ALONE from `_commit_ledger`'s `except` tuple and this reds
-        with the refusal escaping `_commit_ledger` on BOTH legs;
+      * delete `OSError` ALONE from the RESOLVE arm's `except (OSError, RuntimeError)`
+        tuple in `_commit_ledger` and this reds with the refusal escaping
+        `_commit_ledger` on BOTH legs;
       * hardcode `file="deferred-work.md"` in the unavailable journal row and only
-        the STORE legs fail, on the expected `decisions.json` filename. The handler
-        need not branch on `family` for a ledger-specific regression to be detectable."""
+        the STORE legs fail, on the expected `decisions.json` filename. The row
+        need not branch on `family` for a ledger-specific regression to be detectable;
+      * delete the resolve arm's `if family == "ledger": self._record_ledger_doubt()`
+        (DW-260) and only the LEDGER legs fail, on the two doubt assertions — in
+        memory first, then on disk."""
     # shared frame for both legs: on the store leg this ledger is deliberately
     # ignored — never published, never resolved, never asserted on
     write_ledger(project, {"DW-1": "open"}, commit=False)
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
+    # a state file to read back: the ledger leg's arm writes one through `_save()`,
+    # but the store leg's arm writes nothing and `load_state` needs a file to answer
+    engine._save()
     published, tail = _resolve_degrade_target(project, family)
     head = git(project.project, "rev-parse", "HEAD")
     # scoped to the published file: everything else in the frame still resolves
@@ -13955,6 +13982,10 @@ def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, m
     assert _records(engine, "sweep-ledger-commit") == []  # nothing published...
     assert _records(engine, "sweep-ledger-commit-refused") == []  # ...not a target refusal...
     assert _records(engine, "sweep-ledger-commit-clean") == []  # ...and not a clean skip either
+    # DW-260: the ledger leg arms the run's doubt — in memory, and on disk through
+    # `_record_ledger_doubt`'s `_save()` — and the store leg arms nothing
+    assert engine._ledger_unfit_to_publish() is (family == "ledger")
+    assert load_state(engine.run_dir).sweep_ledger_in_doubt is (family == "ledger")
 
 
 @pytest.mark.parametrize("family", ["ledger", "store"])
@@ -13992,27 +14023,36 @@ def test_the_degrade_row_survives_a_runtime_error_from_the_resolve(project, monk
     false guard and was dropped, with no post-write fault to drive in its place.
 
     Parametrized over both FAMILIES for the reason the sibling row states at length
-    (DW-212): the arm is family-agnostic by construction — `root` and `name` bind
-    ahead of the `try` and no code between the `try` and this handler reads `family`
-    when the resolve is what failed — so the store leg is regression coverage of the
+    (DW-212): the ROW is family-agnostic by construction — `root` and `name` bind
+    ahead of the resolve `try` and no code between that `try` and this handler reads
+    `family` in composing it — so for the row the store leg is regression coverage of the
     second call SHAPE, the `path=<store>, family="store"` argument pair, not of a
-    second behavior. The SHAPE only: the two real prune sites derive their store as
+    second behavior. The arm's DOUBT half is the exception (DW-260): the ledger leg
+    arms `sweep_ledger_in_doubt` in memory and on disk, the store leg does not, and
+    this row grades that on the `RuntimeError` class as the sibling does on
+    `OSError` — the arm reads `family` AFTER the row, so a class that escaped the
+    tuple would skip the arm along with the row. The SHAPE only, as to where the
+    store path comes from: the two real prune sites derive their store as
     `store_path(_project_of_run_dir(self.run_dir))` (`sweep.py:1946`, `:2009`) and are
     never entered here, so their own path derivation stays ungraded by this row. On
     3.13+ no other row drives `family="store"` into this arm; the dangling-store row
     named above does so below 3.13 only, and the two are complements, not duplicates.
 
-    Ablations, both performed:
-      * delete `RuntimeError` ALONE from `_commit_ledger`'s `except` tuple and this
-        reds with the `RuntimeError` escaping `_commit_ledger`, on both legs;
+    Ablations, all performed:
+      * delete `RuntimeError` ALONE from the RESOLVE arm's `except (OSError,
+        RuntimeError)` tuple in `_commit_ledger` and this reds with the
+        `RuntimeError` escaping `_commit_ledger`, on both legs;
       * hardcode `file="deferred-work.md"` in the unavailable journal row and only
         the STORE legs fail, on the expected `decisions.json` filename, even though
-        the handler does not branch on `family`."""
+        the row does not branch on `family`;
+      * delete the resolve arm's `if family == "ledger": self._record_ledger_doubt()`
+        (DW-260) and only the LEDGER legs fail, on the two doubt assertions."""
     # shared frame for both legs: on the store leg this ledger is deliberately
     # ignored — never published, never resolved, never asserted on
     write_ledger(project, {"DW-1": "open"}, commit=False)
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
+    engine._save()  # a state file for the store leg's `load_state` to read back
     published, tail = _resolve_degrade_target(project, family)
     head = git(project.project, "rev-parse", "HEAD")
     # CPython's own wording, so the injected fault is a faithful stand-in for the real
@@ -14034,6 +14074,10 @@ def test_the_degrade_row_survives_a_runtime_error_from_the_resolve(project, monk
     assert _records(engine, "sweep-ledger-commit") == []  # nothing published...
     assert _records(engine, "sweep-ledger-commit-refused") == []  # ...not a target refusal...
     assert _records(engine, "sweep-ledger-commit-clean") == []  # ...and not a clean skip either
+    # DW-260: the ledger leg arms the run's doubt, in memory and on disk; the store
+    # leg arms nothing
+    assert engine._ledger_unfit_to_publish() is (family == "ledger")
+    assert load_state(engine.run_dir).sweep_ledger_in_doubt is (family == "ledger")
 
 
 def test_the_journalled_file_is_the_lexical_tail_not_the_symlink_target(project, tmp_path):
@@ -22477,6 +22521,73 @@ def test_a_refused_publish_after_a_landed_effect_withholds_the_cycles_bundles(pr
     assert printed[-1] == _HALTED_HANDBACK
     assert "sweep continues in the background" not in printed[-1]
     # ...and the store-family prunes never arm it: see the parametrized refusal row
+
+
+def test_a_resolve_fault_after_a_landed_effect_withholds_the_cycles_bundles(project, monkeypatch):
+    """DW-260. The DW-244 shape one arm over: DW-2's `close` effect LANDS, so every
+    latch the walk owns is clear; the ledger's own PATH then goes unwalkable before
+    the phase's tail publish — `Path.resolve` refused (an EACCES component) and
+    `Path.stat` refused on the same file, since one unsearchable parent fails both.
+    `_commit_ledger` meets the resolve fault first and DEGRADES
+    (`sweep-ledger-commit-unavailable`), never reaching the refusal arm. Bare, the
+    single `except (GitError, OSError, RuntimeError)` journaled and returned with the
+    dispatch gate still clear, and the cycle's bundle reached `_write_intent`'s bare
+    `read_for_write`, whose `stat` walks the same component — a `PermissionError`,
+    and the run crashed. The resolve arm is now its own `except (OSError,
+    RuntimeError)` and arms the persisted doubt for the ledger family, so the gate
+    withholds and the human is handed the halt.
+
+    The `stat` fault is kept beside the resolve fault deliberately: it is what
+    makes the ablation red on a CRASH rather than only on the dispatched sessions,
+    which is the entry's own repro. Nothing between the landed effect and the gate
+    takes a `stat` the arm does not own — the DW-216 end-of-phase probe is skipped
+    on a landed effect, and `_materialize_bundles`' DW-214 screen catches `OSError`.
+
+    Ablation: delete the `if family == "ledger": self._record_ledger_doubt()` arm
+    from `_commit_ledger`'s RESOLVE branch — `summary.crashed` goes True on the
+    `PermissionError` out of `_write_intent`, and the withheld row and the on-disk
+    flag both vanish. Executed."""
+    real_record_decision = deferredwork.record_decision
+
+    def land_then_lose_the_ledger_path(*args, **kwargs):
+        landed = real_record_decision(*args, **kwargs)
+        assert landed is True  # premise: the effect really did land
+        # EACCES on BOTH: the one unsearchable parent the docstring describes
+        refuse_to_resolve(
+            monkeypatch, project.deferred_work, error=PermissionError(13, "Permission denied")
+        )
+        fault_metadata_probe(monkeypatch, project.deferred_work, "stat")
+        return landed
+
+    monkeypatch.setattr(deferredwork, "record_decision", land_then_lose_the_ledger_path)
+    engine, adapter = _sweep_with_a_bundle_behind_a_decision(project, lambda _ledger: None)
+    # ...and the attended hand-back is observed: the prompt fault above is a no-op,
+    # so the prompter is rebuilt to capture what the human is told
+    _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+    printed: list[str] = []
+    engine.prompter = DecisionPrompter(input_fn=lambda _p: "1", print_fn=printed.append)
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert _records(engine, "sweep-decision-effect-unavailable") == []  # it landed
+    [degraded] = _records(engine, "sweep-ledger-commit-unavailable")
+    assert degraded["message"] == "chore(sweep): record deferred-work decisions"
+    assert degraded["file"] == "deferred-work.md"
+    assert degraded["repo"] == str(project.deferred_work.parent)  # the LEXICAL parent
+    assert "Permission denied" in degraded["error"]
+    assert _records(engine, "sweep-ledger-commit-refused") == []  # the resolve arm, not the refusal
+    # THE claim: the degrade armed the run's doubt, on disk, before the gate read it
+    assert load_state(engine.run_dir).sweep_ledger_in_doubt is True
+    assert engine._ledger_unfit_to_publish()
+    [withheld] = _records(engine, "sweep-bundles-withheld")
+    assert withheld["bundles_not_run"] == 1 and withheld["cycle"] == 1
+    assert [spec.role for spec in adapter.sessions] == ["triage"]  # zero dev/review
+    assert "dw-ledger-fix" not in engine.state.tasks
+    # ...and the human is told the truth: the hand-back reads the verdict AFTER the
+    # tail publish, so it reports the halt rather than promising background work
+    assert printed[-1] == _HALTED_HANDBACK
+    assert "sweep continues in the background" not in printed[-1]
 
 
 def test_a_refusal_armed_doubt_is_released_by_a_later_landed_effect(project, monkeypatch):

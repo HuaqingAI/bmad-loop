@@ -121,8 +121,8 @@ _HANDBACK_LEDGER_MISS = " ".join(
 _HANDBACK_LEDGER_HALTED = " ".join(
     [
         "! answers saved, but the deferred-work ledger is not fit to publish",
-        "(see sweep-resolved-close-unavailable, sweep-decision-effect-unavailable",
-        "or sweep-ledger-commit-refused in the journal) —",
+        "(see sweep-resolved-close-unavailable, sweep-decision-effect-unavailable,",
+        "sweep-ledger-commit-refused or sweep-ledger-commit-unavailable in the journal) —",
         "repair the ledger and re-run",
     ]
 )
@@ -1500,10 +1500,10 @@ class SweepEngine(Engine):
         the resumed cycle sails past every in-memory arm and dispatches — the exact
         resume the prune argument says cannot happen.
 
-        Only on the False->True EDGE, so the eight call sites (the close phase's
+        Only on the False->True EDGE, so the nine call sites (the close phase's
         degrade, the five arms inside the decision phase, that phase's tail
-        publish, and — since DW-244 — `_commit_ledger`'s ledger-family refusal
-        arm) cost one `_save()`
+        publish, `_commit_ledger`'s ledger-family refusal arm since DW-244, and
+        its ledger-family resolve-fault arm since DW-260) cost one `_save()`
         per edge rather than one per arm — an edge, not a run: `_release_ledger_doubt`
         writing False re-opens it, so a fault/success/fault sequence inside one walk
         saves here more than once. That helper owns the lifetime from here: it clears
@@ -4696,15 +4696,26 @@ class SweepEngine(Engine):
         `decisions.apply_pre_answer` already degrades on `GitError` for this very
         file ("best effort, so a non-git or dirty tree never blocks the on-disk
         record") and this keeps them agreeing. The RESOLVE degrades to the same row
-        for the same reason: `path.resolve()` can raise `OSError` (a broken link
-        chain, a permission-denied component) or `RuntimeError` (a symlink loop),
-        so both are caught alongside Git failures. `verify.commit_paths` and
-        `verify.last_commit_for` guard their own resolves against the same pair.
-        Best effort applies to Git publication and resolution only: journal I/O
-        failures propagate, as they do for other journal writes, and so does the
-        refusal arm's `state.json` write (`_record_ledger_doubt()` → `_save()`,
-        DW-244) — a repair write must raise, the doctrine every other arming
-        site follows.
+        for the same reason, but from an arm of its OWN (DW-260): `path.resolve()`
+        can raise `OSError` (a broken link chain, a permission-denied component) or
+        `RuntimeError` (a symlink loop), and that pair is caught around the resolve
+        alone, while the arm around `unpublishable_target`/`path_clean`/
+        `commit_paths` catches `verify.GitError` alone. The split is by SITE, not
+        by class, because the two faults say different things: a resolve that
+        fails is the ledger's own path refusing to be walked — the readability
+        fact `_cycle`'s dispatch gate withholds on — so the resolve arm ARMS the
+        run's doubt for the ledger family exactly as the refusal arm below does,
+        where a git fault after a successful resolve says nothing about
+        readability and arms nothing. Narrowing the git arm loses no fault:
+        `_run_git` translates spawn, timeout and decode faults into the `GitError`
+        taxonomy, `verify.commit_paths` wraps its own resolves and `lstat` probes
+        the same way, and `unpublishable_target` returns a token rather than
+        raising. `verify.last_commit_for` guards its own resolve against the same
+        pair. Best effort applies to Git publication and resolution only: journal
+        I/O failures propagate, as they do for other journal writes, and so does
+        either arming arm's `state.json` write (`_record_ledger_doubt()` →
+        `_save()`, DW-244/DW-260) — a repair write must raise, the doctrine every
+        other arming site follows.
 
         `path` is a REQUIRED keyword argument with no default, replacing the old
         `root=None` arm and its runtime raise. That is strictly louder, not
@@ -4757,7 +4768,14 @@ class SweepEngine(Engine):
         `_cycle`'s dispatch gate withholds on — without the arm a refusal after a
         landed decision effect left the gate clear and the cycle's bundles reached
         `_write_intent`'s bare `read_for_write` on the same ledger. A store
-        refusal says nothing about the ledger and arms nothing.
+        refusal says nothing about the ledger and arms nothing. The resolve arm
+        above ARMS on the same terms and for the same fact (DW-260): a ledger
+        whose `path.resolve()` raises is one whose component `read_for_write`'s
+        `stat` walks too, so a bundle dispatched behind the degrade crashed in
+        `_write_intent` exactly as it did behind a refusal. The git arm — a
+        `GitError` after a successful resolve — does NOT arm: git declining to
+        publish a file it could reach is bookkeeping, not evidence about the
+        file. Both arming arms are ledger-family only.
 
         The guard NARROWS a window it does not close, and the residual is worth
         naming the way `_prune_dropped_pre_answer` names its own: a TRACKED target
@@ -4791,25 +4809,55 @@ class SweepEngine(Engine):
         a symlink to a target the OPERATOR named, so `target.name` can be
         arbitrary operator text of exactly the identifier shape `scrub_json`
         ships verbatim, and a benign row for it would be pre-approving that text.
-        Bound beside `root` and before the `try` for the same reason `root` is,
+        Bound beside `root` and before either `try` for the same reason `root` is,
         so the degrade row still names the file when the resolve is what failed.
         `repo` still carries the resolved directory for anyone reading the raw
         journal."""
-        # `root` is bound inside the `try` because the resolve that derives it can
-        # itself fail; until it succeeds the only directory known is the LEXICAL
-        # parent, which is what the degrade row then names.
+        # `root` is re-bound off the resolved target below because the resolve
+        # that derives it can itself fail; until it succeeds the only directory
+        # known is the LEXICAL parent, which is what the resolve arm's degrade
+        # row then names.
         root = path.parent
         # The LEXICAL tail, bound here rather than off `target` below: see the
         # docstring — it is a code constant at every caller, which is what lets it
         # be a benign (undropped) journal field, and the resolved tail is not.
         name = path.name
-        # Bound ahead of the `try` so neither is possibly-unbound below it: the
+        # Bound ahead of both `try`s so neither is possibly-unbound below them: the
         # refusal short-circuits past the two git calls, and `sha`'s `None` is the
         # same "nothing was published" the clean arm reads.
         sha: str | None = None
         refusal: tuple[str, str | None] | None = None
+        # TWO arms rather than one (DW-260), discriminated by SITE and not by class:
+        # the resolve's fault says the ledger's own path cannot be walked, which is
+        # the readability fact the dispatch gate withholds on; a git fault after a
+        # successful resolve says nothing about readability. The one-tuple handler
+        # that stood here could not tell them apart, so a refused resolve left the
+        # run holding the ledger publishable.
         try:
             target = path.resolve()
+        except (OSError, RuntimeError) as e:
+            # `repo` (not `root`): an absolute host path, already routed out of
+            # diagnostics dumps, exactly as `rearm-baseline-advance-failed` spells
+            # the same value. The LEXICAL parent here — the resolve that would have
+            # replaced it is what failed. `file` is what SURVIVES a dump: `repo`,
+            # `message` and `error` are all dropped.
+            self.journal.append(
+                "sweep-ledger-commit-unavailable",
+                message=message,
+                repo=str(root),
+                error=str(e),
+                file=name,
+            )
+            # DW-260: the same arm the refusal branch below takes, for the same
+            # fact — a ledger whose path cannot be resolved cannot be read by
+            # `_write_intent`'s bare `read_for_write` either (its `stat` walks the
+            # same component). LEDGER family only, AFTER the row, through the
+            # mutate-then-`_save()` helper; see the refusal arm's comment for the
+            # release contract and why neither cycle latch is touched.
+            if family == "ledger":
+                self._record_ledger_doubt()
+            return
+        try:
             root = target.parent
             # THE TARGET VALIDATION (DW-199/203/205), between the resolve and
             # `path_clean` for two reasons the docstring states: git is asked about
@@ -4819,13 +4867,14 @@ class SweepEngine(Engine):
                 # Preserve the clean short-circuit without catching journal write faults.
                 clean = verify.path_clean(root, target.name)
                 sha = None if clean else verify.commit_paths(root, message, [target])
-        except (verify.GitError, OSError, RuntimeError) as e:
-            # `repo` (not `root`): an absolute host path naming a git tree,
-            # already routed out of diagnostics dumps, exactly as
-            # `rearm-baseline-advance-failed` spells the same value. The RESOLVED
-            # directory, which is the one git was actually asked about — or the
-            # lexical parent when the resolve is what failed. `file` is what
-            # SURVIVES a dump: `repo`, `message` and `error` are all dropped.
+        except verify.GitError as e:
+            # `verify.GitError` ALONE: `_run_git` translates spawn/timeout/decode
+            # faults and `commit_paths` its own resolves and `lstat` probes into
+            # this taxonomy, and `unpublishable_target` returns rather than raises,
+            # so nothing an `OSError`/`RuntimeError` arm could catch here escapes
+            # the helpers untranslated. The RESOLVED directory in `repo`, which is
+            # the one git was actually asked about. No doubt is armed: see the
+            # docstring.
             self.journal.append(
                 "sweep-ledger-commit-unavailable",
                 message=message,
