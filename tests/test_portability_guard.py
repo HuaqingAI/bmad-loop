@@ -1419,15 +1419,18 @@ JOURNAL_KINDS = frozenset(
         # DW-246. A ledger publish the RUN declined to attempt because it already
         # held the ledger unfit to publish (`_ledger_unfit_to_publish()`, the
         # persisted DW-218/219 doubt included) — written by
-        # `sweep._withhold_ledger_publish` at the three resume-time publishers that
-        # run AHEAD of `_cycle`'s dispatch gate (`_close_resolved`'s two arms and
-        # `_loop`'s post-recovery publisher). Its own kind rather than a fifth
-        # `refuse_cause`: no target was probed and no git was spawned, so it is not
-        # a `verify.unpublishable_target` verdict. No new diagnostics routing:
-        # `message` and `reason` are already in `_JOURNAL_DROP_FIELDS` (`reason`
-        # carries the fixed DW-217 token `ledger-in-doubt` and renders as a
-        # presence boolean), and `file` is the same already-benign lexical
-        # basename the sibling rows carry.
+        # `sweep._withhold_ledger_publish` at the four resume-time publishers that
+        # run AHEAD of `_cycle`'s dispatch gate (`_close_resolved`'s two arms,
+        # `_loop`'s post-recovery publisher, and since DW-250 the no-open exit's
+        # `_publish_stranded_close`, whose row alone adds `dw_ids` — the cached
+        # plan's already-resolved and decision ids it declined to prove). Its own
+        # kind rather than a fifth `refuse_cause`: no target was probed and no git
+        # was spawned, so it is not a `verify.unpublishable_target` verdict. No new
+        # diagnostics routing: `message` and `reason` are already in
+        # `_JOURNAL_DROP_FIELDS` (`reason` carries the fixed DW-217 token
+        # `ledger-in-doubt` and renders as a presence boolean), `file` is the same
+        # already-benign lexical basename the sibling rows carry, and `dw_ids` is
+        # already a `_JOURNAL_KEYLIST_FIELDS` name.
         "sweep-ledger-commit-withheld",
         "sweep-migrated",
         "sweep-migration-restore-diverged",

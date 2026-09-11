@@ -1386,10 +1386,11 @@ class SweepEngine(Engine):
         OR the RUN's persisted one (DW-218/219).
 
         The dispatch gate in `_cycle`, `_loop`'s shared stop arm,
-        `_prune_pre_answers`' refusal, `_decisions_phase`'s tail publish,
-        `_publish_stranded_close`'s decision term, the three resume-time publish
-        gates (DW-246: `_close_resolved`'s two arms and `_loop`'s post-recovery
-        publisher) and `_loop`'s no-open repair notice (DW-251) all read the doubt
+        `_prune_pre_answers`' refusal, `_decisions_phase`'s tail publish, the four
+        resume-time publish gates (DW-246: `_close_resolved`'s two arms and
+        `_loop`'s post-recovery publisher; DW-250: `_publish_stranded_close`, the
+        whole publisher, above both of its probes) and `_loop`'s no-open repair
+        notice (DW-251) all read the doubt
         through here, so a future arming site cannot be wired into one reader and
         missed by the others — which is precisely how the close phase's fault
         reached `_write_intent`'s bare `read_for_write` while the gate above it saw
@@ -1825,7 +1826,7 @@ class SweepEngine(Engine):
                     )
                 # DW-251: a run that reaches this exit with the doubt armed
                 # withheld every publish it was offered — the stranded-close
-                # republish above refuses its decision term on the same verdict —
+                # republish above withholds on the same verdict (DW-250) —
                 # and then ended on `no-open` with no repair instruction at all.
                 # Not because an earlier notice was lost: `gates.notify` APPENDS
                 # to `<run>/ATTENTION`, which a resume shares. The gap is that the
@@ -2005,42 +2006,62 @@ class SweepEngine(Engine):
         branch it dispatches a triage SESSION, and a nothing-open resume must never
         spend one.
 
-        Second term: the SAME per-id probe the phase arm uses
-        (`_resolved_write_pending`), over the cached plan's `already_resolved` ids
-        AND, since DW-222, over its `decisions` ids. One rule at both sites —
-        publish on positive per-id evidence of a landed write, never on the ledger
-        merely being dirty — so everything that method documents about what the
-        probe does and does not prove applies verbatim here, including its
-        empty-`ids` short-circuit.
+        Second term: the SAME per-id evidence the phase arm uses — one read of the
+        ledger through `_done_on_disk`, answering which named ids read `done` — over
+        the cached plan's `already_resolved` ids AND, since DW-222, over its
+        `decisions` ids. One rule at both sites — publish on positive per-id
+        evidence of a landed write, never on the ledger merely being dirty — so
+        everything that reader documents about what the probe does and does not
+        prove applies verbatim here, including its empty-`ids` short-circuit.
 
-        TWO PROBES combined with `or`, never one merged id list. The decision phase
-        strands a close the same way the close phase does: `_apply_decision_effect`
-        calls `deferredwork.record_decision(..., close_note=...)`, which flips the
-        entry to `status: done <date>` on disk, and `_decisions_phase` publishes
-        only at its own tail — so a crash between that write and that publish leaves
-        a decision-phase close durable on disk and off HEAD, and when it retired the
+        TWO PROBES combined with `or`, never one merged id list, and they are
+        DIFFERENT views of the reader. The decision phase strands a close the same
+        way the close phase does: `_apply_decision_effect` calls
+        `deferredwork.record_decision(..., close_note=...)`, which flips the entry
+        to `status: done <date>` on disk, and `_decisions_phase` publishes only at
+        its own tail — so a crash between that write and that publish leaves a
+        decision-phase close durable on disk and off HEAD, and when it retired the
         last open entry the resume reaches THIS exit with nothing else to run. The
-        combination has to be `or` because `_resolved_write_pending` answers
-        `all(id is done)`: merging the two id lists ANDs the terms, so a plan
-        carrying a stranded already-resolved close beside a decision id the ledger
-        no longer holds would stop publishing — a NARROWING of the arm that shipped,
-        not a widening. Separate calls are strictly a widening, and both short-
-        circuit on empty `ids` before reading anything, so a fresh sweep's "no git
-        at all" property is untouched.
+        already-resolved term is `_resolved_write_pending`, the `all` view: the
+        close phase closes its ids as ONE batch (`mark_done_many`), so a stranded
+        batch write is every id `done`. The decision term is `_any_write_pending`,
+        the `any` view (DW-249): decision closes land one effect at a time, so a
+        plan with two decision ids where one is absent from the ledger — retired
+        by a rival writer, or never closed at all — still carries a stranded close
+        under the other, and an `all` over the pair answered False and never
+        published it at this exit. Merging the two id lists into one `all` call
+        would AND the terms the same way (a NARROWING of the arm that shipped);
+        the `any` view makes an absent or unparseable id veto only itself. Both
+        views short-circuit on empty `ids` before reading anything, the decision
+        set is read ONCE, and the `or` still skips that read when the
+        already-resolved term proves the write.
 
-        The NEW decision term also respects the run's ledger-doubt verdict. A
-        failed decision effect can leave a decodable done flip without its audit
-        line, and a crash can preserve that doubt across a resume. Readability
-        alone must not authorize publishing those bytes. This guard applies only
-        to the new term, preserving the existing already-resolved arm; it does
-        not add a phase gate or change the shared per-id probe.
+        THE DOUBT GATE sits above BOTH probes (DW-250), read through
+        `_ledger_unfit_to_publish()` and reported through `_withhold_ledger_publish`
+        with the union of both id lists in `dw_ids`. A failed decision effect can
+        leave a decodable done flip without its audit line, a ledger-family refusal
+        arms the same verdict (DW-244), and a crash preserves either across a
+        resume; readability alone must not authorize publishing those bytes. Until
+        DW-250 only the decision term read the verdict, so a resumed run holding
+        persisted doubt still published the WHOLE file — the unaudited flip
+        included — whenever its cached plan carried an already-resolved id that
+        read `done`, and a plan with only decision ids under doubt returned with no
+        row at all. The gate is placed AFTER the cache is validated and the two id
+        lists are known, and after the empty-plan short-circuit: an empty plan
+        would never have published (both probes short-circuit), so there is
+        nothing to decline and no row is owed — the same "only when a publish was
+        about to happen" shape the three DW-246 sites have — and a fresh sweep
+        returns even earlier, at the cache term, so its "no read, no git" property
+        is untouched. The gate does not change the shared reader or add a phase
+        gate; the phase arm's own gates are `_close_resolved`'s (DW-246).
 
         WHAT THE PROBE PROVES HERE is weaker than the rule's wording suggests, and
         reading it as a contradiction is the trap. This exit is reached only when
         the open set is EMPTY, so over a well-formed ledger every id still in the
         file already reads `done` — which makes the term close to a PRESENCE check
         at this one call site, for the decision ids and the already-resolved ids
-        alike. That is pre-existing, not something the widening introduced: the
+        alike (and, under the `any` view, presence of ANY ONE decision id). That
+        is pre-existing, not something the widening introduced: the
         already-resolved term has had exactly this property since DW-193, and it is
         tolerable for the reason `_resolved_write_pending` gives — the answer
         authorizes a COMMIT of the ledger, which is the right outcome for a durable
@@ -2055,7 +2076,9 @@ class SweepEngine(Engine):
         journals `sweep-resolved-close-unavailable` with `dw_ids` + `error`, the row
         `_close_resolved`'s degrade arm already writes for the same read. No new
         journal kind is minted at either — reusing the two readers' own rows keeps
-        the kind registry untouched. Neither publishes anything.
+        the kind registry untouched. Neither publishes anything. A WITHHELD publish
+        (DW-250) is the third non-publishing outcome and is not a fault: the gate
+        returns before any read, on `sweep-ledger-commit-withheld`.
 
         No `sweep-resolved-closed` row and no phase emissions: this is a PUBLISHER,
         not a replay of `_close_resolved`. `pre_close_resolved`/`post_close_resolved`
@@ -2104,14 +2127,24 @@ class SweepEngine(Engine):
         ledger = self.workspace.paths.deferred_work
         resolved_ids = [entry.id for entry in plan.already_resolved]
         decision_ids = [decision.id for decision in plan.decisions]
+        if not resolved_ids and not decision_ids:
+            # Nothing would have been published — both probes short-circuit on an
+            # empty list — so there is nothing to decline: no read, no row, no git.
+            return
+        close_message = "chore(sweep): close resolved deferred-work entries"
+        if self._ledger_unfit_to_publish():
+            # DW-250: the run's verdict, over BOTH terms, before either probe reads.
+            # The row names the union — every id this publisher declined to prove.
+            self._withhold_ledger_publish(close_message, dw_ids=resolved_ids + decision_ids)
+            return
         try:
-            # `or`, and two calls: see the docstring — one merged list would AND the
-            # two terms through `_resolved_write_pending`'s `all(...)` and narrow the
+            # `or`, and two calls of two VIEWS: see the docstring — the
+            # already-resolved term is the `all` view, the decision term the `any`
+            # view (DW-249), and one merged `all` list would AND them and narrow the
             # arm that shipped. Short-circuit is deliberate too: a plan whose
             # already-resolved ids already prove the write never reads twice.
-            pending = self._resolved_write_pending(ledger, resolved_ids) or (
-                not self._ledger_unfit_to_publish()
-                and self._resolved_write_pending(ledger, decision_ids)
+            pending = self._resolved_write_pending(ledger, resolved_ids) or self._any_write_pending(
+                ledger, decision_ids
             )
         except (deferredwork.LedgerReadError, OSError, ValueError, StateRootError) as e:
             # The UNION, because either probe can be the one that faulted and the
@@ -2130,7 +2163,7 @@ class SweepEngine(Engine):
         # spell it that way. Same message as `_close_resolved`'s two arms: the diff
         # being published IS the close of resolved entries.
         self._commit_ledger(
-            "chore(sweep): close resolved deferred-work entries",
+            close_message,
             path=self.workspace.paths.deferred_work,
             family="ledger",
         )
@@ -3400,16 +3433,17 @@ class SweepEngine(Engine):
             #     write, read back off disk after a crash lost only its commit),
             #     `_decisions_phase` (`any_effect_landed`), and
             #     `_publish_stranded_close` — `_loop`'s empty-open-set recovery
-            #     arm, which runs the SAME per-id probe as `pending` over the
-            #     CACHED triage plan and so gates on the same landed write. It
-            #     runs that probe TWICE (DW-222), once over the plan's
-            #     `already_resolved` ids and once over its `decisions` ids,
-            #     combined with `or` — the decision phase strands a close the same
+            #     arm, which reads the SAME per-id reader as `pending`
+            #     (`_done_on_disk`) over the CACHED triage plan and so gates on
+            #     the same landed write. Two VIEWS of that one reader, combined
+            #     with `or` (DW-222/DW-249): `all` over the plan's
+            #     `already_resolved` ids, as `pending` does, and `any` over its
+            #     `decisions` ids — the decision phase strands a close the same
             #     way this one does, since `record_decision` flips the entry to
-            #     `done` on disk and `_decisions_phase` publishes only at its tail.
-            #     Two calls and not one merged list: the probe answers
-            #     `all(id is done)`, so a union would AND the terms and narrow the
-            #     arm. Its extra term is the CACHE: `triage{suffix}.json` for the
+            #     `done` on disk and `_decisions_phase` publishes only at its
+            #     tail, one effect at a time. Two calls and not one merged `all`
+            #     list: a union would AND the terms and narrow the arm. Its
+            #     extra term is the CACHE: `triage{suffix}.json` for the
             #     current cycle must already be on disk, which is true only on a
             #     resume, so a fresh sweep over a ledger with nothing open still
             #     reaches no git at all.
@@ -3429,22 +3463,23 @@ class SweepEngine(Engine):
             # two cycle latches and the persisted DW-218/219 mirror) is a SECOND,
             # non-uniform gate laid over the nine, and which sites read it is the
             # other trap to read as uniform:
-            #   * THREE read it at the call site and journal
+            #   * FOUR read it at the call site and journal
             #     `sweep-ledger-commit-withheld` instead of publishing: this site's
             #     TWO arms and `_loop`'s post-recovery publisher (DW-246 — all three
             #     run on a resume AHEAD of `_cycle`'s dispatch gate, so a run that
             #     KNEW its ledger was unfit published the whole file, half-write
-            #     included, before the gate was ever consulted).
+            #     included, before the gate was ever consulted), and
+            #     `_publish_stranded_close` (DW-250 — the gate sits above BOTH of
+            #     its probes, and its row alone carries `dw_ids`, the union of the
+            #     cached plan's already-resolved and decision ids it declined to
+            #     prove; before DW-250 only its decision term read the verdict, so
+            #     a doubted resume still published on an already-resolved id).
             #   * `_decisions_phase`'s tail publish already gated on the same
             #     reader, silently: its withhold is part of the walk's own verdict
             #     and is reported by `sweep-bundles-withheld` and the repeat stop,
             #     so it writes no row of its own.
             #   * `_loop`'s boundary publisher needs no gate of its own: it sits
             #     BELOW the unfit-to-publish stop, which returns first.
-            #   * `_publish_stranded_close` reads it on its DECISION term only and
-            #     deliberately NOT on its already-resolved term — DW-246 named it,
-            #     but gating it narrows a preserved recovery arm, and that change
-            #     belongs to DW-250's recorded decision, not here.
             #   * `_ensure_migration`'s publisher does not read it at all: a
             #     migration rewrite over a doubted ledger is a different question
             #     nobody has decided.
@@ -3525,37 +3560,34 @@ class SweepEngine(Engine):
         self._emit("post_close_resolved")
         return len(closed)
 
-    def _resolved_write_pending(self, ledger: Path, ids: list[str]) -> bool:
-        """Whether every id in `ids` reads `done` in the ledger ON DISK (DW-193) —
-        the state a crash between `mark_done_many`'s write and its commit leaves
-        behind, which the resume's cached triage plan replays as an empty
-        `mark_done_many` return.
+    def _done_on_disk(self, ledger: Path, ids: list[str]) -> frozenset[str] | None:
+        """Which of `ids` read `done` in the ledger ON DISK, in ONE read (DW-193,
+        split out under DW-249) — the shared reader behind `_resolved_write_pending`
+        (the `all` view) and `_any_write_pending` (the `any` view). `None` means the
+        ledger is ABSENT (`read_for_write`'s own answer); an empty `ids` answers an
+        empty set WITHOUT reading, so a caller naming nothing takes no read at all.
 
         WHAT IT PROVES, exactly: that these ids read `done` NOW. Not that a previous
-        pass of this phase is what wrote them, and not that the bytes are still
-        those of that write. This read takes NO cross-process ledger lock, where
-        `mark_done_many` above took one for its read-edit-write, so the same rival
-        writers that lock names — a live run's harvest, the TUI decision modal,
-        `sweep --archive` — can have closed these entries instead, or can edit the
-        file between this read and the publish. That is tolerable because of what
-        the answer is USED for: a commit of the ledger file, which is the right
-        outcome for a durable close whoever wrote it, and which `_commit_ledger`
-        re-validates and no-ops on its own. It would NOT be tolerable for a claim
-        about this run's work, which is exactly why the caller writes no
-        `sweep-resolved-closed` row on this arm and still returns `len(closed)`.
+        pass of the caller's phase is what wrote them, and not that the bytes are
+        still those of that write. This read takes NO cross-process ledger lock,
+        where `mark_done_many` above took one for its read-edit-write, so the same
+        rival writers that lock names — a live run's harvest, the TUI decision
+        modal, `sweep --archive` — can have closed these entries instead, or can
+        edit the file between this read and the publish. That is tolerable because
+        of what the answer is USED for: a commit of the ledger file, which is the
+        right outcome for a durable close whoever wrote it, and which
+        `_commit_ledger` re-validates and no-ops on its own. It would NOT be
+        tolerable for a claim about this run's work, which is exactly why
+        `_close_resolved` writes no `sweep-resolved-closed` row on its `pending`
+        arm and still returns `len(closed)`.
 
         POSITIVE PROOF, per id. `[]` back from a non-empty `ids` is ambiguous:
         `mark_done_many` skips both already-done ids AND ids the ledger holds no
-        entry for. So every named id must parse to :attr:`DWEntry.done` here — an
-        id the ledger does not carry, or one carrying a status the format does not
-        understand, proves nothing and must not authorize a commit. `.done`, never
-        `not .open`, for the reason that property documents.
-
-        The empty-`ids` arm is CORRECTNESS, not merely an ordering nicety: `all()`
-        over an empty sequence is vacuously True, so deleting it makes a phase that
-        resolved nothing publish — the exact regression DW-185 closed. It also
-        keeps that phase from taking this read at all, which is the property
-        `test_a_phase_that_wrote_nothing_spawns_no_git` grades at the git seam.
+        entry for. So an id counts here only when it parses to :attr:`DWEntry.done`
+        — an id the ledger does not carry, or one carrying a status the format does
+        not understand, is simply not in the answer, proves nothing and must not
+        authorize a commit under either view. `.done`, never `not .open`, for the
+        reason that property documents.
 
         `read_for_write`, not `read_for_observation`: this gates a PUBLISH, so its
         `None`/`LedgerReadError`/`OSError` answers belong in the caller's existing
@@ -3565,15 +3597,50 @@ class SweepEngine(Engine):
         question; this method spawns no git and asks no second one.
         """
         if not ids:
-            return False
+            return frozenset()
         text = deferredwork.read_for_write(ledger)
         if text is None:
-            return False
+            return None
         # LAST-wins on a duplicate id, where the writer's `_apply_done` locates the
         # FIRST. The two can disagree only on a ledger carrying duplicate ids, which
         # is a corrupt shape `duplicate_ids` refuses elsewhere; not handled here.
         entries = {entry.id: entry for entry in deferredwork.parse_ledger(text)}
-        return all(dw_id in entries and entries[dw_id].done for dw_id in ids)
+        return frozenset(dw_id for dw_id in ids if dw_id in entries and entries[dw_id].done)
+
+    def _resolved_write_pending(self, ledger: Path, ids: list[str]) -> bool:
+        """Whether EVERY id in `ids` reads `done` in the ledger on disk (DW-193) —
+        the state a crash between `mark_done_many`'s write and its commit leaves
+        behind, which the resume's cached triage plan replays as an empty
+        `mark_done_many` return. The `all` view over `_done_on_disk`, whose
+        docstring holds everything about what one read does and does not prove;
+        `_close_resolved`'s `pending` arm and `_publish_stranded_close`'s
+        already-resolved term read through here.
+
+        The empty-`ids` arm is CORRECTNESS, not merely an ordering nicety: `all()`
+        over an empty sequence is vacuously True, so deleting it makes a phase that
+        resolved nothing publish — the exact regression DW-185 closed. It also
+        keeps that phase from taking this read at all, which is the property
+        `test_a_phase_that_wrote_nothing_spawns_no_git` grades at the git seam. An
+        absent ledger (`None` from the reader) proves nothing either.
+        """
+        if not ids:
+            return False
+        done = self._done_on_disk(ledger, ids)
+        return done is not None and all(dw_id in done for dw_id in ids)
+
+    def _any_write_pending(self, ledger: Path, ids: list[str]) -> bool:
+        """Whether ANY id in `ids` reads `done` in the ledger on disk (DW-249) —
+        the `any` view over the same one read, for `_publish_stranded_close`'s
+        decision term. A decision-phase close is stranded per DECISION: each
+        `_apply_decision_effect` flips its own entry, so one landed flip is a write
+        the exit must publish whether or not the plan's other decision ids are
+        still in the ledger, where the `all` view let one absent id veto its
+        sibling's publish. Same DW-185 properties as the `all` view: `[]` answers
+        False without reading, an absent ledger answers False, and an id the
+        ledger does not carry or cannot parse contributes nothing — it vetoes
+        ITSELF, no longer the others.
+        """
+        return bool(self._done_on_disk(ledger, ids))
 
     # `dict[str, Any]` per answer, not `dict[str, str]`: `unusable_answer_reason`
     # deliberately screens only the fields a reader consumes, so `resolution` and
@@ -4759,12 +4826,18 @@ class SweepEngine(Engine):
             return
         self.journal.append("sweep-ledger-commit", message=message, commit=sha, file=name)
 
-    def _withhold_ledger_publish(self, message: str) -> None:
+    def _withhold_ledger_publish(self, message: str, *, dw_ids: list[str] | None = None) -> None:
         """Journal a ledger publish the RUN declined to attempt because it already
         holds the ledger unfit to publish (DW-246) — `sweep-ledger-commit-withheld`
         with the `message` the publish would have carried, the LEXICAL basename in
         `file` (`deferred-work.md`, as every sibling `_commit_ledger` row spells
-        it — DW-192) and `reason="ledger-in-doubt"`.
+        it — DW-192) and `reason="ledger-in-doubt"`. `dw_ids` (DW-250) is the
+        list of ids the declining publisher would otherwise have set out to prove,
+        emitted ONLY when given: `_publish_stranded_close` names its cached plan's
+        already-resolved and decision ids, while the three DW-246 callers
+        deliberately pass none — `_close_resolved`'s arms have `closed` and `ids`
+        in scope, but their DW-246 row shape stays unchanged. `diagnostics`
+        already routes the field by name (`_JOURNAL_KEYLIST_FIELDS`).
 
         A row of its OWN rather than a fifth `refuse_cause` on
         `sweep-ledger-commit-refused`: a refusal is `verify.unpublishable_target`'s
@@ -4782,14 +4855,15 @@ class SweepEngine(Engine):
         `_commit_ledger` call it stands in for: each gate sits AT its call site so
         `test_every_sweep_ledger_commit_names_its_own_tree` still counts every
         publisher, and so the publishers that deliberately stay ungated (see
-        `_close_resolved`'s inventory) can. DW-250 is expected to reuse it for
-        `_publish_stranded_close`, adding the `dw_ids` that arm can name."""
-        self.journal.append(
-            "sweep-ledger-commit-withheld",
-            message=message,
-            file=self.workspace.paths.deferred_work.name,
-            reason="ledger-in-doubt",
-        )
+        `_close_resolved`'s inventory) can."""
+        fields: dict[str, Any] = {
+            "message": message,
+            "file": self.workspace.paths.deferred_work.name,
+            "reason": "ledger-in-doubt",
+        }
+        if dw_ids is not None:
+            fields["dw_ids"] = dw_ids
+        self.journal.append("sweep-ledger-commit-withheld", **fields)
 
     # ---------------------------------------------------------- bundles
 
