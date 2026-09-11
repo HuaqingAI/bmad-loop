@@ -13852,9 +13852,12 @@ def _resolve_degrade_target(project, family: Literal["ledger", "store"]) -> tupl
 
     Both tails are code constants at every real caller — `deferred-work.md` from
     `ProjectPaths.deferred_work`, `decisions.json` from `decisions.STORE_REL` — which
-    is what lets `file` be a benign (undropped) journal field at all. The store is
-    seeded as a REGULAR file so the "the write survives the degrade" claim has bytes
-    to compare; its own validator never runs here, because the resolve fails first."""
+    is what lets `file` be a benign (undropped) journal field at all. The store seed
+    is UNOBSERVABLE on this arm: `refuse_to_resolve` matches the path string and
+    raises before anything probes the file's existence, and its own validator never
+    runs, because the resolve fails first. It is kept only for symmetry with the
+    ledger family, which is a real file too. Nothing about its bytes is graded: see
+    the contract note in either degrade row."""
     if family == "ledger":
         return project.deferred_work, "deferred-work.md"
     from bmad_loop import decisions as decisions_store
@@ -13886,10 +13889,18 @@ def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, m
     conversions exist to remove, and the seam is scoped to the named path exactly
     as the stub was.
 
-    The remaining claims below are HANDLER properties rather than class ones — the
-    write surviving, HEAD unmoved, `message`, and the sibling arms staying empty — so
-    both class rows assert the identical set. Splitting them would let a regression that
-    commits, or moves HEAD, on the `OSError` leg specifically land green.
+    The remaining claims below are HANDLER properties rather than class ones — HEAD
+    unmoved, `message`, and the sibling arms staying empty — so both class rows assert
+    the identical set. Splitting them would let a regression that commits, or moves
+    HEAD, on the `OSError` leg specifically land green.
+
+    Contract note, not an assertion (DW-242): the published file's bytes are NOT
+    compared before and after. `_commit_ledger` never writes the target's bytes on
+    any path — its only writes are git's, through `verify.commit_paths` — and
+    `path.resolve()` is the first statement inside its `try`, so on this arm nothing
+    runs that could touch the file at all. A `read_text() == before` line here could
+    not fail for any reason, which makes it a false guard rather than a claim; it was
+    dropped, and no post-write fault exists on this path to drive in its place.
 
     Parametrized over both FAMILIES because this arm is family-agnostic BY
     CONSTRUCTION, so the store leg is regression coverage of the second call SHAPE —
@@ -13926,7 +13937,6 @@ def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, m
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
     published, tail = _resolve_degrade_target(project, family)
-    before = published.read_text(encoding="utf-8")
     head = git(project.project, "rev-parse", "HEAD")
     # scoped to the published file: everything else in the frame still resolves
     refuse_to_resolve(monkeypatch, published)
@@ -13941,8 +13951,7 @@ def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, m
     # the LEXICAL parent: the resolve that would have replaced it is what failed
     assert failed["repo"] == str(published.parent)
     assert UNRESOLVABLE in failed["error"]
-    assert published.read_text(encoding="utf-8") == before  # the write survives the degrade
-    assert git(project.project, "rev-parse", "HEAD") == head  # and nothing was committed
+    assert git(project.project, "rev-parse", "HEAD") == head  # nothing was committed
     assert _records(engine, "sweep-ledger-commit") == []  # nothing published...
     assert _records(engine, "sweep-ledger-commit-refused") == []  # ...not a target refusal...
     assert _records(engine, "sweep-ledger-commit-clean") == []  # ...and not a clean skip either
@@ -13968,12 +13977,19 @@ def test_the_degrade_row_survives_a_runtime_error_from_the_resolve(project, monk
     `refuse_to_resolve` makes it version-independent, and a symlink loop remains the
     real-world fault it stands for.
 
-    Beyond the class, three claims the pre-existing `OSError` row does not make: the
-    on-disk ledger write SURVIVES (the degrade is about the commit, never the file),
-    HEAD is unmoved, and `sweep-ledger-commit`, `sweep-ledger-commit-refused` and
+    Beyond the class, two claims the pre-existing `OSError` row did not originally
+    make: HEAD is unmoved, and `sweep-ledger-commit`, `sweep-ledger-commit-refused` and
     `sweep-ledger-commit-clean` are ALL empty. The refusal and clean arms sit
     immediately after this `except` in `sweep.py`, so their absence is what separates
     "the resolve degraded" from "the target was refused before git ever ran".
+
+    Contract note, not an assertion (DW-242): the degrade is about the commit, never
+    the file, and that is a property of `_commit_ledger`'s SHAPE rather than something
+    this row can grade. The method never writes the target's bytes on any path — its
+    only writes are git's, through `verify.commit_paths` — and `path.resolve()` is the
+    first statement inside its `try`, so on this arm nothing runs that could touch the
+    file. A `read_text() == before` line here could not fail for any reason; it was a
+    false guard and was dropped, with no post-write fault to drive in its place.
 
     Parametrized over both FAMILIES for the reason the sibling row states at length
     (DW-212): the arm is family-agnostic by construction — `root` and `name` bind
@@ -13998,7 +14014,6 @@ def test_the_degrade_row_survives_a_runtime_error_from_the_resolve(project, monk
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
     published, tail = _resolve_degrade_target(project, family)
-    before = published.read_text(encoding="utf-8")
     head = git(project.project, "rev-parse", "HEAD")
     # CPython's own wording, so the injected fault is a faithful stand-in for the real
     # one: pre-3.13 `pathlib` raises `RuntimeError("Symlink loop from %r" % e.filename)`.
@@ -14015,8 +14030,7 @@ def test_the_degrade_row_survives_a_runtime_error_from_the_resolve(project, monk
     # the LEXICAL parent: the resolve that would have replaced it is what failed
     assert failed["repo"] == str(published.parent)
     assert loop_error in failed["error"]
-    assert published.read_text(encoding="utf-8") == before  # the write survives the degrade
-    assert git(project.project, "rev-parse", "HEAD") == head  # and nothing was committed
+    assert git(project.project, "rev-parse", "HEAD") == head  # nothing was committed
     assert _records(engine, "sweep-ledger-commit") == []  # nothing published...
     assert _records(engine, "sweep-ledger-commit-refused") == []  # ...not a target refusal...
     assert _records(engine, "sweep-ledger-commit-clean") == []  # ...and not a clean skip either
