@@ -37,6 +37,40 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+class MissingLedgerEntriesError(Exception):
+    """`_write_intent` refused to brief a bundle whose ids are not all in the
+    ledger (DW-252). `ids` names every bundle id with NO parsed entry at all — a
+    present-but-closed entry is still emitted verbatim and is not missing.
+
+    Raised BEFORE any side effect: no `bundles/<dirname>/` directory, no file.
+    An intent document briefs a dev session; an empty "Ledger entries (verbatim)"
+    section briefed it on nothing, and the session was spent anyway.
+
+    A plain `Exception` on purpose, never `OSError` or `ValueError`: the arms
+    around the two writers catch `OSError` for the file's own I/O, and a subclass
+    would be swallowed by exactly the handler this refusal must escape."""
+
+    def __init__(self, ids: tuple[str, ...]) -> None:
+        self.ids = ids
+        super().__init__(f"no ledger entry for {', '.join(ids)}")
+
+
+class _InflightLedgerFault(Exception):
+    """`_ensure_bundle_intent`'s regeneration read refused (DW-243), carried to
+    `_loop` as an exception so the run ends through `_stop_on_ledger_fault` on
+    the existing token pair instead of crashing.
+
+    An exception rather than a return value because `_finish_inflight_bundles`
+    returns an `int` that tests monkeypatch (`lambda: real() or 1`), and the fault
+    must stop the recovery pass mid-loop, before the ledger publisher below it;
+    `RunPaused` already crosses the same frames the same way. Private: nothing
+    outside `_loop` may catch it."""
+
+    def __init__(self, fault: Literal["ledger-unreadable", "ledger-inaccessible"]) -> None:
+        self.fault: Literal["ledger-unreadable", "ledger-inaccessible"] = fault
+        super().__init__(fault)
+
+
 TRIAGE_KEY = "sweep-triage"
 TRIAGE_WORKFLOW = "deferred-sweep-triage"
 MIGRATE_KEY = "sweep-migrate"
@@ -1710,7 +1744,26 @@ class SweepEngine(Engine):
     def _loop(self) -> None:
         ledger = self.workspace.paths.deferred_work
         cycle = max(1, self.state.sweep_cycle)
-        if self._finish_inflight_bundles():
+        try:
+            recovered = self._finish_inflight_bundles()
+        except _InflightLedgerFault as e:
+            # DW-243: an in-flight bundle's intent document was gone and the
+            # ledger read that would have regenerated it refused. A FAULT STOP,
+            # not a doubt-latch gate — the recovery pass itself stays ungated —
+            # routed to the same two-token stop `_read_cycle_ledger`'s refusal
+            # takes, so no new stop token and no new `sweep-repeat-done` write.
+            # `cycle - 1` for the reason that arm gives: this cycle did no work at
+            # all. The task the refusal caught is still non-terminal (persisted by
+            # `_ensure_bundle_intent` before the raise), so the resume after the
+            # repair re-drives it through this same pass. Deliberately, the stop
+            # returns ABOVE the post-recovery ledger publisher and before the
+            # remaining in-flight bundles are re-driven: a ledger a bundle earlier
+            # in this pass restored or closed stays dirty for the operator's
+            # commit-or-stash step (the notice names it), and every other in-flight
+            # bundle waits for the resume after the repair.
+            self._stop_on_ledger_fault(e.fault, cycles=cycle - 1, ledger=ledger)
+            return
+        if recovered:
             # a recovered bundle's ledger restore can leave the LEDGER dirty, and
             # triage plus the first bundle baseline read it, so it is published
             # here. Only it: unrelated dirt in the same repository is left for
@@ -2186,7 +2239,16 @@ class SweepEngine(Engine):
         escalates keeps its ids open. A dev-leg discard never closes them; an
         in-place post-acceptance defer reopens this run's close, while an isolated
         unit's close dies with its unmerged worktree. The existing failed_ids filter
-        then drops the fresh plan's overlapping bundle."""
+        then drops the fresh plan's overlapping bundle.
+
+        Two refusals sit between the recovery and the dispatch (DW-243/252), both
+        in `_ensure_bundle_intent`: a ledger read that faults raises
+        `_InflightLedgerFault` straight through this frame to `_loop`'s stop, and a
+        readable ledger lacking an entry for one of the task's ids answers `False`,
+        on which the dispatch is SKIPPED — the task is saved as it stands
+        (non-terminal) and the loop moves to the next bundle, leaving
+        `_warn_stranded_bundles` to keep the survivor loud every cycle until a
+        resume after the ledger is repaired regenerates and re-drives it."""
         recovered = 0
         for task in list(self.state.tasks.values()):
             if task.terminal or not BUNDLE_KEY_RE.match(task.story_key):
@@ -2200,7 +2262,9 @@ class SweepEngine(Engine):
             )
             if self._recover_inflight_bundle(task):
                 continue
-            self._ensure_bundle_intent(task)
+            if not self._ensure_bundle_intent(task):
+                self._save()
+                continue
             self._save()
             self._emit("pre_bundle", task)
             self._run_story(task)
@@ -3201,6 +3265,24 @@ class SweepEngine(Engine):
                 cached = _read_json(triage_path)
             except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
                 self.journal.append("sweep-triage-reload-failed", errors=[f"unreadable: {exc}"])
+                # DW-263: INVALIDATE before re-triaging. This is the one arm where
+                # a VALID plan can be sitting behind a transient fault: the fresh
+                # triage's write-back below is best-effort, so a refused overwrite
+                # would leave these older bytes in place for the next resume to
+                # replay as if they were this cycle's plan — off a ledger that has
+                # moved since. Not the metadata-fault arm (it cannot reliably unlink
+                # what it cannot stat) and not the validation-failed arm below
+                # (those bytes cannot be replayed as a plan at all). A refused
+                # unlink degrades the same way the read did: row, then fresh triage.
+                try:
+                    triage_path.unlink(missing_ok=True)
+                except OSError as unlink_exc:
+                    self.journal.append(
+                        "sweep-triage-cache-unlink-failed",
+                        errors=[f"unremovable: {unlink_exc}"],
+                    )
+                else:
+                    self.journal.append("sweep-triage-cache-invalidated")
             else:
                 if isinstance(cached, dict):
                     plan, errors = validate_triage(cached, None)
@@ -3287,15 +3369,22 @@ class SweepEngine(Engine):
                 # With no usable cache, resume re-triages this cycle;
                 # `_publish_stranded_close` cannot recover its close at the no-open
                 # exit, and `bmad-loop decisions` cannot reconstruct its decisions.
-                # A refused overwrite may instead leave an older cache to replay;
-                # this best-effort write does not invalidate existing cache bytes.
-                # A directory also reaches this catch: its write raises
-                # `IsADirectoryError` on POSIX or `PermissionError` on Windows.
+                # Written ATOMICALLY (DW-263): a short or refused write leaves either
+                # no cache or a complete one, never torn JSON — and the older bytes
+                # a transient read fault left behind were already unlinked in the
+                # reload arm above, so a refused write-back cannot leave a stale
+                # plan for the next resume to replay, except where that unlink was
+                # itself refused (`sweep-triage-cache-unlink-failed`) or the cache
+                # faulted at the metadata probe, whose arm does not unlink: there the
+                # older plan survives a refused write-back. A directory also reaches this
+                # catch: `os.replace` onto it raises `IsADirectoryError` on POSIX or
+                # `PermissionError` on Windows.
                 try:
-                    triage_path.write_text(
-                        json.dumps(result.result_json, indent=2), encoding="utf-8"
-                    )
-                except OSError as exc:
+                    atomic_write_text(triage_path, json.dumps(result.result_json, indent=2))
+                # `RuntimeError` too: the helper's `path.resolve()` raises it (not
+                # `OSError`) for a symlink loop on 3.11/3.12 — the same pair
+                # `platform_util.resolve_or_lexical` catches for the same reason.
+                except (OSError, RuntimeError) as exc:
                     self.journal.append(
                         "sweep-triage-cache-write-failed", errors=[f"unwritable: {exc}"]
                     )
@@ -3907,10 +3996,12 @@ class SweepEngine(Engine):
                 # could not decode or an OS that refused the read — the two classes
                 # that make `_write_intent`'s bare `read_for_write` RAISE, which is
                 # what a bundle dispatched later this cycle runs into. ABSENCE stays
-                # out: `_write_intent` spells its read `or ""`, so a missing ledger
-                # briefs a thin intent rather than raising, and DW-176's discipline
-                # is that an absent ledger ends the NEXT cycle cleanly on `no-open`
-                # rather than stopping this one.
+                # out, on DW-176's discipline: `_loop`'s cycle-top read exits on
+                # `no-open` before any dispatch, so a bundle can meet an absent
+                # ledger at `_write_intent` only if the file vanishes MID-cycle —
+                # a `MissingLedgerEntriesError` there since DW-252, not a thin
+                # intent — and an absent ledger ends the NEXT cycle cleanly on
+                # `no-open` rather than stopping this one.
                 #
                 # This sets the LOCAL `ledger_in_doubt`, which a later landed effect
                 # clears, so the walk's own final verdict is unchanged by arming here
@@ -4268,9 +4359,12 @@ class SweepEngine(Engine):
         # reaches.
         #
         # Arms on the two classes that make `_write_intent`'s bare `read_for_write`
-        # RAISE and on nothing else: ABSENCE keeps DW-176's discipline, since that
-        # read is spelled `or ""` and an absent ledger ends the next cycle on
-        # `no-open`. Fixed `reason` token, fault text in `error` — both already
+        # RAISE and on nothing else: ABSENCE keeps DW-176's discipline — `_loop`'s
+        # cycle-top read exits on `no-open` before any dispatch, so a bundle meets
+        # an absent ledger at `_write_intent` only if the file vanishes mid-cycle
+        # (a `MissingLedgerEntriesError` there since DW-252), and an absent ledger
+        # ends the next cycle on `no-open`. Fixed `reason` token, fault text in
+        # `error` — both already
         # `diagnostics._JOURNAL_DROP_FIELDS`, so neither needs new routing. The two
         # tokens land on ONE stop: `_loop`'s shared arm reports `ledger-unreadable`,
         # and a persistent `OSError` also trips `_prune_pre_answers`' own read,
@@ -4793,8 +4887,10 @@ class SweepEngine(Engine):
             # crashed on the same ledger the refusal had just declined. Every one
             # of the four `refuse_cause` tokens arms: each is the same fact for the
             # gate's purposes — including `target-absent`, on which that crash
-            # cannot happen (`read_for_write` answers `None` and `_write_intent`
-            # degrades to `or ""`): a bundle dispatched over an absent TRACKED
+            # is not the hazard (`_loop`'s cycle-top read exits on `no-open`
+            # before any dispatch, so `_write_intent` meets an absent ledger only
+            # if it vanishes mid-cycle, a `MissingLedgerEntriesError` since
+            # DW-252): a bundle dispatched over an absent TRACKED
             # ledger commits with a whole-tree `git add -A`, which would stage the
             # ledger's DELETION under the bundle's message — the DW-199 hazard by
             # another route — so absence is withheld on too, at the cost that the
@@ -5081,6 +5177,26 @@ class SweepEngine(Engine):
         `bundles` are that cache and its latch — so a cycle with no adopted `build`
         answer reaching the screen takes no read at all, and two candidates share
         one read (and one refusal row, since the fault is cached with it).
+
+        The same screen covers the PLAN's bundles too (DW-252), in the final keep
+        loop. The cache branch's `expected_open_ids=None` revalidation admits a
+        cached bundle naming an id a rival writer has since retired just as it
+        admits a stale decision, and the keep loop screened those bundles only
+        against `failed_ids | keep_open_ids` — so a resumed cycle spent a dev
+        session on a bundle whose intent document could not find one of its
+        entries. A bundle whose ids are not ALL open is dropped WHOLE (the triage
+        intent prose was authored for the whole id set, and the adjacent
+        `failed-or-escalated-earlier` lane already drops whole bundles on partial
+        overlap) under `sweep-bundle-skipped` `reason="entry-not-open"`, naming the
+        ids that are not open. It sits AFTER that overlap check so the older rows
+        keep precedence, shares the one lazy read and latch above (a refused read
+        screens nothing here either), and is a SKIP rather than a decision drop:
+        no `drop_cause`, no quarantine, and `answer_dropped` untouched — there is
+        no stored answer to release. A cycle whose only bundles were skipped this
+        way therefore reports NO progress, so a `--repeat` run stops on
+        `no-progress` there rather than re-triaging, and the skipped bundle's
+        still-open ids wait for the next `bmad-loop sweep`: the skip deliberately
+        errs toward stopping rather than being counted as progress.
         """
         self._emit("pre_materialize_bundles")
         bundles = list(plan.bundles)
@@ -5527,6 +5643,24 @@ class SweepEngine(Engine):
                     ),
                 )
                 continue
+            # DW-252: every bundle that reaches here — plan-authored or minted
+            # from a decision — must name only ids the ledger holds open NOW. The
+            # same lazy read and latch as the DW-214 lane, so a cycle whose
+            # decisions already paid for the read pays nothing more, and a refused
+            # read (`None`) screens NOTHING. Dropped whole, never trimmed, and a
+            # skip rather than a drop: see the docstring.
+            if not open_screen_read:
+                open_screen, open_screen_read = self._live_open_ids(), True
+            if open_screen is not None:
+                not_open = sorted(set(b.dw_ids) - open_screen)
+                if not_open:
+                    self.journal.append(
+                        "sweep-bundle-skipped",
+                        name=b.name,
+                        dw_ids=not_open,
+                        reason="entry-not-open",
+                    )
+                    continue
             kept.append(b)
         bundles = kept
         if len(bundles) > self.max_bundles:
@@ -5536,14 +5670,43 @@ class SweepEngine(Engine):
         self._emit("post_materialize_bundles")
         return bundles, answer_dropped
 
-    def _write_intent(self, bundle: Bundle, dirname: str) -> Path:
-        ledger = self.workspace.paths.deferred_work
-        # REPAIR/WRITE (DW-146): these bytes become the bundle intent file a
-        # session is dispatched on — an empty one would brief the session on
-        # nothing at all.
-        text = deferredwork.read_for_write(ledger) or ""
+    def _read_intent_ledger(self) -> str | None:
+        """The bare ledger read behind a bundle intent document; `None` is
+        absence, kept distinct so `_ensure_bundle_intent` can report it as
+        `ledger-absent` rather than as every entry missing.
+
+        REPAIR/WRITE (DW-146): these bytes become the bundle intent file a
+        session is dispatched on — an empty one would brief the session on
+        nothing at all. `OSError` and `LedgerReadError` PROPAGATE, unchanged for
+        `_run_bundle` (DW-197's accepted residual); `_ensure_bundle_intent` is the
+        one caller that catches them, and it takes the read through here so the
+        catch covers the ledger alone and not the intent file's own I/O. A second
+        accepted residual sits beside that one since DW-252: `_run_bundle` calls
+        `_write_intent` bare, so a rival write that retires an entry between the
+        keep-loop screen's read and this one raises `MissingLedgerEntriesError`
+        out of the run — crashed, with no journal row — where the old code briefed
+        a thin document."""
+        return deferredwork.read_for_write(self.workspace.paths.deferred_work)
+
+    def _write_intent(self, bundle: Bundle, dirname: str, *, text: str | None = None) -> Path:
+        """Render `bundle`'s intent document under `bundles/<dirname>/` and return
+        its path. `text` is the ledger text to reproduce entries from; `None`
+        reads it here through `_read_intent_ledger`.
+
+        Refuses with `MissingLedgerEntriesError` BEFORE any side effect when a
+        bundle id has no ledger entry at all (DW-252): the document would carry an
+        empty "Ledger entries (verbatim)" section for that id and a dev session
+        would be spent on it anyway. Missing means no entry PARSED for the id; a
+        present-but-closed entry is still emitted verbatim, since the caller — a
+        `_run_bundle` on a fresh plan, or a regeneration of a persisted task —
+        may legitimately be briefing on work the ledger has since retired."""
+        if text is None:
+            text = self._read_intent_ledger() or ""
         entries = {e.id: e for e in deferredwork.parse_ledger(text)}
-        blocks = [entries[i].body.rstrip() for i in bundle.dw_ids if i in entries]
+        missing = tuple(i for i in bundle.dw_ids if i not in entries)
+        if missing:
+            raise MissingLedgerEntriesError(missing)
+        blocks = [entries[i].body.rstrip() for i in bundle.dw_ids]
         lines = [
             f"# Deferred-work bundle: {bundle.name}",
             "",
@@ -5612,23 +5775,49 @@ class SweepEngine(Engine):
             return None if found == set(task.dw_ids) else "dw-ids-mismatch"
         return "dw-ids-mismatch"
 
-    def _ensure_bundle_intent(self, task: StoryTask) -> None:
+    def _ensure_bundle_intent(self, task: StoryTask) -> bool:
         """Guarantee a recovered bundle has the intent file its dev prompt points
         at, and that the file it points at is the one for THIS task's ids. The
         rendered intent.md persists in the run dir and the prompt consumes nothing
-        else from the plan, so the normal case is to reuse it untouched.
+        else from the plan, so the normal case is to reuse it untouched. Returns
+        `True` when a usable intent document is on disk for the task.
 
         Only when `_bundle_intent_reason` rejects it — gone, unreadable, or naming
         other ids — do we rebuild a degraded one from the task itself. The triage
         session's authored intent prose is the single unrecoverable piece; the
         verbatim ledger entries _write_intent re-attaches carry the actual work, so
-        say plainly that they are now the contract."""
+        say plainly that they are now the contract.
+
+        The regeneration's ledger read is CAUGHT here (DW-243), and only the
+        ledger read: `_read_intent_ledger` is split out of `_write_intent` so an
+        `OSError` from the intent file's own `mkdir`/`atomic_write_text` still
+        propagates as before. Undecodable bytes (`LedgerReadError`) and an
+        `OSError` from the read journal `sweep-intent-ledger-refused` under the
+        existing pair of tokens, persist the task — non-terminal, so the next
+        resume re-drives it — and raise `_InflightLedgerFault` for `_loop` to
+        route to `_stop_on_ledger_fault`. Bare, the read crashed the resume at
+        this exact site, ahead of any cycle gate. A FAULT STOP, deliberately not a
+        doubt latch: `_finish_inflight_bundles` stays ungated.
+
+        A READABLE ledger that lacks an entry for one of the task's ids is the
+        other refusal (DW-252): `_write_intent` raises `MissingLedgerEntriesError`
+        before creating anything, and this method journals
+        `sweep-intent-regen-refused` (`reason="entry-missing"`; an ABSENT ledger
+        takes the same kind under `reason="ledger-absent"`, naming the task's
+        ids, so the operator is told to restore the file rather than entries in
+        a file that is not there), notifies, and answers `False` with
+        `task.bundle_file` and the phase exactly as they were — non-terminal, so
+        the caller skips the dispatch, `_warn_stranded_bundles` keeps the task
+        loud every cycle, and a resume after the entry is restored regenerates
+        and re-drives it. Announce-and-strand rather than a stop: the ledger is
+        readable, so neither existing stop token would be truthful, and a seventh
+        would widen the closed set."""
         reason = self._bundle_intent_reason(task)
         if reason is None:
-            return
+            return True
         match = BUNDLE_KEY_RE.match(task.story_key)
         if match is None:  # pragma: no cover - callers filter on BUNDLE_KEY_RE
-            return
+            return True
         cycle = int(match.group(1)) if match.group(1) else 1
         name = match.group(2)
         bundle = Bundle(
@@ -5642,7 +5831,73 @@ class SweepEngine(Engine):
             ),
         )
         dirname = name if cycle == 1 else f"c{cycle}-{name}"
-        task.bundle_file = str(self._write_intent(bundle, dirname))
+        ledger = self.workspace.paths.deferred_work
+        try:
+            text = self._read_intent_ledger()
+        except deferredwork.LedgerReadError as e:
+            # A plain `Exception` on purpose (DW-146), so it must be named: no
+            # `except OSError` would ever see it. Same row shape as
+            # `_read_cycle_ledger`: the decode detail is the message itself.
+            self.journal.append(
+                "sweep-intent-ledger-refused",
+                story_key=task.story_key,
+                ledger=str(ledger),
+                reason="ledger-unreadable",
+                error=str(e),
+            )
+            self._save()  # the recovery's PENDING reset persists; still non-terminal
+            raise _InflightLedgerFault("ledger-unreadable") from e
+        except OSError as e:
+            # The class NAME rides beside the message: "[Errno 13] Permission
+            # denied" alone does not say which refusal it was.
+            self.journal.append(
+                "sweep-intent-ledger-refused",
+                story_key=task.story_key,
+                ledger=str(ledger),
+                reason="ledger-inaccessible",
+                error=f"{e.__class__.__name__}: {e}",
+            )
+            self._save()
+            raise _InflightLedgerFault("ledger-inaccessible") from e
+        if text is None:
+            # ABSENT, kept apart from "every entry missing": `or ""` here would
+            # name each of the task's ids as missing and tell the operator to
+            # restore entries in a file that does not exist. Same kind as the
+            # missing-entries arm below, under its own `reason` token.
+            self.journal.append(
+                "sweep-intent-regen-refused",
+                story_key=task.story_key,
+                dw_ids=list(task.dw_ids),
+                reason="ledger-absent",
+            )
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"bundle {task.story_key}: intent document not regenerated",
+                f"the deferred-work ledger is absent at {ledger}, so the bundle is "
+                "left in flight and not dispatched; restore the ledger and resume "
+                "to re-drive it",
+            )
+            return False
+        try:
+            task.bundle_file = str(self._write_intent(bundle, dirname, text=text))
+        except MissingLedgerEntriesError as e:
+            self.journal.append(
+                "sweep-intent-regen-refused",
+                story_key=task.story_key,
+                dw_ids=list(e.ids),
+                reason="entry-missing",
+            )
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"bundle {task.story_key}: intent document not regenerated",
+                "the deferred-work ledger holds no entry for "
+                + ", ".join(e.ids)
+                + ", so the bundle is left in flight and not dispatched; restore "
+                "the entries and resume to re-drive it",
+            )
+            return False
         self.journal.append(
             "sweep-intent-regenerated",
             story_key=task.story_key,
@@ -5654,6 +5909,7 @@ class SweepEngine(Engine):
             # this file (`drop_cause`) use the same convention for the same reason.
             regen_cause=reason,
         )
+        return True
 
     # ------------------------------------------------------ override seams
 

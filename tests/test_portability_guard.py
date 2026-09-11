@@ -1374,6 +1374,27 @@ JOURNAL_KINDS = frozenset(
         "sweep-decisions-reload-failed",
         "sweep-inflight-redrive",
         "sweep-inflight-stranded",
+        # DW-243. `_ensure_bundle_intent`'s regeneration read of the ledger
+        # refused on a resume — undecodable bytes, or an `OSError` from the read
+        # itself. Bare, it crashed the resume at that site, ahead of any cycle
+        # gate; now it routes to the same two-token `sweep-repeat-done` stop
+        # `_loop`'s own read takes, and this row is what names the in-flight
+        # bundle the refusal caught. No new diagnostics routing: `story_key` is an
+        # alias, `ledger` is benign, and `reason`/`error` are both already in
+        # `diagnostics._JOURNAL_DROP_FIELDS` — `reason` is one of the same two
+        # fixed tokens (`ledger-unreadable`, `ledger-inaccessible`), never free
+        # text, and the decode or errno detail rides in `error`.
+        "sweep-intent-ledger-refused",
+        # DW-252. An in-flight bundle's intent document was NOT regenerated, for
+        # one of two reasons under a closed two-token `reason`: `entry-missing`
+        # (the readable ledger holds no entry for one of the task's ids — the
+        # document would have briefed a dev session on an empty "Ledger entries
+        # (verbatim)" section; `dw_ids` names the MISSING ids) or `ledger-absent`
+        # (no ledger file at all; `dw_ids` names the task's ids). The task is left
+        # in flight and not dispatched; `sweep-inflight-stranded` keeps it loud.
+        # `dw_ids` is routed by name in `diagnostics._JOURNAL_KEYLIST_FIELDS`,
+        # `story_key` is an alias, and `reason` is already a drop field.
+        "sweep-intent-regen-refused",
         "sweep-intent-regenerated",
         "sweep-ledger-commit",
         # DW-191. The NO-OP arm of the same producer, covering BOTH of
@@ -1492,6 +1513,15 @@ JOURNAL_KINDS = frozenset(
         "sweep-selection-empty",
         "sweep-selection-excluded",
         "sweep-selection-missing-severity",
+        # DW-263. `_ensure_triage`'s cache READ faulted and the cache was unlinked
+        # before the fresh triage, so a refused write-back afterwards cannot leave
+        # the older bytes for the next resume to replay as this cycle's plan. No
+        # fields at all.
+        "sweep-triage-cache-invalidated",
+        # DW-263's degrade: the invalidating unlink itself refused. Fresh triage
+        # proceeds either way; `errors` carries the exception text only, already
+        # a benign field (`JOURNAL_BENIGN_FIELDS`).
+        "sweep-triage-cache-unlink-failed",
         # DW-247. `_ensure_triage`'s cache WRITE-BACK refused by the OS: the fresh
         # triage validated and its plan is acted on, but `triage{suffix}.json`
         # never landed, so a resume re-triages, `_publish_stranded_close` finds no
