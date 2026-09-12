@@ -1373,6 +1373,27 @@ JOURNAL_KINDS = frozenset(
         # (`JOURNAL_BENIGN_FIELDS`), and no answer prose goes near it, so the
         # record needs no `diagnostics` routing row.
         "sweep-decisions-reload-failed",
+        # DW-262. `_decisions_phase`'s SEEDED write-back of `<run>/decisions.json`
+        # refused by the OS (a directory planted at the store, which the `S_ISREG`
+        # probe answers silently; a refused parent): the pre-answers adopted from
+        # the project store stay in memory for this cycle's bundling but did not
+        # persist. Its own kind, not `sweep-decisions-reload-failed` (a READER's
+        # row). The interactive write-back is deliberately NOT guarded — a human's
+        # answer that cannot be persisted stops the sweep loudly. `file` is the
+        # store's basename (a code constant, benign above), `dw_ids` the routed
+        # keylist, `error` the dropped exception text — no new field minted.
+        "sweep-decisions-store-write-failed",
+        # DW-264. Both write-backs of `<run>/decisions.json` WITHHELD because the
+        # store's metadata probe or content read was refused with an `OSError`
+        # this cycle: the bytes on disk may hold valid answers that merely could
+        # not be read, so replacing them from an `answers` that started empty
+        # would turn a transient refusal into permanent loss. Decode faults and a
+        # non-object top level do NOT withhold — there the replacement is the
+        # repair. Same fields as the failed row minus `error`; the withheld check
+        # precedes the write, so one write never lands on both rows. The seeded
+        # site emits ONE row listing every id adopted this cycle; the interactive
+        # site emits one row per answer, naming that answer's id alone.
+        "sweep-decisions-store-write-withheld",
         "sweep-inflight-redrive",
         "sweep-inflight-stranded",
         # DW-243. `_ensure_bundle_intent`'s regeneration read of the ledger

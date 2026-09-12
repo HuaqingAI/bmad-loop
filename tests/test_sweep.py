@@ -6566,7 +6566,13 @@ def test_seeded_decisions_write_failure_strands_nothing(project, monkeypatch):
     rows, on an AttributeError) — the `sweep.atomic_write_text` binding survives the
     revert because three other sites still use it. That is exactly why the stub
     filters by filename: a module-wide boom would keep this green through the
-    revert, crashing on a write this test is not about."""
+    revert, crashing on a write this test is not about.
+
+    Since DW-262 the seeded write-back DEGRADES rather than crashing the run: the
+    refusal lands on `sweep-decisions-store-write-failed` naming the seeded id, and
+    the run carries on with the answer in memory. The no-stranded-temp assertion is
+    unchanged — the helper's unlink-on-raise runs before the guard sees the
+    `OSError`."""
     from bmad_loop import decisions
     from bmad_loop.sweep import DecisionOption
 
@@ -6602,7 +6608,9 @@ def test_seeded_decisions_write_failure_strands_nothing(project, monkeypatch):
     monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", boom)
     summary = engine.run()
 
-    assert summary.crashed and "disk full" in str(summary.crash_error)
+    assert not summary.crashed  # DW-262: the seeded write-back degrades
+    [failed] = _records(engine, "sweep-decisions-store-write-failed")
+    assert failed["dw_ids"] == ["DW-1"] and "disk full" in failed["error"]
     assert '"decision-preanswered"' in journal_text(engine)  # PRECONDITION: site reached
     assert not (engine.run_dir / "decisions.json").exists()
     assert list(engine.run_dir.glob("decisions*.tmp")) == []  # no stranded temp
@@ -17905,6 +17913,259 @@ def test_whole_file_fault_is_replaced_by_interactive_decision_write_back(project
     assert rewritten["DW-1"]["effect"] == "build"
 
 
+def test_a_directory_at_the_run_store_degrades_the_seeded_write_back(project):
+    """DW-262. A directory planted at `<run>/decisions.json` is SILENT at the
+    `S_ISREG` probe (DW-248, pinned above) — so the phase reaches the seeded
+    write-back with a project pre-answer adopted, and `os.replace` onto the
+    directory raises `IsADirectoryError` (POSIX) / `PermissionError` (win32). Bare,
+    that aborted an otherwise healthy sweep at a bookkeeping write of an answer the
+    human already gave out of band. Now the phase returns the adopted answer, one
+    `sweep-decisions-store-write-failed` names the store's basename and exactly the
+    seeded id, and the directory is left where it was. No withheld row: the store
+    was READABLE (silently absent), so DW-264's flag was never set.
+
+    Premise before outcome: the pre-answer is adopted (`decision-preanswered`), so
+    the only thing the write-back's fault can cost is the persist.
+
+    Ablation: remove the `try`/`except OSError` around the seeded
+    `atomic_write_text_confined` and this reds with the `IsADirectoryError` out of
+    `_decisions_phase`; widen the withheld branch to fire on the directory shape
+    and the "no withheld row" assertion reds."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open"})
+    good = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
+    pre_store = decisions_store.store_path(project.project)
+    pre_store.parent.mkdir(parents=True, exist_ok=True)
+    pre_store.write_text(json.dumps({"DW-1": good}), encoding="utf-8")
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.mkdir()
+
+    answers, _closed, _unlanded = engine._decisions_phase(plan)  # returns, never raises
+
+    assert answers == {"DW-1": good}
+    assert [r["dw_id"] for r in _records(engine, "decision-preanswered")] == ["DW-1"]
+    [failed] = _records(engine, "sweep-decisions-store-write-failed")
+    assert failed["file"] == "decisions.json"
+    assert failed["dw_ids"] == ["DW-1"]
+    assert failed["error"]  # exception text, never answer prose
+    assert _records(engine, "sweep-decisions-store-write-withheld") == []
+    assert _records(engine, "sweep-decisions-reload-failed") == []  # probe stayed silent
+    assert run_store.is_dir()  # left where it was
+
+
+def test_the_failed_write_back_row_names_only_the_seeded_ids(project, monkeypatch):
+    """DW-262's `dw_ids` is the ids adopted from the PROJECT store this cycle, not
+    every id in `answers`. The directory row above cannot tell the two apart — its
+    run store contributes nothing to `answers` — so here a VALID run store already
+    holds DW-2's answer, the project store pre-answers DW-1, and the plan raises
+    both. `answers` ends up with both ids, but the write the stub refuses was made
+    for DW-1 alone, and the row says so.
+
+    The stub filters by filename, as `test_seeded_decisions_write_failure_strands_nothing`
+    does, so no other write this phase makes is touched.
+
+    Ablation: change the row's `dw_ids=list(seeded_ids)` to `dw_ids=list(answers)` and
+    this reds with `["DW-2", "DW-1"]`."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    old = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
+    pre_store = decisions_store.store_path(project.project)
+    pre_store.parent.mkdir(parents=True, exist_ok=True)
+    pre_store.write_text(json.dumps({"DW-1": old}), encoding="utf-8")
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}),
+        decisions=(_decision_for("DW-1"), _decision_for("DW-2")),
+    )
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.write_text(json.dumps({"DW-2": old}), encoding="utf-8")
+
+    real = sweep_mod.atomic_write_text_confined
+
+    def boom(path, text, *, confine_root, require_writable_target=False):
+        if Path(path).name == "decisions.json":
+            raise OSError("disk full")
+        real(path, text, confine_root=confine_root, require_writable_target=require_writable_target)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", boom)
+
+    answers, _closed, _unlanded = engine._decisions_phase(plan)
+
+    assert set(answers) == {"DW-1", "DW-2"}  # both in memory for this cycle
+    assert [r["dw_id"] for r in _records(engine, "decision-preanswered")] == ["DW-1"]
+    [failed] = _records(engine, "sweep-decisions-store-write-failed")
+    assert failed["dw_ids"] == ["DW-1"]  # the SEEDED id alone, not `list(answers)`
+    assert _records(engine, "sweep-decisions-store-write-withheld") == []
+
+
+def test_a_directory_at_the_run_store_does_not_abort_the_sweep(project):
+    """DW-262 at the surface the ledger entry names: the SWEEP no longer aborts when
+    the seeded write-back of `<run>/decisions.json` lands on a directory planted at
+    the store. The phase-level row above grades the guard; this one runs
+    `engine.run()` end to end, the way the DW-248 twin
+    `test_a_metadata_fault_on_the_stored_answers_does_not_abort_the_sweep` does.
+
+    The pre-answer is `keep-open`, so no bundle is dispatched and the run's health
+    is decided by this write alone.
+
+    Ablation: remove the `try`/`except OSError` around the seeded write-back and
+    this reds on `crashed`."""
+    from bmad_loop import decisions
+    from bmad_loop.sweep import DecisionOption
+
+    write_ledger(project, {"DW-1": "open"})
+    decisions.record_pre_answer(
+        project.project,
+        "DW-1",
+        DecisionOption(key="2", label="Keep", effect="keep-open"),
+        date="2026-06-12",
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(triage_result(["DW-1"], decisions=[_decision("DW-1", _widen_or_keep)]))],
+    )
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.mkdir()
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused  # degrades, never aborts
+    [failed] = _records(engine, "sweep-decisions-store-write-failed")
+    assert failed["dw_ids"] == ["DW-1"]
+    assert run_store.is_dir()  # still there
+
+
+@pytest.mark.parametrize("fault", ["stat", "read_text"])
+@pytest.mark.parametrize("arm", ["seeded", "interactive"])
+def test_an_unreadable_run_store_withholds_both_write_backs(project, monkeypatch, fault, arm):
+    """DW-264. An `OSError` at the store's metadata probe or its content read says
+    nothing about the BYTES on disk: a store full of valid answers merely could
+    not be read this cycle, and `answers`/`unusable` start empty, so either
+    write-back would replace it with a map that had lost every answer it held.
+    Both write-backs are now WITHHELD while that flag is set: the answer taken this
+    cycle stays in memory (the seeded id is adopted; the interactive answer is
+    journaled `decision-answered` and its ledger `decision:` line lands), the old
+    bytes survive untouched, and one `sweep-decisions-store-write-withheld` names
+    the id that did not persist. No `sweep-decisions-store-write-failed` row: the
+    withheld check precedes the write, so no write is attempted at all.
+
+    The two decode arms (truncated JSON, non-object top level) deliberately do NOT
+    withhold — the `test_whole_file_fault_is_replaced_by_*` rows above pin that
+    replacement stays their repair.
+
+    Premise before outcome: a VALID store holding DW-2's answer is planted first,
+    and `read_bytes` (untouched by both fault helpers) reads it back afterwards.
+
+    Ablation: stop setting `store_unreadable` on the `stat` (metadata) arm and the
+    `stat` rows red on the surviving bytes — the write lands and replaces DW-2's
+    answer; stop setting it on the content `OSError` arm and the `read_text` rows
+    red the same way. Fold the split content arm back into one
+    `except (json.JSONDecodeError, OSError, UnicodeDecodeError)` without the flag
+    and both `read_text` rows red. Move the withheld check AFTER the `try` and the
+    seeded rows red on the surviving bytes too — the write lands before the row
+    is written, which is the ordering the withheld-first check exists to forbid."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    old = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
+    original_bytes = json.dumps({"DW-2": old}).encode("utf-8")
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    if arm == "seeded":
+        pre_store = decisions_store.store_path(project.project)
+        pre_store.parent.mkdir(parents=True, exist_ok=True)
+        pre_store.write_text(json.dumps({"DW-1": old}), encoding="utf-8")
+        engine, _ = make_sweep(project, [])
+    else:
+        engine, _ = make_sweep(project, [], answers=["1"], prompting=True)
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.write_bytes(original_bytes)
+    # premise: the stored answer WOULD have been adopted had the read succeeded
+    assert sweep_mod.unusable_answer_reason(old, allow_close=True) is None
+    if fault == "stat":
+        fault_metadata_probe(monkeypatch, run_store, "stat")
+    else:
+        fault_read_text(monkeypatch, run_store)
+
+    answers, _closed, _unlanded = engine._decisions_phase(plan)  # never raises
+
+    assert answers["DW-1"]["effect"] == "build"  # in memory for this cycle's bundling
+    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
+    assert reload_failed["errors"][0].startswith("unreadable: ")
+    [withheld] = _records(engine, "sweep-decisions-store-write-withheld")
+    assert withheld["file"] == "decisions.json"
+    assert withheld["dw_ids"] == ["DW-1"]
+    assert "error" not in withheld  # nothing was attempted, so nothing to report
+    assert _records(engine, "sweep-decisions-store-write-failed") == []
+    assert run_store.read_bytes() == original_bytes  # old answers survive the cycle
+    if arm == "seeded":
+        assert [r["dw_id"] for r in _records(engine, "decision-preanswered")] == ["DW-1"]
+    else:
+        [answered] = _records(engine, "decision-answered")
+        assert answered["dw_id"] == "DW-1" and answered["effect"] == "build"
+        assert "decision:" in ledger_entries(project)["DW-1"].body  # effect walk still ran
+
+
+def test_an_unreadable_run_store_does_not_withhold_on_a_decode_fault(project):
+    """DW-264's boundary, the seeded arm: the flag is set on the two `OSError` arms
+    ONLY. A truncated store is corrupt bytes, not a refusal, so the seeded
+    write-back still replaces it wholesale and no withheld row appears — the
+    `test_whole_file_fault_is_replaced_by_*` rows pin the replacement; this one
+    pins the ABSENCE of the withheld row beside it.
+
+    Ablation: set `store_unreadable = True` on the decode arm and this reds on
+    the withheld row (and the replacement)."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open"})
+    good = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
+    pre_store = decisions_store.store_path(project.project)
+    pre_store.parent.mkdir(parents=True, exist_ok=True)
+    pre_store.write_text(json.dumps({"DW-1": good}), encoding="utf-8")
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.write_text('{"DW-1": {"key": "1"', encoding="utf-8")
+
+    answers, _closed, _unlanded = engine._decisions_phase(plan)
+
+    assert answers == {"DW-1": good}
+    assert _records(engine, "sweep-decisions-store-write-withheld") == []
+    assert _records(engine, "sweep-decisions-store-write-failed") == []
+    assert json.loads(run_store.read_text(encoding="utf-8")) == {"DW-1": good}  # replaced
+
+
+def test_a_directory_at_the_run_store_still_raises_at_the_interactive_write_back(project):
+    """DW-262's deliberate asymmetry: only the SEEDED write-back is guarded. A
+    human's answer at the prompt that cannot be persisted stops the sweep loudly —
+    there is no second copy in the project store for a resume to re-adopt it
+    from. The store is readable (silently absent at the `S_ISREG` probe), so the
+    DW-264 withhold does not apply either, and the bare call propagates.
+
+    Ablation: wrap the interactive `atomic_write_text_confined` in the same
+    `try`/`except OSError` as the seeded one and this reds on `pytest.raises`."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [], answers=["1"], prompting=True)
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.mkdir()
+
+    with pytest.raises(OSError):
+        engine._decisions_phase(plan)
+
+    assert _records(engine, "sweep-decisions-store-write-failed") == []
+    assert _records(engine, "sweep-decisions-store-write-withheld") == []
+
+
 def test_malformed_pre_answer_is_dropped_and_the_write_back_keeps_the_unusable_value(project):
     """DW-134, both halves in one row. `decisions.load_pre_answers` validates only
     the TOP level, so a project-store VALUE can be any JSON and used to reach
@@ -21019,8 +21280,13 @@ def test_the_seeded_decisions_write_refuses_a_redirected_run_dir(project, tmp_pa
     the phase was never entered.
 
     Ablation: revert this site to `atomic_write_text(..., follow_symlinks=False)`
-    and this fails — the run stops crashing and `decisions.json` appears in
-    `outside/`."""
+    and this fails — the refusal row disappears and `decisions.json` appears in
+    `outside/`.
+
+    Since DW-262 the refusal no longer crashes the run: `UnconfinedWriteError` is an
+    `OSError`, so the seeded guard journals it as `sweep-decisions-store-write-failed`
+    (the refusal's message in `error`) and the run carries on. The confinement is
+    what this row grades, and it is unchanged — nothing escapes either way."""
     from bmad_loop import decisions
     from bmad_loop.sweep import DecisionOption
 
@@ -21049,8 +21315,10 @@ def test_the_seeded_decisions_write_refuses_a_redirected_run_dir(project, tmp_pa
 
     summary = engine.run()
 
-    assert summary.crashed
-    assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
+    assert not summary.crashed  # DW-262: the seeded write-back degrades
+    [failed] = _records(engine, "sweep-decisions-store-write-failed")
+    assert failed["dw_ids"] == ["DW-1"]
+    assert "without a redirect" in failed["error"]  # `UnconfinedWriteError`'s message
     assert '"decision-preanswered"' in journal_text(engine)  # PRECONDITION: site reached
     assert not (outside / "decisions.json").exists()  # nothing escaped the project
 

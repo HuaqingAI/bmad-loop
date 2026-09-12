@@ -3737,14 +3737,29 @@ class SweepEngine(Engine):
         #
         # `unusable` keeps the PER-VALUE drops so the two write-backs below
         # re-publish their parsed values unchanged: on that arm the degrade really is
-        # in-memory and this method neither repairs nor trims the file. The two
-        # WHOLE-FILE arms cannot offer that — an unreadable file and a non-object
-        # top level leave nothing per-value to carry — so `unusable` stays empty
-        # there and the next write this phase makes for its own reasons (a seeded
-        # pre-answer, an in-run answer) replaces the corrupt file wholesale.
+        # in-memory and this method neither repairs nor trims the file. The
+        # WHOLE-FILE arms cannot offer that — nothing per-value is left to carry —
+        # and they split two ways by what the fault says about the bytes on disk:
+        #
+        # - A DECODE fault (`JSONDecodeError`, `UnicodeDecodeError`) or a non-object
+        #   top level means the bytes themselves are corrupt, so `unusable` stays
+        #   empty and the next write this phase makes for its own reasons (a
+        #   seeded pre-answer, an in-run answer) replaces the corrupt file
+        #   wholesale — that replacement IS the repair.
+        # - An `OSError` at the metadata probe or the content read says nothing
+        #   about the bytes: a store full of valid answers merely could not be read
+        #   THIS cycle. Replacing it from an `answers` that started empty would
+        #   turn a transient refusal into permanent loss of every answer it held
+        #   (DW-264), so `store_unreadable` is set on those two arms alone and
+        #   BOTH write-backs below are withheld while it is set — the answers stay
+        #   in memory for this cycle's bundling and the row
+        #   `sweep-decisions-store-write-withheld` names the ids that did not
+        #   persist. The withheld check precedes the write at both sites, so a
+        #   withheld write is never also reported as a failed one.
         answers: dict[str, dict[str, Any]] = {}
         unusable: dict[str, Any] = {}
         malformed: list[str] = []
+        store_unreadable = False
         # `stat()` + `S_ISREG`, not `is_file()` (DW-248, the DW-224 shape). The
         # convenience probe splits by RUNTIME on a metadata fault: 3.11-3.13
         # re-raise a `PermissionError` out of this bookkeeping read — aborting the
@@ -3762,10 +3777,18 @@ class SweepEngine(Engine):
         except OSError as exc:
             self.journal.append("sweep-decisions-reload-failed", errors=[f"unreadable: {exc}"])
             store_mode = None
+            store_unreadable = True  # DW-264: the bytes may be fine; withhold the writes
         if store_mode is not None and stat.S_ISREG(store_mode):
             try:
                 stored = _read_json(decisions_path)
-            except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+            # Two arms, one row: the classes are disjoint (`JSONDecodeError` and
+            # `UnicodeDecodeError` are both `ValueError`s), and the split exists
+            # because only the I/O refusal earns the withhold flag — the decode
+            # arm keeps wholesale replacement as its repair (comment block above).
+            except OSError as exc:
+                self.journal.append("sweep-decisions-reload-failed", errors=[f"unreadable: {exc}"])
+                store_unreadable = True
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self.journal.append("sweep-decisions-reload-failed", errors=[f"unreadable: {exc}"])
             else:
                 if isinstance(stored, dict):
@@ -3797,7 +3820,10 @@ class SweepEngine(Engine):
         # when they answered, so here we only take the answer onboard — this run
         # won't re-prompt/re-skip and build answers materialize into bundles.
         pre = decisions_store.load_pre_answers(project_root)
-        seeded = False
+        # The ids adopted from the project store THIS cycle, not every id in
+        # `answers`: the write-back rows below name exactly what this phase tried
+        # to persist, not the answers the run store already held.
+        seeded_ids: list[str] = []
         for decision in plan.decisions:
             if decision.id in answers or decision.id not in pre:
                 continue
@@ -3825,7 +3851,7 @@ class SweepEngine(Engine):
                 dw_id=decision.id,
                 effect=pre_answer.get("effect"),
             )
-            seeded = True
+            seeded_ids.append(decision.id)
         if malformed:
             # The PER-VALUE record: one, however many values it covers, naming the
             # ids that lost their answer and the store each came from. It is not
@@ -3835,7 +3861,18 @@ class SweepEngine(Engine):
             # store names and type names only: an answer's prose stays out of the
             # journal, the way `sweep-decision-option-mismatch` keeps it out.
             self.journal.append("sweep-decisions-reload-failed", errors=malformed)
-        if seeded:
+        if seeded_ids and store_unreadable:
+            # DW-264, withheld FIRST: while the store could not be read, no write
+            # is attempted at all — so the failed row below is unreachable here and
+            # a withheld write is never also reported as failed. Ids and the
+            # store's basename only, never answer prose; both fields are already
+            # routed (`dw_ids` keylist, `file` benign), so no new field is minted.
+            self.journal.append(
+                "sweep-decisions-store-write-withheld",
+                file=decisions_path.name,
+                dw_ids=list(seeded_ids),
+            )
+        elif seeded_ids:
             # Same helper as `decisions._write_store` (#363), but NOT for #363's
             # reason: `decisions_path` here is the PER-RUN file under
             # `.bmad-loop/runs/<id>/`, which init gitignores, so a stranded temp
@@ -3851,15 +3888,37 @@ class SweepEngine(Engine):
             # `self.workspace.root`) — and not `self.run_dir` either: a file
             # confined against its own parent walks no components at all, which
             # would refuse nothing.
-            atomic_write_text_confined(
-                decisions_path,
-                # `unusable` first so a well-shaped answer always wins the key:
-                # the entries it holds are the ones the read above could not use,
-                # re-published unchanged rather than dropped by a write this
-                # method makes for an unrelated reason.
-                json.dumps({**unusable, **answers}, indent=2),
-                confine_root=project_root,
-            )
+            #
+            # Guarded (DW-262), the DW-247 shape: a directory planted at the store
+            # — which the `S_ISREG` probe above deliberately answers SILENTLY —
+            # reaches `os.replace` here as `IsADirectoryError` (POSIX) or
+            # `PermissionError` (win32), and a refused parent reaches it as
+            # `UnconfinedWriteError`, itself an `OSError`. Bare, either aborted an
+            # otherwise healthy sweep at a bookkeeping write of answers the human
+            # ALREADY gave out of band. The answers stay in `answers` for this
+            # cycle's bundling; the row says the store and the ids did not persist,
+            # so a resume re-adopts them from the project store instead. Its own
+            # kind, not `sweep-decisions-reload-failed`, which is a READER's row.
+            # `OSError` alone: unlike `atomic_write_text`, the confined helper
+            # never `resolve()`s, so DW-247's `RuntimeError` arm has nothing to
+            # catch here.
+            try:
+                atomic_write_text_confined(
+                    decisions_path,
+                    # `unusable` first so a well-shaped answer always wins the key:
+                    # the entries it holds are the ones the read above could not use,
+                    # re-published unchanged rather than dropped by a write this
+                    # method makes for an unrelated reason.
+                    json.dumps({**unusable, **answers}, indent=2),
+                    confine_root=project_root,
+                )
+            except OSError as exc:
+                self.journal.append(
+                    "sweep-decisions-store-write-failed",
+                    file=decisions_path.name,
+                    dw_ids=list(seeded_ids),
+                    error=str(exc),
+                )
         pending = [d for d in plan.decisions if d.id not in answers]
         answered_interactively = False
         # THREE flags, because the commit and the hand-back ask different
@@ -4131,11 +4190,31 @@ class SweepEngine(Engine):
                     "effect": option.effect,
                     "answered_at": self._today(),
                 }
-                atomic_write_text_confined(  # same file, same reasoning as above (#363, #593)
-                    decisions_path,
-                    json.dumps({**unusable, **answers}, indent=2),  # as above
-                    confine_root=project_root,
-                )
+                if store_unreadable:
+                    # DW-264, withheld FIRST, as at the seeded site: the answer
+                    # stays in `answers`, the effect walk and `decision-answered`
+                    # below still run, only the persist is skipped.
+                    self.journal.append(
+                        "sweep-decisions-store-write-withheld",
+                        file=decisions_path.name,
+                        dw_ids=[decision.id],
+                    )
+                else:
+                    # Deliberately BARE, unlike the seeded write-back above
+                    # (DW-262): a human just answered at a prompt, and a write that
+                    # FAILS must stop the sweep loudly rather than be spent on a
+                    # bundle a resume cannot reconstruct — the seeded arm can
+                    # re-adopt from the project store; this one has no second copy.
+                    # The WITHHELD branch above is the one deliberate exception:
+                    # after an `OSError` read refusal (DW-264) writing here would
+                    # replace valid answers the refusal merely hid, and the
+                    # ledger's `decision:` line is the durable record of the
+                    # answer — the store is re-read next cycle.
+                    atomic_write_text_confined(  # same file, same reasoning as above (#363, #593)
+                        decisions_path,
+                        json.dumps({**unusable, **answers}, indent=2),  # as above
+                        confine_root=project_root,
+                    )
                 self.journal.append(
                     "decision-answered",
                     dw_id=decision.id,
