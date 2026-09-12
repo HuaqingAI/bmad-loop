@@ -184,7 +184,8 @@ _UNREADABLE_LEDGER_DIGEST = "<unreadable>"
 def _ledger_fault_text(ledger: Path, e: deferredwork.LedgerReadError | OSError) -> str:
     """Attribute a ledger read fault for the journal and the repair notice.
 
-    A `LedgerReadError` already names the path and the codec fault. An `OSError`
+    A `LedgerReadError` already names the path and the decode or OS read fault.
+    A raw `OSError`
     gets the path and its class name, because ``[Errno 13] Permission denied``
     alone does not say what kind of refusal it was — the wording
     ``runs.unreadable_sweep_ledger``'s DW-234 arm uses.
@@ -5349,7 +5350,7 @@ class Engine:
                 error=error,
                 **attributed,
             )
-            if isinstance(e, OSError):
+            if isinstance(e, (OSError, deferredwork.LedgerReadFault)):
                 return _UnreadableLedger(error)
             # Hash the RAW bytes ALREADY IN HAND: the fault means they are not
             # valid UTF-8, so no `_digest_of` answer can ever equal this one.
@@ -5436,15 +5437,16 @@ class Engine:
         Since DW-259 the ``deferredwork`` mutators' own locked re-reads route
         here too, under a ``site`` ending in ``-locked``: every mutator takes its
         own ``read_for_write`` under the ledger lock AFTER the site's pre-read,
-        so bytes that go bad inside that window raise ``LedgerReadError`` from
-        the mutator call itself — the harvest's ``mark_seen_again_many`` and
+        so undecodable bytes or an OS read fault (DW-279) raise
+        ``LedgerReadError`` from the mutator call itself — the harvest's ``mark_seen_again_many`` and
         ``append_entries_published``, the commit-boundary close's
         ``mark_done_many_reopenable``, the review-timeout salvage's
         ``append_entry`` (which has no pre-read at all), the isolated carries'
         ``append_entries`` and ``mark_done_many_reopenable``. The catch is
-        ``LedgerReadError`` ALONE: ``read_for_write`` is its sole raiser and it
-        fires ahead of every write, so a catch at the call proves the mutator
-        wrote nothing — which is what lets the commit-boundary close disarm its
+        ``LedgerReadError`` ALONE, including ``LedgerReadFault`` for OS metadata
+        and text-read failures: lock/write failures remain raw ``OSError``.
+        ``read_for_write`` is its sole raiser and fires ahead of every write, so
+        a catch at the call proves the mutator wrote nothing — which is what lets the commit-boundary close disarm its
         rollback before pausing. The mutators keep raising; the engine owns the
         route, and the same mutators' other callers — ``SweepEngine``'s bundle
         close and its carry override, the CLI — own their own routing (the

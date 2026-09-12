@@ -2202,3 +2202,37 @@ def test_a_store_noop_succeeds_when_no_state_root_is_derivable(project, monkeypa
         decisions.record_pre_answer(project.project, "DW-9", _OPT, date="2026-06-13")
 
     assert store.read_bytes() == before  # the real write raised rather than writing unlocked
+
+
+@pytest.mark.parametrize("operation", ["stat", "read_text"])
+def test_pre_answer_locked_read_fault_preserves_ledger_store_and_head(
+    project, monkeypatch, operation
+):
+    """DW-279: a refused decision read reaches the grouped parent handlers.
+
+    Neither the answer store nor git may publish after the authoritative read
+    refuses. Removing the corresponding read wrap fails the named-class assert.
+    """
+    from conftest import fault_locked_ledger_read
+
+    from bmad_loop.sweep import Decision
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    opt = DecisionOption(key="1", label="Build", effect="build", intent="fix it")
+    decision = Decision(
+        id="DW-1", question="build?", context="", options=(opt,), recommendation="1"
+    )
+    before = fault_locked_ledger_read(monkeypatch, project.deferred_work, operation)
+    head = _git(project, "rev-parse", "HEAD")
+    store = decisions.store_path(project.project)
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(deferredwork.LedgerReadFault) as raised:
+        decisions.apply_pre_answer(project.project, decision, opt, date="2026-09-12")
+
+    assert isinstance(raised.value.__cause__, PermissionError)
+    assert project.deferred_work.read_bytes() == before
+    assert store.read_bytes() == b"{}\n"
+    assert _git(project, "rev-parse", "HEAD") == head

@@ -28,6 +28,7 @@ from conftest import (
     _write_check_script,
     committing_crash_state,
     dev_effect,
+    fault_locked_ledger_read,
     fault_metadata_probe,
     fault_read_text,
     generic_dev_effect,
@@ -16243,22 +16244,23 @@ def test_harvest_over_undecodable_ledger_pauses_and_resume_replays_the_session(p
 
 # DW-259: the window INSIDE each write. Every `deferredwork` mutator takes its
 # own locked `read_for_write` after the engine's pre-read (or, for the salvage
-# refile and the close carry, with no pre-read at all), so bytes that go bad in
-# that window raise `LedgerReadError` from the mutator call itself. The engine
+# refile and the close carry, with no pre-read at all). Decode faults (DW-259)
+# and OS metadata/text-read faults (DW-279) raise `LedgerReadError` from the
+# mutator call itself. The engine
 # catches exactly that class at each of its six mutator calls and takes the same
 # repair pause as the pre-reads, under a site name ending in `-locked`.
 
 
-def _corrupting_mutator(monkeypatch, name: str, ledger: Path):
-    """Wrap `deferredwork.<name>` so the ledger turns UNDECODABLE right before
-    the real mutator runs — inside the window between the site's pre-read and
-    the mutator's own locked re-read. The real mutator and its real locked
-    `read_for_write` still run; only the window is simulated, so the raise a
-    row observes is the one the engine has to route, not a stub of it.
+def _corrupting_mutator(monkeypatch, name: str, ledger: Path, fault_mode="decode"):
+    """Fault the real mutator's authoritative read after successful earlier reads.
 
-    Corrupts `ledger` rather than the wrapper's own `path` argument on purpose:
-    the two are the same file at every site, and naming the sandbox's ledger
-    keeps the row honest about WHICH file went bad."""
+    The decode row corrupts `ledger` immediately before `deferredwork.<name>`;
+    OS rows preserve valid bytes and refuse stat/read_text under its real lock.
+    Both execute the real reader so the exception is the one production routes.
+    Naming the sandbox's ledger keeps the target explicit. Returns the bytes
+    that must survive the refusal."""
+    if fault_mode != "decode":
+        return fault_locked_ledger_read(monkeypatch, ledger, fault_mode)
     real = getattr(deferredwork, name)
 
     def corrupt_then_call(path, *a, **kw):
@@ -16268,18 +16270,20 @@ def _corrupting_mutator(monkeypatch, name: str, ledger: Path):
         return real(path, *a, **kw)
 
     monkeypatch.setattr(deferredwork, name, corrupt_then_call)
+    return UNDECODABLE_LEDGER_BYTES
 
 
 def _refused_sites(engine) -> list[str]:
     return [e["site"] for e in engine.journal.entries() if e["kind"] == "ledger-read-refused"]
 
 
+@pytest.mark.parametrize("fault_mode", ["decode", "stat", "read_text"])
 def test_harvest_append_over_a_ledger_corrupted_under_the_lock_pauses_and_resume_files(
-    project, monkeypatch
+    project, monkeypatch, fault_mode
 ):
-    """The harvest's pre-read decoded, the writer's locked re-read did not: the
-    ledger turns undecodable between the two, so `append_entries_published`
-    raises from inside its lock. The run PAUSES at `escalation` under site
+    """The harvest's pre-read succeeds; the locked re-read refuses on decoding
+    or OS metadata/text access. The decode row corrupts bytes before the mutator;
+    OS rows keep them valid and fault only under `append_entries_published`'s lock. The run PAUSES at `escalation` under site
     `spec-deferrals-harvest-append-locked` with the task left at `DEV_VERIFY`,
     the bytes untouched and nothing filed — not `run-crash`. After the repair,
     `resume` replays the recorded dev result with ZERO sessions and the retried
@@ -16289,7 +16293,7 @@ def test_harvest_append_over_a_ledger_corrupted_under_the_lock_pauses_and_resume
     `append_entries_published` and this reds with `run-crash`."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     ledger = project.deferred_work
-    _corrupting_mutator(monkeypatch, "append_entries_published", ledger)
+    expected = _corrupting_mutator(monkeypatch, "append_entries_published", ledger, fault_mode)
     engine, adapter = make_engine(
         project,
         [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
@@ -16308,8 +16312,11 @@ def test_harvest_append_over_a_ledger_corrupted_under_the_lock_pauses_and_resume
     assert "spec-deferrals-harvested" not in kinds  # the write never happened
     assert _refused_sites(engine) == ["spec-deferrals-harvest-append-locked"]
     (refused,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-read-refused"]
-    assert refused["ledger"] == str(ledger) and "not valid UTF-8" in refused["error"]
-    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES  # nothing written over them
+    assert (
+        refused["ledger"] == str(ledger)
+        and ("not valid UTF-8" if fault_mode == "decode" else "PermissionError") in refused["error"]
+    )
+    assert ledger.read_bytes() == expected  # nothing written over them
     attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
     assert "ACTION REQUIRED" in attention and "`bmad-loop resume test-run`" in attention
 
@@ -16327,13 +16334,15 @@ def test_harvest_append_over_a_ledger_corrupted_under_the_lock_pauses_and_resume
     assert _refused_sites(resumed) == ["spec-deferrals-harvest-append-locked"]  # no second
 
 
+@pytest.mark.parametrize("fault_mode", ["decode", "stat", "read_text"])
 def test_harvest_mark_over_a_ledger_corrupted_under_the_lock_pauses_and_resume_stamps(
-    project, monkeypatch
+    project, monkeypatch, fault_mode
 ):
     """The seen-again mark's own locked re-read. An open entry from ANOTHER spec
     carries the finding's fingerprint, so the harvest decides to stamp
-    `seen-again:` on it rather than file a twin — and the ledger turns
-    undecodable before `mark_seen_again_many` takes its lock. The run pauses
+    `seen-again:` on it rather than file a twin. The decode row corrupts bytes
+    before `mark_seen_again_many`; OS rows keep valid bytes and refuse metadata
+    or text access only under its lock. The run pauses
     under site `spec-deferrals-harvest-mark-locked`, nothing is stamped and
     nothing filed. After the repair, the resume replays the recorded result
     with ZERO sessions, stamps the sighting and files no duplicate.
@@ -16347,7 +16356,7 @@ def test_harvest_mark_over_a_ledger_corrupted_under_the_lock_pauses_and_resume_s
     _seeded_ledger(project, origin=origin, source_spec="spec-9-9-z.md")
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     ledger = project.deferred_work
-    _corrupting_mutator(monkeypatch, "mark_seen_again_many", ledger)
+    expected = _corrupting_mutator(monkeypatch, "mark_seen_again_many", ledger, fault_mode)
     engine, adapter = make_engine(
         project,
         [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
@@ -16363,7 +16372,7 @@ def test_harvest_mark_over_a_ledger_corrupted_under_the_lock_pauses_and_resume_s
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "run-crash" not in kinds and "spec-deferrals-harvested" not in kinds
     assert _refused_sites(engine) == ["spec-deferrals-harvest-mark-locked"]
-    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES
+    assert ledger.read_bytes() == expected
 
     monkeypatch.undo()
     _seeded_ledger(project, origin=origin, source_spec="spec-9-9-z.md")  # the hand repair
@@ -16378,13 +16387,14 @@ def test_harvest_mark_over_a_ledger_corrupted_under_the_lock_pauses_and_resume_s
     assert event["dw_ids"] == [] and event["seen_again"] == ["DW-1"]
 
 
+@pytest.mark.parametrize("fault_mode", ["decode", "stat", "read_text"])
 def test_commit_boundary_close_over_a_ledger_corrupted_under_the_lock_pauses_and_resume_closes(
-    project, monkeypatch
+    project, monkeypatch, fault_mode
 ):
     """The commit-boundary close's own locked re-read. `_close_declared_deferred`'s
-    snapshot decoded and classified `DW-1` open; the ledger turns undecodable
-    before `mark_done_many_reopenable` takes its lock, so it raises ahead of any
-    write. The run pauses under site `story-close-locked` with the task left
+    snapshot decoded and classified `DW-1` open. The decode row then corrupts
+    bytes; OS rows preserve them and refuse metadata/text access under
+    `mark_done_many_reopenable`'s lock. Either raises ahead of any write. The run pauses under site `story-close-locked` with the task left
     COMMITTING, nothing flipped and — because the armed `_ArmedClose` is cleared
     before the pause — NO rollback attempted: no `story-deferred-closed`, no
     `deferred-close-rolled-back`, and no false `deferred-close-rollback-failed`
@@ -16397,7 +16407,7 @@ def test_commit_boundary_close_over_a_ledger_corrupted_under_the_lock_pauses_and
     and this reds on the `deferred-close-rollback-failed` row."""
     ledger = project.deferred_work
     engine = _closes_deferred_run(project, ["DW-1"])
-    _corrupting_mutator(monkeypatch, "mark_done_many_reopenable", ledger)
+    expected = _corrupting_mutator(monkeypatch, "mark_done_many_reopenable", ledger, fault_mode)
 
     summary = engine.run()
 
@@ -16415,7 +16425,7 @@ def test_commit_boundary_close_over_a_ledger_corrupted_under_the_lock_pauses_and
     assert "deferred-close-rolled-back" not in kinds
     assert "deferred-close-rollback-failed" not in kinds
     assert _refused_sites(engine) == ["story-close-locked"]
-    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES
+    assert ledger.read_bytes() == expected
     attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
     assert "ACTION REQUIRED" in attention and "declared close" in attention
 
@@ -16447,10 +16457,14 @@ def test_commit_boundary_close_over_a_ledger_corrupted_under_the_lock_pauses_and
 @pytest.mark.parametrize("rollback", [False, True])
 @pytest.mark.parametrize("repair_ledger", [False, True])
 @pytest.mark.parametrize("review_enabled", [False, True])
+@pytest.mark.parametrize("fault_mode", ["decode", "stat", "read_text"])
 def test_review_timeout_salvage_refile_over_an_undecodable_ledger_pauses_and_resume_refiles(
-    project, monkeypatch, rollback, repair_ledger, review_enabled
+    project, monkeypatch, rollback, repair_ledger, review_enabled, fault_mode
 ):
     """A repair pause preserves the verified product and its pending refile.
+
+    Decode rows corrupt bytes before the refile; OS rows keep valid bytes and
+    refuse metadata/text access only under the mutator's real lock.
 
     Ablation: remove `_pending_salvage_session` from the resume arm and repaired
     retries restart or pause for rollback instead of committing with zero sessions.
@@ -16460,7 +16474,7 @@ def test_review_timeout_salvage_refile_over_an_undecodable_ledger_pauses_and_res
     """
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     ledger = project.deferred_work
-    _corrupting_mutator(monkeypatch, "append_entry", ledger)
+    expected = _corrupting_mutator(monkeypatch, "append_entry", ledger, fault_mode)
     policy = dataclasses.replace(_salvage_policy(), scm=ScmPolicy(rollback_on_failure=rollback))
     engine, adapter = make_engine(
         project,
@@ -16479,7 +16493,7 @@ def test_review_timeout_salvage_refile_over_an_undecodable_ledger_pauses_and_res
     assert task.commit_sha is None
     assert len(adapter.sessions) == 2
     assert _refused_sites(engine) == ["review-timeout-salvage-refile-locked"]
-    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES
+    assert ledger.read_bytes() == expected
     product = (project.project / "src.txt").read_bytes()
     assert product != b"original\n"
     baseline = rev_parse_head(project.project)
@@ -16487,6 +16501,8 @@ def test_review_timeout_salvage_refile_over_an_undecodable_ledger_pauses_and_res
     monkeypatch.undo()
     if repair_ledger:
         ledger.write_text("# Deferred Work\n", encoding="utf-8")
+    elif fault_mode != "decode":
+        fault_locked_ledger_read(monkeypatch, ledger, fault_mode)
     resume_policy = dataclasses.replace(
         policy, review=dataclasses.replace(policy.review, enabled=review_enabled)
     )
@@ -16511,7 +16527,7 @@ def test_review_timeout_salvage_refile_over_an_undecodable_ledger_pauses_and_res
         assert final.salvage_refile_pending and final.followup_review_recommended
         assert final.commit_sha is None
         assert rev_parse_head(project.project) == baseline
-        assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES
+        assert ledger.read_bytes() == expected
         assert _refused_sites(resumed) == ["review-timeout-salvage-refile-locked"] * 2
         return
 

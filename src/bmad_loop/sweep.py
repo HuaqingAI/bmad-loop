@@ -1618,14 +1618,11 @@ class SweepEngine(Engine):
         `open_ids("")` and `open_ids(<absent>)` say the same thing about a ledger
         nobody is writing — or `("", token)` after journaling the refusal.
 
-        Both fault classes degrade, and they degrade to DIFFERENT tokens.
-        Undecodable bytes (`LedgerReadError`, a plain `Exception` on purpose, so no
-        `except OSError` upstream would ever see it) mean a human has to edit the
-        file; an `OSError` means the OS refused the read and the repair is
-        permissions or storage. `read_for_write` documents that `OSError`
-        propagates and that contract is UNCHANGED for its callers elsewhere — what
-        changed is that this caller catches it, the same widened shape
-        `verify.unpublishable_target` already takes.
+        Both fault classes degrade to different tokens. Undecodable bytes
+        (`LedgerReadError`) require a file repair; an OS refusal requires a
+        permissions or storage repair. The `LedgerReadFault` subclass wraps OS
+        read faults (DW-279) and must be caught before its decode parent, retaining
+        the original OS attribution and `ledger-inaccessible` token.
 
         Bare, either fault ended a `--repeat` run as CRASHED at the top of cycle
         N+1, throwing away the report for cycles 1..N that had already completed.
@@ -1636,15 +1633,9 @@ class SweepEngine(Engine):
             # REPAIR/WRITE (DW-146): this text drives migration and the whole
             # write-bearing cycle below it.
             return (deferredwork.read_for_write(ledger) or "", None)
-        except deferredwork.LedgerReadError as e:
-            self.journal.append(
-                "sweep-cycle-ledger-refused",
-                ledger=str(ledger),
-                reason="ledger-unreadable",
-                error=str(e),
-            )
-            return ("", "ledger-unreadable")
-        except OSError as e:
+        except (OSError, deferredwork.LedgerReadFault) as e:
+            if isinstance(e, deferredwork.LedgerReadFault) and isinstance(e.__cause__, OSError):
+                e = e.__cause__  # Preserve the original OS attribution.
             # The class NAME is kept beside the message because the message alone
             # ("[Errno 13] Permission denied") does not say what kind of refusal it
             # was, and this whole field is dropped from a scrubbed dump anyway —
@@ -1656,6 +1647,14 @@ class SweepEngine(Engine):
                 error=f"{e.__class__.__name__}: {e}",
             )
             return ("", "ledger-inaccessible")
+        except deferredwork.LedgerReadError as e:
+            self.journal.append(
+                "sweep-cycle-ledger-refused",
+                ledger=str(ledger),
+                reason="ledger-unreadable",
+                error=str(e),
+            )
+            return ("", "ledger-unreadable")
 
     def _stop_on_ledger_fault(
         self,
@@ -2394,14 +2393,16 @@ class SweepEngine(Engine):
         retired would otherwise take the human's pre-answer with it, committed. It
         carries nothing: the latch it read is already `_loop`-bound.
 
-        `_close_resolved` and `_decisions_phase` also catch `OSError` around
-        `mark_done_many` and `record_decision`, covering both their internal reads
-        and lock failures. The DW-167 re-apply gate catches its direct read too:
+        `_close_resolved` and `_decisions_phase` also catch `OSError` and
+        `LedgerReadFault` around `mark_done_many` and `record_decision`, covering
+        OS read, lock and write failures. The DW-167 re-apply gate catches its
+        direct read too:
         a fault prevents repairing a stored close, leaving the entry open for a
         later cycle. Here the read protects the human's stored answers, so its
         refusal also carries to `_loop`; `_read_cycle_ledger` instead stops before
-        starting work. `read_for_write` itself remains unchanged and propagates
-        `OSError` to every caller that does not catch it.
+        starting work. `read_for_write` wraps OS metadata and text-read faults as
+        `LedgerReadFault` (DW-279); pre-lock probes, lock and write failures
+        remain raw `OSError`.
         """
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
@@ -2410,6 +2411,30 @@ class SweepEngine(Engine):
         # and pruning from bytes nobody could read would drop live answers.
         try:
             text = deferredwork.read_for_write(ledger)
+        except (OSError, deferredwork.LedgerReadFault) as e:
+            if isinstance(e, deferredwork.LedgerReadFault) and isinstance(e.__cause__, OSError):
+                e = e.__cause__  # Preserve the original OS attribution.
+            # THE OS REFUSED THE READ (DW-197) — EACCES, EIO, a vanished mount. The
+            # ledger may be perfectly well-formed; nobody here can tell, and that is
+            # precisely the undecodable case's own argument: the open set is the
+            # KEEP list for a store write, so a ledger this process cannot read is
+            # unknown open work, not zero of it. Same kind and same `reason`-is-a-
+            # fixed-token shape as the two arms around it, under a third token,
+            # with the errno text in `error` (a `_JOURNAL_DROP_FIELDS` field). The
+            # class name rides beside the message because "[Errno 13] Permission
+            # denied" alone does not say which refusal it was.
+            self.journal.append(
+                "sweep-preanswer-prune-refused",
+                ledger=str(ledger),
+                reason="ledger-inaccessible",
+                error=f"{e.__class__.__name__}: {e}",
+            )
+            # ...and CARRIED, for the same reason as the decode arm below: the repeat boundary
+            # commits the ledger, and cycle N+1's own read meets the same refusal.
+            # Its own latch rather than the decode latch, because the two stops report
+            # different closed tokens — see the declaration in `__init__`.
+            self._prune_ledger_inaccessible = True
+            return
         except deferredwork.LedgerReadError as e:
             # UNDECODABLE is refused for the same reason absence is (DW-182), and
             # under the same kind: the open set is the KEEP list for a store write,
@@ -2432,28 +2457,6 @@ class SweepEngine(Engine):
             # state, not `state` — see the declaration in `__init__`. The absence
             # arm below sets nothing: an absent ledger ends the next cycle cleanly.
             self._prune_ledger_unreadable = True
-            return
-        except OSError as e:
-            # THE OS REFUSED THE READ (DW-197) — EACCES, EIO, a vanished mount. The
-            # ledger may be perfectly well-formed; nobody here can tell, and that is
-            # precisely the undecodable case's own argument: the open set is the
-            # KEEP list for a store write, so a ledger this process cannot read is
-            # unknown open work, not zero of it. Same kind and same `reason`-is-a-
-            # fixed-token shape as the two arms around it, under a third token,
-            # with the errno text in `error` (a `_JOURNAL_DROP_FIELDS` field). The
-            # class name rides beside the message because "[Errno 13] Permission
-            # denied" alone does not say which refusal it was.
-            self.journal.append(
-                "sweep-preanswer-prune-refused",
-                ledger=str(ledger),
-                reason="ledger-inaccessible",
-                error=f"{e.__class__.__name__}: {e}",
-            )
-            # ...and CARRIED, for the reason the arm above is: the repeat boundary
-            # commits the ledger, and cycle N+1's own read meets the same refusal.
-            # Its own latch rather than the one above, because the two stops report
-            # different closed tokens — see the declaration in `__init__`.
-            self._prune_ledger_inaccessible = True
             return
         # ABSENCE is refused, not collapsed to `""` (DW-176). The `or ""` spelling
         # every observation-shaped caller uses is exact for them because
@@ -4450,21 +4453,23 @@ class SweepEngine(Engine):
             probe_ledger = self.workspace.paths.deferred_work
             try:
                 deferredwork.read_for_write(probe_ledger)
+            except (OSError, deferredwork.LedgerReadFault) as e:
+                if isinstance(e, deferredwork.LedgerReadFault) and isinstance(e.__cause__, OSError):
+                    e = e.__cause__  # Preserve the original OS attribution.
+                self.journal.append(
+                    "sweep-decision-ledger-refused",
+                    ledger=str(probe_ledger),
+                    reason="ledger-inaccessible",
+                    error=f"{e.__class__.__name__}: {e}",
+                )
+                ledger_in_doubt = True
+                self._record_ledger_doubt()  # DW-218/219: at the ARM, not the tail
             except deferredwork.LedgerReadError as e:
                 self.journal.append(
                     "sweep-decision-ledger-refused",
                     ledger=str(probe_ledger),
                     reason="ledger-unreadable",
                     error=str(e),
-                )
-                ledger_in_doubt = True
-                self._record_ledger_doubt()  # DW-218/219: at the ARM, not the tail
-            except OSError as e:
-                self.journal.append(
-                    "sweep-decision-ledger-refused",
-                    ledger=str(probe_ledger),
-                    reason="ledger-inaccessible",
-                    error=f"{e.__class__.__name__}: {e}",
                 )
                 ledger_in_doubt = True
                 self._record_ledger_doubt()  # DW-218/219: at the ARM, not the tail
@@ -5203,6 +5208,18 @@ class SweepEngine(Engine):
         ledger = self.workspace.paths.deferred_work
         try:
             text = deferredwork.read_for_write(ledger)
+        except (OSError, deferredwork.LedgerReadFault) as e:
+            if isinstance(e, deferredwork.LedgerReadFault) and isinstance(e.__cause__, OSError):
+                e = e.__cause__  # Preserve the original OS attribution.
+            # The class name rides beside the message because "[Errno 13]
+            # Permission denied" alone does not say which refusal it was.
+            self.journal.append(
+                "sweep-decision-open-set-refused",
+                ledger=str(ledger),
+                reason="ledger-inaccessible",
+                error=f"{e.__class__.__name__}: {e}",
+            )
+            return None
         except deferredwork.LedgerReadError as e:
             # `LedgerReadError` is a plain `Exception` on purpose (DW-146), so it
             # must be named: no `except OSError` would ever see it.
@@ -5211,16 +5228,6 @@ class SweepEngine(Engine):
                 ledger=str(ledger),
                 reason="ledger-unreadable",
                 error=str(e),
-            )
-            return None
-        except OSError as e:
-            # The class name rides beside the message because "[Errno 13]
-            # Permission denied" alone does not say which refusal it was.
-            self.journal.append(
-                "sweep-decision-open-set-refused",
-                ledger=str(ledger),
-                reason="ledger-inaccessible",
-                error=f"{e.__class__.__name__}: {e}",
             )
             return None
         # `is None`, never falsiness: an empty-but-PRESENT ledger genuinely holds
@@ -5804,7 +5811,8 @@ class SweepEngine(Engine):
 
         REPAIR/WRITE (DW-146): these bytes become the bundle intent file a
         session is dispatched on — an empty one would brief the session on
-        nothing at all. `OSError` and `LedgerReadError` PROPAGATE, unchanged for
+        nothing at all. `LedgerReadError`, including the OS-read subclass
+        `LedgerReadFault` (DW-279), PROPAGATES; failure handling is unchanged for
         `_run_bundle` (DW-197's accepted residual); `_ensure_bundle_intent` is the
         one caller that catches them, and it takes the read through here so the
         catch covers the ledger alone and not the intent file's own I/O. A second
@@ -5973,7 +5981,8 @@ class SweepEngine(Engine):
         `_carry_isolated_ledger_writes`. Each is a bare
         `deferredwork.mark_done_many_reopenable`, and every mutator takes its own
         locked `read_for_write` ahead of every write, so a `LedgerReadError` from
-        the call itself proves nothing flipped: the pause costs no work. `site`
+        the call itself — including `LedgerReadFault` for OS metadata/text-read
+        faults since DW-279 — proves nothing flipped: the pause costs no work. `site`
         ends in `-locked` like the engine's, and names which of the three calls
         raised.
 
@@ -6114,6 +6123,28 @@ class SweepEngine(Engine):
         ledger = self.workspace.paths.deferred_work
         try:
             text = self._read_intent_ledger()
+        except (OSError, deferredwork.LedgerReadFault) as e:
+            if isinstance(e, deferredwork.LedgerReadFault) and isinstance(e.__cause__, OSError):
+                e = e.__cause__  # Preserve the original OS attribution.
+            # The class NAME rides beside the message: "[Errno 13] Permission
+            # denied" alone does not say which refusal it was.
+            self.journal.append(
+                "sweep-intent-ledger-refused",
+                story_key=task.story_key,
+                ledger=str(ledger),
+                reason="ledger-inaccessible",
+                error=f"{e.__class__.__name__}: {e}",
+            )
+            self._pause_on_intent_refusal(
+                task,
+                f"bundle {task.story_key}: its intent document must be regenerated "
+                f"off the deferred-work ledger, and {ledger} could not be read "
+                f"({e.__class__.__name__}: {e}); repair the ledger by hand and COMMIT "
+                "the fix, then resume",
+                f"bundle {task.story_key}: intent document not regenerated",
+                f"the deferred-work ledger {ledger} could not be read "
+                f"({e.__class__.__name__}: {e}); repair it by hand and COMMIT the fix",
+            )
         except deferredwork.LedgerReadError as e:
             # A plain `Exception` on purpose (DW-146), so it must be named: no
             # `except OSError` would ever see it. Same row shape as
@@ -6133,26 +6164,6 @@ class SweepEngine(Engine):
                 f"bundle {task.story_key}: intent document not regenerated",
                 f"the deferred-work ledger {ledger} could not be decoded ({e}); "
                 "repair it by hand and COMMIT the fix",
-            )
-        except OSError as e:
-            # The class NAME rides beside the message: "[Errno 13] Permission
-            # denied" alone does not say which refusal it was.
-            self.journal.append(
-                "sweep-intent-ledger-refused",
-                story_key=task.story_key,
-                ledger=str(ledger),
-                reason="ledger-inaccessible",
-                error=f"{e.__class__.__name__}: {e}",
-            )
-            self._pause_on_intent_refusal(
-                task,
-                f"bundle {task.story_key}: its intent document must be regenerated "
-                f"off the deferred-work ledger, and {ledger} could not be read "
-                f"({e.__class__.__name__}: {e}); repair the ledger by hand and COMMIT "
-                "the fix, then resume",
-                f"bundle {task.story_key}: intent document not regenerated",
-                f"the deferred-work ledger {ledger} could not be read "
-                f"({e.__class__.__name__}: {e}); repair it by hand and COMMIT the fix",
             )
         if text is None:
             # ABSENT, kept apart from "every entry missing": `or ""` here would
@@ -6342,8 +6353,8 @@ class SweepEngine(Engine):
 
         The mutator's own locked re-read (DW-280): ``mark_done_many_reopenable``
         takes ``read_for_write`` under the ledger lock ahead of every write, so a
-        ledger that turns undecodable before that read raises ``LedgerReadError``
-        from the call itself with nothing flipped. Bare, that crashed the run at
+        ledger that turns undecodable or suffers an OS read fault (DW-279) raises
+        ``LedgerReadError`` from the call itself with nothing flipped. Bare, that crashed the run at
         the accepted-dev close with the session's work on disk. It now routes to
         ``_pause_for_bundle_close_repair`` — the sweep's own route, not the
         engine's ``ledger-read-refused`` — with ``bundle_closes_intended`` already
@@ -6519,8 +6530,9 @@ class SweepEngine(Engine):
             )
         except deferredwork.LedgerReadError as e:
             # A plain `Exception` on purpose (DW-146), so it must be named: no
-            # `except OSError` would ever see it. `LedgerReadError` ALONE — an
-            # `OSError` from the mutator is a write fault as often as a read one.
+            # `except OSError` would ever see it. `LedgerReadError` includes the
+            # OS-read subclass `LedgerReadFault` (DW-279); pre-lock probes and
+            # lock/write failures retain raw `OSError` and their existing route.
             self._pause_for_bundle_close_repair(
                 task,
                 ledger,

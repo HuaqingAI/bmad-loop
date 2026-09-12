@@ -2553,16 +2553,15 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return ExitCode.FAILURE
-    except (OSError, runs.StateRootError) as exc:
+    except (OSError, deferredwork.LedgerReadFault, runs.StateRootError) as exc:
         # `archive_closed` serializes on the ledger's sidecar lock (#286/#469).
-        # THREE ways this arm is reached, not two: the acquisition raises
-        # `OSError` (a rival holder outlasting the blocking retry, or an
-        # unwritable locks dir); deriving the sidecar's path raises
+        # Acquisition raises `OSError` (a rival holder outlasting the blocking
+        # retry, or an unwritable locks dir); deriving the sidecar's path raises
         # `runs.StateRootError` — NOT an OSError — when the environment names no
-        # usable state root; and the archive's own I/O raises `OSError` too, for
-        # the ledger read and for either atomic write. Naming the lock is what
-        # makes the message actionable — a bare `error: [Errno 11] ...` from a
-        # command with no other lock in sight reads as a bug in the archive — but
+        # usable state root; pre-lock probes and atomic writes raise `OSError`,
+        # while the authoritative read wraps OS faults as `LedgerReadFault`
+        # (DW-279). Naming the lock makes the message actionable — a bare
+        # `error: [Errno 11] ...` from a command with no other lock in sight reads as a bug in the archive — but
         # the message must not ASSERT contention, or a full disk sends the
         # operator hunting a rival process that was never there. So it names both
         # possibilities and lets the carried cause decide between them. Existing
@@ -4211,7 +4210,8 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             # codec error escaped untyped. Retyping it to a plain `Exception` is what
             # dropped it out of this handler; naming it puts it back, so the
             # attribution this arm exists for is not lost to the contract that made
-            # the fault attributable.
+            # the fault attributable. Its `LedgerReadFault` subclass also covers
+            # OS metadata/text-read failures since DW-279.
             print(f"error: could not record {decision.id}: {e}", file=sys.stderr)
             return 1
         if option.effect == "close":

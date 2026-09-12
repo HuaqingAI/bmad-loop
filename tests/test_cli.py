@@ -7879,8 +7879,9 @@ def test_resume_control_alias_sweep_keeps_its_own_refusal_over_ledger(project, m
     assert "`bmad-loop sweep`" not in err
 
 
+@pytest.mark.parametrize("operation", ["stat", "read_text"])
 def test_resume_sweep_os_refused_ledger_is_refused_with_the_storage_repair(
-    project, monkeypatch, capsys
+    project, monkeypatch, capsys, operation
 ):
     """The DW-234 row, replacing `..._os_refused_ledger_propagates_to_mains_tail`.
 
@@ -7892,21 +7893,19 @@ def test_resume_sweep_os_refused_ledger_is_refused_with_the_storage_repair(
     run for the same fault, plus every clause `_assert_ledger_refusal` pins.
 
     The errno text and the path still surface (they are the fault), and the run is
-    never armed. Ablation: delete the `except OSError` arm in
-    `runs.unreadable_sweep_ledger` and this row fails on `error: [Errno 13]`
-    returning to stderr with none of the route.
+    never armed. Selective metadata/text faults exercise the real reader and
+    its `LedgerReadFault` wrapper. Ablation: remove that subclass from the OS
+    catch in `runs.unreadable_sweep_ledger`; both rows take the decode repair
+    wording instead of the permissions/storage route.
 
     The ledger on disk is DECODABLE, so the refused read is the only fault in play.
     Monkeypatched rather than chmod'd: a real mode bit does not hold as root and
     does not exist on Windows, so the row would silently stop testing anything."""
-    from bmad_loop import deferredwork
-
     reached = _resume_gate_run(project, monkeypatch, run_type="sweep", ledger_bytes=READABLE_LEDGER)
-
-    def _refused(path):
-        raise PermissionError(13, "Permission denied", str(path))
-
-    monkeypatch.setattr(deferredwork, "read_for_write", _refused)
+    if operation == "stat":
+        fault_metadata_probe(monkeypatch, project.deferred_work, "stat")
+    else:
+        fault_read_text(monkeypatch, project.deferred_work)
     rc = cli.main(["resume", "--project", str(project.project), "r1"])
     assert rc == cli.ExitCode.FAILURE
     err = capsys.readouterr().err
@@ -14899,3 +14898,42 @@ def test_cleanup_says_nothing_about_a_registry_with_no_remainder(project, capsys
 
     assert cli.main(["cleanup", "--project", str(project.project)]) == 0
     assert "not migrated" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("read_target", ["ledger", "archive"])
+@pytest.mark.parametrize("operation", ["stat", "read_text"])
+def test_sweep_archive_routes_a_locked_ledger_os_read_fault(
+    project, monkeypatch, capsys, operation, read_target
+):
+    """DW-279: the archive's read fault stays a CLI failure without publishing.
+
+    Refuse the main ledger or an existing archive sibling under the main lock.
+    Removing the selected OS wrap loses the attributed read-refusal wording;
+    removing LedgerReadFault from _sweep_archive's catch loses its archive error.
+    """
+    from conftest import fault_locked_ledger_read
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "done 2026-06-01"}, commit=False)
+    ledger = project.deferred_work
+    archive = ledger.parent / "deferred-work-archive.md"
+    archive_before = b"# Archived deferred work\n\nExisting entry\n"
+    if read_target == "archive":
+        archive.write_bytes(archive_before)
+    target = ledger if read_target == "ledger" else archive
+    before = ledger.read_bytes()
+    fault_locked_ledger_read(monkeypatch, target, operation, lock_target=ledger)
+
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+
+    assert rc == 1
+    out, err = capsys.readouterr()
+    assert "cannot archive the deferred-work ledger" in err
+    assert f"{target} could not be read (PermissionError:" in err
+    assert "Permission denied" in err
+    assert not out
+    assert ledger.read_bytes() == before
+    if read_target == "archive":
+        assert archive.read_bytes() == archive_before
+    else:
+        assert not archive.exists()

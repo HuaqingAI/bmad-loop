@@ -4777,11 +4777,14 @@ def test_a_refused_ledger_raises_out_of_every_mutator(tmp_path, monkeypatch, nam
         fault_box.append(_refuse_metadata_like_3_14(monkeypatch, path))
     monkeypatch.setattr(deferredwork, "ledger_lock", lock_then_refuse)
 
-    with pytest.raises(OSError) as raised:
+    error_type = OSError if arm == "pre-lock" else deferredwork.LedgerReadFault
+    with pytest.raises(error_type) as raised:
         result = call(path)
         pytest.fail(f"no-op value {result!r} returned where the refusal should raise")
 
-    assert fault_box and raised.value is fault_box[0]
+    assert fault_box
+    observed = raised.value if arm == "pre-lock" else raised.value.__cause__
+    assert observed is fault_box[0]
     assert writes == []
     assert acquisitions == ([] if arm == "pre-lock" else [path])
     assert path.read_text(encoding="utf-8") == before  # `read_text` takes no `stat`
@@ -5083,48 +5086,30 @@ def test_ledger_read_error_is_not_caught_by_an_existing_handler():
     assert not issubclass(deferredwork.LedgerReadError, ValueError)
 
 
-def test_read_for_write_propagates_oserror_unchanged(tmp_path, monkeypatch):
-    """Only the undecodable-bytes case changes shape. An `OSError` out of the read
-    itself — EACCES on a regular file, an I/O fault, a file replaced by a directory
-    between the type classification and the read — reaches the caller as the same
-    `OSError` it always did, so no `except OSError` already in the repo changes
-    behavior. (A directory standing AT the ledger path is the absence arm instead:
-    the `S_ISREG` test is False for it, exactly as `is_file()` was at every
-    converted site — see `test_read_for_write_returns_none_for_a_non_regular_file`.)
+def test_read_for_write_wraps_oserror(tmp_path, monkeypatch):
+    """DW-279: refused repair reads preserve the original OS fault as cause.
 
-    This row is a CHARACTERIZATION pin of behavior DW-221 deliberately preserved,
-    not an independently ablatable change: the `stat` probe succeeds here, so the
-    old and new bodies reach this `read_text` identically.
-    Ablation: widen the except clause to `(UnicodeDecodeError, OSError)` and this
-    reddens with `LedgerReadError`."""
+    Removing the corresponding OS wrap must fail this regression.
+    """
     path = write_ledger(tmp_path)
     fault_read_text(monkeypatch, path)
 
-    with pytest.raises(PermissionError):
+    with pytest.raises(deferredwork.LedgerReadFault) as raised:
         deferredwork.read_for_write(path)
+
+    assert isinstance(raised.value.__cause__, PermissionError)
+    assert str(path) in str(raised.value)
 
 
 @pytest.mark.parametrize("error_number", [errno.EACCES, errno.EIO, errno.ESTALE, errno.EBADF])
 def test_read_for_write_propagates_a_refused_metadata_probe(tmp_path, monkeypatch, error_number):
-    """DW-221, and with it DW-253. The REPAIR/WRITE arm documents that `OSError`
-    PROPAGATES, and that sentence was false on Python 3.14: `is_file()`'s body
-    became `os.path.isfile` there, which swallows every OS error and answers
-    False, so an EACCES on the ledger's own path answered `None` — ABSENCE. Every
-    caller inherited the lie: `_prune_pre_answers`, the DW-167 re-apply gate and
-    `_live_open_ids` journalled `ledger-absent` (a token carrying no `error`,
-    pointing the operator at a file that is right there) where `ledger-inaccessible`
-    is meant, and the re-apply gate never armed ledger doubt. `Path.stat` reports
-    the errno instead, on every supported interpreter, so the contract is true
-    everywhere and DW-253 closes AT THE READER — the three reporting sites' own
-    `except OSError` arms fire on their own and none of them is edited.
+    """Refused metadata is a fault, never absence (DW-221/253/279).
 
-    The 3.14 CONTRACT is simulated rather than the 3.14 interpreter: `Path.is_file`
-    is pinned to answer False for this path, which is what 3.14 does with a refused
-    probe, while `Path.stat` carries the refusal. That is what makes the ablation
-    real on the 3.13 dev interpreter and not merely on one CI leg.
-    Ablation: restore `if not path.is_file(): return None` as the probe and this
-    reddens with `None` returned where a raise was expected — version-
-    independently, because the pin supplies the suppression 3.14 would."""
+    Pin is_file() False to simulate Python 3.14's OS-error suppression on any
+    interpreter while stat() raises EACCES/EIO/ESTALE/EBADF. Restoring the
+    convenience probe returns None; removing the OS wrap loses the exact cause
+    carried by LedgerReadFault. Both regressions fail these assertions.
+    """
     path = write_ledger(tmp_path)
     fault = OSError(error_number, "metadata refused", str(path))
     real_stat = Path.stat
@@ -5142,9 +5127,9 @@ def test_read_for_write_propagates_a_refused_metadata_probe(tmp_path, monkeypatc
         lambda self, *a, **kw: False if self == path else real_is_file(self, *a, **kw),
     )
 
-    with pytest.raises(OSError) as raised:
+    with pytest.raises(deferredwork.LedgerReadFault) as raised:
         deferredwork.read_for_write(path)
-    assert raised.value is fault
+    assert raised.value.__cause__ is fault
 
 
 @pytest.mark.parametrize("shape", ABSORBED_PROBE_FAULTS)
@@ -5168,11 +5153,12 @@ def test_read_for_write_absorbs_pathlibs_ignored_probe_faults(tmp_path, monkeypa
 
 
 def test_read_for_write_propagates_an_unabsorbed_winerror(tmp_path, monkeypatch):
-    """The winerror set `probe_absence` absorbs is EXACTLY pathlib's three; an
-    `OSError` carrying any other `winerror` — 5, `ERROR_ACCESS_DENIED` — is a
-    refusal that raises unchanged, the same instance, like a POSIX `EACCES`.
-    Ablation: make `probe_absence` answer True for any `OSError` with a `winerror`
-    attribute and this reds with `None` returned where a raise was expected."""
+    """Windows access denied stays outside the absorbed absence set (DW-256/279).
+
+    Synthetic winerror 5 exercises that boundary on every host: unlike ignored
+    21/123/1921, it raises LedgerReadFault with the original OS fault chained.
+    Absorbing all winerrors returns None and fails the expected exception.
+    """
     path = write_ledger(tmp_path)
     fault = OSError(errno.EACCES, "metadata refused", str(path))
     fault.winerror = 5
@@ -5185,9 +5171,9 @@ def test_read_for_write_propagates_an_unabsorbed_winerror(tmp_path, monkeypatch)
 
     monkeypatch.setattr(Path, "stat", refused_stat)
 
-    with pytest.raises(OSError) as raised:
+    with pytest.raises(deferredwork.LedgerReadFault) as raised:
         deferredwork.read_for_write(path)
-    assert raised.value is fault
+    assert raised.value.__cause__ is fault
 
 
 def _winerror(exc: OSError, winerror: int) -> OSError:
@@ -5270,22 +5256,12 @@ def _assert_is_a_symlink_loop_refusal(exc: OSError) -> None:
 
 
 def test_read_for_write_raises_on_a_symlink_loop(tmp_path):
-    """ELOOP is the reading DW-221 changes on EVERY interpreter, not just 3.14, and
-    this is its lowest-layer pin — the twin of
-    `test_read_for_observation_classifies_the_ignored_errnos`, which asserts the
-    OTHER arm makes the same call since DW-254 and differs only in disposition
-    (an attributed degrade where this arm raises).
+    """A real symlink cycle is refused rather than absent (DW-221/279).
 
-    Errno 40 is IN `pathlib`'s ignored tuple, so `is_file()` answered False for a
-    symlink cycle through 3.13, and 3.14's `os.path.isfile` swallowed it too — the
-    ledger's repair/write read called a path that EXISTS and cannot be read an
-    ABSENT ledger on every interpreter, and `or ""` sites published from an empty
-    text on the strength of it. `stat` reports the errno, so it is a refusal now.
-    The injected metadata-fault row independently covers EBADF.
-
-    Ablation: restore `if not path.is_file(): return None` and this reds with
-    `None` returned where a raise was expected — on any interpreter, since every
-    one of them ignores errno 40 inside that probe."""
+    is_file() historically suppressed ELOOP on every supported interpreter;
+    stat() exposes it. Restoring that probe returns None, while removing the
+    metadata wrap loses LedgerReadFault. Its cause must preserve errno ELOOP.
+    """
     path, other = tmp_path / "deferred-work.md", tmp_path / "ledger-loop"
     try:
         path.symlink_to(other)
@@ -5293,10 +5269,11 @@ def test_read_for_write_raises_on_a_symlink_loop(tmp_path):
     except OSError as e:
         pytest.skip(f"symlinks unavailable: {e}")
 
-    with pytest.raises(OSError) as excinfo:
+    with pytest.raises(deferredwork.LedgerReadFault) as excinfo:
         deferredwork.read_for_write(path)
 
-    _assert_is_a_symlink_loop_refusal(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, OSError)
+    _assert_is_a_symlink_loop_refusal(excinfo.value.__cause__)
 
 
 def test_read_for_write_returns_none_for_a_path_under_a_non_directory(tmp_path):
@@ -5464,3 +5441,42 @@ def test_mark_done_many_raises_on_an_undecodable_ledger_and_writes_nothing(tmp_p
         mark_done_many(path, ["DW-1"], "2026-06-11", "fixed")
 
     assert path.read_bytes() == raw
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        PermissionError(errno.EACCES, "refused"),
+        OSError(errno.EIO, "read failed"),
+        FileNotFoundError(errno.ENOENT, "vanished after stat"),
+        NotADirectoryError(errno.ENOTDIR, "parent changed after stat"),
+        IsADirectoryError(errno.EISDIR, "target changed after stat"),
+        _winerror(OSError(errno.EIO, "drive vanished after stat"), 21),
+    ],
+)
+def test_read_for_write_wraps_text_read_faults_even_when_the_probe_would_absorb_them(
+    tmp_path, monkeypatch, fault
+):
+    """A successful regular-file probe never licenses synthesizing empty text.
+
+    Ablation: remove the text-read wrap; every row raises the original OSError.
+    Reusing probe_absence here also fails the disappearance/type-change rows.
+    """
+    path = write_ledger(tmp_path)
+    before = path.read_bytes()
+    real_read = Path.read_text
+
+    def refuse(target, *args, **kwargs):
+        if target == path:
+            raise fault
+        return real_read(target, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", refuse)
+    with pytest.raises(deferredwork.LedgerReadFault) as raised:
+        deferredwork.read_for_write(path)
+
+    assert raised.value.__cause__ is fault
+    assert isinstance(raised.value, deferredwork.LedgerReadError)
+    assert not isinstance(raised.value, OSError)
+    assert str(path) in str(raised.value)
+    assert path.read_bytes() == before

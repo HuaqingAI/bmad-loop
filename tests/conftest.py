@@ -1315,6 +1315,42 @@ def fault_read_text(monkeypatch, target: Path) -> None:
     monkeypatch.setattr(Path, "read_text", fake)
 
 
+def fault_locked_ledger_read(
+    monkeypatch, target: Path, operation: str, *, lock_target: Path | None = None
+) -> bytes:
+    """Refuse only the authoritative read inside the real ledger lock (DW-279).
+
+    Earlier probes remain healthy. Each wrap is independently ablatable by
+    selecting the stat or read_text rows. Return the target bytes that must survive.
+    `lock_target` permits an archive sibling read under the main ledger lock.
+    """
+    from bmad_loop import deferredwork
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists():
+        target.write_text("# Deferred Work\n", encoding="utf-8")
+    before = target.read_bytes()
+    lock_target = target if lock_target is None else lock_target
+    real_lock = deferredwork.ledger_lock
+    real_read = getattr(Path, operation)
+
+    def refuse(path, *args, **kwargs):
+        if path == target:
+            raise PermissionError(13, "Permission denied", str(target))
+        return real_read(path, *args, **kwargs)
+
+    @contextlib.contextmanager
+    def locked(path):
+        with real_lock(path):
+            with monkeypatch.context() as patch:
+                if path == lock_target:
+                    patch.setattr(Path, operation, refuse)
+                yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", locked)
+    return before
+
+
 def fault_metadata_probe(monkeypatch, target: Path, probe: str) -> None:
     """Make exactly ``target``'s ``probe`` metadata call raise PermissionError; every
     other path still answers normally, and so does every other probe on ``target`` —

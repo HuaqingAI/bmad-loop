@@ -5273,14 +5273,15 @@ def unpublishable_target(target: Path, family: Literal["ledger", "store"]) -> (
     for any file a later caller publishes.
 
     LEDGER: `deferredwork.read_for_write`, because the ledger's own read
-    contract (DW-146) already answers both questions in the two shapes this
-    guard asks them — `None` for absence, `LedgerReadError` for bytes nobody
-    can decode. Its `OSError` normally propagates; here it does not, because
+    contract (DW-146/DW-279) answers `None` for absence, `LedgerReadFault`
+    for OS metadata/text-read faults, and its parent `LedgerReadError` for
+    bytes nobody can decode. Here read faults do not propagate, because
     every caller is best-effort bookkeeping whose whole degrade discipline
     exists so a publication fault never aborts the work that wrote the file. The
-    two faults are NOT folded into one cause, though (DW-237): `LedgerReadError`
-    returns `target-undecodable` and a raised
-    `OSError` returns `target-unreadable`, because they differ in the one way a
+    two faults are NOT folded into one cause, though (DW-237): the
+    `LedgerReadFault` subclass is handled first as `target-unreadable`, as is
+    a raw probe `OSError`; the remaining `LedgerReadError` returns
+    `target-undecodable`, because they differ in the one way a
     caller holding a retry obligation has to know about. Undecodable bytes are a
     DURABLE content shape — a replay re-reads the same file and refuses it
     identically, exactly like an absence or a directory — while an `OSError` a
@@ -5396,14 +5397,16 @@ def unpublishable_target(target: Path, family: Literal["ledger", "store"]) -> (
                         return ("target-absent", None)
                     return ("target-unreadable", str(e))
                 return ("target-not-a-file", None)
-        except deferredwork.LedgerReadError as e:
-            # DURABLE: the bytes on disk are what nobody can decode, and a replay
-            # re-reads them identically. Kept apart from the `OSError` arm below so
-            # a latch-holding caller can refuse this and retry only the other.
-            return ("target-undecodable", str(e))
-        except OSError as e:
+        except (OSError, deferredwork.LedgerReadFault) as e:
+            if isinstance(e, deferredwork.LedgerReadFault) and isinstance(e.__cause__, OSError):
+                e = e.__cause__  # Preserve the original OS attribution.
             # TRANSIENT: a probe RAISED, which the next pass may not see.
             return ("target-unreadable", str(e))
+        except deferredwork.LedgerReadError as e:
+            # DURABLE: the bytes on disk are what nobody can decode, and a replay
+            # re-reads them identically. Kept apart from the `OSError` arm above so
+            # a latch-holding caller can refuse this and retry only the other.
+            return ("target-undecodable", str(e))
         return None
     if family == "store":
         # ONE `lstat`, never `is_file()`/`is_symlink()`/`exists()` (DW-257): those
