@@ -7246,6 +7246,90 @@ def test_generic_bundle_prompt_spells_the_post_rename_primitive(project):
     )
 
 
+@pytest.mark.parametrize("branch", ["initial", "restored-review", "repair"])
+def test_bundle_prompt_conditions_artifact_only_receipt_on_session_deliverables(project, branch):
+    """DW-284: every rendered bundle leg carries the conditional receipt contract
+    alongside its existing routing, with repair winning over a latched restore.
+    These are prompt assertions; minting and verifier tests grade enforcement.
+
+    Ablation: delete `_generic_bundle_prompt`'s `_reset_spec_for_repair(task)` call
+    and the repair row fails on the reopened status assertion.
+    Ablation: delete `_reset_spec_for_repair`'s `strip_auto_run_result` call and
+    the repair row fails on the stale marker absence assertion.
+    """
+    install_build_auto_skill(project.project, ".claude/skills")
+    engine, adapter = make_sweep(project, [])
+    attach_profile(adapter)
+    spec = project.implementation_artifacts / "spec-dw-fix.md"
+    status = "in-review" if branch == "restored-review" else "done"
+    frozen_intent = "<intent-contract>Keep the accepted deliverables.</intent-contract>\n"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text(
+        f"---\nstatus: {status}\n---\n\n{frozen_intent}"
+        "\n## Auto Run Result\nStatus: done\nArtifact only: true\n",
+        encoding="utf-8",
+    )
+    original_spec = spec.read_bytes()
+    task = StoryTask(
+        story_key="dw-fix",
+        epic=0,
+        dw_ids=["DW-1"],
+        bundle_file="/run/bundles/fix/intent.md",
+        spec_file=str(spec),
+        restore_patch="/run/artifacts/attempt-dw-fix.patch" if branch != "initial" else None,
+    )
+    feedback = project.implementation_artifacts / "feedback.md" if branch == "repair" else None
+
+    prompt = engine._dev_prompt(task, feedback)
+
+    assert task.bundle_file in prompt
+    for clause in (
+        "only if this session's actual deliverables are confined to ignored content",
+        "configured `implementation_artifacts` directory strictly inside the code repository",
+        "you may write `Artifact only: true` on its own line beside `Status:`",
+        "this session's last genuine `## Auto Run Result` section",
+        "Author that marker in the current session",
+        "outside fenced blocks and without an orchestrator repair note",
+        "frontmatter does not assert the receipt",
+        "value must be the strict boolean `true`",
+        "Do not assert it for ordinary changes or other nonqualifying deliverables",
+        "or based on old artifacts alone",
+        "ordinary proof-of-work probe must first positively find no changes",
+        "receipt gate then requires a positive ignored-file listing scoped to that directory",
+        "listing cannot prove which files you wrote",
+        "All other verification and ledger-close checks still apply",
+        "In an isolated worktree, ignored files do not ride the branch merge",
+        "not automatically copied back",
+        "accepting a receipt does not publish them",
+    ):
+        assert clause in prompt
+
+    if branch == "repair":
+        assert prompt.startswith("/bmad-build-auto Resume the autonomous dev session")
+        assert f"in-progress spec at `{spec}`" in prompt
+        assert "previous session's work failed deterministic verification" in prompt
+        assert (
+            "without changing the frozen intent contract or editing the deferred-work ledger"
+            in prompt
+        )
+        assert f"Verification evidence is in `{feedback}`" in prompt
+        repaired = spec.read_text(encoding="utf-8")
+        assert "status: in-progress" in repaired
+        assert frozen_intent in repaired
+        assert "## Auto Run Result" not in repaired
+    else:
+        assert "Do NOT edit the deferred-work ledger; the orchestrator records resolution" in prompt
+        assert spec.read_bytes() == original_spec
+        if branch == "restored-review":
+            assert prompt.startswith("/bmad-build-auto Resume review of the in-review spec")
+            assert f"spec at `{spec}`" in prompt
+            assert "restored onto the working tree after an intent-gap resolution" in prompt
+            assert "review it against the amended spec" in prompt
+        else:
+            assert prompt.startswith("/bmad-build-auto Implement the deferred-work bundle")
+            assert "it carries the intent and the verbatim ledger entries to resolve" in prompt
+
+
 def test_sweep_bundle_restore_redrive_reaches_done_and_clears_latch(project, monkeypatch):
     # T-C + T-D: rearm with a restore patch, resume, land done; assert the dispatched
     # prompt pointed at the in-review spec, the patch apply seam fired, the dw id

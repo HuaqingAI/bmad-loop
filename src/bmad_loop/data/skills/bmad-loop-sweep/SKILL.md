@@ -100,6 +100,22 @@ Every entry in the triage universe appears in exactly one category. The orchestr
 this deterministically; a missed or double-counted entry fails the whole
 result and burns a retry.
 
+For a bundle whose intended deliverables are confined to ignored content in the
+configured `implementation_artifacts` directory strictly inside the code repository,
+describe those deliverables and their location in the existing `intent` field.
+Do not add a triage receipt field or assert a receipt on the executing session's
+behalf. That session may write `Artifact only: true` on its own line beside
+`Status:`, with `true` on the same line as the label and no trailing explanation,
+in its own last genuine `## Auto Run Result` only when its actual deliverables
+qualify, never based on old artifacts alone. The marker must be authored in the
+current session, outside fenced blocks and without an orchestrator repair note; frontmatter does
+not assert it, and the value must be the strict boolean `true`. The ordinary
+proof-of-work probe must first positively find no changes, and the receipt gate
+requires a positive ignored-file listing scoped to that directory. All other
+verification and ledger-close checks still apply. In an isolated worktree, ignored
+files do not ride the branch merge and are not automatically copied back; accepting
+a receipt does not publish them. Account for that limitation in the bundle's intent.
+
 ### Step 4: Write the result and end your turn
 
 Write the result.json per `./automation-mode.md` and state in one line how

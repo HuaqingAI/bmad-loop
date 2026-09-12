@@ -6256,6 +6256,23 @@ class SweepEngine(Engine):
         `_restore_patch` just laid onto the tree. The freeform intent.md pointer
         takes the path where that dirty-tree check runs first."""
         bundle_ref = task.bundle_file or task.story_key
+        artifact_only_guidance = (
+            "\n\nArtifact-only receipt: only if this session's actual deliverables are "
+            "confined to ignored content in the configured `implementation_artifacts` "
+            "directory strictly inside the code repository, you may write "
+            "`Artifact only: true` on its own line beside `Status:` in this session's "
+            "last genuine `## Auto Run Result` section. Author that marker in the "
+            "current session, outside fenced blocks and without an orchestrator "
+            "repair note; frontmatter does not assert the receipt. The value must "
+            "be the strict boolean `true`. Do not assert it for ordinary changes "
+            "or other nonqualifying deliverables, or based on old artifacts alone. "
+            "The ordinary proof-of-work probe must first positively find no changes; "
+            "the receipt gate then requires a positive ignored-file listing scoped "
+            "to that directory. The listing cannot prove which files you wrote. "
+            "All other verification and ledger-close checks still apply. In an "
+            "isolated worktree, ignored files do not ride the branch merge and are "
+            "not automatically copied back; accepting a receipt does not publish them."
+        )
         if feedback is None:
             if task.restore_patch and task.spec_file:
                 return (
@@ -6264,13 +6281,13 @@ class SweepEngine(Engine):
                     f"The attempted change was restored onto the working tree after "
                     f"an intent-gap resolution; review it against the amended spec. "
                     f"Do NOT edit the deferred-work ledger; the orchestrator records "
-                    f"resolution."
+                    f"resolution.{artifact_only_guidance}"
                 )
             return (
                 f"/{self._dev_skill()} Implement the deferred-work bundle described in "
                 f"`{bundle_ref}` — it carries the intent and the verbatim ledger "
                 f"entries to resolve. Do NOT edit the deferred-work ledger; the "
-                f"orchestrator records resolution."
+                f"orchestrator records resolution.{artifact_only_guidance}"
             )
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or bundle_ref
@@ -6280,7 +6297,7 @@ class SweepEngine(Engine):
             f"previous session's work failed deterministic verification; repair the "
             f"working tree so verification passes without changing the frozen intent "
             f"contract or editing the deferred-work ledger. Verification evidence is "
-            f"in `{feedback}`."
+            f"in `{feedback}`.{artifact_only_guidance}"
         )
 
     def _post_dev_state_sync(self, task: StoryTask, result_json: dict | None) -> None:
