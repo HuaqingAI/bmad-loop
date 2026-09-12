@@ -1076,6 +1076,28 @@ class VerifyOutcome:
     # only what the waived gate would have found. `True` / `False` / `None` have
     # the same no-diff / diff / unknown meanings as `park_zero_diff`.
     plan_halt_zero_diff: bool | None = None
+    # A deferred-work BUNDLE's artifact-only receipt (DW-273). `True` when the
+    # bundle path's proof-of-work gate found nothing it counts, the session's
+    # synthesized result asserted `artifact_only: true` (the strict boolean
+    # `devcontract` mints from the current session's genuine marker, exactly as
+    # `park_asserted`), and a directory-scoped `git status --ignored` listing of
+    # the configured `implementation_artifacts` dir held IGNORED entries (`!!`
+    # records — the tracked and untracked ones are what the probe already
+    # measured). Only
+    # `verify.verify_dev_bundle` sets it; the sprint and stories legs never
+    # consult the receipt, so on their outcomes it is always `False`.
+    #
+    # It is a receipt, not a waiver: the gate still ran and positively answered
+    # "nothing changed" before the receipt was consulted, and what the receipt
+    # proves is bounded — ignored paths carry no baseline, so the listing shows
+    # only that the artifacts dir holds session-reachable content under the code
+    # tree, never WHICH entry this session wrote. The assertion is the
+    # load-bearing half, as it is for a park.
+    artifact_only_accepted: bool = False
+    # The number of ignored entries the receipt's listing held, carried to the journal
+    # (`bundle-artifact-only-accepted`'s `count`). `None` whenever no receipt was
+    # accepted, including on every non-bundle leg.
+    artifact_only_residue: int | None = None
 
     @classmethod
     def passed(
@@ -1084,12 +1106,16 @@ class VerifyOutcome:
         park_proof_skipped: bool = False,
         park_zero_diff: bool | None = None,
         plan_halt_zero_diff: bool | None = None,
+        artifact_only_accepted: bool = False,
+        artifact_only_residue: int | None = None,
     ) -> "VerifyOutcome":
         return cls(
             ok=True,
             park_proof_skipped=park_proof_skipped,
             park_zero_diff=park_zero_diff,
             plan_halt_zero_diff=plan_halt_zero_diff,
+            artifact_only_accepted=artifact_only_accepted,
+            artifact_only_residue=artifact_only_residue,
         )
 
     @classmethod

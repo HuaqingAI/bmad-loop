@@ -21280,6 +21280,92 @@ def test_bundle_gate_excludes_the_nested_ledger_under_the_monorepo_shape(project
     assert engine._verify_dev_artifacts(task, result_json).ok
 
 
+# ------------------------- the bundle's artifact-only receipt, engine-driven (DW-273)
+
+
+def _artifact_only_bundle_tree(project):
+    """`_bmad-output/` gitignored and COMMITTED before the baseline, so the bundle
+    spec written under `implementation_artifacts` afterwards is invisible to the
+    ordinary proof-of-work probe and visible only to a `--ignored` listing — the
+    DW-236 shape (a spec-only erratum on a project that keeps BMAD output out of
+    git). Returns `(task, spec_path)` with the spec at `done`, since
+    `_dev_review_enabled` is False on the generic dev path."""
+    ignore_before_commit(project, "_bmad-output/")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ignore bmad output")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    task = StoryTask(story_key="dw-fix-things", epic=0, dw_ids=["DW-1"])
+    task.baseline_commit = verify.rev_parse_head(project.repo_root)
+    sp = bundle_spec_path(project, "fix-things")
+    write_spec(sp, "done", task.baseline_commit)
+    return task, sp
+
+
+def test_bundle_artifact_only_receipt_is_accepted_and_journaled(project):
+    """DW-273, through the engine's own `_verify_dev_artifacts` so the wiring is
+    part of what reddens: an asserted artifact-only bundle over an artifact-only
+    tree clears the dev gate on the receipt, and the acceptance is journaled once
+    as `bundle-artifact-only-accepted` with the listing's count.
+
+    The unasserted control in the same row is what makes the acceptance
+    attributable to the assertion: the identical tree without `artifact_only`
+    keeps the verbatim refusal and writes no row.
+
+    Ablation, MEASURED: drop `artifact_only_dir=` from `verify_dev_bundle`'s call
+    into `_verify_shared_gates` and this fails on `assert outcome.ok`."""
+    engine, _ = make_sweep(project, [], policy=_harvest_bundle_policy(attempts=1))
+    task, sp = _artifact_only_bundle_tree(project)
+
+    # the control: no assertion, the ordinary refusal, no record
+    refused = engine._verify_dev_artifacts(task, {"workflow": "auto-dev", "spec_file": str(sp)})
+    assert not refused.ok
+    assert refused.reason == "no changes in worktree since baseline commit"
+    assert [
+        e for e in engine.journal.entries() if e["kind"] == "bundle-artifact-only-accepted"
+    ] == []
+
+    # `count` is pinned to FILES — the spec and the ledger `_artifact_only_bundle_tree`
+    # wrote, both ignored: dropping `--untracked-files=all` collapses the listing
+    # to one directory record and the count reads 1
+    assert {p.name for p in project.implementation_artifacts.iterdir()} == {
+        sp.name,
+        project.deferred_work.name,
+    }
+    outcome = engine._verify_dev_artifacts(
+        task, {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+    )
+
+    assert outcome.ok
+    assert outcome.artifact_only_accepted is True
+    rows = [e for e in engine.journal.entries() if e["kind"] == "bundle-artifact-only-accepted"]
+    assert len(rows) == 1
+    assert rows[0]["story_key"] == "dw-fix-things"
+    assert rows[0]["attempt"] == task.attempt
+    assert rows[0]["dw_ids"] == ["DW-1"]
+    assert rows[0]["count"] == 2
+
+
+def test_bundle_artifact_only_receipt_leaves_the_review_ledger_gate_intact(project):
+    """The receipt relaxes the dev proof-of-work gate and NOTHING downstream: an
+    accepted artifact-only bundle whose ledger ids are still open is refused by
+    `verify_review_bundle` on those ids exactly as before, and the receipt closed
+    nothing in the ledger on its own."""
+    engine, _ = make_sweep(project, [], policy=_harvest_bundle_policy(attempts=1))
+    task, sp = _artifact_only_bundle_tree(project)
+
+    accepted = engine._verify_dev_artifacts(
+        task, {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+    )
+    assert accepted.ok and accepted.artifact_only_accepted is True
+    assert task.spec_file == str(sp)
+    assert ledger_entries(project)["DW-1"].open
+
+    review = verify.verify_review_bundle(task, project, engine.policy)
+
+    assert not review.ok and review.fixable
+    assert "DW-1" in review.reason
+
+
 # ------------------------- the per-run decisions writes, confined to the project (#593)
 
 

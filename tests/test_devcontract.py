@@ -453,6 +453,159 @@ def test_synth_genuine_park_marker_defaults_to_unasserted_without_session_proven
     assert rj["park_asserted"] is False
 
 
+# ------------------------------------- the bundle's artifact-only mint (DW-273)
+
+
+def _artifact_only_spec(tmp_path, *, line: str | None = "Artifact only: true", extra: str = ""):
+    """A done spec whose genuine marker carries (or omits) the artifact-only line."""
+    marker = "\n## Auto Run Result\n\n- Status: done\n"
+    if line is not None:
+        marker += f"- {line}\n"
+    marker += extra
+    return _spec(tmp_path / "s.md", status="done", auto_run=None, body_extra=marker)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Artifact only: true",
+        "artifact_only: true",
+        "**Artifact only:** TRUE",
+        "Artifact-only: true",
+    ],
+    ids=["prose", "snake", "bold-upper", "hyphen"],
+)
+def test_synth_mints_artifact_only_from_a_genuine_session_authored_marker(tmp_path, line):
+    """The four-part shape `park_asserted` uses: a present, genuine (no synth
+    note), session-authored marker carrying the line. The line tolerates the
+    same bullet/bold spellings `STATUS_LINE_RE` does.
+
+    Ablation: drop the `"artifact_only"` key from the result and every parameter
+    fails on the `is True`."""
+    sp = _artifact_only_spec(tmp_path, line=line)
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj is not None and rj["status"] == "done"
+    assert rj["artifact_only"] is True
+    assert rj["park_asserted"] is False  # a done marker is no park
+
+
+def test_synth_artifact_only_trailing_prose_fails_closed(tmp_path):
+    """The value is anchored to end of line: `true` followed by prose is a
+    sentence, not an assertion."""
+    sp = _artifact_only_spec(tmp_path, line="Artifact only: true for the ledger, false for code")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_fenced_example_inside_the_marker_fails_closed(tmp_path):
+    """A pasted example inside the genuine marker's own body is documentation:
+    a match inside a fenced block mints nothing when no real line follows."""
+    sp = _artifact_only_spec(tmp_path, line=None, extra="\n```\n- Artifact only: true\n```\n")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_tolerates_a_run_of_separators(tmp_path):
+    sp = _artifact_only_spec(tmp_path, line="Artifact  only: true")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is True
+
+
+def test_synth_artifact_only_absent_line_fails_closed(tmp_path):
+    sp = _artifact_only_spec(tmp_path, line=None)
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_false_value_fails_closed(tmp_path):
+    sp = _artifact_only_spec(tmp_path, line="Artifact only: false")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_repaired_marker_fails_closed(tmp_path):
+    """The orchestrator's missing-marker repair cannot retroactively assert on the
+    session's behalf, exactly as it cannot for a park."""
+    sp = _artifact_only_spec(tmp_path, extra=f"\n{devcontract.ORCHESTRATOR_SYNTH_NOTE}\n")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_defaults_to_unasserted_without_session_provenance(tmp_path):
+    """`park_marker_session_authored` is the ONE authorship proof serving both
+    mints: without it a genuine-looking marker asserts nothing."""
+    sp = _artifact_only_spec(tmp_path)
+
+    rj = devcontract.synthesize_result(sp, story_key="dw-bundle").result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_frontmatter_never_mints(tmp_path):
+    """Frontmatter-only fallback (no marker at all) mints nothing, even with the
+    key spelled in the frontmatter."""
+    sp = _spec(tmp_path / "s.md", status="done", auto_run=None)
+    text = sp.read_text(encoding="utf-8").replace(
+        "status: 'done'\n", "status: 'done'\nartifact_only: true\n"
+    )
+    sp.write_text(text, encoding="utf-8")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj is not None and rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_reads_only_the_last_real_marker(tmp_path):
+    """A fenced example and an older genuine marker cannot authorize a later
+    result, mirroring the park row above."""
+    sp = _spec(
+        tmp_path / "s.md",
+        status="done",
+        auto_run=None,
+        body_extra=(
+            "\n```md\n## Auto Run Result\n\nStatus: done\nArtifact only: true\n```\n"
+            "\n## Auto Run Result\n\nStatus: done\nArtifact only: true\n"
+            "\n## Auto Run Result\n\nStatus: done\n"
+        ),
+    )
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
 def test_auto_run_result_fingerprint_detects_an_identical_appended_marker():
     marker = "## Auto Run Result\n\nStatus: awaiting-operator\n"
 

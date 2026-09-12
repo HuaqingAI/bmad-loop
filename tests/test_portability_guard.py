@@ -1233,6 +1233,15 @@ JOURNAL_KINDS = frozenset(
         "stories-validated",
         "stories-wedged",
         # sweep.py
+        # DW-273. The bundle path's artifact-only receipt was ACCEPTED at the dev
+        # proof-of-work gate: the ordinary probe positively found nothing, the
+        # session's synthesized result asserted the strict `artifact_only: true`
+        # boolean, and the directory-scoped `git status --ignored` listing of the
+        # configured `implementation_artifacts` held ignored (`!!`) entries. Mirrors
+        # the sprint leg's `park-proof-of-work-skipped`. `story_key` and `dw_ids`
+        # are routed, `attempt` and `count` (the number of ignored files under the
+        # artifacts dir, never of entries this session wrote) are benign.
+        "bundle-artifact-only-accepted",
         "bundle-start",
         "decision-answered",
         "decision-pending",

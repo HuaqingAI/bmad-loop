@@ -22,6 +22,7 @@ from conftest import (
     fault_metadata_probe,
     fault_read_text,
     git,
+    ignore_before_commit,
     make_git_noisy,
     nested_repo_root_paths,
     plant_root_markers,
@@ -2875,6 +2876,357 @@ def test_verify_dev_bundle_absent_dw_ids_passes(project, claim):
     assert task.spec_file == str(sp)
 
 
+# ------------------------------------------- the bundle's artifact-only receipt (DW-273)
+
+
+def ignore_artifacts_before_baseline(paths) -> None:
+    """Gitignore the whole `_bmad-output/` tree and COMMIT the rule, so the baseline
+    a task cut afterwards already carries it and everything later written under
+    `implementation_artifacts` is ignored — invisible to the ordinary
+    proof-of-work probe (tracked + untracked-not-ignored) and visible only to a
+    `--ignored` listing. This is the production shape DW-236 hit: a project that
+    keeps its BMAD output out of git."""
+    ignore_before_commit(paths, "_bmad-output/")
+    git(paths.project, "add", "-A")
+    git(paths.project, "commit", "-q", "-m", "ignore bmad output")
+
+
+def artifact_only_bundle(paths, *, status: str = "in-review"):
+    """The accepted-receipt tree: `_bmad-output/` ignored before the baseline, and
+    the attempt's ENTIRE residue the bundle spec under `implementation_artifacts`.
+    Returns `(task, spec_path)`; the ordinary probe finds nothing here."""
+    ignore_artifacts_before_baseline(paths)
+    task = make_bundle_task(paths)
+    sp = paths.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, status, task.baseline_commit)
+    return task, sp
+
+
+def test_verify_dev_bundle_accepts_an_asserted_artifact_only_receipt(project):
+    """DW-273. A bundle whose only permitted deliverable lives under a gitignored
+    `implementation_artifacts` (a spec-only erratum) can never satisfy the ordinary
+    proof-of-work probe. With the strict `artifact_only: True` assertion in the
+    result, the bundle gate consults a directory-scoped `git status --ignored`
+    listing instead and accepts a positive one, carrying the count out.
+
+    Ablation, MEASURED: drop the `artifact_only_dir=` argument from
+    `verify_dev_bundle`'s call into `_verify_shared_gates` and this fails on
+    `assert out.ok` — the retry reason is the verbatim
+    `no changes in worktree since baseline commit`."""
+    task, sp = artifact_only_bundle(project)
+    # a second ignored file, so the count is pinned to FILES: dropping
+    # `--untracked-files=all` collapses the listing to one directory record
+    (project.implementation_artifacts / "erratum-note.md").write_text("note\n", encoding="utf-8")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert out.ok
+    assert out.artifact_only_accepted is True
+    assert out.artifact_only_residue == 2
+    assert task.spec_file == str(sp)
+
+
+def test_verify_dev_bundle_unasserted_artifact_only_tree_is_refused(project):
+    """The same tree WITHOUT the assertion keeps the ordinary refusal, reason
+    verbatim — the receipt is never consulted on the session's behalf.
+
+    Ablation: make the receipt unconditional (pass `artifact_only_dir` regardless
+    of `rj`) and this passes the gate."""
+    task, sp = artifact_only_bundle(project)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp)}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason == "no changes in worktree since baseline commit"
+    assert out.artifact_only_accepted is False
+    assert out.artifact_only_residue is None
+
+
+@pytest.mark.parametrize("loose", ["true", 1, "yes"], ids=["str-true", "int-1", "str-yes"])
+def test_verify_dev_bundle_loose_truthy_artifact_only_is_no_assertion(project, loose):
+    """The selector is `is True` — a truthy string or int never asserts, the same
+    strictness `park_asserted` holds.
+
+    Ablation: change the selector to `bool(rj.get("artifact_only"))` and every
+    parameter passes the gate."""
+    task, sp = artifact_only_bundle(project)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": loose}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_story_ignores_an_artifact_only_assertion(project):
+    """The receipt fires on the bundle path ONLY. A sprint story result carrying
+    `artifact_only: True` over an artifact-only tree still owes the ordinary diff
+    and no receipt field is set.
+
+    Ablation: pass `artifact_only_dir=paths.implementation_artifacts` from
+    `verify_dev` and this passes the gate."""
+    ignore_artifacts_before_baseline(project)
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {**dev_result(sp), "artifact_only": True}
+
+    out = verify.verify_dev(task, project, rj)
+
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+    assert out.artifact_only_accepted is False
+    assert out.artifact_only_residue is None
+
+
+def test_verify_dev_stories_ignores_an_artifact_only_assertion(project):
+    """Stories-mode twin of the sprint row above: `verify_dev_stories` never
+    passes `artifact_only_dir`, so the assertion changes nothing."""
+    ignore_artifacts_before_baseline(project)
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = StoryTask(story_key="1", epic=0)
+    task.baseline_commit = verify.rev_parse_head(project.project)
+    d = spec_folder / "stories"
+    d.mkdir(parents=True, exist_ok=True)
+    sp = d / "1-user-auth.md"
+    write_spec(sp, "done", task.baseline_commit)
+    # artifact-only residue the bundle receipt WOULD have counted
+    (project.implementation_artifacts / "spec-1.md").write_text("erratum\n", encoding="utf-8")
+    rj = {**dev_result(sp), "artifact_only": True}
+
+    out = verify.verify_dev_stories(
+        task, project, rj, spec_folder=spec_folder, review_enabled=False
+    )
+
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+    assert out.artifact_only_accepted is False
+    assert out.artifact_only_residue is None
+
+
+def test_verify_dev_bundle_real_change_passes_the_ordinary_arm_without_a_receipt(project):
+    """An asserted bundle that ALSO changed a tracked file passes through the
+    ordinary probe; the receipt is consulted only after a positive "nothing
+    changed", so nothing is accepted on its account and no count is carried."""
+    task, sp = artifact_only_bundle(project)
+    (project.project / "src.txt").write_text("real work\n", encoding="utf-8")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert out.ok
+    assert out.artifact_only_accepted is False
+    assert out.artifact_only_residue is None
+
+
+def test_verify_dev_bundle_empty_artifacts_listing_refuses_the_receipt(project):
+    """An asserted bundle whose artifacts dir holds NO ignored or untracked entry
+    — the spec is a tracked file outside it and the attempt only flipped its
+    status, which the probe already excludes — is refused with the verbatim
+    prefix and the receipt's cause.
+
+    Ablation: make the receipt accept on `entries is not None` and this passes."""
+    sp = project.project / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-progress", "placeholder")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track the bundle spec outside the artifacts dir")
+    task = make_bundle_task(project)
+    write_spec(sp, "in-review", task.baseline_commit)
+    assert not any(project.implementation_artifacts.iterdir())
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "artifact-only receipt refused" in out.reason
+    assert "lists no ignored entries" in out.reason
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_tracked_spec_status_flip_under_a_not_ignored_dir_is_refused(project):
+    """The `bmad-loop init` default layout: `_bmad-output/` is NOT gitignored. An
+    asserted bundle whose only residue is its own TRACKED spec's status flip (a
+    ` M` record the ordinary probe already excludes) must not be accepted on that
+    record — only `!!` entries count.
+
+    Ablation: keep every porcelain record in `_artifact_dir_entries` and this
+    passes the gate with a count of one."""
+    sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-progress", "placeholder")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track the bundle spec under the artifacts dir")
+    task = make_bundle_task(project)
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "lists no ignored entries" in out.reason
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_untracked_spec_under_a_not_ignored_dir_is_refused(project):
+    """Same default layout, the other excluded record: the bundle spec newly
+    written (`??`) under a not-ignored `implementation_artifacts` is what the
+    ordinary probe excludes as the spec path, and it is no receipt either."""
+    task = make_bundle_task(project)
+    sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "lists no ignored entries" in out.reason
+    assert out.artifact_only_accepted is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="`*` is not a legal filename on Windows")
+def test_verify_dev_bundle_glob_magic_artifacts_dir_is_listed_literally(project):
+    """An ignored artifacts dir whose name carries pathspec magic (`impl*`) is
+    listed as ITSELF — pins `_literal_specs`. Measured: git literal-prefix-matches
+    a `[1]` or `?` name either way, so a bracket or question mark cannot separate
+    the two spellings; a `*` can, because as a glob it sweeps a SIBLING ignored
+    dir (`impl-sibling/`) into the listing and the count reads 2 for a dir
+    holding one file.
+
+    Ablation, MEASURED: hand `rel.as_posix()` to git bare instead of through
+    `_literal_specs` and this fails on the count (2, not 1)."""
+    magic = project.output_folder / "impl*"
+    magic.mkdir(parents=True)
+    sibling = project.output_folder / "impl-sibling"
+    sibling.mkdir()
+    paths = dataclasses.replace(project, implementation_artifacts=magic)
+    ignore_artifacts_before_baseline(paths)
+    (sibling / "unrelated.md").write_text("not this bundle's\n", encoding="utf-8")
+    task = make_bundle_task(paths)
+    sp = magic / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, paths, rj)
+
+    assert out.ok
+    assert out.artifact_only_accepted is True
+    assert out.artifact_only_residue == 1
+
+
+def test_verify_dev_bundle_artifacts_dir_at_the_repo_root_refuses_without_git(project, monkeypatch):
+    """An `implementation_artifacts` that IS `repo_root` would make the receipt's
+    pathspec `.`, listing every ignored file in the tree (`.venv`, caches) and
+    accepting the receipt trivially. Refused before any `status --ignored` is
+    spawned, with the same cause as the outside-the-tree shape."""
+    at_root = dataclasses.replace(project, implementation_artifacts=project.project)
+    task = make_bundle_task(at_root)
+    sp = project.project / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    real = verify._run_git
+    receipt_calls: list[list[str]] = []
+
+    def spy(cmd, repo, **kw):
+        if "status" in cmd and "--ignored" in cmd:
+            receipt_calls.append(cmd)
+        return real(cmd, repo, **kw)
+
+    monkeypatch.setattr(verify, "_run_git", spy)
+    out = verify.verify_dev_bundle(task, at_root, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "outside the code tree" in out.reason
+    assert receipt_calls == []
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_artifacts_dir_outside_the_tree_refuses_without_git(
+    project, tmp_path, monkeypatch
+):
+    """An `implementation_artifacts` configured OUTSIDE `repo_root` cannot be listed
+    by git in the code tree, so the receipt is refused before any `status --ignored`
+    is spawned — fail closed, no git call for the receipt."""
+    outside = tmp_path / "outside-artifacts"
+    outside.mkdir()
+    external = dataclasses.replace(project, implementation_artifacts=outside)
+    task = make_bundle_task(external)
+    sp = outside / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    real = verify._run_git
+    receipt_calls: list[list[str]] = []
+
+    def spy(cmd, repo, **kw):
+        if "status" in cmd and "--ignored" in cmd:
+            receipt_calls.append(cmd)
+        return real(cmd, repo, **kw)
+
+    monkeypatch.setattr(verify, "_run_git", spy)
+    out = verify.verify_dev_bundle(task, external, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "artifact-only receipt refused" in out.reason
+    assert "outside the code tree" in out.reason
+    assert receipt_calls == []
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_git_refusing_the_listing_refuses_the_receipt(project, monkeypatch):
+    """rc 128 on the receipt's `status --ignored` is a REFUSAL, not an answer: the
+    receipt fails closed onto the ordinary retry with the cause named."""
+    task, sp = artifact_only_bundle(project)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    real = verify._run_git
+
+    def refuse_listing(cmd, repo, **kw):
+        proc = real(cmd, repo, **kw)
+        if "status" in cmd and "--ignored" in cmd:
+            proc.returncode = 128
+            proc.stderr = "fatal: simulated refusal\n"
+        return proc
+
+    monkeypatch.setattr(verify, "_run_git", refuse_listing)
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "artifact-only receipt refused" in out.reason
+    assert "git refused to list it" in out.reason
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_git_fault_on_the_listing_escalates(project, monkeypatch):
+    """A `GitError` from the receipt's listing is an environment fault and takes
+    the same `except GitError` the ordinary probe's does: escalate, never retry."""
+    task, sp = artifact_only_bundle(project)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    real = verify._run_git
+
+    def hang_listing(cmd, repo, **kw):
+        if "status" in cmd and "--ignored" in cmd:
+            raise verify.GitTimeoutError(f"git status timed out after 1s in {repo}")
+        return real(cmd, repo, **kw)
+
+    monkeypatch.setattr(verify, "_run_git", hang_listing)
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL"
+    assert "git status timed out" in out.reason
+
+
 def test_verify_dev_bundle_ancestor_baseline_passes(project):
     """#161: a bundle that adopts a pre-existing story spec (bmad-dev-auto
     routes a "follow-up review of story X" bundle into that story's done spec)
@@ -5481,6 +5833,37 @@ def test_path_clean_ignores_stderr_chatter_on_success(project):
 
     (repo / "src.txt").write_text("real change\n", encoding="utf-8")
     assert not verify.path_clean(repo, "src.txt")  # ...and a genuine change still shows
+
+
+def test_verify_dev_bundle_empty_artifacts_listing_refuses_the_receipt_under_host_noise(project):
+    """`_artifact_dir_entries` inherits `path_clean`'s hazard: `status --porcelain`
+    exits 0 while warning on stderr, so read against a merged stream an EMPTY
+    artifacts dir would list one phantom record and the receipt would be accepted
+    over nothing. Only stdout counts.
+
+    Two guards stand between the chatter and the receipt — the stdout-alone read
+    and the `!! ` record filter — and either alone keeps this row green, so the
+    row pins the PAIR: it holds as long as at least one survives. Ablation,
+    MEASURED: build the entries from `(proc.stdout + proc.stderr)` AND keep every
+    non-blank line, and this fails with the receipt accepted over an empty dir;
+    the merged stream with the filter kept still passes, which is why the filter
+    is not a license to drop the stdout-alone read (the filter is about which
+    RECORDS count, not about which STREAM carries them)."""
+    make_git_noisy(project.project)
+    sp = project.project / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-progress", "placeholder")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track the bundle spec outside the artifacts dir")
+    task = make_bundle_task(project)
+    write_spec(sp, "in-review", task.baseline_commit)
+    assert not any(project.implementation_artifacts.iterdir())
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert "lists no ignored entries" in out.reason
+    assert out.artifact_only_accepted is False
 
 
 # ------------------------------------------ probes that return git's text (#442)

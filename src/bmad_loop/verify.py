@@ -718,6 +718,74 @@ def path_clean(repo: Path, rel: str) -> bool:
     return proc.stdout.strip() == ""
 
 
+def _artifact_dir_entries(repo: Path, artifact_dir: Path) -> list[str] | None:
+    """The IGNORED porcelain records (`!!`) git lists under `artifact_dir` — the
+    probe behind the bundle path's artifact-only receipt (DW-273).
+
+    `None` when the receipt cannot be consulted at all: `artifact_dir` resolves
+    outside `repo` (an artifacts dir configured beside the checkout holds nothing
+    git in `repo` can list, and a pathspec that escapes the tree would be a git
+    error rather than an answer), `artifact_dir` IS `repo` (a `.` pathspec would
+    list every ignored file in the tree — `.venv`, caches — and accept the receipt
+    trivially), or git refuses the listing (rc != 0). A `[]` is the OTHER answer —
+    git ran and listed no ignored entry — and callers that relax a gate on this
+    must treat both as "no receipt". A `GitError` propagates: the chokepoint's
+    environment faults (timeout, spawn) are the caller's to escalate, exactly as
+    they are for the ordinary proof-of-work probe.
+
+    ONLY `!!` records count. `status --ignored` also lists the tracked (` M`) and
+    untracked-not-ignored (`??`) records under the dir, and those are exactly what
+    the ordinary probe already measured — and, for the bundle's own spec, already
+    EXCLUDED. Under the `bmad-loop init` default layout (`_bmad-output/` is not
+    gitignored) a bundle whose only residue is its own spec's status flip or its
+    own newly written spec would otherwise be accepted on a listing of one; the
+    receipt exists for the gitignored layout alone, so it reads only what that
+    layout produces.
+
+    Why `status --ignored` and not a baseline diff: ignored paths never enter the
+    index, so there is no commit to diff them against. The listing answers only
+    "the artifacts dir holds ignored content under the code tree" — it cannot say
+    which entry a session wrote, and no caller may read it as if it could.
+    `--untracked-files=all` makes git enumerate the individual files inside an
+    ignored directory rather than collapsing the directory to one record, so the
+    count carried to the journal is a count of files, not of prefixes.
+
+    Reads `stdout` ALONE, for the reason :func:`path_clean` spells out: `status`
+    exits 0 while still writing advisories to stderr, and against a merged stream
+    that chatter would be one phantom entry — enough, on its own, to accept a
+    receipt over an empty directory. Literal pathspec, like every other
+    directory-scoped operand here (`_exclude_specs`): a configured artifacts dir
+    may carry glob magic in a segment."""
+    try:
+        rel = artifact_dir.resolve().relative_to(repo.resolve())
+    except ValueError:
+        return None
+    except (OSError, RuntimeError):
+        try:
+            rel = artifact_dir.relative_to(repo)
+        except ValueError:
+            return None
+    if rel == Path("."):
+        return None
+    proc = _run_git(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "status",
+            "--porcelain",
+            "--ignored",
+            "--untracked-files=all",
+            "--",
+            *_literal_specs([rel.as_posix()]),
+        ],
+        repo,
+    )
+    if proc.returncode != 0:
+        return None
+    return [line for line in proc.stdout.splitlines() if line.startswith("!! ")]
+
+
 def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     """True when `ancestor` is an ancestor of (or equal to) `descendant`.
 
@@ -3581,10 +3649,19 @@ class _SharedGateResult:
     that derivation. A caller re-probing from ``task.baseline_commit`` would count
     a commit that arrived in a shared ``isolation = "none"`` checkout from outside
     the session as this attempt's work — the exact false negative the observation
-    exists to expose."""
+    exists to expose.
+
+    ``artifact_only_residue`` is the third kind, on the bundle leg alone: the
+    number of IGNORED entries the artifact-only receipt's listing held when the ordinary
+    proof-of-work probe positively answered "nothing changed" and the receipt was
+    then ACCEPTED in its place (DW-273). ``None`` everywhere else — no assertion,
+    no ``artifact_only_dir``, a probe that found real changes (the ordinary arm
+    passed and no receipt was consulted), or a receipt that was refused (the leg
+    then carries the retry outcome, not a count)."""
 
     outcome: VerifyOutcome | None = None
     skipped_proof_zero_diff: bool | None = None
+    artifact_only_residue: int | None = None
 
 
 def _verify_shared_gates(
@@ -3598,6 +3675,7 @@ def _verify_shared_gates(
     observe_skipped_proof: tuple[str, ...] | None = None,
     allow_ancestor_baseline: bool = False,
     fm: dict[str, Any] | None = None,
+    artifact_only_dir: Path | None = None,
 ) -> _SharedGateResult:
     """The workflow-tag, expected-status, baseline-match, and proof-of-work gates
     shared verbatim by :func:`verify_dev`, :func:`verify_dev_bundle`, and
@@ -3646,7 +3724,28 @@ def _verify_shared_gates(
     ``elif`` on that order. Passing both is not a richer mode, it is a caller
     error that silently drops the observation — the gate arm wins and the leg was
     never skipped, so there was nothing to observe. Pass ``extra_exclude`` OR
-    ``observe_skipped_proof``, never both."""
+    ``observe_skipped_proof``, never both.
+
+    ``artifact_only_dir`` is the bundle leg's artifact-only RECEIPT (DW-273), and
+    it composes onto the gate arm only: when the ordinary probe positively answers
+    "nothing changed" (``is False`` — a refusal or a fault never reaches it) and
+    the caller passed a directory, :func:`_artifact_dir_entries` lists that
+    directory's IGNORED entries (`!!` records only — tracked and untracked ones
+    are what the ordinary probe already measured), and a positive listing is
+    accepted as proof of work with its count on
+    ``_SharedGateResult.artifact_only_residue``. An empty listing, a directory
+    outside ``paths.repo_root`` (or equal to it) or a git refusal
+    keep the ordinary retry, with the receipt's refusal appended to the verbatim
+    reason; a ``GitError`` escalates through the same ``except`` as the ordinary
+    probe's. Only :func:`verify_dev_bundle` passes it — ``verify_dev`` and
+    ``verify_dev_stories`` never do, so a story result asserting
+    ``artifact_only`` still owes the ordinary diff — and the caller passes it only
+    when the session's synthesized result carries the strict ``artifact_only:
+    True`` boolean, so the decision to consult the receipt is the caller's and
+    this gate never reads ``rj`` for it. It lives HERE rather than after the fact
+    for the reason ``skipped_proof_zero_diff`` does: the ordinary probe's baseline
+    can be re-anchored by the newer-claim branch above, and "the gate found
+    nothing" is known at exactly one point."""
     workflow = rj.get("workflow")
     if workflow != DEV_WORKFLOW:
         return _SharedGateResult(
@@ -3794,9 +3893,26 @@ def _verify_shared_gates(
             # REFUSAL (`None`) keeps the stricter path exactly as it did when this
             # arm called `has_changes_since` and let that function collapse it.
             if proof_of_work_probe(extra_exclude) is False:
-                return _SharedGateResult(
-                    VerifyOutcome.retry("no changes in worktree since baseline commit")
+                reason = "no changes in worktree since baseline commit"
+                if artifact_only_dir is None:
+                    return _SharedGateResult(VerifyOutcome.retry(reason))
+                # The receipt (DW-273): consulted only here, after the ordinary
+                # probe positively found nothing, and only on the leg whose caller
+                # asked. `None` (outside the tree, or git refused) and `[]` (git
+                # listed no ignored entry) both refuse it — the retry keeps its
+                # verbatim prefix so existing readers still match, and names the
+                # cause.
+                entries = _artifact_dir_entries(paths.repo_root, artifact_only_dir)
+                if entries:
+                    return _SharedGateResult(artifact_only_residue=len(entries))
+                cause = (
+                    "artifact-only receipt refused: implementation_artifacts is "
+                    "outside the code tree or git refused to list it"
+                    if entries is None
+                    else "artifact-only receipt refused: implementation_artifacts "
+                    "lists no ignored entries"
                 )
+                return _SharedGateResult(VerifyOutcome.retry(f"{reason} ({cause})"))
         except GitError as e:
             return _SharedGateResult(VerifyOutcome.escalate(str(e)))
     elif observe_skipped_proof is not None and task.baseline_commit:
@@ -4063,7 +4179,30 @@ def verify_dev_bundle(
     when the session actually claims them — an empty/absent claim is the normal
     generic path and passes.
 
-    ``engine_written`` has the same contract as :func:`verify_dev`."""
+    ``engine_written`` has the same contract as :func:`verify_dev`.
+
+    The artifact-only RECEIPT (DW-273) is this leg's alone. A bundle whose only
+    permitted deliverable lives under a gitignored ``implementation_artifacts``
+    (a spec-only erratum) can never satisfy the ordinary proof-of-work probe —
+    it measures tracked and untracked-not-ignored paths only — and a bundle has
+    no ``awaiting-operator`` park to fall back on (``_operator_park_enabled`` is
+    False for bundles). So when the session's synthesized result carries the
+    strict ``artifact_only: True`` boolean — minted by ``devcontract`` from the
+    current session's genuine marker, never from frontmatter, exactly as
+    ``park_asserted`` is — and the ordinary probe positively found nothing, the
+    gate accepts a positive ``git status --ignored`` listing scoped to
+    ``paths.implementation_artifacts`` in its place, and the acceptance rides out
+    as ``artifact_only_accepted`` / ``artifact_only_residue`` for the sweep
+    engine to journal. A bundle with a real change passes the ordinary arm and
+    records no receipt; a loose truthy value (``"true"``, ``1``) is no assertion.
+
+    What the receipt does NOT relax: the workflow tag, the expected status, the
+    baseline match, the dw_ids cross-check below, the configured ``[verify]``
+    commands, and the review gate — ``verify_review_bundle`` still requires every
+    bundle id ``status: done``. And what it cannot prove: ignored paths carry no
+    baseline, so the listing shows that the artifacts dir holds content under the
+    code tree, not which entry this session wrote. The assertion is the
+    load-bearing half."""
     rj = result_mapping(result_json)
     spec_file = rj.get("spec_file")
     if not spec_file:
@@ -4071,6 +4210,10 @@ def verify_dev_bundle(
     spec_path = resolve_spec_path(str(spec_file), paths)
     if not spec_path.is_file():
         return VerifyOutcome.retry(f"claimed spec file does not exist: {spec_path}")
+
+    # The strict boolean, never a truthy string/int — the same selector shape as
+    # `park_asserted`'s (`is True`).
+    artifact_only = rj.get("artifact_only") is True
 
     # With review disabled, the dev session finalizes the bundle straight to done.
     # allow_ancestor_baseline: a bundle that adopts a pre-existing story spec
@@ -4083,6 +4226,7 @@ def verify_dev_bundle(
         expected_status="in-review" if review_enabled else "done",
         extra_exclude=engine_written,
         allow_ancestor_baseline=True,
+        artifact_only_dir=paths.implementation_artifacts if artifact_only else None,
     )
     if gate.outcome is not None:
         return gate.outcome
@@ -4095,7 +4239,10 @@ def verify_dev_bundle(
         )
 
     task.spec_file = str(spec_path)
-    return VerifyOutcome.passed()
+    return VerifyOutcome.passed(
+        artifact_only_accepted=gate.artifact_only_residue is not None,
+        artifact_only_residue=gate.artifact_only_residue,
+    )
 
 
 # A spec_checkpoint story's plan-halt leg leaves the spec at this status (the

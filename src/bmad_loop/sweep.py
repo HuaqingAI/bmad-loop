@@ -6360,13 +6360,32 @@ class SweepEngine(Engine):
         self.journal.append("sweep-bundle-close-carried", story_key=task.story_key, dw_ids=carried)
 
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
-        return verify.verify_dev_bundle(
+        outcome = verify.verify_dev_bundle(
             task,
             self.workspace.paths,
             result_json,
             review_enabled=self._dev_review_enabled(),
             engine_written=self._harvest_gate_exclude(task),
         )
+        # The accepted artifact-only receipt (DW-273) is never silent: one row per
+        # accepted attempt, mirroring `Engine._verify_dev_artifacts`'s
+        # `park-proof-of-work-skipped`. `count` is the receipt listing's size — a
+        # count of IGNORED files under `implementation_artifacts`, not of
+        # entries this session wrote, since ignored paths carry no baseline to
+        # attribute against. The bound is the park record's: the flag rides the
+        # `passed()` return, so a receipt refused by the dw_ids cross-check inside
+        # `verify_dev_bundle` records nothing, while the `[verify]` commands, the
+        # review gate (`verify_review_bundle` still requires every id `done`) and
+        # the commit all run AFTER this append and may still reject the attempt.
+        if outcome.artifact_only_accepted:
+            self.journal.append(
+                "bundle-artifact-only-accepted",
+                story_key=task.story_key,
+                attempt=task.attempt,
+                dw_ids=list(task.dw_ids),
+                count=outcome.artifact_only_residue,
+            )
+        return outcome
 
     def _verify_review(self, task: StoryTask):
         # Generic bundle dev sessions are told not to edit deferred-work.md; the
@@ -6390,7 +6409,10 @@ class SweepEngine(Engine):
         # A bundle carries no sprint-status entry, so the pair a park is verified
         # against does not exist, and `verify_review_bundle` gates on closed dw
         # ids instead. Whether a deferred-work bundle can owe a human action is a
-        # separate question from whether a story can; not answered here.
+        # separate question from whether a story can; not answered here. The one
+        # relaxation a bundle DOES get is the artifact-only receipt in
+        # `verify.verify_dev_bundle` (DW-273), which is a gate-side receipt over
+        # the artifacts dir, not a park: no status change, no waiver.
         return False
 
     def _commit_message(self, task: StoryTask) -> str:
