@@ -16444,64 +16444,308 @@ def test_commit_boundary_close_over_a_ledger_corrupted_under_the_lock_pauses_and
     assert worktree_clean(project.project)
 
 
+@pytest.mark.parametrize("rollback", [False, True])
+@pytest.mark.parametrize("repair_ledger", [False, True])
+@pytest.mark.parametrize("review_enabled", [False, True])
 def test_review_timeout_salvage_refile_over_an_undecodable_ledger_pauses_and_resume_refiles(
-    project, monkeypatch
+    project, monkeypatch, rollback, repair_ledger, review_enabled
 ):
-    """The salvage refile has no pre-read at all: `append_entry`'s locked
-    `read_for_write` is the only read, so an undecodable ledger raises from the
-    call itself. The run pauses under site `review-timeout-salvage-refile-locked`
-    with `followup_review_recommended` still True (the refile is still owed), no
-    `review-timeout-salvage` row and no commit — not `run-crash`. The `timeout`
-    record is not resumable, so after the repair `resume` takes the restart arm,
-    which resets the attempt to baseline and re-drives the whole story from dev
-    (two sessions, not a zero-session replay); the salvage runs again at its
-    end, the work commits and the follow-up is refiled as a `DW-…` entry.
-    `_salvage_policy`'s `rollback_on_failure=True` is the precondition for
-    reaching `done`: with it off the restart arm pauses for manual recovery.
+    """A repair pause preserves the verified product and its pending refile.
 
-    Ablation: delete the `except LedgerReadError` around the salvage's
-    `append_entry` and this reds with `run-crash`."""
+    Ablation: remove `_pending_salvage_session` from the resume arm and repaired
+    retries restart or pause for rollback instead of committing with zero sessions.
+    Delete the salvage's `except LedgerReadError` and the initial run crashes.
+    Restore the unconditional review-disabled shortcut and disabled-review rows
+    skip the owed publication instead of refile/repair-pause recovery.
+    """
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     ledger = project.deferred_work
     _corrupting_mutator(monkeypatch, "append_entry", ledger)
+    policy = dataclasses.replace(_salvage_policy(), scm=ScmPolicy(rollback_on_failure=rollback))
     engine, adapter = make_engine(
         project,
         [dev_effect(project, "1-1-a"), SessionResult(status="timeout")],
-        policy=_salvage_policy(),
+        policy=policy,
     )
 
     summary = engine.run()
 
     assert summary.paused and not summary.crashed and summary.done == 0
     assert engine.state.paused_stage == PAUSE_ESCALATION
-    task = engine.state.tasks["1-1-a"]
-    assert task.phase == Phase.REVIEW_VERIFY  # left where it was
-    assert task.followup_review_recommended is True  # the refile is still owed
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.REVIEW_VERIFY
+    assert task.followup_review_recommended is True
+    assert task.salvage_refile_pending is True
     assert task.commit_sha is None
     assert len(adapter.sessions) == 2
-    kinds = [e["kind"] for e in engine.journal.entries()]
-    assert "run-crash" not in kinds and "story-escalated" not in kinds
-    assert "review-timeout-salvage" not in kinds
     assert _refused_sites(engine) == ["review-timeout-salvage-refile-locked"]
     assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES
+    product = (project.project / "src.txt").read_bytes()
+    assert product != b"original\n"
+    baseline = rev_parse_head(project.project)
 
     monkeypatch.undo()
-    ledger.write_text("# Deferred Work\n", encoding="utf-8")  # the hand repair
-    resumed, resumed_adapter = resume_engine(
-        project, engine, [dev_effect(project, "1-1-a"), SessionResult(status="timeout")]
+    if repair_ledger:
+        ledger.write_text("# Deferred Work\n", encoding="utf-8")
+    resume_policy = dataclasses.replace(
+        policy, review=dataclasses.replace(policy.review, enabled=review_enabled)
     )
+    resumed, resumed_adapter = resume_engine(project, engine, [], policy=resume_policy)
     summary = resumed.run()
 
-    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert not summary.crashed
+    assert len(resumed_adapter.sessions) == 0
+    assert (project.project / "src.txt").read_bytes() == product
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert (final.attempt, final.review_cycle, final.generation) == (
+        task.attempt,
+        task.review_cycle,
+        task.generation,
+    )
+    assert final.sessions == task.sessions
     kinds = [e["kind"] for e in resumed.journal.entries()]
-    assert "resume-restart" in kinds
-    assert len(resumed_adapter.sessions) == 2  # reset to baseline, re-driven from dev
+    assert "resume-restart" not in kinds
+    if not repair_ledger:
+        assert summary.paused and summary.done == 0
+        assert final.phase == Phase.REVIEW_VERIFY
+        assert final.salvage_refile_pending and final.followup_review_recommended
+        assert final.commit_sha is None
+        assert rev_parse_head(project.project) == baseline
+        assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES
+        assert _refused_sites(resumed) == ["review-timeout-salvage-refile-locked"] * 2
+        return
+
+    assert summary.done == 1 and not summary.paused
     (salvage,) = [e for e in resumed.journal.entries() if e["kind"] == "review-timeout-salvage"]
     assert salvage["refiled"] and salvage["refiled"].startswith("DW-")
     text = ledger.read_text(encoding="utf-8")
-    assert "origin: review-timeout-salvage" in text and "1-1-a" in text
+    assert text.count("origin: review-timeout-salvage") == 1 and "1-1-a" in text
+    assert final.phase == Phase.DONE and final.commit_sha
+    assert final.followup_review_recommended is False
+    assert final.salvage_refile_pending is False
+
+
+@pytest.mark.parametrize("interruption", ["notification", "commit-gate-save"])
+def test_pending_salvage_refile_survives_interrupted_commit_handoff(
+    project, monkeypatch, interruption
+):
+    """Successful publication retains replay authority until COMMITTING saves.
+
+    Ablation: clear the latch in salvage before its save and either interruption
+    persists an unresumable timeout. Remove the pending-latch exception from the
+    recommendation shortcut and replay bypasses salvage verification.
+    """
+    from bmad_loop import gates
+
+    class PowerLoss(BaseException):
+        pass
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    _corrupting_mutator(monkeypatch, "append_entry", ledger)
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), SessionResult(status="timeout")],
+        policy=dataclasses.replace(_salvage_policy(), scm=ScmPolicy(rollback_on_failure=False)),
+    )
+    assert engine.run().paused
+    monkeypatch.undo()
+    ledger.write_text("# Deferred Work\n", encoding="utf-8")
+    resumed, adapter = resume_engine(project, engine, [SessionResult(status="completed")])
+
+    if interruption == "notification":
+
+        def notify_then_die(*args, **kwargs):
+            raise PowerLoss
+
+        monkeypatch.setattr(gates, "notify", notify_then_die)
+    else:
+
+        def gate_then_die(stage, task, seq):
+            assert stage == "pre_commit_gate"
+            # The workflow's actual session path saves the live task while it
+            # remains REVIEW_VERIFY; a later gate save must retain the latch.
+            resumed._run_session(
+                task,
+                role="review",
+                prompt="commit gate",
+                seq=seq,
+                label="test.pre_commit_gate",
+            )
+            raise PowerLoss
+
+        monkeypatch.setattr(resumed, "_run_workflows", gate_then_die)
+
+    # Drive the recovery arm directly so run()'s final save cannot simulate a
+    # graceful shutdown and hide what was durable at the host-loss boundary.
+    with pytest.raises(PowerLoss):
+        resumed._finish_inflight()
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.phase == Phase.REVIEW_VERIFY and saved.salvage_refile_pending
+    assert saved.followup_review_recommended is False
+    assert len(adapter.sessions) == (interruption == "commit-gate-save")
+    assert ledger.read_text(encoding="utf-8").count("origin: review-timeout-salvage") == 1
+    product = (project.project / "src.txt").read_bytes()
+    monkeypatch.undo()
+    recovered, recovered_adapter = resume_engine(project, resumed, [])
+    gates_run = []
+    original_workflows = recovered._run_workflows
+
+    def record_commit_gate(stage, task, seq):
+        gates_run.append(stage)
+        return original_workflows(stage, task, seq)
+
+    monkeypatch.setattr(recovered, "_run_workflows", record_commit_gate)
+    summary = recovered.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert len(recovered_adapter.sessions) == 0
+    assert gates_run == ["pre_commit_gate"]
+    assert (project.project / "src.txt").read_bytes() == product
+    final = load_state(recovered.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.DONE and not final.salvage_refile_pending
+    assert (final.attempt, final.review_cycle, final.generation) == (
+        saved.attempt,
+        saved.review_cycle,
+        saved.generation,
+    )
+    assert ledger.read_text(encoding="utf-8").count("origin: review-timeout-salvage") == 1
+    # Both handoffs ran salvage's authoritative verification; the second did
+    # not publish again because the successful refile was already persisted.
+    salvages = [e for e in recovered.journal.entries() if e["kind"] == "review-timeout-salvage"]
+    assert len(salvages) == 2 and salvages[-1]["refiled"] is None
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+def test_unlatched_review_timeout_resume_keeps_restart_recovery(project, monkeypatch, rollback):
+    """Legacy timeout state still rebuilds or pauses for manual recovery.
+
+    Ablation: remove the latch condition from `_pending_salvage_session` and
+    this commits the preserved product instead of taking restart recovery.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    _corrupting_mutator(monkeypatch, "append_entry", project.deferred_work)
+    policy = dataclasses.replace(_salvage_policy(), scm=ScmPolicy(rollback_on_failure=rollback))
+    engine, _ = make_engine(
+        project, [dev_effect(project, "1-1-a"), SessionResult(status="timeout")], policy=policy
+    )
+    assert engine.run().paused
+    state = load_state(engine.run_dir)
+    state.tasks["1-1-a"].salvage_refile_pending = False
+    save_state(engine.run_dir, state)
+    monkeypatch.undo()
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    resumed, adapter = resume_engine(
+        project, engine, [dev_effect(project, "1-1-a"), SessionResult(status="timeout")]
+    )
+
+    summary = resumed.run()
+
+    assert not summary.crashed
+    assert "resume-restart" in [e["kind"] for e in resumed.journal.entries()]
+    if rollback:
+        assert summary.done == 1 and not summary.paused
+        assert len(adapter.sessions) == 2
+    else:
+        assert summary.paused and summary.done == 0
+        assert "manual rollback needed" in resumed.state.paused_reason.lower()
+        assert len(adapter.sessions) == 0
+
+
+@pytest.mark.parametrize("status", ["timeout", "stalled", "over_budget"])
+@pytest.mark.parametrize("phase", [Phase.REVIEW_RUNNING, Phase.REVIEW_VERIFY])
+def test_pending_salvage_session_replays_current_timeout(project, status, phase):
+    engine, _ = make_engine(project, [], policy=_salvage_policy())
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=phase,
+        attempt=2,
+        review_cycle=3,
+        generation=1,
+        salvage_refile_pending=True,
+    )
+    record = SessionRecord(
+        task_id=_session_task_id(task.story_key, "review", 3, 1),
+        role="review",
+        status=status,
+    )
+    task.record_session(record)
+    role, result = engine._pending_salvage_session(task)
+    assert role == "review" and result.status == status
+    assert engine._resumable_session(task) is None  # still an incomplete session
+
+
+@pytest.mark.parametrize("mismatch", ["phase", "cycle", "generation", "role", "status"])
+def test_pending_salvage_session_requires_current_review_record(project, mismatch):
+    """The latch cannot authorize a different phase, identity, or result.
+
+    Ablation targets: remove the phase guard, ID comparison, or role/status
+    refusal separately; their corresponding mismatch rows then return a replay.
+    """
+    engine, _ = make_engine(project, [], policy=_salvage_policy())
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.REVIEW_VERIFY,
+        attempt=2,
+        review_cycle=3,
+        generation=1,
+        salvage_refile_pending=True,
+    )
+    record = SessionRecord(
+        task_id=_session_task_id(task.story_key, "review", 3, 1),
+        role="review",
+        status="timeout",
+    )
+    if mismatch == "phase":
+        task.phase = Phase.DEV_VERIFY
+    elif mismatch == "cycle":
+        task.review_cycle += 1
+    elif mismatch == "generation":
+        task.generation += 1
+    elif mismatch == "role":
+        record.role = "dev"
+    else:
+        # An older eligible record cannot override the newest matching result.
+        task.record_session(dataclasses.replace(record))
+        record.status = "running"
+    task.record_session(record)
+    assert engine._pending_salvage_session(task) is None
+
+
+def test_pending_salvage_refile_resume_reverifies_preserved_product(project, monkeypatch):
+    """Verification failure after repair follows the normal exhausted fallback.
+
+    Ablation: replace salvage's `_verify_review` outcome with a pass and this
+    commits the now-invalid product instead of deferring it.
+    """
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = project.project / "verify-marker.txt"
+    marker.write_text("ok", encoding="utf-8")
+    policy = dataclasses.replace(
+        _salvage_policy(max_review_cycles=1),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+    )
+    _corrupting_mutator(monkeypatch, "append_entry", project.deferred_work)
+    engine, _ = make_engine(
+        project, [dev_effect(project, "1-1-a"), SessionResult(status="timeout")], policy=policy
+    )
+    assert engine.run().paused
+    assert load_state(engine.run_dir).tasks["1-1-a"].salvage_refile_pending
+    monkeypatch.undo()
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    marker.unlink()
+    resumed, adapter = resume_engine(project, engine, [])
+
+    summary = resumed.run()
+
+    assert summary.deferred == 1 and summary.done == 0 and not summary.crashed
+    assert len(adapter.sessions) == 0
     final = load_state(resumed.run_dir).tasks["1-1-a"]
-    assert final.phase == Phase.DONE and final.followup_review_recommended is False
+    assert final.commit_sha is None and final.salvage_refile_pending is False
+    assert "salvage not applicable" in final.defer_reason
+    assert "review-timeout-salvage-failed" in [e["kind"] for e in resumed.journal.entries()]
 
 
 def test_story_over_undecodable_ledger_completes_when_the_spec_records_no_findings(project):

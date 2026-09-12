@@ -29,6 +29,7 @@ from . import deferredwork, devcontract, envvars, gates, operatoractions, verify
 from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec, SpecSnapshot
 from .bmadconfig import ProjectPaths
 from .escalation import (
+    REVIEW_TIMEOUT_STATUSES,
     Action,
     Decision,
     critical_session_reason,
@@ -1799,11 +1800,15 @@ class Engine:
                 else:
                     self._release_orphaned_mount(task)
                     self._resume_after_dev_verify(task)
-            elif (resumable := self._resumable_session(task)) is not None:
+            elif (
+                resumable := self._pending_salvage_session(task) or self._resumable_session(task)
+            ) is not None:
                 # the host died inside the post-session window: the session
                 # itself completed and its recorded result is on disk, so
                 # continue into the normal verify/decide pipeline instead of
                 # rolling the finished work back through resume-restart.
+                # A pending salvage refile also replays its current timeout here:
+                # the latch authorizes retrying salvage, never session completion.
                 role, result = resumable
                 self.journal.append("resume-verify", story_key=task.story_key, role=role)
                 if role == "dev":
@@ -1877,6 +1882,7 @@ class Engine:
                 # past the gate — the same thing an escalation pause does, and the
                 # cheaper of the two mistakes.
                 self._refuse_gated_story(task.story_key)
+                task.salvage_refile_pending = False  # abandoning this product's retry
                 self.journal.append(
                     "resume-restart", story_key=task.story_key, phase=str(task.phase)
                 )
@@ -1903,6 +1909,32 @@ class Engine:
             # the _loop path fires (e.g. the stories-mode done_checkpoint pause),
             # after any worktree integration above — no-op in the base engine.
             self._after_story(task)
+
+    def _pending_salvage_session(self, task: StoryTask) -> tuple[str, SessionResult] | None:
+        """Retry only a latched current review timeout, through normal salvage.
+
+        REVIEW_RUNNING also covers a host loss during this replay's first save.
+        This is separate from completed-session eligibility: the timeout remains
+        incomplete and the preserved product must pass salvage verification again.
+        """
+        if not task.salvage_refile_pending or task.phase not in (
+            Phase.REVIEW_RUNNING,
+            Phase.REVIEW_VERIFY,
+        ):
+            return None
+        task_id = _session_task_id(task.story_key, "review", task.review_cycle, task.generation)
+        for record in reversed(task.sessions):
+            if record.task_id != task_id:
+                continue
+            if record.role != "review" or record.status not in REVIEW_TIMEOUT_STATUSES:
+                return None
+            return "review", SessionResult(
+                status=record.status,
+                result_json=record.result_json,
+                session_id=record.session_id,
+                transcript_path=record.transcript_path,
+            )
+        return None
 
     def _resumable_session(self, task: StoryTask) -> tuple[str, SessionResult] | None:
         """The in-flight session's durably-recorded result, when complete enough
@@ -2799,9 +2831,11 @@ class Engine:
     ) -> None:
         if self._park_awaiting_operator(task):
             return
-        if not self.policy.review.enabled:
+        if not self.policy.review.enabled and not task.salvage_refile_pending:
             # review.enabled = false: the bmad-build-auto session's own inline
             # review is the only review; verify the deterministic gates + commit.
+            # A latched salvage still owes publication/commit even if the
+            # operator disabled new review passes during the repair pause.
             self._skip_review_and_commit(task)
             return
         # review.enabled = true (default): run a follow-up review session by
@@ -2825,7 +2859,11 @@ class Engine:
         # scored the flag; kept as the orchestrator-side bound): once the damping
         # grant is spent, such a round converges + refiles instead of burning
         # cycles to the outer cap.
-        if self.policy.review.trigger == "recommended" and not task.followup_review_recommended:
+        if (
+            self.policy.review.trigger == "recommended"
+            and not task.followup_review_recommended
+            and not task.salvage_refile_pending
+        ):
             self.journal.append("review-not-recommended", story_key=task.story_key)
             self._skip_review_and_commit(task)
             return
@@ -2887,6 +2925,9 @@ class Engine:
                 result_json=result.result_json,
             )
             decision = decide_review_session(task, result, self.policy)
+            if decision.action != Action.SALVAGE and task.salvage_refile_pending:
+                task.salvage_refile_pending = False
+                self._save()
             if decision.action == Action.PAUSE:
                 self._escalate(task, decision.reason)
             if decision.action == Action.DEFER:
@@ -2906,6 +2947,8 @@ class Engine:
                 # through the default retry/exhaust routing.
                 if self._salvage_review_timeout(task, result):
                     return
+                task.salvage_refile_pending = False
+                self._save()
                 fallback = review_retry_or_exhaust(
                     task, self.policy, f"{decision.reason}; salvage not applicable"
                 )
@@ -3250,11 +3293,9 @@ class Engine:
             # A PUBLISH site with no pre-read of its own: the writer's locked
             # `read_for_write` is the only read, so undecodable bytes raise from
             # the call itself and take the repair pause (DW-259). The
-            # recommendation is cleared only AFTER the call, so a pause leaves
-            # the refile owed: the `timeout` record is not resumable, so the
-            # restart arm resets the attempt to baseline (`scm.rollback_on_failure`
-            # governing — off, it pauses for manual recovery) and re-drives the
-            # whole story from dev, and this salvage runs again at its end.
+            # recommendation is cleared only AFTER the call. A repair pause
+            # latches the owed refile so resume retries this current timeout's
+            # salvage over the preserved product, with fresh verification.
             try:
                 refiled = deferredwork.append_entry(
                     ledger,
@@ -3275,6 +3316,7 @@ class Engine:
                     severity="low",
                 )
             except deferredwork.LedgerReadError as e:
+                task.salvage_refile_pending = True
                 self._pause_for_ledger_repair(
                     task,
                     ledger,
@@ -3282,6 +3324,10 @@ class Engine:
                     site="review-timeout-salvage-refile-locked",
                 )
             task.followup_review_recommended = False
+        # Keep recovery authority through notification and commit-gate saves.
+        # The cleared recommendation records successful publication, so replay
+        # re-verifies without appending again. COMMITTING takes over the latch.
+        self._save()
         self.journal.append(
             "review-timeout-salvage",
             story_key=task.story_key,
@@ -3404,6 +3450,7 @@ class Engine:
         if self._run_workflows("pre_commit_gate", task, task.review_cycle):
             return
         advance(task, Phase.COMMITTING)
+        task.salvage_refile_pending = False
         self._save()
         self._finalize_commit_phase(task)
 
@@ -5380,11 +5427,10 @@ class Engine:
         arms redo the write on ``bmad-loop resume``: resume recovery replays the
         recorded session result where one exists — ``_resumable_session`` finds
         the completed dev or review record and re-enters the harvest with it —
-        and otherwise re-drives the leg (the review-timeout salvage leg holds a
-        ``timeout`` record and resumes into the restart arm; the fix leg, at
-        ``DEV_VERIFY`` with ``task.spec_file`` already set, resumes into
-        ``_resume_after_dev_verify`` and a fresh review), retrying the write
-        either way. The ``defer_reason`` re-entry or
+        and a latched timeout salvage refile retries salvage over the preserved
+        product with fresh verification. Other incomplete records re-drive the
+        leg (the fix leg, at ``DEV_VERIFY`` with ``task.spec_file`` already set,
+        resumes into ``_resume_after_dev_verify`` and a fresh review). The ``defer_reason`` re-entry or
         ``_replay_unlatched_ledger_carries`` re-runs the carry.
 
         Since DW-259 the ``deferredwork`` mutators' own locked re-reads route
@@ -5406,9 +5452,9 @@ class Engine:
         through ``SweepEngine._pause_for_bundle_close_repair`` under their own
         ``sweep-bundle-close-refused`` row, at the story gate). The same resume arms
         above retry the write: the COMMITTING re-drive re-runs the close, the
-        restart arm resets the salvage leg's attempt to baseline (rollback
-        policy governing) and re-drives the story from dev, and the carries
-        replay as described.
+        latched salvage refile retries without a new session, and the carries
+        replay as described. Unlatched timeouts retain restart/manual recovery
+        governed by rollback policy.
         """
         self.journal.append(
             "ledger-read-refused",

@@ -332,6 +332,18 @@ def test_followup_review_recommended_defaults_false_for_legacy_state():
     assert StoryTask.from_dict(doc).followup_review_recommended is False
 
 
+@pytest.mark.parametrize("pending", [False, True])
+def test_salvage_refile_pending_round_trips(pending):
+    task = StoryTask(story_key="1-1-a", epic=1, salvage_refile_pending=pending)
+    assert StoryTask.from_dict(task.to_dict()).salvage_refile_pending is pending
+
+
+def test_salvage_refile_pending_defaults_false_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["salvage_refile_pending"]
+    assert StoryTask.from_dict(doc).salvage_refile_pending is False
+
+
 def test_legacy_park_eligible_state_loads_but_is_not_persisted():
     """Retired authorization state is tolerated but cannot influence new runs."""
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()

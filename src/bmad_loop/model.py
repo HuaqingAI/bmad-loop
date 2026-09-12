@@ -255,6 +255,10 @@ class StoryTask:
     # orchestrator runs a follow-up review pass (bmad-build-auto re-invoked on the
     # done spec); otherwise it skips it.
     followup_review_recommended: bool = False
+    # A timeout salvage verified this product but could not refile its follow-up
+    # over an unreadable ledger. Resume retries that current review's salvage,
+    # including authoritative verification, instead of rebuilding the attempt.
+    salvage_refile_pending: bool = False
     baseline_commit: str | None = None
     # untracked, non-ignored paths present at baseline capture (repo-relative
     # posix). On rollback only paths NOT in this set are removed, so files the
@@ -455,6 +459,7 @@ class StoryTask:
             "generation": self.generation,
             "escalations_resolved_upto": self.escalations_resolved_upto,
             "followup_review_recommended": self.followup_review_recommended,
+            "salvage_refile_pending": self.salvage_refile_pending,
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
             "baseline_ledger_digest": self.baseline_ledger_digest,
@@ -653,6 +658,7 @@ class StoryTask:
             generation=int(d.get("generation", 0)),
             escalations_resolved_upto=int(d.get("escalations_resolved_upto", 0)),
             followup_review_recommended=bool(d.get("followup_review_recommended", False)),
+            salvage_refile_pending=bool(d.get("salvage_refile_pending", False)),
             baseline_commit=d.get("baseline_commit"),
             baseline_untracked=(
                 [str(p) for p in d["baseline_untracked"]]
