@@ -16135,6 +16135,269 @@ def test_harvest_over_undecodable_ledger_pauses_and_resume_replays_the_session(p
     ]  # the two pauses' own rows, and no third one
 
 
+# DW-259: the window INSIDE each write. Every `deferredwork` mutator takes its
+# own locked `read_for_write` after the engine's pre-read (or, for the salvage
+# refile and the close carry, with no pre-read at all), so bytes that go bad in
+# that window raise `LedgerReadError` from the mutator call itself. The engine
+# catches exactly that class at each of its six mutator calls and takes the same
+# repair pause as the pre-reads, under a site name ending in `-locked`.
+
+
+def _corrupting_mutator(monkeypatch, name: str, ledger: Path):
+    """Wrap `deferredwork.<name>` so the ledger turns UNDECODABLE right before
+    the real mutator runs — inside the window between the site's pre-read and
+    the mutator's own locked re-read. The real mutator and its real locked
+    `read_for_write` still run; only the window is simulated, so the raise a
+    row observes is the one the engine has to route, not a stub of it.
+
+    Corrupts `ledger` rather than the wrapper's own `path` argument on purpose:
+    the two are the same file at every site, and naming the sandbox's ledger
+    keeps the row honest about WHICH file went bad."""
+    real = getattr(deferredwork, name)
+
+    def corrupt_then_call(path, *a, **kw):
+        assert Path(path) == ledger
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_bytes(UNDECODABLE_LEDGER_BYTES)
+        return real(path, *a, **kw)
+
+    monkeypatch.setattr(deferredwork, name, corrupt_then_call)
+
+
+def _refused_sites(engine) -> list[str]:
+    return [e["site"] for e in engine.journal.entries() if e["kind"] == "ledger-read-refused"]
+
+
+def test_harvest_append_over_a_ledger_corrupted_under_the_lock_pauses_and_resume_files(
+    project, monkeypatch
+):
+    """The harvest's pre-read decoded, the writer's locked re-read did not: the
+    ledger turns undecodable between the two, so `append_entries_published`
+    raises from inside its lock. The run PAUSES at `escalation` under site
+    `spec-deferrals-harvest-append-locked` with the task left at `DEV_VERIFY`,
+    the bytes untouched and nothing filed — not `run-crash`. After the repair,
+    `resume` replays the recorded dev result with ZERO sessions and the retried
+    append files the entry.
+
+    Ablation: delete the `except LedgerReadError` around the harvest's
+    `append_entries_published` and this reds with `run-crash`."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    _corrupting_mutator(monkeypatch, "append_entries_published", ledger)
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed and summary.done == 0
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEV_VERIFY  # left where it was: not ESCALATED
+    assert len(adapter.sessions) == 1
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-crash" not in kinds and "story-escalated" not in kinds
+    assert "spec-deferrals-harvested" not in kinds  # the write never happened
+    assert _refused_sites(engine) == ["spec-deferrals-harvest-append-locked"]
+    (refused,) = [e for e in engine.journal.entries() if e["kind"] == "ledger-read-refused"]
+    assert refused["ledger"] == str(ledger) and "not valid UTF-8" in refused["error"]
+    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES  # nothing written over them
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention and "`bmad-loop resume test-run`" in attention
+
+    monkeypatch.undo()
+    ledger.write_text("# Deferred Work\n", encoding="utf-8")
+    resumed, resumed_adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert resumed_adapter.sessions == []  # the append was retried, not the dev
+    assert resumed.state.tasks["1-1-a"].phase == Phase.DONE
+    assert "resume-verify" in [e["kind"] for e in resumed.journal.entries()]
+    (entry,) = _harvest_entries(project)
+    assert entry.title == HARVEST_A["summary"] and entry.open
+    assert _refused_sites(resumed) == ["spec-deferrals-harvest-append-locked"]  # no second
+
+
+def test_harvest_mark_over_a_ledger_corrupted_under_the_lock_pauses_and_resume_stamps(
+    project, monkeypatch
+):
+    """The seen-again mark's own locked re-read. An open entry from ANOTHER spec
+    carries the finding's fingerprint, so the harvest decides to stamp
+    `seen-again:` on it rather than file a twin — and the ledger turns
+    undecodable before `mark_seen_again_many` takes its lock. The run pauses
+    under site `spec-deferrals-harvest-mark-locked`, nothing is stamped and
+    nothing filed. After the repair, the resume replays the recorded result
+    with ZERO sessions, stamps the sighting and files no duplicate.
+
+    Ablation: delete the `except LedgerReadError` around the harvest's
+    `mark_seen_again_many` and this reds with `run-crash`."""
+    from bmad_loop import devcontract
+
+    fp = devcontract.harvest_fingerprint(HARVEST_A["summary"], HARVEST_A["location"])
+    origin = f"spec-deferred {fp}"
+    _seeded_ledger(project, origin=origin, source_spec="spec-9-9-z.md")
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    _corrupting_mutator(monkeypatch, "mark_seen_again_many", ledger)
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
+        policy=_harvest_policy(),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed and summary.done == 0
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert engine.state.tasks["1-1-a"].phase == Phase.DEV_VERIFY
+    assert len(adapter.sessions) == 1
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-crash" not in kinds and "spec-deferrals-harvested" not in kinds
+    assert _refused_sites(engine) == ["spec-deferrals-harvest-mark-locked"]
+    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES
+
+    monkeypatch.undo()
+    _seeded_ledger(project, origin=origin, source_spec="spec-9-9-z.md")  # the hand repair
+    resumed, resumed_adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert resumed_adapter.sessions == []
+    (entry,) = _harvest_entries(project)  # no duplicate filed
+    assert entry.id == "DW-1" and entry.open and "seen-again: " in entry.body
+    (event,) = [e for e in resumed.journal.entries() if e["kind"] == "spec-deferrals-harvested"]
+    assert event["dw_ids"] == [] and event["seen_again"] == ["DW-1"]
+
+
+def test_commit_boundary_close_over_a_ledger_corrupted_under_the_lock_pauses_and_resume_closes(
+    project, monkeypatch
+):
+    """The commit-boundary close's own locked re-read. `_close_declared_deferred`'s
+    snapshot decoded and classified `DW-1` open; the ledger turns undecodable
+    before `mark_done_many_reopenable` takes its lock, so it raises ahead of any
+    write. The run pauses under site `story-close-locked` with the task left
+    COMMITTING, nothing flipped and — because the armed `_ArmedClose` is cleared
+    before the pause — NO rollback attempted: no `story-deferred-closed`, no
+    `deferred-close-rolled-back`, and no false `deferred-close-rollback-failed`
+    against bytes `mark_open_many` could not read either. After the repair,
+    `resume` re-drives the commit phase (`resume-commit`), the close lands `DW-1`
+    done once inside the single story commit, with ZERO sessions.
+
+    Ablation: delete the `except LedgerReadError` around `_apply_deferred_closes`
+    and this reds with `run-crash`; delete only the `snapshot.clear()` inside it
+    and this reds on the `deferred-close-rollback-failed` row."""
+    ledger = project.deferred_work
+    engine = _closes_deferred_run(project, ["DW-1"])
+    _corrupting_mutator(monkeypatch, "mark_done_many_reopenable", ledger)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed and summary.done == 0
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.COMMITTING  # left where it was
+    assert task.commit_sha is None
+    # the pause `_save()`d: no intent record for a close that flipped nothing
+    assert load_state(engine.run_dir).tasks["1-1-a"].story_closes_intended == []
+    baseline = task.baseline_commit
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-crash" not in kinds and "story-escalated" not in kinds
+    assert "story-deferred-closed" not in kinds
+    assert "deferred-close-rolled-back" not in kinds
+    assert "deferred-close-rollback-failed" not in kinds
+    assert _refused_sites(engine) == ["story-close-locked"]
+    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention and "declared close" in attention
+
+    monkeypatch.undo()
+    write_ledger(project, {"DW-1": "open"}, commit=False)  # the hand repair
+    resumed, resumed_adapter = resume_engine(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert resumed_adapter.sessions == []
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.DONE
+    assert final.commit_sha == rev_parse_head(project.project) != baseline
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-commit" in kinds and "story-done" in kinds
+    assert kinds.count("story-deferred-closed") == 1
+    assert "deferred-close-rollback-failed" not in kinds
+    entry = _ledger_entries(project)["DW-1"]
+    assert entry.status.startswith("done")
+    assert entry.body.count("resolution: resolved by story 1-1-a") == 1
+    # the close rode the ONE story commit above baseline
+    log = git(project.project, "log", "--format=%s", f"{baseline}..HEAD")
+    assert len(log.splitlines()) == 1
+    ledger_rel = ledger.relative_to(project.project).as_posix()
+    assert "status: done" in git(project.project, "show", f"HEAD:{ledger_rel}")
+    assert worktree_clean(project.project)
+
+
+def test_review_timeout_salvage_refile_over_an_undecodable_ledger_pauses_and_resume_refiles(
+    project, monkeypatch
+):
+    """The salvage refile has no pre-read at all: `append_entry`'s locked
+    `read_for_write` is the only read, so an undecodable ledger raises from the
+    call itself. The run pauses under site `review-timeout-salvage-refile-locked`
+    with `followup_review_recommended` still True (the refile is still owed), no
+    `review-timeout-salvage` row and no commit — not `run-crash`. The `timeout`
+    record is not resumable, so after the repair `resume` takes the restart arm,
+    which resets the attempt to baseline and re-drives the whole story from dev
+    (two sessions, not a zero-session replay); the salvage runs again at its
+    end, the work commits and the follow-up is refiled as a `DW-…` entry.
+    `_salvage_policy`'s `rollback_on_failure=True` is the precondition for
+    reaching `done`: with it off the restart arm pauses for manual recovery.
+
+    Ablation: delete the `except LedgerReadError` around the salvage's
+    `append_entry` and this reds with `run-crash`."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    _corrupting_mutator(monkeypatch, "append_entry", ledger)
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), SessionResult(status="timeout")],
+        policy=_salvage_policy(),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed and summary.done == 0
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.REVIEW_VERIFY  # left where it was
+    assert task.followup_review_recommended is True  # the refile is still owed
+    assert task.commit_sha is None
+    assert len(adapter.sessions) == 2
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "run-crash" not in kinds and "story-escalated" not in kinds
+    assert "review-timeout-salvage" not in kinds
+    assert _refused_sites(engine) == ["review-timeout-salvage-refile-locked"]
+    assert ledger.read_bytes() == UNDECODABLE_LEDGER_BYTES
+
+    monkeypatch.undo()
+    ledger.write_text("# Deferred Work\n", encoding="utf-8")  # the hand repair
+    resumed, resumed_adapter = resume_engine(
+        project, engine, [dev_effect(project, "1-1-a"), SessionResult(status="timeout")]
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-restart" in kinds
+    assert len(resumed_adapter.sessions) == 2  # reset to baseline, re-driven from dev
+    (salvage,) = [e for e in resumed.journal.entries() if e["kind"] == "review-timeout-salvage"]
+    assert salvage["refiled"] and salvage["refiled"].startswith("DW-")
+    text = ledger.read_text(encoding="utf-8")
+    assert "origin: review-timeout-salvage" in text and "1-1-a" in text
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.DONE and final.followup_review_recommended is False
+
+
 def test_story_over_undecodable_ledger_completes_when_the_spec_records_no_findings(project):
     """The OBSERVATION arm on a full run. With no `deferred:` findings the harvest
     never reads the ledger, so every read this run makes after the session is an

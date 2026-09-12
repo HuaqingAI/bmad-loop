@@ -3231,24 +3231,41 @@ class Engine:
             # commit. A distinct origin string: `review-budget-followup` is the
             # re-review-cap key `_journal_review_budget_spent` scans for, and a
             # timeout salvage must not trip it.
-            refiled = deferredwork.append_entry(
-                self.workspace.paths.deferred_work,
-                title=(
-                    f"Follow-up review still outstanding for {task.story_key}"
-                    " after a review timeout"
-                ),
-                origin="review-timeout-salvage",
-                source_spec=spec_path.name if task.spec_file else task.story_key,
-                reason=(
-                    f"The review session ended {result.status} with the story already "
-                    f"finalized (status: done, verify green). Per review.on_timeout = "
-                    f"'salvage-if-done' the work was committed by bmad-loop run "
-                    f"{self.state.run_id} without another review pass; this entry "
-                    f"preserves the outstanding follow-up recommendation for a "
-                    f"deliberate later review."
-                ),
-                severity="low",
-            )
+            ledger = self.workspace.paths.deferred_work
+            # A PUBLISH site with no pre-read of its own: the writer's locked
+            # `read_for_write` is the only read, so undecodable bytes raise from
+            # the call itself and take the repair pause (DW-259). The
+            # recommendation is cleared only AFTER the call, so a pause leaves
+            # the refile owed: the `timeout` record is not resumable, so the
+            # restart arm resets the attempt to baseline (`scm.rollback_on_failure`
+            # governing — off, it pauses for manual recovery) and re-drives the
+            # whole story from dev, and this salvage runs again at its end.
+            try:
+                refiled = deferredwork.append_entry(
+                    ledger,
+                    title=(
+                        f"Follow-up review still outstanding for {task.story_key}"
+                        " after a review timeout"
+                    ),
+                    origin="review-timeout-salvage",
+                    source_spec=spec_path.name if task.spec_file else task.story_key,
+                    reason=(
+                        f"The review session ended {result.status} with the story already "
+                        f"finalized (status: done, verify green). Per review.on_timeout = "
+                        f"'salvage-if-done' the work was committed by bmad-loop run "
+                        f"{self.state.run_id} without another review pass; this entry "
+                        f"preserves the outstanding follow-up recommendation for a "
+                        f"deliberate later review."
+                    ),
+                    severity="low",
+                )
+            except deferredwork.LedgerReadError as e:
+                self._pause_for_ledger_repair(
+                    task,
+                    ledger,
+                    _ledger_fault_text(ledger, e),
+                    site="review-timeout-salvage-refile-locked",
+                )
             task.followup_review_recommended = False
         self.journal.append(
             "review-timeout-salvage",
@@ -4435,12 +4452,24 @@ class Engine:
             if not task.harvest_wrote_ledger:
                 task.harvest_wrote_ledger = True
                 self._save()
-            _, marked_published, stale, marked_preimage = deferredwork.mark_seen_again_many(
-                ledger,
-                seen_again_ids,
-                self._today(),
-                f"spec-deferral harvest of {spec_name}",
-            )
+            # The mutator's own locked re-read (DW-259): bytes that went bad
+            # after the pre-read above raise here, ahead of any write, and take
+            # the same repair pause — the phase is untouched, so the resume
+            # replay re-enters this harvest and retries the mark.
+            try:
+                _, marked_published, stale, marked_preimage = deferredwork.mark_seen_again_many(
+                    ledger,
+                    seen_again_ids,
+                    self._today(),
+                    f"spec-deferral harvest of {spec_name}",
+                )
+            except deferredwork.LedgerReadError as e:
+                self._pause_for_ledger_repair(
+                    task,
+                    ledger,
+                    _ledger_fault_text(ledger, e),
+                    site="spec-deferrals-harvest-mark-locked",
+                )
             if marked_published is not None and self._may_move_ledger_anchor(task, marked_preimage):
                 # Re-anchor the pre-harvest restore's CAS on what the mark
                 # published; a following append overwrites this with its own
@@ -4518,7 +4547,23 @@ class Engine:
         # because each spec is applied to the text the previous one produced.
         # The scan above already ran, and the latch above already fired, so the
         # durability ordering the comment there describes is unchanged.
-        minted, published, append_preimage = deferredwork.append_entries_published(ledger, specs)
+        #
+        # The writer's own locked re-read (DW-259): a ledger that turned
+        # undecodable between the pre-read above and this lock raises here,
+        # before any write, and takes the same repair pause as the pre-read —
+        # the latch above already fired, which is fine: a replay retries the
+        # append, and dedupes to nothing if a rival filed the row meanwhile.
+        try:
+            minted, published, append_preimage = deferredwork.append_entries_published(
+                ledger, specs
+            )
+        except deferredwork.LedgerReadError as e:
+            self._pause_for_ledger_repair(
+                task,
+                ledger,
+                _ledger_fault_text(ledger, e),
+                site="spec-deferrals-harvest-append-locked",
+            )
         filed = [dw_id for dw_id in minted if dw_id is not None]
         if filed and self._may_move_ledger_anchor(task, append_preimage):
             # Re-anchor the pre-harvest restore's compare-and-set on what this
@@ -4756,7 +4801,29 @@ class Engine:
         # crash, which is the stale snapshot `_declared_deferred_ids` reads live to
         # avoid.
         task.story_closes_intended = list(ids)
-        marked = self._apply_deferred_closes(task, declared, ledger)
+        try:
+            marked = self._apply_deferred_closes(task, declared, ledger)
+        except deferredwork.LedgerReadError as e:
+            # The close's own locked re-read (DW-259): the snapshot above decoded,
+            # the bytes under the lock did not. `read_for_write` is the sole
+            # raiser and it fires ahead of the write, so NOTHING flipped — the
+            # armed plan above is disarmed before the pause, or the caller's
+            # `BaseException` arm would run `_restore_deferred_closes` over the
+            # same bytes, whose `mark_open_many` cannot read them either, and
+            # journal a false `deferred-close-rollback-failed`. The phase stays
+            # COMMITTING, so the `resume-commit` arm re-drives this close. The
+            # snapshot read above degrades the same bytes to
+            # `deferred-close-ledger-unavailable` because it decides nothing and
+            # publishes nothing; this read was about to publish a declared
+            # close, so it pauses — the DW-146 discriminator.
+            if snapshot is not None:
+                snapshot.clear()
+            # The pause `_save()`s, and the intent record must not outlive a close
+            # that flipped nothing: the re-drive re-derives it from the spec.
+            task.story_closes_intended = []
+            self._pause_for_ledger_repair(
+                task, ledger, _ledger_fault_text(ledger, e), site="story-close-locked"
+            )
         if snapshot is not None:
             if marked:
                 # Narrow the plan to the outcome. `exact` from here on: every id
@@ -5294,6 +5361,27 @@ class Engine:
         ``_resume_after_dev_verify`` and a fresh review), retrying the write
         either way. The ``defer_reason`` re-entry or
         ``_replay_unlatched_ledger_carries`` re-runs the carry.
+
+        Since DW-259 the ``deferredwork`` mutators' own locked re-reads route
+        here too, under a ``site`` ending in ``-locked``: every mutator takes its
+        own ``read_for_write`` under the ledger lock AFTER the site's pre-read,
+        so bytes that go bad inside that window raise ``LedgerReadError`` from
+        the mutator call itself — the harvest's ``mark_seen_again_many`` and
+        ``append_entries_published``, the commit-boundary close's
+        ``mark_done_many_reopenable``, the review-timeout salvage's
+        ``append_entry`` (which has no pre-read at all), the isolated carries'
+        ``append_entries`` and ``mark_done_many_reopenable``. The catch is
+        ``LedgerReadError`` ALONE: ``read_for_write`` is its sole raiser and it
+        fires ahead of every write, so a catch at the call proves the mutator
+        wrote nothing — which is what lets the commit-boundary close disarm its
+        rollback before pausing. The mutators keep raising; the engine owns the
+        route, and the same mutators' other callers — ``SweepEngine``'s bundle
+        close and its carry override, the CLI — own their own routing (the
+        sweep's bundle-close calls are NOT covered here). The same resume arms
+        above retry the write: the COMMITTING re-drive re-runs the close, the
+        restart arm resets the salvage leg's attempt to baseline (rollback
+        policy governing) and re-drives the story from dev, and the carries
+        replay as described.
         """
         self.journal.append(
             "ledger-read-refused",
@@ -5306,9 +5394,10 @@ class Engine:
         # the ledger's path, so the notice does not name the path a second time.
         notice = (
             "**ACTION REQUIRED — deferred-work ledger unreadable**\n"
-            f"Story **{task.story_key}** has findings to file, but the orchestrator "
-            f"could not read the deferred-work ledger to publish them: {error}.\n"
-            "Nothing was written and no work was discarded. Repair the ledger by hand "
+            f"Story **{task.story_key}** has a ledger write to publish (findings to "
+            "file, or a declared close to record), but the orchestrator could not "
+            f"read the deferred-work ledger to publish it: {error}.\n"
+            "This write did not land and no work was discarded. Repair the ledger by hand "
             "(it must be valid UTF-8, and the path's permissions or storage must let "
             "it be read), then run "
             f"`bmad-loop resume {self.state.run_id}`: resume recovery replays the "
@@ -7623,7 +7712,17 @@ class Engine:
                     cross_spec_dedupe=True,
                 )
             )
-        carried = [dw_id for dw_id in deferredwork.append_entries(ledger, specs) if dw_id]
+        # The writer's own locked re-read (DW-259): bytes that went bad after the
+        # pre-read above raise here, before any write, and take the same repair
+        # pause. The commit latch above is already set, which is fine — a replay
+        # retries the append and the latched commit with it.
+        try:
+            appended = deferredwork.append_entries(ledger, specs)
+        except deferredwork.LedgerReadError as e:
+            self._pause_for_ledger_repair(
+                task, ledger, _ledger_fault_text(ledger, e), site="harvest-carry-append-locked"
+            )
+        carried = [dw_id for dw_id in appended if dw_id]
         commit_needed = bool(carried) or task.harvest_carry_commit_pending
         if commit_needed:
             # The pre-append latch also covers every git observation/write below.
@@ -7745,13 +7844,23 @@ class Engine:
         if not task.story_closes_intended:
             return
         ledger = self.paths.deferred_work
-        carried = deferredwork.mark_done_many_reopenable(
-            ledger,
-            task.story_closes_intended,
-            self._today(),
-            self._story_close_note(task),
-            self._story_close_operation_id(task),
-        )
+        # A PUBLISH site with no pre-read of its own: the close's locked
+        # `read_for_write` is the only read, so undecodable bytes raise from the
+        # call itself, ahead of any write, and take the repair pause (DW-259). A
+        # pause leaves `isolated_ledger_carried` False, so
+        # `_replay_unlatched_ledger_carries` re-runs the whole carry hook.
+        try:
+            carried = deferredwork.mark_done_many_reopenable(
+                ledger,
+                task.story_closes_intended,
+                self._today(),
+                self._story_close_note(task),
+                self._story_close_operation_id(task),
+            )
+        except deferredwork.LedgerReadError as e:
+            self._pause_for_ledger_repair(
+                task, ledger, _ledger_fault_text(ledger, e), site="story-close-carry-locked"
+            )
         if carried:
             # The DW-237 guard, before any git: `commit_paths` hands its operand to
             # `git add` as a LITERAL pathspec, so a ledger replaced by a directory

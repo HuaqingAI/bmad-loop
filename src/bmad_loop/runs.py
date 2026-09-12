@@ -3120,13 +3120,20 @@ def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
       the write — replaying the recorded session result where one exists,
       re-driving the leg otherwise. At those four sites a story run over an
       undecodable OR OS-refused ledger therefore no longer dies as `run-crash`.
-      Residual, recorded as a deferral: every `deferredwork` mutator's own locked
-      re-read (the harvest's and carry's `append_entries`,
-      `mark_done_many_reopenable`) still raises inside its window, and the
-      review-timeout salvage refile
-      (`deferredwork.append_entry` in `engine._salvage_review_timeout`) has no
-      pre-read at all — a ledger that goes bad in exactly those windows still
-      crashes the run.
+      Since DW-259 the mutators' locked re-reads route the same way for a DECODE
+      fault only: every `deferredwork` mutator takes its own locked
+      `read_for_write` — after a routed pre-read at the harvest and the harvest
+      carry, after an observation snapshot at the commit-boundary close, and with
+      no pre-read at all at the review-timeout salvage refile
+      (`deferredwork.append_entry` in `engine._salvage_review_timeout`) and the
+      isolated close carry — so a `LedgerReadError` raised from the mutator call
+      itself (the harvest's mark and append, the commit-boundary close, the
+      salvage refile, the isolated carries' append and close) now pauses through
+      the same `ledger-read-refused` route under a site name ending in `-locked`,
+      with the phase untouched. That closes the residual DW-231 recorded; an
+      `OSError` from a mutator's locked read still escapes, as a mutator raises
+      the same class from its write and the engine cannot tell the two apart
+      without changing `deferredwork`.
 
     Timing — a best-effort ENTRY SNAPSHOT, never a guarantee about the inputs the
     run actually arms. The probe reads `load_state` / `bmadconfig.load_paths` at its
