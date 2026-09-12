@@ -472,8 +472,21 @@ def _artifact_only_spec(tmp_path, *, line: str | None = "Artifact only: true", e
         "artifact_only: true",
         "**Artifact only:** TRUE",
         "Artifact-only: true",
+        "**Artifact only:** **true**",
+        "**Artifact only: true**",
+        "Artifact only: **true**",
+        "Artifact only:\u00a0true",  # a non-ASCII horizontal space, as `Status:` tolerates
     ],
-    ids=["prose", "snake", "bold-upper", "hyphen"],
+    ids=[
+        "prose",
+        "snake",
+        "bold-upper",
+        "hyphen",
+        "balanced-bold",
+        "bold-whole-line",
+        "bold-value",
+        "nbsp",
+    ],
 )
 def test_synth_mints_artifact_only_from_a_genuine_session_authored_marker(tmp_path, line):
     """The four-part shape `park_asserted` uses: a present, genuine (no synth
@@ -491,6 +504,47 @@ def test_synth_mints_artifact_only_from_a_genuine_session_authored_marker(tmp_pa
     assert rj is not None and rj["status"] == "done"
     assert rj["artifact_only"] is True
     assert rj["park_asserted"] is False  # a done marker is no park
+
+
+def test_synth_artifact_only_balanced_bold_shapes_mint(tmp_path):
+    """The advertised Status-like bold shapes include a closing delimiter after
+    the value (`**Artifact only:** **true**`, `- **Artifact only: true**`); the
+    regex consumes it before the end-of-line anchor, so the value is still
+    `true` alone on the line.
+
+    Ablation: drop the trailing `(?:\\*\\*)?` from `ARTIFACT_ONLY_LINE_RE` and
+    both shapes fall to the `$` anchor."""
+    sp = _artifact_only_spec(tmp_path, line="**Artifact only:** **true**")
+    assert "- **Artifact only:** **true**\n" in sp.read_text(encoding="utf-8")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is True
+    assert devcontract._artifact_only_asserted("**Artifact only:** **true**") is True
+    assert devcontract._artifact_only_asserted("- **Artifact only: true**") is True
+
+
+def test_synth_artifact_only_newline_separated_value_fails_closed(tmp_path):
+    """The label and its value must share one line. `Artifact only:` with `true`
+    on the NEXT line — or `Artifact only` with `: true` on the next line — is a
+    bare label and a stray token: every gap in the regex is horizontal
+    whitespace (`[^\\S\\r\\n]*`), so the match cannot cross the boundary the `$`
+    anchor holds, on either side of the colon.
+
+    Ablation: restore `\\s*` AFTER the colon and the spec row mints; restore
+    `\\s*` BEFORE the colon and the pre-colon assertion mints."""
+    sp = _artifact_only_spec(tmp_path, line="Artifact only:\ntrue")
+    assert "Artifact only:\ntrue\n" in sp.read_text(encoding="utf-8")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+    assert devcontract._artifact_only_asserted("Artifact only:\ntrue") is False
+    assert devcontract._artifact_only_asserted("Artifact only\n: true") is False
 
 
 def test_synth_artifact_only_trailing_prose_fails_closed(tmp_path):

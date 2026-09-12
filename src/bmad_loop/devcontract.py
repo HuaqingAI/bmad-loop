@@ -58,15 +58,24 @@ STATUS_LINE_RE = re.compile(
 )
 # The bundle leg's artifact-only assertion (DW-273): an `Artifact only: true` /
 # `artifact_only: true` / `Artifact-only: true` line (any run of space/underscore/
-# hyphen between the words, case-insensitive) inside the SAME marker, in the same
-# bulleted/bolded shapes `STATUS_LINE_RE` tolerates. Only the literal value `true`
+# hyphen between the words, case-insensitive) inside the SAME marker. It takes the
+# bulleted/bolded shapes `STATUS_LINE_RE` tolerates PLUS bold around the value or
+# the whole line (`**Artifact only:** **true**`, `- **Artifact only: true**` — a
+# shape `STATUS_LINE_RE` does not read): every `**` is optional and the closing
+# one is consumed before the end-of-line anchor. Only the literal value `true`
 # ALONE on the line asserts — anchored to end of line so prose such as
 # `Artifact only: true for the ledger, false for code` is no assertion; neither is
-# `false`, a bare label, or any other token. Matches are read through
+# `false`, a bare label, or any other token. Every gap is HORIZONTAL whitespace of
+# any kind (`[^\S\r\n]*` — space, tab, NBSP..., never a line break), so unlike
+# `Status:` — whose `\s*` gaps read a value across a line boundary — the label and
+# its value must share one line: `Artifact only:` followed by `true` on the next
+# line, or `Artifact only` with `: true` on the next line, is a bare label and a
+# stray token, not an assertion. Matches are read through
 # `_artifact_only_asserted`, which skips a match inside a fenced block (a pasted
 # example within the marker).
 ARTIFACT_ONLY_LINE_RE = re.compile(
-    r"^\s*(?:[-*]\s*)?(?:\*\*)?artifact[ _-]*only(?:\*\*)?\s*:\s*(?:\*\*)?\s*true[ \t]*$",
+    r"^[^\S\r\n]*(?:[-*][^\S\r\n]*)?(?:\*\*)?artifact[ _-]*only(?:\*\*)?[^\S\r\n]*:"
+    r"(?:\*\*)?[^\S\r\n]*(?:\*\*)?[^\S\r\n]*true(?:\*\*)?[^\S\r\n]*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
