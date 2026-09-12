@@ -5908,6 +5908,103 @@ class SweepEngine(Engine):
         self._save()
         raise RunPaused(reason, PAUSE_STORY_GATE, task.story_key)
 
+    def _pause_for_bundle_close_repair(
+        self,
+        task: StoryTask,
+        ledger: Path,
+        error: str,
+        *,
+        site: str,
+        dw_ids: list[str],
+    ) -> NoReturn:
+        """Pause the run over a ledger a bundle-close mutator could not read under
+        its own lock (DW-280): journal `sweep-bundle-close-refused`, notify with
+        the RESUME route, save, and raise `RunPaused` at the story gate on the
+        task, its phase and `bundle_closes_intended` exactly as they were.
+
+        The sweep's own route for the two calls `Engine._pause_for_ledger_repair`
+        names as NOT covered — `_close_bundle_ledger_when_spec_status` (the
+        accepted-dev close and the review-leg reclose) and the sweep half of
+        `_carry_isolated_ledger_writes`. Each is a bare
+        `deferredwork.mark_done_many_reopenable`, and every mutator takes its own
+        locked `read_for_write` ahead of every write, so a `LedgerReadError` from
+        the call itself proves nothing flipped: the pause costs no work. `site`
+        ends in `-locked` like the engine's, and names which of the three calls
+        raised.
+
+        NOT `_pause_on_intent_refusal`: that tail clears the task's baseline pair,
+        which is right for a task whose attempt was already rolled back and wrong
+        here — an accepted dev attempt still owns its baseline, and the resume
+        re-drives from it. NOT the engine's `_pause_for_ledger_repair` either: its
+        `ledger-read-refused` row is the engine's inventory, and the sweep carries
+        its own refusal vocabulary (`sweep-bundle-close-carry-refused` beside it).
+        `gates.notify` directly, never `_notify_ledger_repair`: that helper steers
+        to a fresh `bmad-loop sweep`, which abandons this run's in-flight task.
+
+        PAUSE_STORY_GATE, not PAUSE_ESCALATION, for the reason `_pause_on_intent_refusal`
+        gives: every escalation action requires Phase.ESCALATED, which none of the
+        three sites' tasks are (DEV_VERIFY, REVIEW_VERIFY, DONE), and the gate
+        stage's single action is "resume", which is the whole remedy once the
+        ledger reads again. `runs.unreadable_sweep_ledger` fronts that resume for
+        the MAIN checkout's ledger — the in-place sites and the carry; under
+        `scm.isolation = "worktree"` the two close sites write the unit worktree's
+        copy (`self.workspace.paths.deferred_work`), which the notice names via
+        `error` and the gate does not probe, so an unrepaired copy simply
+        re-pauses here on resume. With the phase untouched the existing resume arms redo the
+        close: at DEV_VERIFY, `_recover_inflight_bundle`'s accepted-session arm
+        re-enters `_resume_after_dev_verify` → `_post_dev_accepted_sync` and the
+        close re-drives with no session spent; at DONE with the latch left False,
+        `Engine._replay_unlatched_ledger_carries` re-runs the whole carry hook
+        ahead of `_loop`; at REVIEW_VERIFY the sweep has no `_resumable_session`
+        arm, so the pause takes its restart arm — `_rollback_or_pause` resets the
+        attempt to baseline (rollback policy governing) and the bundle is
+        re-driven from dev, whose accepted close then lands. That last is the
+        pre-existing sweep resume shape, not widened here."""
+        self.journal.append(
+            "sweep-bundle-close-refused",
+            story_key=task.story_key,
+            dw_ids=list(dw_ids),
+            site=site,
+            ledger=str(ledger),
+            reason="ledger-unreadable",
+            error=error,
+        )
+        ids = ", ".join(dw_ids)
+        # `error` is `LedgerReadError`'s text and already begins with the ledger's
+        # path, so neither string names the path a second time (the engine's
+        # `_pause_for_ledger_repair` does the same). One wording for all three
+        # sites, no per-site branch. No "COMMIT the fix" steer, unlike
+        # `_pause_on_intent_refusal`: at the accepted-dev site the session's
+        # uncommitted work sits beside the ledger, and a whole-tree commit by hand
+        # would swallow it under the repair. The bundle's own commit carries a
+        # tracked ledger's repair once it lands.
+        notice = (
+            "**ACTION REQUIRED — deferred-work ledger unreadable**\n"
+            f"Bundle **{task.story_key}** was about to publish a ledger close for "
+            f"{ids} (a close, or a re-assertion of one after review), but the "
+            f"orchestrator could not decode the deferred-work ledger to publish it: "
+            f"{error}.\n"
+            "This write did not land and no work was discarded. Repair the ledger by "
+            "hand (it must be valid UTF-8)"
+        )
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"ACTION REQUIRED: repair the deferred-work ledger for {task.story_key}",
+            f"{notice} — then `bmad-loop resume {self.state.run_id}`, which re-drives "
+            "the write: replaying the recorded dev result at the accepted-dev close "
+            "and the isolated carry with no session spent, and restarting the bundle "
+            "from dev at the review-leg reclose, rollback policy governing",
+        )
+        self._save()
+        raise RunPaused(
+            f"bundle {task.story_key}: its ledger close for {ids} could not be "
+            f"published because the ledger could not be decoded ({error}); repair "
+            "the ledger by hand, then resume",
+            PAUSE_STORY_GATE,
+            task.story_key,
+        )
+
     def _ensure_bundle_intent(self, task: StoryTask) -> bool:
         """Guarantee a recovered bundle has the intent file its dev prompt points
         at, and that the file it points at is the one for THIS task's ids. The
@@ -6157,7 +6254,9 @@ class SweepEngine(Engine):
         if not spec_file:
             return
         success_status = "in-review" if self._dev_review_enabled() else "done"
-        self._close_bundle_ledger_when_spec_status(task, str(spec_file), success_status)
+        self._close_bundle_ledger_when_spec_status(
+            task, str(spec_file), success_status, site="bundle-close-locked"
+        )
 
     def _bundle_close_operation_id(self, task: StoryTask) -> str:
         """Stable identity for a close and its possible defer-time undo."""
@@ -6183,7 +6282,30 @@ class SweepEngine(Engine):
         spec_file: str,
         success_status: str,
         kind: str = "sweep-bundle-closed",
+        *,
+        site: str,
     ) -> None:
+        """Mark the bundle's ids ``done`` once its spec reaches ``success_status``.
+
+        Called once after accepted dev (``_post_dev_accepted_sync``,
+        ``site="bundle-close-locked"``) and again by the review-leg reclose
+        (``_verify_review``, ``site="bundle-reclose-locked"``). The catch sits here
+        rather than at those callers so there is one arm and one row shape; the
+        ``site`` kwarg is what tells the two apart in the journal — keyword-only
+        with no default, so a further caller must name its own token rather than
+        inherit the accepted-dev one.
+
+        The mutator's own locked re-read (DW-280): ``mark_done_many_reopenable``
+        takes ``read_for_write`` under the ledger lock ahead of every write, so a
+        ledger that turns undecodable before that read raises ``LedgerReadError``
+        from the call itself with nothing flipped. Bare, that crashed the run at
+        the accepted-dev close with the session's work on disk. It now routes to
+        ``_pause_for_bundle_close_repair`` — the sweep's own route, not the
+        engine's ``ledger-read-refused`` — with ``bundle_closes_intended`` already
+        assigned, so the resume arms re-drive the close. ``LedgerReadError`` ALONE:
+        an ``OSError`` here is a write fault as often as a read one and stays on
+        the DW-182/186 contract.
+        """
         spec_path = verify.resolve_spec_path(spec_file, self.workspace.paths)
         if not spec_path.is_file():
             return
@@ -6199,13 +6321,21 @@ class SweepEngine(Engine):
         # normally finds every entry already done, so `marked` is empty; deriving
         # the record from it would erase exactly the state a landing bundle needs.
         task.bundle_closes_intended = list(task.dw_ids)
-        marked = deferredwork.mark_done_many_reopenable(
-            ledger,
-            task.dw_ids,
-            self._today(),
-            note,
-            self._bundle_close_operation_id(task),
-        )
+        try:
+            marked = deferredwork.mark_done_many_reopenable(
+                ledger,
+                task.dw_ids,
+                self._today(),
+                note,
+                self._bundle_close_operation_id(task),
+            )
+        except deferredwork.LedgerReadError as e:
+            # A plain `Exception` on purpose (DW-146), so it must be named: no
+            # `except OSError` would ever see it. The record above stays as
+            # assigned — it is what the resume's re-drive closes.
+            self._pause_for_bundle_close_repair(
+                task, ledger, str(e), site=site, dw_ids=list(task.dw_ids)
+            )
         if marked:
             self.journal.append(kind, story_key=task.story_key, dw_ids=marked)
 
@@ -6295,6 +6425,21 @@ class SweepEngine(Engine):
         already done. The flips themselves are unguarded: losing them is the hazard
         this exists to prevent.
 
+        One fault here RAISES, as a pause rather than a crash — the mutator's own
+        locked read (DW-280). ``mark_done_many_reopenable`` takes ``read_for_write``
+        under the ledger lock ahead of every write, so a MAIN ledger that is
+        undecodable when this half runs raises ``LedgerReadError`` from the call
+        itself, before the flips the carry exists to make. That is the one fault
+        the best-effort argument does not cover: nothing is on disk yet, so
+        degrading would lose exactly the closes this hook is for. Bare, it crashed
+        the run after the merge with ``isolated_ledger_carried`` False (neither
+        ``worktree_flow.integrate_unit`` nor ``_replay_unlatched_ledger_carries``
+        catches it). It now routes to ``_pause_for_bundle_close_repair`` under
+        ``bundle-close-carry-locked``, the latch left False by the call site — so
+        ``bmad-loop resume`` replays the whole hook through
+        ``_replay_unlatched_ledger_carries`` once the ledger reads. The base half's
+        harvest carry routes its own locked read through the engine (DW-259).
+
         A publication REFUSAL (DW-237) is best effort on strictly stronger terms.
         ``verify.unpublishable_target`` answers a different question from a
         ``GitError`` — not "can git own this path" but "is this operand a publishable
@@ -6319,13 +6464,25 @@ class SweepEngine(Engine):
         if not task.bundle_closes_intended:
             return
         ledger = self.paths.deferred_work
-        carried = deferredwork.mark_done_many_reopenable(
-            ledger,
-            task.bundle_closes_intended,
-            self._today(),
-            self._bundle_close_note(task),
-            self._bundle_close_operation_id(task),
-        )
+        try:
+            carried = deferredwork.mark_done_many_reopenable(
+                ledger,
+                task.bundle_closes_intended,
+                self._today(),
+                self._bundle_close_note(task),
+                self._bundle_close_operation_id(task),
+            )
+        except deferredwork.LedgerReadError as e:
+            # A plain `Exception` on purpose (DW-146), so it must be named: no
+            # `except OSError` would ever see it. `LedgerReadError` ALONE — an
+            # `OSError` from the mutator is a write fault as often as a read one.
+            self._pause_for_bundle_close_repair(
+                task,
+                ledger,
+                str(e),
+                site="bundle-close-carry-locked",
+                dw_ids=list(task.bundle_closes_intended),
+            )
         if carried:
             # The DW-237 publishable-target guard, before any git runs: `commit_paths`
             # forces every operand LITERAL, so a ledger replaced by a DIRECTORY is
@@ -6396,7 +6553,11 @@ class SweepEngine(Engine):
         # makes "a review rewrote the ledger" greppable when diagnosing runs.
         if self._generic_dev() and task.spec_file:
             self._close_bundle_ledger_when_spec_status(
-                task, task.spec_file, "done", kind="sweep-bundle-reclosed"
+                task,
+                task.spec_file,
+                "done",
+                kind="sweep-bundle-reclosed",
+                site="bundle-reclose-locked",
             )
         return verify.verify_review_bundle(
             task,

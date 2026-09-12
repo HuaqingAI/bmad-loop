@@ -3108,7 +3108,16 @@ def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
       sweep on an absent ledger ends cleanly at `sweep-nothing-open`, unless it
       holds an in-flight bundle whose intent document must be regenerated: that
       run re-pauses at the story gate under `sweep-intent-regen-refused`
-      `reason="ledger-absent"` (DW-243/252) before any cycle runs.
+      `reason="ledger-absent"` (DW-243/252) before any cycle runs. A bundle close
+      paused at the same gate under `sweep-bundle-close-refused` — the mutator's
+      own locked read at the accepted-dev close, the review-leg reclose or the
+      isolated close carry (DW-280) — resumes the same way once the ledger
+      reads: this gate fronts that resume for the MAIN checkout's ledger (the
+      in-place sites and the carry), and the existing recovery arms then
+      re-drive the close. Under `scm.isolation = "worktree"` the two close
+      sites write the unit worktree's copy, which the pause notice names and
+      this gate does not probe, so an unrepaired copy simply re-pauses on
+      resume.
     * Story runs are out of scope, and since DW-231 (undecodable bytes) and
       DW-258 (a read the OS refuses) that is SAFE rather than merely decided at
       the engine's four direct `read_for_write` sites. Its observation reads

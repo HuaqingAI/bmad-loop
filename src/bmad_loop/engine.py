@@ -5388,7 +5388,9 @@ class Engine:
         rollback before pausing. The mutators keep raising; the engine owns the
         route, and the same mutators' other callers — ``SweepEngine``'s bundle
         close and its carry override, the CLI — own their own routing (the
-        sweep's bundle-close calls are NOT covered here). The same resume arms
+        sweep's bundle-close calls are NOT covered here: since DW-280 they pause
+        through ``SweepEngine._pause_for_bundle_close_repair`` under their own
+        ``sweep-bundle-close-refused`` row, at the story gate). The same resume arms
         above retry the write: the COMMITTING re-drive re-runs the close, the
         restart arm resets the salvage leg's attempt to baseline (rollback
         policy governing) and re-drives the story from dev, and the carries

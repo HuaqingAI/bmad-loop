@@ -4342,6 +4342,255 @@ def test_generic_bundle_review_verify_recloses_ledger_after_review_rewrites_it(p
     assert "sweep-bundle-reclosed" in {e["kind"] for e in engine.journal.entries()}
 
 
+# DW-280: the window INSIDE the sweep's two bundle-close mutator calls. Every
+# `deferredwork` mutator takes its own locked `read_for_write` ahead of every
+# write, so bytes that go bad before that read raise `LedgerReadError` from the
+# `mark_done_many_reopenable` call itself, with nothing flipped. The engine routes
+# its own six calls (DW-259); the sweep's accepted-dev close, review-leg reclose
+# and isolated close carry were bare. Each row below corrupts the ledger INSIDE
+# the window — a wrapper that writes the undecodable bytes and then calls the
+# REAL mutator, so the raise a row observes is the real locked read's — and
+# asserts the sweep's own pause: `sweep-bundle-close-refused` under a `-locked`
+# site, `RunPaused` at the story gate, phase and `bundle_closes_intended`
+# untouched, so the existing resume arms re-drive the close.
+
+
+def _corrupt_ledger_before_mark(monkeypatch, project, *, main_only: bool = False):
+    """Wrap `deferredwork.mark_done_many_reopenable` so the ledger turns
+    UNDECODABLE right before the real mutator runs. `main_only` corrupts only
+    when the operand is the MAIN checkout's ledger, so under isolation the
+    worktree copy's close passes and it is the carry's locked read that raises.
+    Returns the real mutator so a row can restore it before the resume."""
+    real = deferredwork.mark_done_many_reopenable
+
+    def corrupt_then_mark(path, *a, **kw):
+        if not main_only:
+            assert Path(path) == project.deferred_work
+        if Path(path) == project.deferred_work:
+            path.write_bytes(_UNDECODABLE_LEDGER)
+        return real(path, *a, **kw)
+
+    monkeypatch.setattr(deferredwork, "mark_done_many_reopenable", corrupt_then_mark)
+    return real
+
+
+def _assert_bundle_close_pause(engine, task_key, *, site, dw_ids):
+    """The DW-280 row and notice, shared by the three sites."""
+    [refused] = _records(engine, "sweep-bundle-close-refused")
+    assert refused["story_key"] == task_key
+    assert refused["site"] == site
+    assert refused["dw_ids"] == dw_ids
+    assert refused["ledger"] == str(engine.paths.deferred_work)
+    assert refused["reason"] == "ledger-unreadable"
+    assert "not valid UTF-8" in refused["error"]
+    # the sweep's route, not the engine's
+    assert _records(engine, "ledger-read-refused") == []
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention
+    assert str(engine.paths.deferred_work) in attention
+    assert f"then `bmad-loop resume {engine.state.run_id}`" in attention
+    assert "re-run `bmad-loop sweep`" not in attention  # the fresh-sweep route is wrong here
+    return refused
+
+
+def test_accepted_dev_bundle_close_pauses_when_the_ledger_turns_undecodable_under_the_lock(
+    project, monkeypatch
+):
+    """DW-280 at `_close_bundle_ledger_when_spec_status`'s accepted-dev call, in
+    place. Bare, the `LedgerReadError` from the mutator's locked read escaped
+    `_post_dev_accepted_sync` and ended the run as `run-crash` with the accepted
+    session's work on disk and no repair route. It now pauses at the story gate
+    under `sweep-bundle-close-refused` site `bundle-close-locked`, the task left at
+    DEV_VERIFY with `bundle_closes_intended` already assigned and its baseline pair
+    intact (NOT `_pause_on_intent_refusal`, which clears it — an accepted attempt
+    still owns its baseline), the ledger's bytes untouched.
+
+    The resume half is the whole point of the phase being untouched:
+    `_recover_inflight_bundle`'s DEV_VERIFY + accepted-session arm re-enters
+    `_resume_after_dev_verify` → `_post_dev_accepted_sync`, which re-drives the
+    close with ZERO sessions, and the bundle lands DONE with both ids `done`.
+
+    Ablation: delete the `except deferredwork.LedgerReadError` arm in
+    `_close_bundle_ledger_when_spec_status` and this reds on `summary.paused` with
+    a `run-crash` row naming `LedgerReadError`."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "fix-things", "dw_ids": ["DW-1", "DW-2"], "intent": "fix both"}],
+    )
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix-things", ["DW-1", "DW-2"], mark_ledger=False),
+        ],
+        policy=pol,
+    )
+    real = _corrupt_ledger_before_mark(monkeypatch, project)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert _records(engine, "run-crash") == []
+    assert [s.role for s in adapter.sessions] == ["triage", "dev"]
+    assert engine.state.paused_stage == PAUSE_STORY_GATE
+    assert engine.state.paused_story_key == "dw-fix-things"
+    [paused] = _gate_pauses(engine)
+    assert paused["reason"] == summary.paused_reason
+    assert str(project.deferred_work) in paused["reason"]
+    _assert_bundle_close_pause(
+        engine, "dw-fix-things", site="bundle-close-locked", dw_ids=["DW-1", "DW-2"]
+    )
+    assert "sweep-bundle-closed" not in journal_kinds(engine)
+    assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER  # nothing flipped
+    on_disk = load_state(engine.run_dir)
+    assert not on_disk.finished and on_disk.paused_stage == PAUSE_STORY_GATE
+    for task in (engine.state.tasks["dw-fix-things"], on_disk.tasks["dw-fix-things"]):
+        assert task.phase == Phase.DEV_VERIFY
+        assert task.bundle_closes_intended == ["DW-1", "DW-2"]
+        assert task.baseline_commit is not None  # the accepted attempt still owns it
+        assert task.accepted_dev_session_index == len(task.sessions) - 1
+
+    # repair by hand (the bundle's own commit carries the tracked repair), resume
+    monkeypatch.setattr(deferredwork, "mark_done_many_reopenable", real)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"}, commit=False)
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert adapter.sessions == []  # the close re-drives off the persisted receipt
+    assert [e["dw_ids"] for e in _records(resumed, "sweep-bundle-closed")] == [["DW-1", "DW-2"]]
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done")
+    assert entries["DW-2"].status.startswith("done")
+    assert load_state(resumed.run_dir).tasks["dw-fix-things"].phase == Phase.DONE
+
+
+def test_isolated_bundle_close_carry_pauses_when_the_main_ledger_is_undecodable_under_the_lock(
+    project, monkeypatch
+):
+    """DW-280 at the sweep half of `_carry_isolated_ledger_writes`. The worktree
+    copy's close passes (the wrapper corrupts the MAIN ledger only), the branch
+    merges, and then the carry's own locked read meets the undecodable main
+    ledger. Bare, the raise crashed the run after `unit-merged` with
+    `isolated_ledger_carried` False — nothing in `worktree_flow.integrate_unit` or
+    `_replay_unlatched_ledger_carries` catches it. It now pauses at the story gate
+    under site `bundle-close-carry-locked`, with the task DONE, the latch still
+    False (the call site owns it, and the pause propagates past it) and
+    `bundle_closes_intended` intact, main bytes untouched.
+
+    That unlatched shape IS the resume story: `_replay_unlatched_ledger_carries`
+    re-runs the whole carry hook ahead of `_loop` once the ledger reads, with zero
+    sessions, and DW-1 lands `done` in the main checkout.
+
+    Ablation: delete the `except deferredwork.LedgerReadError` arm in the sweep's
+    `_carry_isolated_ledger_writes` and this reds on `summary.paused` with a
+    `run-crash` row naming `LedgerReadError`."""
+    ignored_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan(["DW-1"])), wt_bundle_dev(project)],
+        policy=isolated_seeded_policy(project),
+    )
+    real = _corrupt_ledger_before_mark(monkeypatch, project, main_only=True)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert _records(engine, "run-crash") == []
+    kinds = journal_kinds(engine)
+    assert "unit-merged" in kinds  # the merge landed; the carry is what refused
+    assert "sweep-bundle-close-carried" not in kinds
+    assert engine.state.paused_stage == PAUSE_STORY_GATE
+    assert engine.state.paused_story_key == "dw-fix"
+    _assert_bundle_close_pause(engine, "dw-fix", site="bundle-close-carry-locked", dw_ids=["DW-1"])
+    assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER  # main: nothing flipped
+    paused = load_state(engine.run_dir).tasks["dw-fix"]
+    assert paused.phase == Phase.DONE
+    assert not paused.isolated_ledger_carried
+    assert paused.bundle_closes_intended == ["DW-1"]
+    assert paused.worktree_path  # the replay keys on the recorded mount
+
+    # repair by hand (gitignored: nothing to commit), resume
+    monkeypatch.setattr(deferredwork, "mark_done_many_reopenable", real)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert adapter.sessions == []  # no re-triage: the replayed close left the open set first
+    kinds = journal_kinds(resumed)
+    assert "resume-ledger-carry" in kinds and "sweep-bundle-close-carried" in kinds
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+    assert load_state(resumed.run_dir).tasks["dw-fix"].isolated_ledger_carried
+
+
+def test_review_leg_reclose_pauses_when_the_ledger_turns_undecodable_under_the_lock(
+    project, monkeypatch
+):
+    """DW-280 at `_verify_review`'s reclose — the second caller of
+    `_close_bundle_ledger_when_spec_status`, told apart from the accepted-dev close
+    only by `site="bundle-reclose-locked"`. Driven directly, like the reclose row
+    above it: the ledger is corrupted before the reclose's mutator, and the call
+    raises `RunPaused` at the story gate instead of a bare `LedgerReadError`, with
+    no `sweep-bundle-reclosed` row, the bytes untouched, and the task's phase and
+    `bundle_closes_intended` as the call left them.
+
+    The resume shape at this site is the sweep's pre-existing restart arm —
+    `_recover_inflight_bundle` has no `_resumable_session` arm, so a REVIEW_VERIFY
+    pause resets the attempt to baseline and re-drives the bundle from dev, whose
+    accepted close then lands; not widened here, so not driven here.
+
+    Ablation: delete the `except deferredwork.LedgerReadError` arm in
+    `_close_bundle_ledger_when_spec_status` and this reds on `pytest.raises` with
+    the bare `LedgerReadError` escaping the call."""
+    from bmad_loop.engine import RunPaused
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    baseline = git(project.project, "rev-parse", "HEAD")
+    spec = project.implementation_artifacts / "spec-dw-fix-things.md"
+    write_spec(spec, "done", baseline)
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, _ = make_sweep(project, [], policy=pol)
+    task = StoryTask(
+        story_key="dw-fix-things",
+        epic=0,
+        dw_ids=["DW-1", "DW-2"],
+        spec_file=str(spec),
+    )
+    task.phase = Phase.REVIEW_VERIFY
+    engine.state.tasks[task.story_key] = task
+    _corrupt_ledger_before_mark(monkeypatch, project)
+
+    with pytest.raises(RunPaused) as raised:
+        engine._verify_review(task)
+
+    assert raised.value.stage == PAUSE_STORY_GATE
+    assert raised.value.story_key == "dw-fix-things"
+    assert str(project.deferred_work) in raised.value.reason
+    _assert_bundle_close_pause(
+        engine, "dw-fix-things", site="bundle-reclose-locked", dw_ids=["DW-1", "DW-2"]
+    )
+    assert "sweep-bundle-reclosed" not in journal_kinds(engine)
+    assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER  # nothing flipped
+    for saved in (task, load_state(engine.run_dir).tasks["dw-fix-things"]):
+        assert saved.phase == Phase.REVIEW_VERIFY
+        assert saved.bundle_closes_intended == ["DW-1", "DW-2"]
+
+
 def test_generic_bundle_reconcile_closes_ledger_on_stale_frontmatter(project):
     """Regression for the DW-159/160/162 false-defer: the bundle session finalized
     in prose (## Auto Run Result: Status done) but left the bundle spec frontmatter
