@@ -422,7 +422,18 @@ this run` when the original engine still appears to be running. Heed this
   one: two engines driving one run dir corrupt each other's state. It can also
   mean the pid was recycled by another process — verify before resuming.
 
-Confirming spawns `bmad-loop resume <run-id>` detached in `bmad-loop-ctl`,
+After the multiplexer and engine-liveness checks, confirming an unfinished sweep
+checks whether the main checkout's deferred-work ledger can be read. An undecodable ledger or a
+permissions/storage read failure shows an error toast with the same repair guidance
+as the CLI, and no detached window launches. Repair the ledger by hand (or fix its
+permissions or storage), then resume again to keep the in-flight bundle recovery.
+The toast also offers `bmad-loop sweep` after committing or stashing changes so the
+worktree is clean. Story runs and cases where the probe cannot locate the ledger
+retain the existing handoff, as does an absent ledger. The probe does not check an
+isolated unit worktree's ledger; an unreadable copy there may still re-pause the run
+after handoff until that copy is repaired.
+
+When these checks pass, confirming spawns `bmad-loop resume <run-id>` detached in `bmad-loop-ctl`,
 like any other launch. Resume drops any stale `bmad-loop-<run-id>` session a
 stopped or interrupted run left behind and spins up a fresh one, so the run
 never re-attaches to a dead session.
