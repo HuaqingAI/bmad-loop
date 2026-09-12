@@ -6790,14 +6790,18 @@ def test_preanswered_keep_open_whose_option_was_re_authored_stops_suppressing(pr
 # ------------------------------- the two per-run `decisions.json` writes (cf. #363)
 #
 # `sweep.atomic_write_text_confined` (#593) is the binding the two `_decisions_phase`
-# writes below share. The module's OTHER two writers — the `_ensure_migration` ledger
-# restore and `_write_bundle_intent` — kept the plain `sweep.atomic_write_text`, so
-# splitting the adoption narrowed what these patches can reach. The FILENAME filter
-# and the delegate-otherwise arm stay anyway: a bare module-wide boom would make the
-# "revert this site" ablation pass for the WRONG REASON — the run still crashes on
-# "disk full", just raised from somewhere else — and the filter is what keeps that
-# true if a third site in this module ever adopts the confined helper. Both plans
-# carry ZERO bundles so the bundle-intent write is unreachable too.
+# writes below share — and, since DW-269, the `_ensure_triage` cache write-back and
+# `_write_intent` too. Of the module's `atomic_write_text` callers only the
+# `_ensure_migration` ledger restore keeps the plain helper (a project-level ledger
+# write with its own symlink policy, DW-188); the migration's two run-dir JSON
+# records, `migrate-manifest.json` and `migrate-result.json`, are bare `Path.write_text`
+# and go through neither binding. The FILENAME filter and the delegate-otherwise arm
+# are therefore load-bearing: a bare module-wide boom would make the "revert this
+# site" ablation pass for the WRONG REASON — the triage cache write-back DEGRADES
+# (DW-247), so a module-wide boom would leave a stray `sweep-triage-cache-write-failed`
+# row with the plan still acted on, and would crash the intent write wherever a plan
+# carries a bundle — and the filter is what keeps each row graded on its own site.
+# Both plans carry ZERO bundles so the bundle-intent write is unreachable too.
 #
 # The filter is safe against the project-level pre-answer store, which is also named
 # `decisions.json`: that goes through `decisions.atomic_write_text_confined`, a
@@ -9732,18 +9736,22 @@ def _cache_triage(engine, result_json, cycle: int = 1) -> Path:
 
 def _fault_cache_write(monkeypatch, cache: Path) -> None:
     """Make `_ensure_triage`'s write-back of exactly `cache` raise `PermissionError`
-    at the `bmad_loop.sweep.atomic_write_text` seam; every other atomic write the
-    run makes (intent documents, the sandbox ledger) still lands. The helper, not
-    `Path.write_text`: since DW-263 the write-back is atomic, and a `write_text`
-    fault would sail past it."""
-    real = sweep_mod.atomic_write_text
+    at the `bmad_loop.sweep.atomic_write_text_confined` seam; every other write
+    the run makes (the other intent documents, the decisions store, the sandbox
+    ledger) still lands. The helper, not `Path.write_text`: since DW-263 the
+    write-back is atomic, and since DW-269 it is CONFINED, so a fault at either
+    `write_text` or the plain `atomic_write_text` would sail past it. The DW-243
+    `intent-write` row aims this same seam at a regenerated intent document."""
+    real = sweep_mod.atomic_write_text_confined
 
-    def refused(path, *args, **kwargs):
+    def refused(path, text, *, confine_root, require_writable_target=False):
         if path == cache:
             raise PermissionError(13, "Permission denied", str(path))
-        return real(path, *args, **kwargs)
+        return real(
+            path, text, confine_root=confine_root, require_writable_target=require_writable_target
+        )
 
-    monkeypatch.setattr(sweep_mod, "atomic_write_text", refused)
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", refused)
 
 
 def _no_git(monkeypatch, where: str):
@@ -11409,16 +11417,17 @@ def test_a_triage_cache_write_fault_degrades_and_keeps_the_plan(project, monkeyp
 
     Premise before outcome (docs/testing.md): the ledger is valid, the adapter carries
     exactly one triage effect whose plan validates, and the fault is a SELECTIVE
-    `bmad_loop.sweep.atomic_write_text` monkeypatch keyed on the cache path alone
-    (chmod is a no-op for root and carries no write bit on Windows; since DW-263 the
-    write-back goes through that helper rather than `Path.write_text`, so a
+    `bmad_loop.sweep.atomic_write_text_confined` monkeypatch keyed on the cache path alone
+    (chmod is a no-op for root and carries no write bit on Windows; since DW-263/DW-269
+    the write-back goes through that helper rather than `Path.write_text`, so a
     `write_text` fault no longer bites it), so every other write this run makes —
     state, journal, sandbox ledger — still lands. The plan contains one close and
     one `wontfix` skip: the sandbox ledger must record the close while leaving the
     skipped entry open, proving the plan reached its downstream effects.
 
-    Ablation: restore a bare `atomic_write_text(triage_path, ...)` and this reds on
-    `crashed` — the `PermissionError` propagates out of `_ensure_triage`. Delete only
+    Ablation: remove the write-back's `except OSError` handling, leaving the
+    `atomic_write_text_confined` call bare, and this reds on `crashed` — the
+    `PermissionError` propagates out of `_ensure_triage`. Delete only
     the journal write inside the `except OSError` arm and the row assertion reds while
     the run stays healthy; reuse `sweep-triage-reload-failed` there instead and the
     new-kind assertion reds the same way. Clear `plan.already_resolved` in the
@@ -11479,10 +11488,12 @@ def test_a_triage_cache_that_is_not_a_regular_file_re_triages_silently(project, 
     What this row grades is the GUARD, which is why the outcome asserted is the
     journal's silence plus a fresh session. Past the guard, the `directory` shape
     reaches the write-back: a fresh triage writes its plan back to that same path
-    (`atomic_write_text`, since DW-263), whose `os.replace` of the staged temp onto
-    a directory is refused whichever guard stood in front of it (`IsADirectoryError`
-    on POSIX, `PermissionError` on Windows — the row asserts the path both carry,
-    not the message). Since DW-247 that write DEGRADES to
+    (`atomic_write_text_confined`, since DW-263/DW-269), whose `os.replace` of the
+    staged temp onto a directory is refused whichever guard stood in front of it
+    (`IsADirectoryError` on POSIX, `PermissionError` on Windows — the row asserts
+    the FILENAME both carry, not the message: the anchored POSIX arm replaces
+    dir_fd-relative, so its error names `triage.json` bare, while the win32 arm's
+    plain no-follow write names the full path). Since DW-247 that write DEGRADES to
     `sweep-triage-cache-write-failed` rather than crashing the run, so both shapes
     now end healthy; the `directory` row asserts that write-side row on top of the
     guard's silence, and the `stat-not-a-directory` shape (whose refusal is only on
@@ -11528,11 +11539,12 @@ def test_a_triage_cache_that_is_not_a_regular_file_re_triages_silently(project, 
     if shape == "directory":
         [failed] = write_failed  # the planted directory refuses the fresh plan's write-back
         assert failed["errors"][0].startswith("unwritable: ")
-        # the path, not the message: POSIX raises `IsADirectoryError`, Windows a
-        # `PermissionError` from the same `open`, and both carry the filename —
-        # rendered through `repr` by `OSError.__str__`, so compare that spelling
-        # (Windows doubles the backslashes there)
-        assert repr(str(cache)) in failed["errors"][0]
+        # the DESTINATION's name, not the message: POSIX raises `IsADirectoryError`,
+        # Windows a `PermissionError` from the same `open`, and both quote the
+        # filename (the confined POSIX arm's dir_fd-relative replace names it bare,
+        # DW-269). The closing quote is what rules out the staged temp, whose
+        # `triage.json.<pid>.<hex>.tmp'` the bare name alone would also match.
+        assert f"{cache.name}'" in failed["errors"][0]
     else:
         assert write_failed == []  # only `stat` was refused; the write landed
         # read, not `is_file()`: the refused `stat` is still installed on this path
@@ -20777,8 +20789,8 @@ def test_a_refused_ledger_pauses_the_resume_at_intent_regeneration(project, monk
     routes to `bmad-loop resume <run_id>`, never to a fresh `bmad-loop sweep`.
 
     Only the LEDGER read is caught: `_read_intent_ledger` is split out of
-    `_write_intent` so the intent file's own `mkdir`/`atomic_write_text` faults still
-    propagate — the `intent-write` case, which refuses the regenerated document's
+    `_write_intent` so the intent file's own `mkdir`/`atomic_write_text_confined`
+    faults still propagate — the `intent-write` case, which refuses the regenerated document's
     own write and asserts the run CRASHES with no refusal row, no pause and no
     "by hand" notice: a run-dir write refusal reported as `ledger-inaccessible`
     would send the operator to repair a ledger that reads perfectly.
@@ -21762,11 +21774,14 @@ def _redirect_the_run_dir(project, tmp_path):
     project, and hand back where it points.
 
     The link goes at the run dir rather than at `.bmad-loop/` deliberately: the
-    engine writes its journal, state and triage records into this same directory
-    through the ordinary (unconfined) writers, and those must keep working so the
-    run reaches the decisions phase at all. Only the two confined writes walk the
-    components from the project root, so only they refuse — which makes the
-    refusal attributable to the site under test rather than to a broken run."""
+    engine writes its journal and state into this same directory through the
+    ordinary (unconfined) writers, and those must keep working so the run reaches
+    the site under test at all. Only the confined writes walk the components from
+    the project root, so only they refuse — which makes the refusal attributable
+    to the site under test rather than to a broken run. Since DW-269 the triage
+    cache write-back is one of them: through this link it refuses and DEGRADES
+    (`sweep-triage-cache-write-failed`), so a decisions-phase row driven through
+    here also carries that row, and the run still reaches the phase."""
     run_dir = project.project / ".bmad-loop" / "runs" / "sweep-run"
     run_dir.parent.mkdir(parents=True, exist_ok=True)
     outside = tmp_path / "outside"
@@ -21898,6 +21913,225 @@ def test_the_decisions_writes_land_on_a_clean_tree(project):
     assert not summary.crashed
     landed = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
     assert landed["DW-1"]["effect"] == "close"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_triage_cache_write_back_refuses_a_redirected_run_dir(project, tmp_path):
+    """The #593 escape on `_ensure_triage`'s cache write-back (DW-269). The cache
+    `<run>/triage.json` sits three deep under the project root, and the plain
+    `atomic_write_text` resolved every directory above it by name, so a link
+    planted at `.bmad-loop/`, `runs/` or the run dir aimed both the staged temp
+    and the published cache out of the project.
+
+    The refusal DEGRADES, on the row DW-247 already gave this site:
+    `UnconfinedWriteError` is an `OSError`, so the write-back's `except OSError`
+    journals it as `sweep-triage-cache-write-failed` (`unwritable: ...` carrying
+    the refusal's message) before `sweep-triage-result`, and the validated plan
+    is still acted on — the sandbox ledger records the close.
+
+    Precondition: `sweep-triage-result` proves a fresh triage validated and reached
+    the write-back; without it "nothing escaped" would pass because no triage ran.
+    The row's ordering and the ledger closure prove the degrade, not a crash.
+
+    Ablation: restore `atomic_write_text(triage_path, ...)` at the site and this
+    reds on `outside/triage.json` — the cache lands outside the project — and on
+    the refusal row, which never appears."""
+    outside = _redirect_the_run_dir(project, tmp_path)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(
+                triage_result(
+                    ["DW-1", "DW-2"],
+                    skip=[{"id": "DW-1", "reason": "wontfix"}],
+                    already_resolved=[{"id": "DW-2", "evidence": "fixed in abc123"}],
+                )
+            )
+        ],
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused  # degrades, never raises
+    [failed] = _records(engine, "sweep-triage-cache-write-failed")
+    assert failed["errors"] and failed["errors"][0].startswith("unwritable: ")
+    assert "without a redirect" in failed["errors"][0]  # `UnconfinedWriteError`'s message
+    kinds = journal_kinds(engine)
+    assert kinds.index("sweep-triage-cache-write-failed") < kinds.index("sweep-triage-result")
+    [result] = _records(engine, "sweep-triage-result")  # PRECONDITION: the site was reached
+    assert result["skip"] == 1 and result["already_resolved"] == 1
+    assert len(adapter.sessions) == 1  # exactly the one fresh triage ran
+    entries = ledger_entries(project)  # the plan still landed
+    assert entries["DW-1"].open
+    assert entries["DW-2"].status.startswith("done")
+    assert not (outside / "triage.json").exists()  # nothing escaped the project
+    assert list(outside.glob("triage*")) == []  # and no staged temp either
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_bundle_intent_write_refuses_a_redirected_bundles_dir(project, tmp_path):
+    """The #593 escape on `_write_intent` (DW-269). The intent document lands at
+    `<run>/bundles/<dirname>/intent.md`, and `path.parent.mkdir(parents=True,
+    exist_ok=True)` accepts a symlink-to-a-directory at any component, so a link
+    planted at `bundles/` survived the setup step and the plain `atomic_write_text`
+    then wrote the document — and its temp — wherever the link pointed.
+
+    The link goes at `bundles/` rather than the run dir so the journal, state and
+    (now-confined, degrading) triage cache are untouched: the crash is attributable
+    to the intent write alone. The refusal PROPAGATES — `_write_intent` has no
+    degrade arm by design (DW-243 pins that its own write faults crash rather than
+    being misreported as a ledger fault), and `UnconfinedWriteError` is an
+    `OSError`, so this is exactly the `PermissionError` shape that row grades.
+
+    Precondition: the `mkdir` runs before the write, so `outside/<dirname>/`
+    exists — the site was reached — while `intent.md` under it does not; and
+    `sweep-triage-result` counts the one bundle the plan carried. Exactly one
+    session ran: the crash lands before any dev session is dispatched.
+
+    Ablation: restore `atomic_write_text(path, ...)` at the site and this reds on
+    the crash MESSAGE (the run carries on into a dev session the script has no
+    effect for, so `crashed` alone would not tell), on the session count, and on
+    `outside/fix/intent.md`, which lands."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(
+                triage_result(
+                    ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "do x"}]
+                )
+            )
+        ],
+    )
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (engine.run_dir / "bundles").symlink_to(outside, target_is_directory=True)
+
+    summary = engine.run()
+
+    assert summary.crashed and not summary.paused
+    assert "without a redirect" in str(summary.crash_error)  # `UnconfinedWriteError`'s message
+    assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
+    [result] = _records(engine, "sweep-triage-result")
+    assert result["bundles"] == 1
+    assert len(adapter.sessions) == 1  # the triage ran; no dev session was dispatched
+    assert _records(engine, "sweep-intent-ledger-refused") == []  # not a ledger fault
+    assert _records(engine, "sweep-intent-regen-refused") == []
+    assert (outside / "fix").is_dir()  # PRECONDITION: `_write_intent`'s mkdir ran
+    assert not (outside / "fix" / "intent.md").exists()  # nothing escaped the project
+    assert list((outside / "fix").iterdir()) == []  # and no staged temp either
+    assert (engine.run_dir / "triage.json").is_file()  # the cache, under a REAL run dir, landed
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_bundle_intent_write_refuses_a_redirected_run_dir(project, tmp_path):
+    """The intent write's root, pinned. The `bundles/` row above plants its link
+    BELOW the run dir, so `confine_root=self.run_dir` at the intent site would pass
+    it — a file confined against a parent still walks the components under it.
+    This row plants the link AT the run dir (`_redirect_the_run_dir`), which only
+    a walk anchored above it — at the project root — can refuse.
+
+    The cache write-back refuses through the same link and DEGRADES, so
+    `sweep-triage-cache-write-failed` is present beside `sweep-triage-result`;
+    the intent write then refuses and PROPAGATES, exactly one session having run.
+
+    Ablation: `confine_root=self.run_dir` at the intent site and this reds — the
+    run carries on into a dev session the script has no effect for, and
+    `outside/bundles/fix/intent.md` lands."""
+    outside = _redirect_the_run_dir(project, tmp_path)
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(
+                triage_result(
+                    ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "do x"}]
+                )
+            )
+        ],
+    )
+
+    summary = engine.run()
+
+    assert summary.crashed and not summary.paused
+    assert "without a redirect" in str(summary.crash_error)
+    assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
+    assert len(adapter.sessions) == 1  # the triage ran; no dev session was dispatched
+    kinds = journal_kinds(engine)
+    assert "sweep-triage-cache-write-failed" in kinds and "sweep-triage-result" in kinds
+    assert not (outside / "bundles" / "fix" / "intent.md").exists()  # nothing escaped
+    assert not (outside / "triage.json").exists()
+
+
+def test_the_confined_sweep_writes_land_under_a_disjoint_repo_root(project, tmp_path):
+    """Both DW-269 roots, pinned against `self.workspace.root`. Under the
+    supported `repo_root` override (`isolation = "none"`) the workspace root is a
+    separate CODE repo while the run dir stays under the PROJECT, so a
+    workspace-rooted confinement would refuse every cache write-back (a lost cache
+    per cycle) and crash every bundle at its intent write. Both sites derive their
+    root from the run dir's own shape (`_project_of_run_dir`), which no workspace
+    swap moves — the same root `_decisions_phase` uses.
+
+    The premise is guarded before the outcome, as every divergent-root row here
+    must be (docs/testing.md): the two roots are compared RESOLVED and asserted
+    DISJOINT, since nested (`repo_root` an ancestor of the project) a
+    workspace-rooted confinement would still accept the run dir and grade nothing.
+    The scripted dev session edits the CODE repo and claims its HEAD as baseline, so
+    the bundle completes and the run ends healthy.
+
+    Ablation: `confine_root=self.workspace.root` at either site and this reds — the
+    cache row appears (the cache never lands), or the run crashes at the intent
+    write."""
+    from bmad_loop.verify import rev_parse_head
+
+    elsewhere = tmp_path / "code-repo"
+    # Copy this test's disposable sandbox, retaining the fixture's Git settings;
+    # never initialize another ad hoc repo or touch the shared template.
+    shutil.copytree(project.project, elsewhere)
+    paths = replace(project, repo_root=elsewhere)
+    write_ledger(paths, {"DW-1": "open"})
+
+    def dev(spec):
+        baseline = rev_parse_head(elsewhere)
+        (elsewhere / "src.txt").write_text("original\nchange for dw-fix\n", encoding="utf-8")
+        sp = bundle_spec_path(paths, "fix")
+        write_spec(sp, "done", baseline)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": "dw-fix",
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "tasks_total": 1,
+                "tasks_done": 1,
+                "verification": [],
+                "escalations": [],
+                "dw_ids": ["DW-1"],
+                "followup_review_recommended": False,
+            },
+        )
+
+    plan = triage_result(["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "do x"}])
+    engine, adapter = make_sweep(paths, [triage_effect(plan), dev])
+    # premise before outcome: resolved, and DISJOINT — not merely unequal
+    code_root, project_root = engine.workspace.root.resolve(), paths.project.resolve()
+    assert code_root != project_root
+    assert project_root not in code_root.parents and code_root not in project_root.parents
+    assert engine.run_dir.resolve().is_relative_to(
+        project_root
+    )  # the run dir stays with the PROJECT
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 2  # triage, then the one dev session
+    assert (engine.run_dir / "triage.json").is_file()
+    assert _records(engine, "sweep-triage-cache-write-failed") == []
+    assert (engine.run_dir / "bundles" / "fix" / "intent.md").is_file()
+    assert list(elsewhere.rglob("triage.json")) == [] and list(elsewhere.rglob("intent.md")) == []
 
 
 # ------------------------------------------ batched locked ledger adoption (#286/#469)

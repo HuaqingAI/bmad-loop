@@ -3348,13 +3348,25 @@ class SweepEngine(Engine):
                 # faulted at the metadata probe, whose arm does not unlink: there the
                 # older plan survives a refused write-back. A directory also reaches this
                 # catch: `os.replace` onto it raises `IsADirectoryError` on POSIX or
-                # `PermissionError` on Windows.
+                # `PermissionError` on Windows. Confined to the project root (#593,
+                # DW-269): the plain writer resolved `.bmad-loop/`, `runs/` and the
+                # run dir by name, so a link planted at any of them aimed the temp
+                # and the published cache out of the project. The root is the
+                # PROJECT that owns the run dir (`_decisions_phase` says why not
+                # `self.workspace.root`), not `self.run_dir` — a file confined
+                # against its own parent walks no components and refuses nothing.
+                # A refused parent reaches this catch as `UnconfinedWriteError`,
+                # itself an `OSError`, so it costs the cycle its cache and nothing
+                # else. `OSError` alone: unlike `atomic_write_text`, the confined
+                # helper never `resolve()`s, so DW-247's `RuntimeError` arm has
+                # nothing to catch here.
                 try:
-                    atomic_write_text(triage_path, json.dumps(result.result_json, indent=2))
-                # `RuntimeError` too: the helper's `path.resolve()` raises it (not
-                # `OSError`) for a symlink loop on 3.11/3.12 — the same pair
-                # `platform_util.resolve_or_lexical` catches for the same reason.
-                except (OSError, RuntimeError) as exc:
+                    atomic_write_text_confined(
+                        triage_path,
+                        json.dumps(result.result_json, indent=2),
+                        confine_root=_project_of_run_dir(self.run_dir),
+                    )
+                except OSError as exc:
                     self.journal.append(
                         "sweep-triage-cache-write-failed", errors=[f"unwritable: {exc}"]
                     )
@@ -5814,7 +5826,15 @@ class SweepEngine(Engine):
         would be spent on it anyway. Missing means no entry PARSED for the id; a
         present-but-closed entry is still emitted verbatim, since the caller — a
         `_run_bundle` on a fresh plan, or a regeneration of a persisted task —
-        may legitimately be briefing on work the ledger has since retired."""
+        may legitimately be briefing on work the ledger has since retired.
+
+        The write is confined to the project root (#593, DW-269): a link planted
+        at any directory component below the project root (`.bmad-loop/`,
+        `runs/`, the run dir, `bundles/` or `bundles/<dirname>/`) refuses with
+        `UnconfinedWriteError` rather than landing the document outside the
+        project. That refusal is an `OSError` and PROPAGATES like any other write
+        fault here — no degrade arm, by design (DW-243): the document's own write
+        faults must never be misreported as a ledger fault."""
         if text is None:
             text = self._read_intent_ledger() or ""
         entries = {e.id: e for e in deferredwork.parse_ledger(text)}
@@ -5843,7 +5863,15 @@ class SweepEngine(Engine):
         # later. Line breaks are deliberately *kept* — this file is markdown, so
         # `_one_line`'s collapse would be damage, and the ledger blocks are read
         # back from a strict-UTF-8 file and so pass through byte-unchanged.
-        atomic_write_text(path, neutralize_surrogates("\n".join(lines)))
+        # Confined against the PROJECT that owns the run dir, never
+        # `self.workspace.root` (`_decisions_phase` says why): the `mkdir` above
+        # accepts a symlink-to-a-directory at any component, so it is the
+        # anchored walk here that refuses a planted parent.
+        atomic_write_text_confined(
+            path,
+            neutralize_surrogates("\n".join(lines)),
+            confine_root=_project_of_run_dir(self.run_dir),
+        )
         return path
 
     def _bundle_intent_reason(self, task: StoryTask) -> str | None:
@@ -6037,8 +6065,8 @@ class SweepEngine(Engine):
 
         The regeneration's ledger read is CAUGHT here (DW-243), and only the
         ledger read: `_read_intent_ledger` is split out of `_write_intent` so an
-        `OSError` from the intent file's own `mkdir`/`atomic_write_text` still
-        propagates as before. Undecodable bytes (`LedgerReadError`) and an
+        `OSError` from the intent file's own `mkdir`/`atomic_write_text_confined`
+        still propagates as before. Undecodable bytes (`LedgerReadError`) and an
         `OSError` from the read journal `sweep-intent-ledger-refused` under the
         existing pair of tokens (`ledger-unreadable`, `ledger-inaccessible`) and
         then PAUSE the run through `_pause_on_intent_refusal`. Bare, the read
