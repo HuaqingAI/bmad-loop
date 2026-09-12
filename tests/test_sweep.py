@@ -12462,6 +12462,76 @@ def test_non_write_state_does_not_call_a_refused_ledger_gone(project, monkeypatc
     assert engine._non_write_state("DW-1") == "the ledger holds no entry for this id"
 
 
+@pytest.mark.parametrize("shape", ["metadata-3.14", "metadata-3.13"])
+def test_an_interactive_non_write_does_not_call_a_refused_ledger_gone(project, monkeypatch, shape):
+    """DW-281, the site row beside the DW-265 unit row above: the INTERACTIVE arm of
+    `_decisions_phase` wrote its own sentence from a bare `is_file()` probe on the
+    ledger, outside any `try`, instead of asking `_non_write_state`. On Python
+    3.14 that probe suppresses every OS error and answers False, so a ledger
+    sitting in place, unreadable, was journaled as GONE — the sentence that tells
+    the operator every `decision:` line already written went with it; on 3.11–3.13
+    the same probe raised the `PermissionError` straight out of `_decisions_phase`
+    and ended `run()`. The arm now takes the sentence from `_non_write_state`,
+    whose absence is the observation reader's own `("", None)` answer, so a
+    refused ledger falls through to "the ledger holds no entry for this id" and
+    nothing raises.
+
+    The entry is retired inside the patched recorder so the REAL `record_decision`
+    refuses it (answers False) off a good read; only then is the shape installed,
+    so the refusal is genuine and the fault lands on the diagnostic alone.
+    `metadata-3.14` pins `Path.is_file` False for the ledger and refuses `stat`;
+    `metadata-3.13` refuses `stat` alone. Dispositions are the DW-186 ones,
+    unchanged: `closed == 0`, no `sweep-ledger-commit`.
+
+    In green both rows exercise the identical reader path — nothing calls
+    `is_file` on the ledger any more — so the pin matters only under the ablation.
+
+    Ablation: restore the inline `"...gone" if not ...deferred_work.is_file() else
+    "...no entry"` conditional at the arm. The pinned `metadata-3.14` row reds with
+    "the ledger file is gone" on every interpreter. The `metadata-3.13` row reds
+    only on 3.11–3.13, with the `PermissionError` escaping `_decisions_phase`; on a
+    real 3.14 `is_file()` bypasses the `Path.stat` monkeypatch and answers True, so
+    that row stays GREEN ("holds no entry") and the pinned row is the only
+    discriminating one — a complementary pair, the DW-265 doctrine."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [])
+    engine.prompting = True
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_close_or_keep_decision("DW-1"),))
+    _stub_return(monkeypatch, launch.ReturnOutcome.RETURNED)
+    engine.prompter = DecisionPrompter(input_fn=lambda _p: "1", print_fn=lambda _l: None)
+    ledger = project.deferred_work
+    real_record = deferredwork.record_decision
+
+    def retire_then_refuse_probe(*args, **kwargs):
+        write_ledger(project, {}, commit=False)  # a rival writer retired the entry
+        recorded = real_record(*args, **kwargs)
+        assert recorded is False
+        if shape == "metadata-3.14":
+            real_is_file = Path.is_file
+            monkeypatch.setattr(
+                Path,
+                "is_file",
+                lambda self, *a, **kw: False if self == ledger else real_is_file(self, *a, **kw),
+            )
+        fault_metadata_probe(monkeypatch, ledger, "stat")
+        return recorded
+
+    monkeypatch.setattr(deferredwork, "record_decision", retire_then_refuse_probe)
+
+    _answers, closed, _unlanded = engine._decisions_phase(plan)  # must not raise
+
+    assert closed == 0
+    [failed] = _records(engine, "sweep-decision-effect-unavailable")
+    assert failed["dw_id"] == "DW-1" and failed["effect"] == "close"
+    assert failed["error"].endswith("the ledger holds no entry for this id")
+    assert _records(engine, "sweep-ledger-commit") == []
+    # a refused OBSERVATION probe must not arm the doubt latch
+    assert engine.state.sweep_ledger_in_doubt is False
+    # the human's answer survives the degrade
+    assert [r["dw_id"] for r in _records(engine, "decision-answered")] == ["DW-1"]
+
+
 @pytest.mark.parametrize("fault", [PermissionError("denied"), OSError("metadata I/O failure")])
 def test_a_refused_replay_survives_a_fault_in_its_diagnostic_probe(project, monkeypatch, fault):
     """A metadata fault after refusal is observation, so it must not crash replay.

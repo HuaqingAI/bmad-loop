@@ -1011,8 +1011,8 @@ def test_decisions_reports_a_close_the_ledger_never_took(project, capsys, monkey
 
 def test_decisions_names_an_absent_ledger_rather_than_a_missing_entry(project, capsys, monkeypatch):
     """The other of `record_decision`'s two False states, and why the outcome line
-    re-probes `is_file()` to say which fired: a retired id is one entry, where a
-    ledger that is gone took every `decision:` line the walk already wrote with it.
+    asks the observation reader to say which fired: a retired id is one entry, where
+    a ledger that is gone took every `decision:` line the walk already wrote with it.
 
     Ablation: collapse the two-state probe to the single "holds no entry" sentence
     and this reddens while the sibling above still passes."""
@@ -1154,13 +1154,39 @@ def test_decisions_names_a_written_answer_git_could_not_commit(project, capsys, 
     ]
 
 
+@pytest.mark.parametrize("shape", ["metadata-3.14", "metadata-3.13"])
 def test_decisions_continues_when_the_non_write_diagnostic_probe_fails(
-    project, capsys, monkeypatch
+    project, capsys, monkeypatch, shape
 ):
-    """A later observation failure must not abort a completed non-write.
+    """A later observation failure must not abort a completed non-write, and must
+    be REPORTED as unavailable rather than as absence (DW-282).
 
-    Ablation: remove the diagnostic probe's OSError handler and the command
-    returns failure before asking DW-2.
+    The outcome line's diagnostic was `is_file()` inside `try/except OSError`. On
+    Python 3.14 that probe suppresses every OS error and answers False, so the
+    fault never reached the `except` and a ledger sitting in place, unreadable,
+    was reported as "the ledger file is gone" — the sentence that says every
+    `decision:` line already written went with it. The line now asks the
+    observation reader, whose probe is `stat`: a refused ledger is an attributed
+    fault on every interpreter and keeps the "ledger state unavailable" wording.
+
+    The fault is installed only after `apply_pre_answer` reports the non-write,
+    and it restores itself on the first ledger hit, so DW-2 sees the recovered FS
+    (a permanent `fault_metadata_probe` would refuse DW-2's own `record_decision`).
+    `metadata-3.14` additionally pins `Path.is_file` False for the ledger, the
+    shape 3.14 gives a refused ledger; `metadata-3.13` refuses `stat` alone.
+
+    In green both rows exercise the same reader path — nothing calls `is_file` on
+    the ledger any more — so the pin matters only under the ablation.
+
+    Ablation, RUN on 3.13: restore the `is_file()` probe inside `try/except
+    OSError` and the `metadata-3.14` row reds — DW-1's line reads "the ledger file
+    is gone", `probe_faults == []`, and the never-hit `stat` fault then refuses
+    DW-2's own recorder, so `main` answers 1 (`error: could not record DW-2`); the
+    3.13 row stays green there because `is_file()` re-raises the refused `stat` on
+    3.11–3.13. On a real 3.14 BOTH rows red: `is_file()` bypasses the `Path.stat`
+    monkeypatch and answers True, DW-1 prints "holds no entry", and the never-hit
+    `stat` fault again refuses DW-2's recorder, `main` answering 1. Drop the fault
+    handling altogether and DW-2 is never asked.
     """
     from conftest import write_ledger
 
@@ -1179,21 +1205,31 @@ def test_decisions_continues_when_the_non_write_diagnostic_probe_fails(
             return decision.option("1")
 
     apply = decisions.apply_pre_answer
+    stat = Path.stat
     is_file = Path.is_file
     probe_faults = []
 
-    def failing_probe(path):
+    def failing_probe(path, *args, **kwargs):
         if path == project.deferred_work:
             # Only the diagnostic fails; later decisions see the recovered FS.
+            monkeypatch.setattr(Path, "stat", stat)
             monkeypatch.setattr(Path, "is_file", is_file)
             probe_faults.append(path)
             raise PermissionError("ledger observation denied")
-        return is_file(path)
+        return stat(path, *args, **kwargs)
 
     def record_then_fail_probe(*args, **kwargs):
         result = apply(*args, **kwargs)
         if not result.recorded:
-            monkeypatch.setattr(Path, "is_file", failing_probe)
+            if shape == "metadata-3.14":
+                monkeypatch.setattr(
+                    Path,
+                    "is_file",
+                    lambda self, *a, **kw: (
+                        False if self == project.deferred_work else is_file(self, *a, **kw)
+                    ),
+                )
+            monkeypatch.setattr(Path, "stat", failing_probe)
         return result
 
     monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())

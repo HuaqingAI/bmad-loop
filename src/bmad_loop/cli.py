@@ -4225,17 +4225,24 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             # This later probe is only diagnostic: paths predates the prompt and
             # may differ from the writer's reloaded config. A probe fault must not
             # turn a completed non-write into a failed walk.
+            #
+            # The probe is the observation reader, not `is_file()` inside a
+            # `try/except OSError` (DW-282): `is_file()` answers False for a
+            # refused ledger on Python 3.14 — it suppresses every OS error there —
+            # so the fault never reached the `except` and a ledger sitting in
+            # place, unreadable, was reported as GONE, the sentence that says every
+            # `decision:` line already written went with it. The reader never
+            # raises: absence is its own `("", None)` answer, and a refused ledger
+            # is an attributed fault on every interpreter, which keeps the
+            # "ledger state unavailable" wording.
             outcome = "no decision line was written"
-            try:
-                why = (
-                    "the ledger file is gone"
-                    if not paths.deferred_work.is_file()
-                    else "the ledger holds no entry for this id"
-                )
-            except OSError:
+            text, fault = deferredwork.read_for_observation(paths.deferred_work)
+            if fault is not None:
                 outcome += "; ledger state unavailable"
+            elif not text:
+                outcome += ": the ledger file is gone"
             else:
-                outcome += f": {why}"
+                outcome += ": the ledger holds no entry for this id"
             if option.effect != "close":
                 outcome += "; your answer was saved to the pre-answer store"
         # A written operand that could not be published, in either of its two

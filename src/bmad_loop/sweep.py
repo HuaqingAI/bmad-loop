@@ -4322,20 +4322,30 @@ class SweepEngine(Engine):
                 # WHICH of the two states it was is named in `error`, because they
                 # are not the same news: a missing entry is one retired id, where a
                 # ledger that is gone means every earlier `decision:` line this walk
-                # wrote went with it. `is_file()` is the same probe `record_decision`
-                # made, re-taken rather than plumbed out of it — this is a journal
-                # sentence, not a control decision, and a race between the two only
-                # ever mislabels a row nothing acts on.
+                # wrote went with it. The sentence comes from `_non_write_state` —
+                # the same call the DW-167 re-apply walk makes — whose absence answer
+                # is the observation reader's own `("", None)` (DW-265), not an
+                # `is_file()` probe re-taken here (DW-281). The window is narrow but
+                # real: a ledger refused at the recorder itself raises out of
+                # `_ledger_present` and takes the `except` arm above, so this probe
+                # sees a fault only when the ledger goes unreadable BETWEEN the
+                # recorder's False answer and the probe. In that window `is_file()`
+                # suppresses every OS error on Python 3.14 and answers False, so a
+                # ledger sitting in place read as GONE, and on 3.11–3.13 it raised
+                # the `PermissionError` straight out of this bare arm and ended
+                # `run()`. Through the reader a refused ledger reads "holds no entry"
+                # and the probe cannot raise. This is a journal sentence, not a
+                # control decision: the helper's third sentence ("present but no
+                # longer open") is reachable here only as a race — a rival writer
+                # adding and closing the entry between `record_decision`'s refusal
+                # and the probe — and a race between the two only ever mislabels a
+                # row nothing acts on.
                 if not recorded:
                     self.journal.append(
                         "sweep-decision-effect-unavailable",
                         dw_id=decision.id,
                         effect=option.effect,
-                        error=(
-                            "record_decision wrote no line: the ledger file is gone"
-                            if not self.workspace.paths.deferred_work.is_file()
-                            else "record_decision wrote no line: the ledger holds no entry for this id"
-                        ),
+                        error=f"record_decision wrote no line: {self._non_write_state(decision.id)}",
                     )
                     if option.effect == "build":
                         # DW-200. The build lane routed purely on the stored
@@ -4573,14 +4583,18 @@ class SweepEngine(Engine):
         """Which of `record_decision`'s non-write states an id is in, as the tail
         of a `sweep-decision-effect-unavailable` sentence.
 
-        THREE states, which is one more than the interactive arm can reach: the
-        DW-167 replay walk passes `require_open=True`, so beside "no ledger file"
+        THREE states. Both arms of `_decisions_phase` call this (the interactive
+        arm since DW-281), but only the DW-167 replay walk can be refused into the
+        third by design: it passes `require_open=True`, so beside "no ledger file"
         and "no entry carries this id" it can also be refused for an entry that is
         present and no longer open — a rival writer closed it between the walk's
         gate and its write, which means the close being repaired is already
         recorded. That is not a missing entry and must not be reported as one:
         the operator would go hunting a vanished entry that is sitting in the
-        ledger, done.
+        ledger, done. The interactive arm passes no `require_open`, so it reaches
+        the third sentence only as a race — an entry added and closed between
+        `record_decision`'s refusal and this probe — which is prose on a row
+        nothing acts on, not a state the refusal saw.
 
         A fresh best-effort read, taken only to write the sentence. The OBSERVATION
         arm (DW-146) is the right one precisely because nothing is written from it
