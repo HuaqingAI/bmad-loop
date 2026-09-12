@@ -2,6 +2,7 @@
 
 import contextlib
 import dataclasses
+import errno
 import hashlib
 import json
 import os
@@ -5901,6 +5902,10 @@ def test_closes_deferred_ledger_replaced_by_a_directory_is_an_outage_not_a_typo(
     ledger = project.deferred_work
     ledger.unlink()
     ledger.mkdir()
+    # Windows refuses a directory read with PermissionError rather than
+    # IsADirectoryError; grade the actual OS fault without depending on its locale.
+    with pytest.raises(OSError) as fault:
+        ledger.read_text(encoding="utf-8")
 
     summary = engine.run()
 
@@ -5909,6 +5914,14 @@ def test_closes_deferred_ledger_replaced_by_a_directory_is_an_outage_not_a_typo(
     assert "deferred-close-ledger-unavailable" in kinds
     assert "deferred-close-unmatched" not in kinds
     assert "story-deferred-closed" not in kinds
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    notices = [
+        line for line in attention.splitlines() if "declared deferred closes unapplied" in line
+    ]
+    assert len(notices) == 1, attention
+    notice = notices[0]
+    assert "1-1-a" in notice and "DW-1" in notice and str(ledger) in notice
+    assert type(fault.value).__name__ in notice and f"[Errno {fault.value.errno}]" in notice
 
 
 def _loop_the_ledger(project) -> Path:
@@ -6027,13 +6040,19 @@ def test_closes_deferred_over_a_looped_ledger_with_no_findings_completes_and_jou
     observation and degrades (`ledger-read-degraded` naming the ledger and the
     `OSError`); the story completes, and the declared close reaches
     `_close_declared_deferred`'s own degrade arm, which journals
-    `deferred-close-ledger-unavailable` rather than closing — never a typo
+    `deferred-close-ledger-unavailable` and notifies with every unapplied ID
+    (DW-277) rather than closing — never a typo
     (`deferred-close-unmatched`), never `story-deferred-closed`, and since DW-258
     never `run-crash`.
 
     Ablation: narrow `_ledger_text`'s tuple back to `LedgerReadError` and this
-    reds with `run-crash` (`OSError`) at the baseline digest."""
-    engine = _closes_deferred_run(project, ["DW-1"])
+    reds with `run-crash` (`OSError`) at the baseline digest. Remove only the
+    `gates.notify` call in `_journal_ledger_unavailable` and this fails on the
+    missing outage notice, while the lifecycle and journal checks still pass."""
+    # Exceed the fault-prose cap so truncating the whole notice drops declared IDs.
+    ids = [f"DW-{number}" for number in range(1, 41)]
+    assert len(", ".join(ids)) > NOTICE_REASON_MAX
+    engine = _closes_deferred_run(project, ids, ledger=dict.fromkeys(ids, "open"))
     ledger = project.deferred_work
     _loop_the_ledger_past_the_gate(project, engine)
 
@@ -6050,6 +6069,23 @@ def test_closes_deferred_over_a_looped_ledger_with_no_findings_completes_and_jou
     assert "deferred-close-ledger-unavailable" in kinds
     assert "run-crash" not in kinds and "ledger-read-refused" not in kinds
     assert "deferred-close-unmatched" not in kinds and "story-deferred-closed" not in kinds
+    (outage,) = [
+        e for e in engine.journal.entries() if e["kind"] == "deferred-close-ledger-unavailable"
+    ]
+    assert outage["story_key"] == "1-1-a" and outage["dw_ids"] == ids
+    assert outage["ledger"] == str(ledger) and "OSError" in outage["error"]
+    assert ledger.is_symlink()  # the advisory snapshot did not replace the loop
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    notices = [
+        line for line in attention.splitlines() if "declared deferred closes unapplied" in line
+    ]
+    assert len(notices) == 1, attention
+    notice = notices[0]
+    assert "1-1-a" in notice and "declared closes were not applied" in notice
+    assert set(re.findall(r"\bDW-\d+\b", notice)) == set(ids)
+    assert str(ledger) in notice
+    assert "OSError" in notice and f"[Errno {errno.ELOOP}]" in notice
+    assert "story continues" in notice and "sweep" in notice
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")

@@ -4868,6 +4868,16 @@ class Engine:
             ledger=str(ledger),
             error=error,
         )
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"declared deferred closes unapplied: {task.story_key}",
+            f"Could not read the deferred-work ledger {ledger}; declared closes were not applied: "
+            f"{', '.join(ids)}. Fault: {_notice_reason(error)}. "
+            "The story continues without these ledger updates. Restore ledger readability, "
+            "then run a sweep to reconcile the still-open entries against the completed "
+            "story's commit.",
+        )
 
     def _ledger_in_repo(self, ledger: Path) -> bool:
         """Whether the ledger's annotation rides the story's commit. Decided on
