@@ -4586,7 +4586,12 @@ class SweepEngine(Engine):
         arm (DW-146) is the right one precisely because nothing is written from it
         and it never raises — a ledger that has gone unreadable since the refusal
         answers the empty text, which falls through to "no entry carries this id",
-        the same sentence the pre-DW-167 code gave.
+        the same sentence the pre-DW-167 code gave. Absence is the reader's own
+        `("", None)` answer, not an `is_file()` pre-gate (DW-265): that gate
+        suppresses every OS error on Python 3.14 and answers False, so a refused
+        ledger was reported as GONE there — a sentence that tells the operator
+        every `decision:` line already written went with it, when the file is
+        sitting in place, unreadable.
 
         `.done`, never `not .open` — the derivation `DWEntry.done`'s docstring
         exists to refuse. Two states of the entry fall through to the
@@ -4606,14 +4611,9 @@ class SweepEngine(Engine):
         otherwise let this sentence describe a different entry than the write
         did."""
         ledger = self.workspace.paths.deferred_work
-        try:
-            if not ledger.is_file():
-                return "the ledger file is gone"
-            text, _fault = deferredwork.read_for_observation(ledger)
-        except OSError:
-            # The extra absence probe is observation too: metadata faults must
-            # degrade to the same fallback as the observation reader's faults.
-            text = ""
+        text, fault = deferredwork.read_for_observation(ledger)
+        if fault is None and not text:
+            return "the ledger file is gone"
         entry = next((e for e in deferredwork.parse_ledger(text) if e.id == dw_id), None)
         if entry is not None and entry.done:
             return "the ledger entry is present but no longer open"

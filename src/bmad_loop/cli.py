@@ -12,6 +12,7 @@ import sys
 import time
 from enum import IntEnum
 from pathlib import Path
+from stat import S_ISREG
 from typing import TYPE_CHECKING, Any
 
 from . import (
@@ -1600,8 +1601,17 @@ def _validate_deferred_ledger(
     # routed through `read_for_observation`: `validate` writes nothing, but it has
     # to REPORT the fault as a graded problem rather than degrade quietly to an
     # empty ledger — see the reasoning below. Same classification, richer response.
+    # The presence probe is `stat` + `S_ISREG` INSIDE the `try` (DW-267): the
+    # `is_file()` it replaced suppresses every OS error on Python 3.14 and answers
+    # False, so a refused ledger read as an empty one and `validate` reported a
+    # clean deferred check with the finding below unreachable. Only absence
+    # (`ENOENT`/`ENOTDIR`, a present non-regular file) is the empty text; a
+    # refused probe takes the same arm a refused `read_text` does.
     try:
-        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        try:
+            text = ledger.read_text(encoding="utf-8") if S_ISREG(ledger.stat().st_mode) else ""
+        except (FileNotFoundError, NotADirectoryError):
+            text = ""
     except (OSError, UnicodeDecodeError) as e:
         # Split from the manifest read in the checks below, which is silent for a
         # good reason that does not apply here: nothing else in `validate` reads
@@ -2514,19 +2524,32 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
     ledger = paths.deferred_work
     # Call the primitive BEFORE reporting a missing ledger, and report the
     # missing ledger from its empty result. `archive_closed` validates `before`
-    # ahead of its own `is_file` short-circuit precisely so a malformed date
-    # fails the same way whether or not a ledger exists; short-circuiting here
-    # first put that back, and `--before not-a-date` then exited 0 on a project
-    # that happens to have no ledger today and 1 on one that does — the same
+    # ahead of its own presence guard precisely so a malformed date fails the
+    # same way whether or not a ledger exists; short-circuiting here first put
+    # that back, and `--before not-a-date` then exited 0 on a project that
+    # happens to have no ledger today and 1 on one that does — the same
     # invocation graded by optional project data rather than by its own shape
     # (#711 review). The call is safe on a missing file: it short-circuits to
     # an empty list without writing.
+    #
+    # The post-report presence probe sits INSIDE the same `try`, as `stat` +
+    # `S_ISREG` (DW-265). It is reachable only in the window after
+    # `archive_closed`'s own guard answered without raising, but a probe that
+    # raised a traceback out of the CLI (Python 3.13, where `is_file()` raises
+    # EACCES) or reported "no deferred-work ledger" after a successful archive
+    # (3.14, where `is_file()` suppresses every OS error and answers False) is
+    # still wrong; a refused probe now reaches the FAILURE arm below, whose
+    # message already says the ledger could not be read.
     try:
         archived = deferredwork.archive_closed(
             ledger,
             before=args.before,
             dry_run=args.dry_run,
         )
+        try:
+            present = S_ISREG(ledger.stat().st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            present = False
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return ExitCode.FAILURE
@@ -2551,7 +2574,7 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
             file=sys.stderr,
         )
         return ExitCode.FAILURE
-    if not ledger.is_file():
+    if not present:
         print(f"no deferred-work ledger at {ledger}")
         return ExitCode.OK
     archive_path = ledger.parent / deferredwork.ARCHIVE_REL
@@ -2592,7 +2615,22 @@ def _sweep_dry_run(
     # about whether or not there is anything to sweep.
     _warn_preflight_would_abort(paths, pol)
     ledger = paths.deferred_work
-    if not ledger.is_file():
+    # OBSERVATION arm of the ledger-read contract (DW-146): this listing writes
+    # nothing, but it is an OPERATOR SURFACE, so degrading to an empty document
+    # would report "0 open" for a ledger nobody could read — a fabricated listing
+    # is worse than no listing. Say which file and which fault, and fail.
+    # Absence is taken from the reader's own `("", None)` answer rather than an
+    # `is_file()` pre-gate (DW-265): that gate suppressed every OS error on
+    # Python 3.14 and answered False, printing "no deferred-work ledger" for a
+    # refused one (and raised a traceback out of the CLI on 3.11–3.13), so the
+    # DW-254 attributed fault below was shadowed before the reader was asked. A
+    # 0-byte ledger answers the same empty text and is reported as absent too —
+    # deliberate, it holds nothing to list.
+    text, fault = deferredwork.read_for_observation(ledger)
+    if fault is not None:
+        print(f"error: {ledger} cannot be read ({fault})", file=sys.stderr)
+        return ExitCode.FAILURE
+    if not text:
         if only_ids is not None:
             try:
                 select_entries((), only_ids=only_ids, validate_only=True)
@@ -2601,14 +2639,6 @@ def _sweep_dry_run(
                 return ExitCode.FAILURE
         print(f"no deferred-work ledger at {ledger}")
         return 0
-    # OBSERVATION arm of the ledger-read contract (DW-146): this listing writes
-    # nothing, but it is an OPERATOR SURFACE, so degrading to an empty document
-    # would report "0 open" for a ledger nobody could read — a fabricated listing
-    # is worse than no listing. Say which file and which fault, and fail.
-    text, fault = deferredwork.read_for_observation(ledger)
-    if fault is not None:
-        print(f"error: {ledger} cannot be read ({fault})", file=sys.stderr)
-        return ExitCode.FAILURE
     entries = deferredwork.parse_ledger(text)
     open_entries = [e for e in entries if e.open]
     legacy = deferredwork.parse_legacy(text)

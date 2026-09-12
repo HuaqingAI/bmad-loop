@@ -3859,15 +3859,37 @@ def test_verify_review_gates_read_artifacts_from_the_project_root(project, tmp_p
     assert ("in-progress" if mode == "review" else "DW-1") in refused.reason
 
 
-def test_verify_review_bundle_ledger_oserror_degrades_to_retry(project, monkeypatch):
+@pytest.mark.parametrize("fault", ["read_text", "metadata-3.14", "metadata-3.13"])
+def test_verify_review_bundle_ledger_oserror_degrades_to_retry(project, monkeypatch, fault):
     """The ledger read is the same TOCTOU class as the spec read beside it — the
-    orchestrator's own `mark_done` rewrites it between the dev and review gates."""
+    orchestrator's own `mark_done` rewrites it between the dev and review gates.
+
+    Three faults, one arm. `read_text` is the read refused; the two `metadata`
+    rows refuse the PRESENCE PROBE (DW-267). `metadata-3.14` pins `Path.is_file`
+    False for the ledger AND refuses `stat` — the Python 3.14 shape, where
+    `is_file()` suppresses every OS error and answers False, so the old
+    `read_text(...) if ledger.is_file() else ""` read the refusal as an empty
+    ledger and the verify retried with the misleading "entries not marked done"
+    verdict, fixable. `metadata-3.13` refuses `stat` alone. Ablation: restore
+    `if ledger.is_file() else ""` and the `metadata-3.14` row reds with "DW-1"
+    in the reason and `fixable=True`."""
     task = make_bundle_task(project)
     sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
     write_spec(sp, "done", task.baseline_commit)
     task.spec_file = str(sp)
     bundle_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
-    fault_read_text(monkeypatch, project.deferred_work)  # spec reads fine
+    ledger = project.deferred_work
+    if fault == "read_text":
+        fault_read_text(monkeypatch, ledger)  # spec reads fine
+    else:
+        if fault == "metadata-3.14":
+            real = Path.is_file
+            monkeypatch.setattr(
+                Path,
+                "is_file",
+                lambda self, *a, **kw: False if self == ledger else real(self, *a, **kw),
+            )
+        fault_metadata_probe(monkeypatch, ledger, "stat")
 
     out = verify.verify_review_bundle(task, project, Policy())
     assert not out.ok and out.retryable and not out.fixable

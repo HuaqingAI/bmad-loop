@@ -12183,34 +12183,69 @@ def test_a_reapply_whose_write_reports_no_line_is_not_counted_closed(
     assert _records(engine, "sweep-ledger-commit") == []
 
 
+@pytest.mark.parametrize("shape", ["metadata-3.14", "metadata-3.13"])
+def test_non_write_state_does_not_call_a_refused_ledger_gone(project, monkeypatch, shape):
+    """DW-265, the direct unit row beside the `file-gone` absence row above.
+    `_non_write_state` probed absence with `is_file()` BEFORE asking the reader;
+    on Python 3.14 that probe suppresses every OS error and answers False, so a
+    ledger sitting in place, unreadable, was reported as GONE — the sentence that
+    tells the operator every `decision:` line already written went with it.
+    Absence is now the reader's own `("", None)` answer; a refused ledger is an
+    attributed fault with the empty text and falls through to the documented
+    unreadable sentence, "the ledger holds no entry for this id". `metadata-3.14`
+    pins `Path.is_file` False for the ledger and refuses `stat`; `metadata-3.13`
+    refuses `stat` alone (which the old `try/except OSError` already absorbed into
+    the same fallthrough). Ablation: restore the `if not ledger.is_file(): return
+    "the ledger file is gone"` pre-gate and the `metadata-3.14` row reds with
+    "the ledger file is gone"."""
+    engine, _ = make_sweep(project, [])
+    write_ledger(project, {"DW-1": "open"})
+    ledger = project.deferred_work
+    if shape == "metadata-3.14":
+        real = Path.is_file
+        monkeypatch.setattr(
+            Path,
+            "is_file",
+            lambda self, *a, **kw: False if self == ledger else real(self, *a, **kw),
+        )
+    fault_metadata_probe(monkeypatch, ledger, "stat")
+
+    assert engine._non_write_state("DW-1") == "the ledger holds no entry for this id"
+
+
 @pytest.mark.parametrize("fault", [PermissionError("denied"), OSError("metadata I/O failure")])
 def test_a_refused_replay_survives_a_fault_in_its_diagnostic_probe(project, monkeypatch, fault):
     """A metadata fault after refusal is observation, so it must not crash replay.
 
     Retire the entry after the gate and let the real recorder refuse it. Only
-    then fault the diagnostic's is_file probe, leaving the earlier repair reads
-    intact. Removing the diagnostic guard must raise here before its journal row.
+    then fault the diagnostic's `stat` presence probe — the one
+    `read_for_observation` takes for `_non_write_state` since DW-265 retired the
+    site's own `is_file()` pre-gate — leaving the earlier repair reads intact.
+    The reader attributes the fault and answers the empty text, which falls
+    through to the missing-entry sentence rather than crashing the replay.
 
-    Ablation, RUN: the test fails with the unguarded probe, then passes with the
-    guard; the effect stays uncounted and no ledger commit is attempted.
+    Ablation, RUN: hoist the diagnostic's read out of the reader (a bare
+    `ledger.read_text(...) if S_ISREG(ledger.stat().st_mode) else ""`) and this
+    reds with the injected fault escaping `_decisions_phase`; with the reader the
+    effect stays uncounted and no ledger commit is attempted.
     """
     write_ledger(project, {"DW-1": "open"})
     engine, _ = make_sweep(project, [])
     _seed_run_store(engine, {"DW-1": _stored_close_answer()})
     plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_reapply_decision("DW-1"),))
     real_record = deferredwork.record_decision
-    real_is_file = Path.is_file
+    real_stat = Path.stat
 
     def fault_ledger_probe(path, *args, **kwargs):
         if path == project.deferred_work:
             raise fault
-        return real_is_file(path, *args, **kwargs)
+        return real_stat(path, *args, **kwargs)
 
     def retire_then_fault_probe(*args, **kwargs):
         write_ledger(project, {}, commit=False)
         recorded = real_record(*args, **kwargs)
         assert recorded is False
-        monkeypatch.setattr(Path, "is_file", fault_ledger_probe)
+        monkeypatch.setattr(Path, "stat", fault_ledger_probe)
         return recorded
 
     monkeypatch.setattr(deferredwork, "record_decision", retire_then_fault_probe)

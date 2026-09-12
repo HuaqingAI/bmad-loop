@@ -22,6 +22,7 @@ import traceback
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from stat import S_ISREG
 from typing import TYPE_CHECKING, Callable, Literal, NamedTuple, NoReturn, Protocol, Sequence
 
 from . import deferredwork, devcontract, envvars, gates, operatoractions, verify
@@ -1420,8 +1421,18 @@ class Engine:
         # than routed through `read_for_observation`: this site carries behavior
         # the helper cannot — it notifies the human and REFUSES the story instead
         # of degrading to an empty ledger. Same classification, richer response.
+        # The presence probe is `stat` + `S_ISREG` INSIDE the `try` (DW-266): the
+        # `is_file()` it replaced suppresses every OS error on Python 3.14 and
+        # answers False, so a refused ledger read as an empty one and this hard
+        # gate failed OPEN — the story dispatched, and the pause below was
+        # unreachable. Only absence (`ENOENT`/`ENOTDIR`, a present non-regular
+        # file) is the empty text; a refused probe takes the pause arm exactly
+        # as a refused `read_text` does.
         try:
-            text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+            try:
+                text = ledger.read_text(encoding="utf-8") if S_ISREG(ledger.stat().st_mode) else ""
+            except (FileNotFoundError, NotADirectoryError):
+                text = ""
         except (OSError, UnicodeDecodeError) as e:
             self.journal.append("story-gate-unreadable", story_key=story_key, error=str(e))
             reason = (

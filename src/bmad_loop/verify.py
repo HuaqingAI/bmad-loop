@@ -4904,8 +4904,16 @@ def verify_review_bundle(
     # nothing and already degrades into the `retry` it returns. `UnicodeDecodeError`
     # joins the tuple because it is a `ValueError`, not an `OSError` — undecodable
     # bytes escaped this arm entirely and aborted the verify instead of retrying it.
+    # The presence probe is `stat` + `S_ISREG` INSIDE the `try` (DW-267), so a
+    # refused probe is the "unreadable" retry below and not the "entries not
+    # marked done" one: the `is_file()` it replaced suppresses every OS error on
+    # Python 3.14 and answers False, so a refused ledger read as an empty one and
+    # the verify retried, fixable, with a misleading verdict naming every id.
     try:
-        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        try:
+            text = ledger.read_text(encoding="utf-8") if S_ISREG(ledger.stat().st_mode) else ""
+        except (FileNotFoundError, NotADirectoryError):
+            text = ""
     except (OSError, UnicodeDecodeError) as exc:
         return VerifyOutcome.retry(
             f"deferred-work ledger unreadable ({exc.__class__.__name__}: {exc}): {ledger}"

@@ -27,6 +27,7 @@ from conftest import (
     _write_check_script,
     committing_crash_state,
     dev_effect,
+    fault_metadata_probe,
     fault_read_text,
     generic_dev_effect,
     git,
@@ -5912,16 +5913,35 @@ def test_closes_deferred_ledger_replaced_by_a_directory_is_an_outage_not_a_typo(
 
 def _loop_the_ledger(project) -> Path:
     """Replace the committed ledger with a symlink CYCLE (ELOOP), the OS-refused
-    shape a story run can meet from the outset: `_refuse_gated_story` probes with
-    `Path.is_file()`, which absorbs ELOOP on every interpreter, so the loop passes
-    the gate and reaches the engine's own `read_for_write` sites, where DW-221's
-    `Path.stat` probe reports the errno. Returns the loop's other end so a repair
-    can unlink both."""
+    shape the engine's own `read_for_write` sites meet as a `Path.stat` errno
+    (DW-221). Returns the loop's other end so a repair can unlink both."""
     ledger = project.deferred_work
     ledger.unlink()
     other = project.project / "ledger-loop"
     ledger.symlink_to(other)
     other.symlink_to(ledger)
+    return other
+
+
+def _loop_the_ledger_past_the_gate(project, engine) -> Path:
+    """Install `_loop_the_ledger`'s cycle the moment `_refuse_gated_story` has
+    passed the story, so the loop reaches the DW-258 sites downstream of the gate
+    — `_ledger_digest`'s baseline capture first. Until DW-266 the gate probed with
+    `Path.is_file()`, which absorbs ELOOP on every interpreter, so a loop installed
+    up front passed it; the gate's `Path.stat` probe now reports the errno and
+    pauses the run before any of those sites is reached (`test_dispatch_pauses_
+    when_the_ledger_cannot_be_read`), which is the right verdict for a ledger
+    that exists and cannot be read, and not the window these rows grade. Returns
+    the loop's other end, resolved once the gate has run."""
+    other = project.project / "ledger-loop"
+    real_gate = engine._refuse_gated_story
+
+    def gate_then_loop(story_key: str) -> None:
+        real_gate(story_key)  # over the readable, committed ledger
+        if not project.deferred_work.is_symlink():
+            _loop_the_ledger(project)
+
+    engine._refuse_gated_story = gate_then_loop
     return other
 
 
@@ -5957,7 +5977,7 @@ def test_closes_deferred_in_repo_ledger_link_loop_degrades_the_digest_and_pauses
     this reds with `run-crash` (`OSError`) at the baseline digest, zero sessions."""
     engine = _closes_deferred_run(project, ["DW-1"], deferred=[HARVEST_A])
     ledger = project.deferred_work
-    other = _loop_the_ledger(project)
+    other = _loop_the_ledger_past_the_gate(project, engine)
 
     summary = engine.run()
 
@@ -6015,7 +6035,7 @@ def test_closes_deferred_over_a_looped_ledger_with_no_findings_completes_and_jou
     reds with `run-crash` (`OSError`) at the baseline digest."""
     engine = _closes_deferred_run(project, ["DW-1"])
     ledger = project.deferred_work
-    _loop_the_ledger(project)
+    _loop_the_ledger_past_the_gate(project, engine)
 
     summary = engine.run()
 
@@ -6052,7 +6072,7 @@ def test_no_work_session_over_a_looped_ledger_never_lands_on_the_engines_own_app
     Ablation: make `_ledger_changed_since_baseline` a plain `!=` and this reds by
     landing `DONE` with zero sessions on the resume."""
     engine = _closes_deferred_run(project, ["DW-1"], deferred=[HARVEST_A], write_src=False)
-    other = _loop_the_ledger(project)
+    other = _loop_the_ledger_past_the_gate(project, engine)
 
     summary = engine.run()
 
@@ -10974,14 +10994,64 @@ def test_dispatch_gate_does_not_fire_for_a_story_it_does_not_name(project):
     assert summary.done == 1 and not summary.paused
 
 
-def test_dispatch_pauses_when_the_ledger_cannot_be_read(project, monkeypatch):
+@pytest.mark.parametrize("fault", ["read_text", "metadata-3.14", "metadata-3.13"])
+def test_dispatch_pauses_when_the_ledger_cannot_be_read(project, monkeypatch, fault):
     """Degrading to "not gated" would let a broken file disable the one deferred
     check that refuses, and "does this project use gates?" is answerable only from
-    the file that will not open. `validate` reports the same fault as a problem."""
+    the file that will not open. `validate` reports the same fault as a problem.
+
+    Three faults, one arm. `read_text` is the read refused; the two `metadata`
+    rows refuse the PRESENCE PROBE (DW-266). `metadata-3.14` pins `Path.is_file`
+    False for the ledger AND refuses `stat`, the shape Python 3.14 gives a refused
+    ledger — `is_file()` there suppresses every OS error and answers False, so the
+    old `read_text(...) if ledger.is_file() else ""` read the refusal as an empty
+    ledger and the hard gate failed OPEN. `metadata-3.13` refuses `stat` alone,
+    which `is_file()` re-raised on 3.11–3.13. Ablation: restore
+    `if ledger.is_file() else ""` and the `metadata-3.14` row reds with
+    `summary.done == 1` and no pause — the story dispatched past the gate."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     write_gated_ledger(project, {"DW-1": ("open", ["gate: 9-9"])})
     engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
-    fault_read_text(monkeypatch, project.deferred_work)
+    ledger = project.deferred_work
+    if fault == "read_text":
+        fault_read_text(monkeypatch, ledger)
+    else:
+        if fault == "metadata-3.14":
+            real = Path.is_file
+            monkeypatch.setattr(
+                Path,
+                "is_file",
+                lambda self, *a, **kw: False if self == ledger else real(self, *a, **kw),
+            )
+        fault_metadata_probe(monkeypatch, ledger, "stat")
+
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert saved.paused_stage == PAUSE_STORY_GATE
+    assert adapter.sessions == []
+    assert "cannot be read" in saved.paused_reason
+    assert [e["kind"] for e in engine.journal.entries()].count("story-gate-unreadable") == 1
+
+
+def test_dispatch_pauses_on_a_symlink_loop_at_the_ledgers_name(project):
+    """A REAL OS refusal ahead of the gate, not an injected one: a symlink cycle at
+    the ledger's name is a path that exists and cannot be read, and `is_file()`
+    absorbed its ELOOP on every interpreter (not only 3.14's blanket suppression),
+    so the loop passed the `gate:` hard gate as an empty ledger. The gate's `stat`
+    probe reports errno 40 (DW-266), the side-switch DW-254 recorded for the
+    observation reader, so the run pauses at `PAUSE_STORY_GATE` before any
+    session. Ablation: absorb ELOOP as absence in `_refuse_gated_story` (add
+    `OSError` with `errno.ELOOP` to the inner `except`) and this reds with the
+    story dispatched — `adapter.sessions` non-empty, no pause."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 9-9"])})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+    try:
+        _loop_the_ledger(project)
+    except OSError as exc:  # symlinks unavailable on this host
+        pytest.skip(f"symlinks unavailable: {exc}")
 
     summary = engine.run()
 

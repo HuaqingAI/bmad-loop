@@ -97,7 +97,11 @@ OSError`` never caught it. Two sites were spelled that way — ``verify``'s
 degrade arm sitting right there (a retryable outcome, an unavailable pane) that
 undecodable bytes flew straight past; each now catches both. The other two
 inline observation sites, ``Engine._refuse_gated_story`` and
-``cli._validate_deferred_ledger``, already caught the pair and are unchanged.
+``cli._validate_deferred_ledger``, already caught the pair and were unchanged by
+DW-146; since DW-266/267 their presence probe is ``stat`` + ``S_ISREG`` inside
+that same ``try`` (as is ``verify_review_bundle``'s), so on Python 3.14 the pair
+is reached for a refused probe too, where ``is_file()`` had answered False and
+read the refusal as an empty ledger.
 No repair/write site's ``OSError`` behavior changes anywhere IN DW-146's OWN
 DIFF: ``read_for_write`` lets it propagate untouched. (DW-221 later made that
 propagation actually HAPPEN on Python 3.14, where the ``is_file()`` probe had
