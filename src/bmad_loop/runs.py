@@ -3109,19 +3109,21 @@ def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
       holds an in-flight bundle whose intent document must be regenerated: that
       run re-pauses at the story gate under `sweep-intent-regen-refused`
       `reason="ledger-absent"` (DW-243/252) before any cycle runs.
-    * Story runs are out of scope, and since DW-231 that is SAFE rather than
-      merely decided at the engine's four direct `read_for_write` sites. Its
-      observation reads (`_ledger_digest`, the pre-harvest and defer snapshots,
-      the two restores) degrade to a typed answer nothing can write back and
-      journal `ledger-read-degraded`; its two publish reads (the spec-deferral
-      harvest and the isolated carry) pause the run with an `ACTION REQUIRED`
-      repair notice and no phase change, so `bmad-loop resume` after the repair
-      retries the write — replaying the recorded session result where one
-      exists, re-driving the leg otherwise. At those four sites a story run over
-      an undecodable ledger therefore no longer dies as `run-crash`. Residual,
-      recorded as a deferral: every `deferredwork` mutator's own locked re-read
-      (the harvest's and carry's `append_entries`, `mark_done_many_reopenable`)
-      still raises inside its window, and the review-timeout salvage refile
+    * Story runs are out of scope, and since DW-231 (undecodable bytes) and
+      DW-258 (a read the OS refuses) that is SAFE rather than merely decided at
+      the engine's four direct `read_for_write` sites. Its observation reads
+      (`_ledger_digest`, the pre-harvest and defer snapshots, the two restores)
+      degrade to a typed answer nothing can write back and journal
+      `ledger-read-degraded`; its two publish reads (the spec-deferral harvest
+      and the isolated carry) pause the run with an `ACTION REQUIRED` repair
+      notice and no phase change, so `bmad-loop resume` after the repair retries
+      the write — replaying the recorded session result where one exists,
+      re-driving the leg otherwise. At those four sites a story run over an
+      undecodable OR OS-refused ledger therefore no longer dies as `run-crash`.
+      Residual, recorded as a deferral: every `deferredwork` mutator's own locked
+      re-read (the harvest's and carry's `append_entries`,
+      `mark_done_many_reopenable`) still raises inside its window, and the
+      review-timeout salvage refile
       (`deferredwork.append_entry` in `engine._salvage_review_timeout`) has no
       pre-read at all — a ledger that goes bad in exactly those windows still
       crashes the run.

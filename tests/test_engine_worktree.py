@@ -25,6 +25,7 @@ from conftest import (
     attach_profile,
     crash_at_merge_back,
     fault_metadata_probe,
+    fault_read_text,
     git,
     ignore_before_commit,
     install_build_auto_skill,
@@ -2173,6 +2174,49 @@ def test_carry_harvest_over_undecodable_main_ledger_pauses_before_the_latch(proj
     (refused,) = _rows(engine, "ledger-read-refused")
     assert refused["site"] == "harvest-carry"
     assert refused["ledger"] == str(project.deferred_work) and "not valid UTF-8" in refused["error"]
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "ACTION REQUIRED" in attention and str(project.deferred_work) in attention
+    assert "`bmad-loop resume test-run`" in attention
+
+
+def test_carry_harvest_over_os_refused_main_ledger_pauses_before_the_latch(project, monkeypatch):
+    """The PUBLISH arm at the isolated carry for a read the OS refuses (DW-258),
+    the EACCES twin of the DW-231 row above. The main ledger the unit's findings
+    are to be re-filed into raises `PermissionError`, so the carry pauses the run
+    for repair — `RunPaused` at `escalation`, `ledger-read-refused` site
+    `harvest-carry` naming `PermissionError`, an `ACTION REQUIRED` notice naming
+    the ledger — BEFORE `harvest_carry_commit_pending` is latched: nothing records
+    a commit obligation, nothing is written, no `harvest-carried` row.
+
+    Injected with `conftest.fault_read_text` (selective, never `chmod`; `read_bytes`
+    is untouched so the bytes can be asserted unchanged).
+
+    Ablation: narrow the carry's `except` tuple back to `LedgerReadError` and this
+    reds with `PermissionError` escaping the call."""
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.model import PAUSE_ESCALATION
+
+    before = b"# Deferred Work\n"
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(before)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1, harvested_deferrals=[_harvest_record()])
+    engine.state.tasks[task.story_key] = task
+    fault_read_text(monkeypatch, project.deferred_work)
+
+    with pytest.raises(RunPaused) as excinfo:
+        engine._carry_harvested_deferrals(task)
+
+    assert excinfo.value.stage == PAUSE_ESCALATION
+    assert excinfo.value.story_key == "1-1-a"
+    assert task.harvest_carry_commit_pending is False  # paused BEFORE the latch
+    assert project.deferred_work.read_bytes() == before  # nothing written
+    assert _harvest_carry_events(engine) == []
+    (refused,) = _rows(engine, "ledger-read-refused")
+    assert refused["site"] == "harvest-carry" and refused["story_key"] == "1-1-a"
+    assert refused["ledger"] == str(project.deferred_work)
+    assert "PermissionError" in refused["error"] and str(project.deferred_work) in refused["error"]
     attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
     assert "ACTION REQUIRED" in attention and str(project.deferred_work) in attention
     assert "`bmad-loop resume test-run`" in attention

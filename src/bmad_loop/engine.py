@@ -147,6 +147,51 @@ class _UndecodableLedger:
     error: str
 
 
+@dataclass(frozen=True)
+class _UnreadableLedger:
+    """The typed degraded answer of :meth:`Engine._ledger_text` for a ledger the
+    OS refused to read — EACCES, EIO, ELOOP (DW-258).
+
+    A second type beside :class:`_UndecodableLedger` rather than a discriminator
+    on it: that type's ``digest`` is a contract (sha256 of the raw bytes, exact
+    equality) an OS refusal cannot honor, because there are no bytes in hand — the
+    ``OSError`` branch reads NOTHING from the ledger. Keeping ``digest``
+    non-optional there and absent here lets pyright reject any consumer that
+    tries to digest the unreadable answer, and the frozen dataclass keeps the
+    DW-231 guarantees: it equals no ``str``/``None`` snapshot, cannot be passed
+    where a ``str`` is typed, and every consumer takes its skip arm explicitly.
+
+    For attribution the answer is UNKNOWN, which :meth:`Engine._ledger_digest`
+    spells as :data:`_UNREADABLE_LEDGER_DIGEST` and
+    :meth:`Engine._ledger_changed_since_baseline` treats as "not credited".
+    """
+
+    error: str
+
+
+# `isinstance` tuple for the two typed degraded answers of `_ledger_text`.
+_DEGRADED_LEDGER = (_UndecodableLedger, _UnreadableLedger)
+# The `str` `_ledger_digest` answers for an `_UnreadableLedger`, so that
+# `baseline_ledger_digest` (persisted, typed `str | None`) can still be captured
+# over a refused read. Not a hex sha256, so no `_digest_of` answer and no raw-bytes
+# digest ever collides with it. It is the ABSENCE of a digest, not a digest: the
+# only compare that may inspect it is `_ledger_changed_since_baseline`.
+_UNREADABLE_LEDGER_DIGEST = "<unreadable>"
+
+
+def _ledger_fault_text(ledger: Path, e: deferredwork.LedgerReadError | OSError) -> str:
+    """Attribute a ledger read fault for the journal and the repair notice.
+
+    A `LedgerReadError` already names the path and the codec fault. An `OSError`
+    gets the path and its class name, because ``[Errno 13] Permission denied``
+    alone does not say what kind of refusal it was — the wording
+    ``runs.unreadable_sweep_ledger``'s DW-234 arm uses.
+    """
+    if isinstance(e, deferredwork.LedgerReadError):
+        return str(e)
+    return f"{ledger} could not be read ({e.__class__.__name__}: {e})"
+
+
 def _bounded_stream_tail(text: str, max_bytes: int) -> tuple[str, int, int]:
     """Cut a verifier stream down to what ``verify.stream_capture_kb`` retains.
 
@@ -2481,8 +2526,8 @@ class Engine:
                     self._save()
                 elif not replayed or not task.harvest_wrote_ledger:
                     if task.baseline_ledger_digest is not None:
-                        task.ledger_changed_before_harvest = (
-                            self._ledger_digest(task) != task.baseline_ledger_digest
+                        task.ledger_changed_before_harvest = self._ledger_changed_since_baseline(
+                            task
                         )
                     self._save()
                 # Snapshot after the session has finished, preserving any ledger
@@ -2499,13 +2544,14 @@ class Engine:
                     snapshot = self._ledger_text(
                         site="pre-harvest-snapshot", story_key=task.story_key
                     )
-                    # Undecodable bytes leave the snapshot UNARMED (DW-231): there
-                    # is no text a restore could put back, and arming over the
-                    # typed answer would only turn a later rejected attempt's
-                    # restore into a journaled skip anyway. The degraded read is
-                    # already journaled by `_ledger_text`; the harvest below is
-                    # the site that decides whether this run can go on.
-                    if not isinstance(snapshot, _UndecodableLedger):
+                    # Undecodable bytes (DW-231) and a read the OS refused
+                    # (DW-258) both leave the snapshot UNARMED: there is no text
+                    # a restore could put back, and arming over either typed
+                    # answer would only turn a later rejected attempt's restore
+                    # into a journaled skip anyway. The degraded read is already
+                    # journaled by `_ledger_text`; the harvest below is the site
+                    # that decides whether this run can go on.
+                    if not isinstance(snapshot, _DEGRADED_LEDGER):
                         task.pre_harvest_ledger = snapshot
                         task.pre_harvest_ledger_captured = True
                         # The snapshot's own text is the first thing this engine
@@ -2625,7 +2671,11 @@ class Engine:
                     # The repair session is judged against the kept chain. Move
                     # the ledger reference onto that tree so the retained harvest
                     # is accounted for, while a new session-authored ledger edit
-                    # still makes `ledger_changed_before_harvest` true.
+                    # still makes `ledger_changed_before_harvest` true — except
+                    # when this read is refused by the OS (DW-258): the reference
+                    # becomes the `<unreadable>` sentinel and the repair session's
+                    # ledger edit is NOT credited, the trade-off
+                    # `_ledger_changed_since_baseline` accepts.
                     task.baseline_ledger_digest = self._ledger_digest(task)
                 else:
                     feedback = None
@@ -4288,14 +4338,17 @@ class Engine:
         ledger = self.workspace.paths.deferred_work
         # REPAIR/WRITE (DW-146): the seen-again match derived here decides which
         # findings are appended, and both writes run off this text. A PUBLISH
-        # site, so undecodable bytes pause the run for repair (DW-231) rather
-        # than degrade: the findings are real and this is the write that files
-        # them. The phase is left where it is, so `bmad-loop resume` replays the
-        # recorded session result straight back into this harvest.
+        # site, so undecodable bytes (DW-231) and a read the OS refuses (DW-258)
+        # pause the run for repair rather than degrade: the findings are real
+        # and this is the write that files them. The phase is left where it is,
+        # so `bmad-loop resume` replays the recorded session result straight
+        # back into this harvest.
         try:
             text = deferredwork.read_for_write(ledger) or ""
-        except deferredwork.LedgerReadError as e:
-            self._pause_for_ledger_repair(task, ledger, str(e), site="spec-deferrals-harvest")
+        except (deferredwork.LedgerReadError, OSError) as e:
+            self._pause_for_ledger_repair(
+                task, ledger, _ledger_fault_text(ledger, e), site="spec-deferrals-harvest"
+            )
         seen = deferredwork.parse_ledger(text)
 
         # Cross-spec dedupe (DW-88 vs DW-65). A real finding that is not this
@@ -5121,29 +5174,44 @@ class Engine:
 
     def _ledger_text(
         self, *, site: str, story_key: str | None = None
-    ) -> str | None | _UndecodableLedger:
+    ) -> str | None | _UndecodableLedger | _UnreadableLedger:
         """Return the active workspace ledger text, preserving absence.
 
-        REPAIR/WRITE arm (DW-146): this feeds proof-of-work attribution, so an
-        ``OSError`` stays fail-loud — guessing either equality answer misjudges
-        the session's work. Absence is preserved because an absent and an empty
-        ledger are a real distinction to the caller.
-
-        Undecodable bytes DEGRADE rather than raise (DW-231): every consumer of
-        this read is an observation — a digest compared for equality, a snapshot
-        armed for a later restore, a restore's own compare-and-set probe — and
-        none of them is about to publish the text. The answer is the typed
-        :class:`_UndecodableLedger`, which no consumer can write back or anchor a
-        write on, and the fault is journaled as ``ledger-read-degraded`` naming
-        the ``site`` so the degraded read stays visible. The two reads that DO
-        precede a publish (the harvest append and the isolated carry) call
-        ``read_for_write`` directly and pause through
+        REPAIR/WRITE arm (DW-146): this feeds proof-of-work attribution, and
+        absence is preserved because an absent and an empty ledger are a real
+        distinction to the caller. Neither fault class raises out of here any
+        more, because every consumer of this read is an observation — a digest
+        compared for equality, a snapshot armed for a later restore, a restore's
+        own compare-and-set probe — and none of them is about to publish the
+        text. The two reads that DO precede a publish (the harvest append and
+        the isolated carry) call ``read_for_write`` directly and pause through
         :meth:`_pause_for_ledger_repair` instead.
+
+        Undecodable bytes DEGRADE to the typed :class:`_UndecodableLedger`
+        (DW-231), which carries the raw bytes' digest so "did the ledger change"
+        stays exact. A read the OS refuses — EACCES, EIO, ELOOP — DEGRADES to the
+        typed :class:`_UnreadableLedger` (DW-258), which carries NO digest: that
+        branch reads nothing from the ledger (no ``read_bytes()``, no re-``stat``
+        — either would raise again), so the attribution answer is unknown and
+        :meth:`_ledger_changed_since_baseline` declines to credit it. Both are
+        journaled as ``ledger-read-degraded`` naming the ``site`` so the degraded
+        read stays visible, and neither can be written back or anchor a write.
         """
         ledger = self.workspace.paths.deferred_work
         try:
             return deferredwork.read_for_write(ledger)
-        except deferredwork.LedgerReadError as e:
+        except (deferredwork.LedgerReadError, OSError) as e:
+            error = _ledger_fault_text(ledger, e)
+            attributed = {} if story_key is None else {"story_key": story_key}
+            self.journal.append(
+                "ledger-read-degraded",
+                site=site,
+                ledger=str(ledger),
+                error=error,
+                **attributed,
+            )
+            if isinstance(e, OSError):
+                return _UnreadableLedger(error)
             # Hash the RAW bytes ALREADY IN HAND: the fault means they are not
             # valid UTF-8, so no `_digest_of` answer can ever equal this one.
             # `read_text()` decodes the whole buffer in one `final=True` call, so
@@ -5155,15 +5223,7 @@ class Engine:
             # reachable only for a `LedgerReadError` raised without that cause.
             cause = e.__cause__
             raw = cause.object if isinstance(cause, UnicodeDecodeError) else ledger.read_bytes()
-            attributed = {} if story_key is None else {"story_key": story_key}
-            self.journal.append(
-                "ledger-read-degraded",
-                site=site,
-                ledger=str(ledger),
-                error=str(e),
-                **attributed,
-            )
-            return _UndecodableLedger(hashlib.sha256(raw).hexdigest(), str(e))
+            return _UndecodableLedger(hashlib.sha256(raw).hexdigest(), error)
 
     def _ledger_digest(self, task: StoryTask) -> str:
         """Digest the current ledger text for proof-of-work attribution.
@@ -5171,17 +5231,51 @@ class Engine:
         An absent ledger and an empty one intentionally hash alike: neither
         carries an entry, and this comparison never restores or unlinks the file.
         Undecodable bytes hash as themselves (see :class:`_UndecodableLedger`), so
-        the equality this feeds stays exact without guessing either answer.
+        the equality this feeds stays exact without guessing either answer. A
+        read the OS refused has no bytes to hash and answers the constant
+        :data:`_UNREADABLE_LEDGER_DIGEST` (DW-258) — still a ``str``, because the
+        answer is persisted in ``baseline_ledger_digest``, but not a digest:
+        :meth:`_ledger_changed_since_baseline` is the one compare allowed to
+        read it, and it reads it as "unknown".
         """
         text = self._ledger_text(site="ledger-digest", story_key=task.story_key)
         if isinstance(text, _UndecodableLedger):
             return text.digest
+        if isinstance(text, _UnreadableLedger):
+            return _UNREADABLE_LEDGER_DIGEST
         return _digest_of(text)
+
+    def _ledger_changed_since_baseline(self, task: StoryTask) -> bool:
+        """Has the ledger changed from the attempt's attribution reference?
+
+        The one consumer of the answer is ``ledger_changed_before_harvest``,
+        which :meth:`_harvest_gate_exclude` reads as "stand the exclusion down":
+        True credits the ledger diff as the session's own work. So the answer
+        must never be True on a guess. :data:`_UNREADABLE_LEDGER_DIGEST` on
+        EITHER side means one of the two reads had no bytes to compare, and the
+        rule for unknown attribution (:meth:`_legacy_ledger_changed_before_harvest`,
+        :meth:`_harvest_gate_exclude`) is that uncertainty never turns the
+        engine's own harvest append into session proof: the answer is False and
+        the ledger path stays excluded. A plain ``!=`` would call "unreadable
+        then, readable now" CHANGED and let a session that wrote nothing pass
+        the gate on the engine's append after the human repair. The accepted
+        trade-off is that a session whose sole work was repairing and editing
+        the ledger is rolled back and retried once, over a readable baseline
+        where attribution is exact. This rule lives here ONLY:
+        ``_harvest_gate_exclude`` never inspects the sentinel.
+        """
+        current = self._ledger_digest(task)
+        if _UNREADABLE_LEDGER_DIGEST in (current, task.baseline_ledger_digest):
+            # Unknown attribution is never credited: the engine's own append
+            # must not become the session's proof of work.
+            return False
+        return current != task.baseline_ledger_digest
 
     def _pause_for_ledger_repair(
         self, task: StoryTask, ledger: Path, error: str, *, site: str
     ) -> NoReturn:
-        """Pause the run over a ledger a PUBLISH site could not read (DW-231).
+        """Pause the run over a ledger a PUBLISH site could not read (DW-231;
+        a read the OS refuses routes the same way since DW-258).
 
         Mirrors :meth:`recovery_flow.RecoveryFlow.pause_for_manual_recovery`'s
         shape — journal, ``ACTION REQUIRED`` notice, ``_save()``, ``RunPaused`` at
@@ -5208,14 +5302,15 @@ class Engine:
             ledger=str(ledger),
             error=error,
         )
-        # `error` already begins with the ledger's path (`read_for_write` attributes
-        # it), so the path is named once, by the fault, not twice.
+        # `error` is `_ledger_fault_text`'s attribution and already begins with
+        # the ledger's path, so the notice does not name the path a second time.
         notice = (
             "**ACTION REQUIRED — deferred-work ledger unreadable**\n"
             f"Story **{task.story_key}** has findings to file, but the orchestrator "
             f"could not read the deferred-work ledger to publish them: {error}.\n"
             "Nothing was written and no work was discarded. Repair the ledger by hand "
-            "(it must be valid UTF-8), then run "
+            "(it must be valid UTF-8, and the path's permissions or storage must let "
+            "it be read), then run "
             f"`bmad-loop resume {self.state.run_id}`: resume recovery replays the "
             "recorded session result where one exists (the dev and review legs) and "
             "otherwise re-drives the leg, retrying the ledger write either way."
@@ -5497,12 +5592,13 @@ class Engine:
             current = self._ledger_text(site="ledger-restore-locked", story_key=task.story_key)
             if current == snapshot:
                 return
-            if isinstance(current, _UndecodableLedger):
-                # Bytes nobody can read are nobody's to retract (DW-231): the
-                # typed answer equals no snapshot, is never digested as "ours"
-                # and never reaches the unlink or the write below. The
-                # `observed == snapshot` probe above is already False for it, so
-                # this is the arm that ends every undecodable read in the skip.
+            if isinstance(current, _DEGRADED_LEDGER):
+                # Bytes nobody can read are nobody's to retract (DW-231, and the
+                # OS-refused read of DW-258): either typed answer equals no
+                # snapshot, is never digested as "ours" and never reaches the
+                # unlink or the write below. The `observed == snapshot` probe
+                # above is already False for it, so this is the arm that ends
+                # every degraded read in the skip.
                 diverged = True
             else:
                 ours = _digest_of(current) == task.post_engine_ledger_digest
@@ -6231,9 +6327,7 @@ class Engine:
                 and result.result_json is not None
                 and task.baseline_ledger_digest is not None
             ):
-                task.ledger_changed_before_harvest = (
-                    self._ledger_digest(task) != task.baseline_ledger_digest
-                )
+                task.ledger_changed_before_harvest = self._ledger_changed_since_baseline(task)
             # A hard stop honored *inside* the session: the adapter's wait loop
             # saw a `mode: "hard"` stop-request.json, tore its window down and
             # returned this abort verdict. Position is load-bearing at both ends.
@@ -6380,7 +6474,7 @@ class Engine:
             and result.result_json is not None  # pyright: ignore[reportOptionalMemberAccess]
             and task.baseline_ledger_digest is not None
         ):
-            ledger_changed = self._ledger_digest(task) != task.baseline_ledger_digest
+            ledger_changed = self._ledger_changed_since_baseline(task)
             if ledger_changed != task.ledger_changed_before_harvest:
                 task.ledger_changed_before_harvest = ledger_changed
                 self._save()
@@ -7185,21 +7279,22 @@ class Engine:
             # REPAIR/WRITE (DW-146), absence preserved: this snapshot is the input
             # to `_restore_defer_ledger`, so a snapshot taken from bytes nobody
             # could read would be republished over the real ledger. Undecodable
-            # bytes therefore DEGRADE to no snapshot (DW-231): the restore is
-            # skipped rather than the defer crashed, since nothing here was about
-            # to publish and the reset cannot lose what nobody could read — a
-            # tracked ledger's uncommitted bytes are parked on the attempt's
-            # recovery ref by `preserve_attempt_worktree` ahead of the reset, and
-            # an untracked one is never reset at all.
+            # bytes (DW-231) and a read the OS refuses (DW-258) therefore DEGRADE
+            # to no snapshot: the restore is skipped rather than the defer
+            # crashed, since nothing here was about to publish and the reset
+            # cannot lose what nobody could read — a tracked ledger's uncommitted
+            # bytes are parked on the attempt's recovery ref by
+            # `preserve_attempt_worktree` ahead of the reset, and an untracked
+            # one is never reset at all.
             try:
                 snapshot = deferredwork.read_for_write(deferred_work)
-            except deferredwork.LedgerReadError as e:
+            except (deferredwork.LedgerReadError, OSError) as e:
                 self.journal.append(
                     "ledger-read-degraded",
                     story_key=task.story_key,
                     site="defer-snapshot",
                     ledger=str(deferred_work),
-                    error=str(e),
+                    error=_ledger_fault_text(deferred_work, e),
                 )
                 snapshot = None
             try:
@@ -7323,8 +7418,9 @@ class Engine:
                 atomic_write_text(ledger, snapshot)
                 return
             # `isinstance`, not `is not None`: an UNDECODABLE ledger answers the
-            # typed `_UndecodableLedger` (DW-231), which the merge must never see —
-            # there is no text to append onto — so it falls through to the
+            # typed `_UndecodableLedger` (DW-231) and an OS-REFUSED one the typed
+            # `_UnreadableLedger` (DW-258), neither of which the merge may see —
+            # there is no text to append onto — so both fall through to the
             # divergence journal below exactly as a missing ledger does.
             if isinstance(current, str):
                 restored, merged, flat_remainder, collided = self._merge_snapshot_entries(
@@ -7473,14 +7569,17 @@ class Engine:
         ledger = self.paths.deferred_work
         # REPAIR/WRITE (DW-146): this one fresh read is the whole on-disk guard
         # for the `append_entries` write below it. A PUBLISH site, so undecodable
-        # bytes pause the run for repair (DW-231) — BEFORE the commit latch below,
-        # so nothing records an obligation this call never took on. The phase is
-        # left where it is: the `defer_reason` re-entry and
-        # `_replay_unlatched_ledger_carries` re-run this carry on resume.
+        # bytes (DW-231) and a read the OS refuses (DW-258) pause the run for
+        # repair — BEFORE the commit latch below, so nothing records an
+        # obligation this call never took on. The phase is left where it is: the
+        # `defer_reason` re-entry and `_replay_unlatched_ledger_carries` re-run
+        # this carry on resume.
         try:
             text = deferredwork.read_for_write(ledger) or ""
-        except deferredwork.LedgerReadError as e:
-            self._pause_for_ledger_repair(task, ledger, str(e), site="harvest-carry")
+        except (deferredwork.LedgerReadError, OSError) as e:
+            self._pause_for_ledger_repair(
+                task, ledger, _ledger_fault_text(ledger, e), site="harvest-carry"
+            )
         seen = deferredwork.parse_ledger(text)
         specs: list[deferredwork.EntrySpec] = []
         for item in task.harvested_deferrals:
