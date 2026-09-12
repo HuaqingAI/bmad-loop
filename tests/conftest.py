@@ -1082,6 +1082,24 @@ def seed_outer_decoy_ledger(paths: ProjectPaths) -> tuple[Path, bytes]:
 
 UNRESOLVABLE = "stubbed: the provider is registered but not serving"
 
+# The two `ValueError`-family faults `Path.resolve()` raises on CPython 3.11-3.14 POSIX
+# (DW-275), spelled once for the three publisher rows that drive them through
+# `refuse_to_resolve(..., error=)`: an embedded NUL in the path raises `ValueError`
+# with CPython's own `lstat: embedded null character in path` wording (3.12+; 3.11
+# says `embedded null byte`), and a lone surrogate OUTSIDE the `surrogateescape`
+# range (`\ud800`; a `\udcff` round-trips through `os.fsencode` and does not raise)
+# raises `UnicodeEncodeError`, a `ValueError` subclass, which `refuse_to_resolve`
+# reconstructs faithfully from its five args. INJECTED rather than driven with a
+# real path because `ntpath.realpath` tolerates a NUL, so a real NUL path is not a
+# cross-platform driver at the publisher.
+NUL_PATH_RESOLVE_FAULTS = [
+    pytest.param(ValueError("lstat: embedded null character in path"), id="nul"),
+    pytest.param(
+        UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogates not allowed"),
+        id="lone-surrogate",
+    ),
+]
+
 
 def refuse_to_resolve(monkeypatch, *targets: Path, error: Exception | None = None) -> None:
     """Make ``Path.resolve()`` fail for exactly ``targets``.

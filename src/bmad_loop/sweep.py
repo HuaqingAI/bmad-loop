@@ -4925,10 +4925,13 @@ class SweepEngine(Engine):
         # the readability fact the dispatch gate withholds on; a git fault after a
         # successful resolve says nothing about readability. The one-tuple handler
         # that stood here could not tell them apart, so a refused resolve left the
-        # run holding the ledger publishable.
+        # run holding the ledger publishable. `ValueError` sits in the resolve arm's
+        # tuple (DW-275): `Path.resolve()` raises it for an embedded NUL, and its
+        # `UnicodeEncodeError` subclass for a lone surrogate, on CPython POSIX — the
+        # same fold `engine._publication_refusal` makes.
         try:
             target = path.resolve()
-        except (OSError, RuntimeError) as e:
+        except (OSError, RuntimeError, ValueError) as e:
             # `repo` (not `root`): an absolute host path, already routed out of
             # diagnostics dumps, exactly as `rearm-baseline-advance-failed` spells
             # the same value. The LEXICAL parent here — the resolve that would have

@@ -11715,7 +11715,8 @@ def test_confirm_drops_a_record_path_replaced_by_a_directory(project, capsys, mo
 @pytest.mark.parametrize("refused", ["record", "all"])
 def test_confirm_drops_operands_it_cannot_resolve(project, capsys, monkeypatch, refused):
     """The OTHER cause `_land_confirmation`'s per-operand guard can return, and the
-    arm that grades `_publication_refusal`'s `except (OSError, RuntimeError)` fold:
+    arm that grades `_publication_refusal`'s `except (OSError, RuntimeError,
+    ValueError)` fold on its `OSError` class:
     `Path.resolve` fails before the family leg is ever asked, so without the fold a
     bare `OSError` escapes into a publish that is best effort by construction.
 
@@ -11732,8 +11733,8 @@ def test_confirm_drops_operands_it_cannot_resolve(project, capsys, monkeypatch, 
     above states: the operands are read and written by the statements ahead of the
     guard, and only the window between the drop and the commit is this guard's.
 
-    Ablation: delete `_publication_refusal`'s `except (OSError, RuntimeError)` and
-    both rows red with the stubbed `OSError` escaping `cli.main`. Delete the
+    Ablation: delete `_publication_refusal`'s `except (OSError, RuntimeError,
+    ValueError)` and both rows red with the stubbed `OSError` escaping `cli.main`. Delete the
     `if survivors:` test and the `all` row reds on its `commit_paths` call count."""
     from bmad_loop import operatoractions, sprintstatus
 

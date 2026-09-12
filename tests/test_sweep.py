@@ -13,6 +13,7 @@ from typing import Literal
 import pytest
 from conftest import (
     _OK,
+    NUL_PATH_RESOLVE_FAULTS,
     UNRESOLVABLE,
     _file_exists_cmd,
     _spec_baseline,
@@ -3480,6 +3481,7 @@ def test_replayed_bundle_close_leaves_the_open_set_before_the_sweep_loop_reads_i
         ("undecodable", "target-undecodable", "not valid UTF-8"),
         ("unreadable", "target-unreadable", "Permission"),
         ("unresolvable", "target-unreadable", UNRESOLVABLE),
+        ("nul", "target-unreadable", "lstat: embedded null character in path"),
     ],
 )
 def test_bundle_close_carry_refuses_an_unpublishable_ledger(
@@ -3505,19 +3507,23 @@ def test_bundle_close_carry_refuses_an_unpublishable_ledger(
     invalid UTF-8 after the write — refused here like every other cause, since this
     carry holds no latch), the DW-227 metadata fault, and a RESOLVE that fails — the
     last two both landing on `target-unreadable`. A wrong type has no exception text
-    to carry in `error` (an empty string would read as one); the other three do. The
-    resolve row is the one that grades `_publication_refusal`'s own
-    `except (OSError, RuntimeError)` fold: `Path.resolve` is what fails first, before
+    to carry in `error` (an empty string would read as one); the others do. The
+    two resolve rows are the ones that grade `_publication_refusal`'s own
+    `except (OSError, RuntimeError, ValueError)` fold, per class: `unresolvable` on
+    `OSError`, `nul` on `ValueError` (DW-275, an embedded NUL, injected with CPython's
+    3.12+ wording so a publisher-level journal row observes the fold for that class
+    too). `Path.resolve` is what fails first, before
     the family leg is ever asked, and without the fold a bare `OSError` escapes into
-    bookkeeping whose whole degrade discipline exists to prevent that. Both faults
+    bookkeeping whose whole degrade discipline exists to prevent that. All faults
     are injected through their seams rather than with chmod so they hold on every
     supported interpreter.
 
     Ablation: delete this site's `refusal` branch and every row reds — the wrong-type
-    row on its HEAD assertions as `swept-in.txt` reaches `git ls-files`, the other
-    two on the fault escaping into a caller with no handler for it. Delete
-    `_publication_refusal`'s `except (OSError, RuntimeError)` and the resolve row
-    reds alone."""
+    row on its HEAD assertions as `swept-in.txt` reaches `git ls-files`, the others
+    on the fault escaping into a caller with no handler for it. Delete
+    `_publication_refusal`'s whole `except (OSError, RuntimeError, ValueError)` and
+    both resolve rows red alone; drop `ValueError` ALONE from it and the `nul` row
+    reds alone, with the `ValueError` escaping."""
     write_ledger(project, {"DW-1": "open"})
     head = git(project.project, "rev-parse", "HEAD")
     engine, _ = make_sweep(project, [], policy=isolated_seeded_policy(project))
@@ -3538,6 +3544,11 @@ def test_bundle_close_carry_refuses_an_unpublishable_ledger(
             # The #552 shape: a resolve that FAILS rather than answering. It is the
             # first thing the guard does, so the family leg never runs at all.
             refuse_to_resolve(monkeypatch, ledger)
+        elif fault == "nul":
+            # DW-275: the same resolve failure on its `ValueError` class.
+            refuse_to_resolve(
+                monkeypatch, ledger, error=ValueError("lstat: embedded null character in path")
+            )
         else:
             # AFTER the write, for the same reason the directory arrives after it:
             # the guard's own probe is what must meet the fault, and a ledger
@@ -14313,8 +14324,8 @@ def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, m
       * move `name = path.name` inside the `try` beside `target` and this reds with
         a `NameError` escaping a method the docstring calls strictly best effort —
         which makes the BINDING POSITION, not merely the field, the graded thing;
-      * delete `OSError` ALONE from the RESOLVE arm's `except (OSError, RuntimeError)`
-        tuple in `_commit_ledger` and this reds with the refusal escaping
+      * delete `OSError` ALONE from the RESOLVE arm's `except (OSError, RuntimeError,
+        ValueError)` tuple in `_commit_ledger` and this reds with the refusal escaping
         `_commit_ledger` on BOTH legs;
       * hardcode `file="deferred-work.md"` in the unavailable journal row and only
         the STORE legs fail, on the expected `decisions.json` filename. The row
@@ -14407,7 +14418,7 @@ def test_the_degrade_row_survives_a_runtime_error_from_the_resolve(project, monk
 
     Ablations, all performed:
       * delete `RuntimeError` ALONE from the RESOLVE arm's `except (OSError,
-        RuntimeError)` tuple in `_commit_ledger` and this reds with the
+        RuntimeError, ValueError)` tuple in `_commit_ledger` and this reds with the
         `RuntimeError` escaping `_commit_ledger`, on both legs;
       * hardcode `file="deferred-work.md"` in the unavailable journal row and only
         the STORE legs fail, on the expected `decisions.json` filename, even though
@@ -14437,6 +14448,64 @@ def test_the_degrade_row_survives_a_runtime_error_from_the_resolve(project, monk
     # the LEXICAL parent: the resolve that would have replaced it is what failed
     assert failed["repo"] == str(published.parent)
     assert loop_error in failed["error"]
+    assert git(project.project, "rev-parse", "HEAD") == head  # nothing was committed
+    assert _records(engine, "sweep-ledger-commit") == []  # nothing published...
+    assert _records(engine, "sweep-ledger-commit-refused") == []  # ...not a target refusal...
+    assert _records(engine, "sweep-ledger-commit-clean") == []  # ...and not a clean skip either
+    # DW-260: the ledger leg arms the run's doubt, in memory and on disk; the store
+    # leg arms nothing
+    assert engine._ledger_unfit_to_publish() is (family == "ledger")
+    assert load_state(engine.run_dir).sweep_ledger_in_doubt is (family == "ledger")
+
+
+@pytest.mark.parametrize("family", ["ledger", "store"])
+@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
+def test_the_degrade_row_survives_a_value_error_from_the_resolve(
+    project, monkeypatch, fault, family
+):
+    """The `ValueError` CLASS of the same resolve `except` tuple, driven on its own
+    (DW-275), in the shape of the `RuntimeError` row above.
+
+    `Path.resolve()` raises `ValueError` for an embedded NUL and `UnicodeEncodeError`
+    (a `ValueError` subclass) for a lone surrogate outside the `surrogateescape`
+    range on CPython 3.11-3.14 POSIX, and the two-class tuple that stood here let
+    both escape a method whose docstring calls it strictly best effort. Both faults
+    come from `NUL_PATH_RESOLVE_FAULTS` and are injected through `refuse_to_resolve`
+    for the reason the constant states — `ntpath.realpath` tolerates a NUL, so a real
+    NUL path is not a cross-platform driver here — and the injected `nul` fault
+    carries CPython's 3.12+ wording (3.11 says `embedded null byte`) so the stand-in
+    is faithful. Every claim the sibling row makes is made again on this
+    class: the one `sweep-ledger-commit-unavailable` row with `file` the lexical
+    tail and `repo` the lexical parent, HEAD unmoved, no `sweep-ledger-commit`,
+    `-refused` or `-clean`, and the DW-260 doubt half — the ledger leg arms
+    `sweep_ledger_in_doubt` in memory and on disk, the store leg does not — since the
+    arm reads `family` AFTER the row, and a class that escaped the tuple would skip
+    the arm along with the row.
+
+    Ablation, per class: delete `ValueError` ALONE from the RESOLVE arm's
+    `except (OSError, RuntimeError, ValueError)` tuple in `_commit_ledger` and all
+    four legs red with the injected fault escaping `_commit_ledger`, while the
+    `OSError` and `RuntimeError` rows above stay green."""
+    # shared frame for both legs: on the store leg this ledger is deliberately
+    # ignored — never published, never resolved, never asserted on
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    engine._save()  # a state file for the store leg's `load_state` to read back
+    published, tail = _resolve_degrade_target(project, family)
+    head = git(project.project, "rev-parse", "HEAD")
+    refuse_to_resolve(monkeypatch, published, error=fault)
+
+    engine._commit_ledger(
+        "chore(sweep): nul target", path=published, family=family
+    )  # must not raise
+
+    [failed] = _records(engine, "sweep-ledger-commit-unavailable")
+    assert failed["message"] == "chore(sweep): nul target"
+    assert failed["file"] == tail  # bound before the try, so still here
+    # the LEXICAL parent: the resolve that would have replaced it is what failed
+    assert failed["repo"] == str(published.parent)
+    assert str(fault) in failed["error"]
     assert git(project.project, "rev-parse", "HEAD") == head  # nothing was committed
     assert _records(engine, "sweep-ledger-commit") == []  # nothing published...
     assert _records(engine, "sweep-ledger-commit-refused") == []  # ...not a target refusal...

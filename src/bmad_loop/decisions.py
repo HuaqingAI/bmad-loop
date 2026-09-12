@@ -636,7 +636,10 @@ def apply_pre_answer(
     for path, family in wrote:
         try:
             target = path.resolve()
-        except (OSError, RuntimeError) as e:
+        except (OSError, RuntimeError, ValueError) as e:
+            # `ValueError` too (DW-275): an embedded NUL, or a lone surrogate as its
+            # `UnicodeEncodeError` subclass, on CPython POSIX. This publisher has no
+            # journal, so the refusal is the fault's only route out.
             refusals.append(PublishRefusal(file=path.name, cause="target-unreadable", error=str(e)))
             continue
         refusal = verify.unpublishable_target(target, family)

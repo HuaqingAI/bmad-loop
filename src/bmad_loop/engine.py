@@ -712,13 +712,17 @@ def _publication_refusal(path: Path, family: Literal["ledger", "store"]) -> (
     resolve fault lands on the transient cause too, so a caller reads the cause
     alone and never asks which call produced it, and never re-reads the ledger or
     matches fault text to tell an undecodable file from an unreadable one.
+    `ValueError` is in the tuple beside `OSError` and `RuntimeError` because
+    `Path.resolve()` raises it for an embedded NUL, and its `UnicodeEncodeError`
+    subclass for a lone surrogate, on CPython 3.11-3.14 POSIX (DW-275) — the same
+    three-class tuple `_park_spec_relpath` folds its own resolve through.
 
     Returns the `Literal` cause unchanged so every caller's `refuse_cause` journal
     field stays the closed four-value enum `tests/test_portability_guard.py`
     declares benign."""
     try:
         target = path.resolve()
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         return ("target-unreadable", str(e))
     return verify.unpublishable_target(target, family)
 

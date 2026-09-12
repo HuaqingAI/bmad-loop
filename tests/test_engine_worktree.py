@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 from conftest import (
     _OK,
+    NUL_PATH_RESOLVE_FAULTS,
     UNDECODABLE_LEDGER,
     _exists_run,
     _file_exists_cmd,
@@ -41,7 +42,7 @@ from bmad_loop import deferredwork, runs, sprintstatus, verify, worktree_flow
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths
-from bmad_loop.engine import Engine, _story_label_stripped
+from bmad_loop.engine import Engine, _publication_refusal, _story_label_stripped
 from bmad_loop.install import (
     BMAD_SCRIPTS_SEED_REL,
     CENTRAL_CONFIG_REL,
@@ -2569,6 +2570,82 @@ def test_carry_harvest_keeps_its_latch_when_the_ledger_becomes_unreadable(projec
     assert load_state(engine.run_dir).tasks[task.story_key].harvest_carry_commit_pending
     assert "harvest-carry-refused" not in journal_kinds(engine)
     assert "harvest-carried" not in journal_kinds(engine)
+
+
+@pytest.mark.parametrize("family", ["ledger", "store"])
+@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
+def test_publication_refusal_folds_a_value_error_from_the_resolve(
+    project, monkeypatch, fault, family
+):
+    """The `ValueError` CLASS of `_publication_refusal`'s resolve `except` tuple,
+    driven on its own (DW-275), at the pure-helper layer four of the five publishers
+    fold through.
+
+    `Path.resolve()` raises `ValueError` for an embedded NUL (`lstat: embedded null
+    character in path` on 3.12+; `embedded null byte` on 3.11) and
+    `UnicodeEncodeError` (a `ValueError` subclass) for a lone surrogate outside the
+    `surrogateescape` range on CPython 3.11-3.14 POSIX, and the
+    two-class tuple that stood here let both escape best-effort bookkeeping whose
+    whole degrade discipline exists to prevent exactly that. The fold lands on
+    `target-unreadable` with `str(e)` as its text — the same transient cause the
+    `OSError`/`RuntimeError` classes take, for the reason the docstring gives: a
+    caller reads the cause alone and never asks which call produced it.
+
+    INJECTED through `refuse_to_resolve(..., error=)` rather than driven with a real
+    NUL so the row holds on every supported interpreter and platform:
+    `ntpath.realpath` tolerates a NUL, so neither is a cross-platform driver at the
+    publisher. The real-driver sibling below shows both stand-ins match what
+    `Path.resolve()` actually raises on POSIX.
+    Parametrized over both families for the SHAPE only: the fold sits ahead of the
+    family leg, so `family` never reaches anything on this arm — which is what
+    `never` grades.
+
+    Ablation, per class: delete `ValueError` ALONE from `_publication_refusal`'s
+    `except (OSError, RuntimeError, ValueError)` and both rows red with the injected
+    fault escaping the helper; the `OSError`/`RuntimeError` rows in
+    `tests/test_sweep.py` and `tests/test_cli.py` stay green, which is why a per-class
+    row is the only honest one for a multi-class handler."""
+    ledger = project.deferred_work
+    refuse_to_resolve(monkeypatch, ledger, error=fault)
+
+    def never(*_a, **_k):
+        raise AssertionError("the family leg was asked about an unresolvable target")
+
+    monkeypatch.setattr(verify, "unpublishable_target", never)
+
+    assert _publication_refusal(ledger, family) == ("target-unreadable", str(fault))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="ntpath.realpath tolerates a NUL")
+@pytest.mark.parametrize(
+    "tail,fragment",
+    [
+        pytest.param("\0x", "embedded null", id="nul"),
+        pytest.param("\ud800", "surrogates not allowed", id="lone-surrogate"),
+    ],
+)
+def test_publication_refusal_folds_a_real_nul_path_on_posix(project, tail, fragment):
+    """The real faults behind the two injected rows above, on the one platform where
+    they ARE drivers (DW-275): a ledger path with an embedded NUL, and one with a lone
+    surrogate outside the `surrogateescape` range, no stub, each fold into
+    `target-unreadable` carrying CPython's own text — which is what shows the
+    `NUL_PATH_RESOLVE_FAULTS` stand-ins match what `Path.resolve()` actually raises.
+
+    The NUL leg asserts the shared `embedded null` fragment rather than the full
+    wording because CPython 3.11 says `embedded null byte` where 3.12+ says
+    `lstat: embedded null character in path`, and 3.11 is the `requires-python`
+    floor and a CI leg.
+
+    Ablation: delete `ValueError` from `_publication_refusal`'s resolve arm and both
+    legs red with the fault escaping the helper."""
+    ledger = Path(f"{project.deferred_work}{tail}")
+
+    refusal = _publication_refusal(ledger, "ledger")
+
+    assert refusal is not None
+    cause, error = refusal
+    assert cause == "target-unreadable"
+    assert error is not None and fragment in error
 
 
 @pytest.mark.parametrize(
