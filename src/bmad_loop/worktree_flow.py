@@ -567,28 +567,30 @@ def worktree_seed_undelivered(
     try:
         worktree = worktree.resolve()
         repo_root = repo_root.resolve()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         # Observation only: root uncertainty cannot prove delivery, but it must
         # not turn an informational journal probe into a run-wide failure.
         rels = [str(rel) for rel in seed_files]
         for pattern in seed_globs:
             try:
                 matches = sorted(unresolved_repo_root.glob(pattern))
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, ValueError):
                 continue
             rels.extend(match.relative_to(unresolved_repo_root).as_posix() for match in matches)
         return list(dict.fromkeys(rels))
     rels = [str(rel) for rel in seed_files]
     for pattern in seed_globs:
-        rels.extend(
-            match.relative_to(repo_root).as_posix() for match in sorted(repo_root.glob(pattern))
-        )
+        try:
+            matches = sorted(repo_root.glob(pattern))
+        except (OSError, RuntimeError, ValueError):
+            continue
+        rels.extend(match.relative_to(repo_root).as_posix() for match in matches)
     hook_configs = {Path(rel) for rel in config_paths}
 
     def contained(path: Path, root: Path) -> bool:
         try:
             return path.resolve().is_relative_to(root)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
 
     def delivered(src: Path, dst: Path) -> bool:
@@ -682,7 +684,7 @@ def module_skills_seed_undelivered(
         skills_root = resources.files("bmad_loop.data").joinpath("skills")
     try:
         worktree = worktree.resolve()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         # This is a journal-only observation. Root uncertainty means every
         # bundled skill the wheel actually carries is coarsely undelivered.
         return [
@@ -695,7 +697,7 @@ def module_skills_seed_undelivered(
     def contained(target: Path) -> bool:
         try:
             return target.resolve().is_relative_to(worktree)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
 
     def delivered(src: Traversable, dst: Path) -> bool:
@@ -857,7 +859,7 @@ def provision_worktree(
         try:
             src = (repo_root / rel).resolve()
             dst = raw.resolve()
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             continue
         if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
             continue
@@ -925,13 +927,17 @@ def provision_worktree(
     # copy-when-absent semantics. rel is taken from the unresolved match so the
     # worktree path mirrors the repo layout; resolve only guards containment.
     for pattern in seed_globs:
-        for match in sorted(repo_root.glob(pattern)):
+        try:
+            matches = sorted(repo_root.glob(pattern))
+        except (OSError, RuntimeError, ValueError):
+            continue
+        for match in matches:
             rel = match.relative_to(repo_root)
             raw = worktree / rel
             try:
                 src = match.resolve()
                 dst = raw.resolve()
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, ValueError):
                 continue
             if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
                 continue
@@ -1017,7 +1023,7 @@ def provision_worktree(
             dst = tree_dir / skill
             try:
                 src = (repo_root / tree / skill).resolve()
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, ValueError):
                 continue
             if not src.is_relative_to(repo_root) or not _is_dir(src):
                 continue
@@ -1063,7 +1069,7 @@ def provision_worktree(
                     break
                 cursor = cursor.parent
             config_path = raw_config_path.resolve()
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             continue
         if refused or config_path != raw_config_path or not config_path.is_relative_to(worktree):
             continue

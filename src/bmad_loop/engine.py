@@ -2352,7 +2352,7 @@ class Engine:
             ):
                 return None
             return str(resolved)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return None
 
     def _read_dispatched_spec_snapshot(self, task: StoryTask) -> tuple[str, bytes] | None:
@@ -2402,7 +2402,7 @@ class Engine:
                 or resolved.resolve(strict=True) != resolved
             ):
                 raise RuntimeError("attempt-owned spec changed identity while being read")
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return None
         return str(resolved), snapshot
 
@@ -2458,7 +2458,7 @@ class Engine:
                 or not verify.spec_within_roots(resolved, self.workspace.paths)
             ):
                 return False
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
         return str(resolved) == observed[0]
 

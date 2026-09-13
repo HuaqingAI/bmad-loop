@@ -1765,24 +1765,72 @@ def test_snapshot_read_rejects_in_place_change_after_read(project, monkeypatch):
 
 @pytest.mark.parametrize(
     "fault",
-    [OSError(36, "File name too long"), RuntimeError("symlink loop")],
-    ids=["oserror", "runtime-error"],
+    [
+        pytest.param(OSError(36, "File name too long"), id="oserror"),
+        pytest.param(RuntimeError("symlink loop"), id="runtime-error"),
+        *NUL_PATH_RESOLVE_FAULTS,
+    ],
 )
 def test_dispatched_spec_observation_fault_leaves_attempt_unbound(project, monkeypatch, fault):
     """A filesystem observation fault cannot abort before DEV_RUNNING is saved.
 
-    Ablation: delete the typed guard in ``_dispatched_spec_for_attempt`` and both
-    rows raise instead of returning the deliberately unbound fallback.
+    Ablation: delete the typed guard in ``_dispatched_spec_for_attempt`` and the
+    fault rows raise instead of returning the deliberately unbound fallback.
     """
     engine, _ = make_engine(project, [])
-    task = StoryTask(story_key="1-1-a", epic=1, spec_file="recorded-spec.md")
-
-    def fail_observation(*_args, **_kwargs):
-        raise fault
-
-    monkeypatch.setattr(verify, "resolve_spec_path", fail_observation)
+    recorded = spec_path(project, "1-1-a")
+    write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(recorded))
+    refuse_to_resolve(monkeypatch, recorded, error=fault)
 
     assert engine._dispatched_spec_for_attempt(task) is None
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_dispatched_snapshot_read_fault_retains_retry_authority(
+    project, monkeypatch, resolve_fault
+):
+    """A failed read observation does not erase an established retry binding."""
+    engine, _ = make_engine(project, [])
+    recorded = spec_path(project, "1-1-a")
+    write_spec(recorded, "ready-for-dev", rev_parse_head(project.project))
+    snapshot = recorded.read_bytes()
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        dispatched_spec_file=str(recorded.resolve()),
+        dispatched_spec_snapshot=snapshot,
+    )
+    refuse_to_resolve(monkeypatch, recorded, error=resolve_fault)
+
+    assert not engine._refresh_dispatched_spec_snapshot(task, clear_on_failure=False)
+    assert task.dispatched_spec_file == str(recorded)
+    assert task.dispatched_spec_snapshot == snapshot
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_dispatched_snapshot_validation_fault_returns_false_without_mutation(
+    project, monkeypatch, resolve_fault
+):
+    """Accepted-path uncertainty cannot replace retained retry-chain authority."""
+    engine, _ = make_engine(project, [])
+    owned = spec_path(project, "1-1-owned")
+    accepted = spec_path(project, "1-1-accepted")
+    write_spec(owned, "ready-for-dev", rev_parse_head(project.project))
+    write_spec(accepted, "ready-for-dev", rev_parse_head(project.project))
+    snapshot = owned.read_bytes()
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        spec_file=str(accepted),
+        dispatched_spec_file=str(owned.resolve()),
+        dispatched_spec_snapshot=snapshot,
+    )
+    refuse_to_resolve(monkeypatch, accepted, error=resolve_fault)
+
+    assert not engine._validate_dispatched_spec_snapshot(task)
+    assert task.dispatched_spec_file == str(owned)
+    assert task.dispatched_spec_snapshot == snapshot
 
 
 def test_resume_continues_from_completed_review_session(project):
