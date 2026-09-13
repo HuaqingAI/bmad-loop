@@ -817,7 +817,7 @@ def provision_worktree(
     try:
         worktree = worktree.resolve()
         repo_root = repo_root.resolve()
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         raise verify.GitError(
             "cannot resolve worktree provisioning roots safely "
             f"(worktree={unresolved_worktree}, repo_root={unresolved_repo_root}): {e}"

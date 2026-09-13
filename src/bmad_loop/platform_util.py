@@ -350,8 +350,9 @@ def resolve_or_lexical(path: str | Path) -> Path:
 
     ``RuntimeError`` is caught alongside ``OSError`` because ``resolve()`` raises it,
     not an ``OSError``, for a symlink loop on the 3.11/3.12 floor — the asymmetry
-    ``install._shield_undo_extension`` documents; the pair is this repo's house guard,
-    applied at 17-odd sites already.
+    ``install._shield_undo_extension`` documents. ``ValueError`` covers invalid path
+    spellings such as embedded NULs and its ``UnicodeEncodeError`` subclass for lone
+    surrogates. Together the three classes are this repo's resolution guard.
 
     **Degrade, not fail** — deliberately, and bounded. The fallback is exactly
     ``Path(path).absolute()``: absolute, nothing else. It is enough for the
@@ -389,15 +390,19 @@ def resolve_or_lexical(path: str | Path) -> Path:
     there is no lexical answer to degrade to, and the backstop is the honest reply."""
     try:
         return Path(path).resolve()
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         lexical = Path(path).absolute()
         if str(lexical) not in _LEXICAL_FALLBACK_NOTED:
             _LEXICAL_FALLBACK_NOTED.add(str(lexical))
             # stderr, never stdout: `<cmd> --json` is a one-object-on-stdout contract.
-            print(
+            note = (
                 f"note: cannot canonicalize {path}: {e} — continuing with the lexical "
                 f"path {lexical} (symlinks are not dereferenced). "
-                "Run `bmad-loop validate` for what this host is doing.",
+                "Run `bmad-loop validate` for what this host is doing."
+            )
+            encoding = getattr(sys.stderr, "encoding", None) or "utf-8"
+            print(
+                note.encode(encoding, errors="backslashreplace").decode(encoding, errors="replace"),
                 file=sys.stderr,
             )
         return lexical

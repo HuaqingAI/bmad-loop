@@ -3555,7 +3555,7 @@ def spec_within_roots(spec_path: Path, paths: ProjectPaths) -> bool:
             paths.planning_artifacts,
         )
         return any(sp == r.resolve() or sp.is_relative_to(r.resolve()) for r in roots)
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         return False
 
 

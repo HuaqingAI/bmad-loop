@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from conftest import git, refuse_to_resolve
+from conftest import NUL_PATH_RESOLVE_FAULTS, git, refuse_to_resolve
 
 from bmad_loop import verify
 from bmad_loop.bmadconfig import ProjectPaths
@@ -542,10 +542,20 @@ def test_run_isolated_defers_on_open_failure(tmp_path):
     assert not any(e.startswith("unit-") for e in flow.journal.events())
 
 
-def test_mount_resolution_fault_is_typed_and_defers_only_the_unit(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "resolve_fault",
+    [
+        pytest.param(OSError("injected mount resolve fault"), id="oserror"),
+        pytest.param(RuntimeError("injected mount resolve fault"), id="runtimeerror"),
+        *NUL_PATH_RESOLVE_FAULTS,
+    ],
+)
+def test_mount_resolution_fault_is_typed_and_defers_only_the_unit(
+    tmp_path, monkeypatch, resolve_fault
+):
     """An uncertain mount is an ordinary per-unit open failure, not a spawn fault.
 
-    Ablation: delete the mount-resolution translation and the raw provider fault
+    Ablation: delete the mount-resolution translation and the raw resolve fault
     escapes ``run_isolated`` instead of reaching DEFERRED/worktree-open-failed.
     """
     repo = tmp_path / "repo"
@@ -556,12 +566,13 @@ def test_mount_resolution_fault_is_typed_and_defers_only_the_unit(tmp_path, monk
         planning_artifacts=repo / "_bmad-output/planning-artifacts",
     )
     mount = unit_worktrees_dir(tmp_path) / "1-1"
-    refuse_to_resolve(monkeypatch, mount)
+    refuse_to_resolve(monkeypatch, mount, error=resolve_fault)
 
     with pytest.raises(verify.GitError) as excinfo:
         open_unit_workspace(repo, paths, "run-1", "1-1", "main", "story", tmp_path)
     assert "worktree mount path" in str(excinfo.value)
-    assert isinstance(excinfo.value.__cause__, OSError)
+    assert isinstance(excinfo.value.__cause__, type(resolve_fault))
+    assert excinfo.value.__cause__.args == resolve_fault.args
 
     state = SimpleNamespace(
         target_branch="main",

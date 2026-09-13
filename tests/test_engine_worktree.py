@@ -8608,6 +8608,32 @@ def test_story_remount_refuses_a_branch_checked_out_at_a_foreign_path(project, t
     assert first.path not in [p.resolve() for p in worktree_list(project.project)]
 
 
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_story_remount_refuses_value_error_family_from_checkout_holder_resolution(
+    project, tmp_path, monkeypatch, resolve_fault
+):
+    """Checkout identity uncertainty refuses before preserving or moving the branch."""
+    from bmad_loop.workspace import open_unit_workspace
+
+    first, _run_dir = _open_unit(project, branch_per="story")
+    (first.path / "attempt.txt").write_text("committed on the attempt\n")
+    git(first.path, "add", "-A")
+    git(first.path, "commit", "-q", "-m", "story attempt")
+    tip = rev_parse_head(first.path)
+    holder = tmp_path / "unresolvable-holder"
+    monkeypatch.setattr(verify, "branch_checkout_path", lambda _repo, _branch: holder)
+    refuse_to_resolve(monkeypatch, holder, error=resolve_fault)
+
+    with pytest.raises(verify.GitError) as excinfo:
+        open_unit_workspace(*_open_args(project, branch_per="story"))
+
+    assert isinstance(excinfo.value.__cause__, type(resolve_fault))
+    assert excinfo.value.__cause__.args == resolve_fault.args
+    assert git(project.project, "rev-parse", f"refs/heads/{first.branch}") == tip
+    assert rev_parse_head(first.path) == tip
+    assert git(project.project, "for-each-ref", "refs/attempt-preserve/") == ""
+
+
 def test_run_branch_remount_refuses_a_fast_forward_under_a_foreign_checkout(project, tmp_path):
     """Same hazard on the `branch_per=run` arm: the fast-forward would fire (run tip
     is an ancestor of the advanced base) but the run branch is checked out at a

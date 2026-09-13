@@ -14,6 +14,7 @@ from conftest import (
     _FAIL,
     _OK,
     MISSING_TOOL_CMD,
+    NUL_PATH_RESOLVE_FAULTS,
     OMIT,
     PROJECT_MARKER_CMD,
     REPO_ROOT_MARKER_CMD,
@@ -8373,6 +8374,21 @@ def test_spec_within_roots_refuses_uncertain_trusted_root(
     corresponding root/error row raises instead of returning fail-closed False."""
     reported = tmp_path / "outside" / "spec.md"
     _refuse_resolution_as(monkeypatch, getattr(project, root_name), error_type)
+
+    assert verify.spec_within_roots(reported, project) is False
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize(
+    "refused_operand",
+    ["reported", "project", "output_folder", "implementation_artifacts", "planning_artifacts"],
+)
+def test_spec_within_roots_refuses_value_error_family_from_every_operand(
+    project, tmp_path, monkeypatch, resolve_fault, refused_operand
+):
+    reported = tmp_path / "outside" / "spec.md"
+    refused = reported if refused_operand == "reported" else getattr(project, refused_operand)
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
 
     assert verify.spec_within_roots(reported, project) is False
 

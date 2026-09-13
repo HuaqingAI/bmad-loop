@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 from conftest import (
+    NUL_PATH_RESOLVE_FAULTS,
     RENDERER_SCRIPT_IMPORTING_SIBLING,
     RENDERER_STUB_SKILL_MD,
     git,
@@ -4015,26 +4016,36 @@ def test_provision_worktree_seed_rejects_escaping_path(tmp_path):
 
 
 @pytest.mark.parametrize("refused_root", ["worktree", "repo"])
+@pytest.mark.parametrize(
+    "resolve_fault",
+    [
+        pytest.param(OSError("injected root resolve fault"), id="oserror"),
+        pytest.param(RuntimeError("injected root resolve fault"), id="runtimeerror"),
+        *NUL_PATH_RESOLVE_FAULTS,
+    ],
+)
 def test_provision_worktree_root_resolution_fault_is_typed_and_precedes_writes(
-    tmp_path, monkeypatch, refused_root
+    tmp_path, monkeypatch, refused_root, resolve_fault
 ):
     """Provisioning cannot write against roots whose identity is uncertain.
 
-    Ablation: delete the provisioning-root translation and this raises raw
-    ``OSError`` instead of typed ``GitError`` before the seed or hook config write.
+    Ablation: delete the provisioning-root translation and this raises the raw
+    resolve fault instead of typed ``GitError`` before the seed or hook config write.
     """
     repo, wt = tmp_path / "repo", tmp_path / "wt"
     repo.mkdir()
     (repo / "seed.json").write_text("FROM_REPO\n", encoding="utf-8")
     profile = get_profile("claude")
     refused = wt if refused_root == "worktree" else repo
-    refuse_to_resolve(monkeypatch, refused)
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
 
     with pytest.raises(verify.GitError) as excinfo:
         provision_worktree(wt, [profile], repo, seed_files=["seed.json"])
 
     assert "provisioning roots" in str(excinfo.value)
-    assert isinstance(excinfo.value.__cause__, OSError)
+    assert isinstance(excinfo.value.__cause__, type(resolve_fault))
+    assert excinfo.value.__cause__.args == resolve_fault.args
+    assert not wt.exists()
     assert not (wt / "seed.json").exists()
     assert not (wt / profile.hooks.config_path).exists()
 

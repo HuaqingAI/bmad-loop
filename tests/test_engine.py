@@ -19,6 +19,7 @@ from conftest import (
     _OK,
     MARKER_IN_PROJECT,
     MARKER_IN_REPO_ROOT,
+    NUL_PATH_RESOLVE_FAULTS,
     PROJECT_MARKER_CMD,
     REPO_ROOT_MARKER_CMD,
     _disarm_check_script,
@@ -14745,18 +14746,29 @@ def test_spec_deferrals_skip_out_of_tree_session_spec(project, tmp_path):
     assert skipped[0]["spec"] == str(outside)
 
 
-@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
-def test_spec_deferrals_skip_when_containment_probe_faults(project, monkeypatch, error_type):
+@pytest.mark.parametrize(
+    "resolve_fault",
+    [
+        pytest.param(OSError("injected containment fault"), id="oserror"),
+        pytest.param(RuntimeError("injected containment fault"), id="runtimeerror"),
+        *NUL_PATH_RESOLVE_FAULTS,
+    ],
+)
+def test_spec_deferrals_skip_when_containment_probe_faults(project, monkeypatch, resolve_fault):
     engine, _ = make_engine(project, [], policy=_harvest_policy())
     task = StoryTask(story_key="1-1-a", epic=1)
     sp = spec_path(project, task.story_key)
     sp.parent.mkdir(parents=True, exist_ok=True)
     write_spec(sp, "done", "abc123", deferred=[HARVEST_A])
 
-    def containment_fault(*args, **kwargs):
-        raise error_type("injected containment fault")
+    if isinstance(resolve_fault, (OSError, RuntimeError)):
 
-    monkeypatch.setattr(verify, "spec_within_roots", containment_fault)
+        def containment_fault(*_args, **_kwargs):
+            raise type(resolve_fault)(*resolve_fault.args)
+
+        monkeypatch.setattr(verify, "spec_within_roots", containment_fault)
+    else:
+        refuse_to_resolve(monkeypatch, sp, error=resolve_fault)
     engine._harvest_spec_deferrals(task, {"spec_file": str(sp)})
 
     assert not project.deferred_work.exists()
@@ -14764,6 +14776,31 @@ def test_spec_deferrals_skip_when_containment_probe_faults(project, monkeypatch,
     assert task.harvest_wrote_ledger is False
     skipped = [
         e for e in engine.journal.entries() if e["kind"] == "spec-deferrals-skipped-out-of-tree"
+    ]
+    assert len(skipped) == 1 and skipped[0]["spec"] == str(sp)
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_declared_deferred_ids_skip_value_error_family_containment_faults(
+    project, monkeypatch, resolve_fault
+):
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    sp = spec_path(project, task.story_key)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "done", "abc123", closes_deferred=["DW-1"])
+    task.spec_file = str(sp)
+    before = project.deferred_work.read_bytes()
+    refuse_to_resolve(monkeypatch, sp, error=resolve_fault)
+
+    engine._close_declared_deferred(task)
+
+    assert project.deferred_work.read_bytes() == before
+    skipped = [
+        event
+        for event in engine.journal.entries()
+        if event["kind"] == "deferred-close-skipped-out-of-tree"
     ]
     assert len(skipped) == 1 and skipped[0]["spec"] == str(sp)
 
@@ -15576,6 +15613,19 @@ def test_ledger_classifier_reports_tracked_inside_workspace_as_gits(project):
     engine, _ = make_engine(project, [], policy=_harvest_policy())
 
     assert engine._ledger_is_gits_to_restore(StoryTask(story_key="1-1-a", epic=1)) is True
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("refused_operand", ["ledger", "workspace-root"])
+def test_ledger_in_repo_value_error_family_fault_is_observed_as_external(
+    project, monkeypatch, resolve_fault, refused_operand
+):
+    engine, _ = make_engine(project, [])
+    ledger = project.deferred_work
+    refused = ledger if refused_operand == "ledger" else engine.workspace.root
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    assert engine._ledger_in_repo(ledger) is False
 
 
 @pytest.mark.skipif(

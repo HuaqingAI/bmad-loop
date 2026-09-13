@@ -4368,8 +4368,8 @@ class Engine:
         # orchestrator-owned roots steer a ledger write.
         try:
             within = verify.spec_within_roots(spec_path, self.workspace.paths)
-        except (OSError, RuntimeError):
-            # resolve() faulted (a symlink loop, an unreadable component):
+        except (OSError, RuntimeError, ValueError):
+            # resolve() faulted (an invalid spelling, symlink loop, unreadable component):
             # containment can vouch for nothing, so refuse the same way.
             within = False
         if not within:
@@ -4746,8 +4746,8 @@ class Engine:
         if spec_path is not None:
             try:
                 within = verify.spec_within_roots(spec_path, self.workspace.paths)
-            except (OSError, RuntimeError):
-                # resolve() faulted (a symlink loop, an unreadable component):
+            except (OSError, RuntimeError, ValueError):
+                # resolve() faulted (an invalid spelling, symlink loop, unreadable component):
                 # containment can vouch for nothing, so refuse the same way.
                 within = False
             if not within:
@@ -4973,7 +4973,7 @@ class Engine:
         the claim that stays true when nothing else is known."""
         try:
             return ledger.resolve().is_relative_to(self.workspace.root.resolve())
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
 
     def _restore_deferred_closes(self, task: StoryTask, snapshot: list[_ArmedClose]) -> None:
