@@ -1,9 +1,10 @@
-"""Explicit ignored bundle deliverables, independent of artifact-only receipts.
+"""Explicit bundle deliverable byte authority, independent of artifact-only receipts.
 
 A complete pre-execution inventory grants comparison authority, never selection
-authority. The accepted spec selects exact files; base64 snapshots in task state
-freeze their bytes before integration. Publication is replayable after any partial
-write because each destination must still equal its baseline or intended bytes.
+authority. The accepted spec selects exact files; ignored bytes are frozen as base64
+snapshots while tracked and pending-tracked bytes are bound to Git-normalized blob
+identities and checked in the final index. Publication is replayable after any partial
+write because each ignored destination must still equal its baseline or intended bytes.
 Files are created privately (0600); modes and xattrs are not preserved. The
 check after staging is not a lock or atomic compare-and-swap: a noncooperating
 filesystem writer can still race the final check and replacement. On platforms
@@ -18,6 +19,7 @@ import base64
 import hashlib
 import os
 import stat
+import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
@@ -164,6 +166,37 @@ def _contents(root: Path, path: Path, *, max_bytes: int | None = None) -> bytes 
     """Read a regular file, optionally stopping after one bounded sentinel byte."""
     with _open_regular(root, path) as stream:
         return None if stream is None else _read_bytes(stream, max_bytes)
+
+
+def _git_identity_from_confined_file(root: Path, path: Path, repo: Path, rel: str) -> str:
+    """Stream an opened source into a snapshot Git hashes under ``rel`` attributes."""
+    with _open_regular(root, path) as stream:
+        if stream is None:
+            raise PublicationError(f"artifact deliverable is missing: {path}")
+        opened = os.fstat(stream.fileno())
+        opened_size = opened.st_size
+        remaining = opened_size
+        copied = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = Path(tmp) / "source"
+            with snapshot.open("wb") as target:
+                while remaining:
+                    chunk = stream.read(min(_BOUNDED_READ_CHUNK_BYTES, remaining))
+                    if not chunk:
+                        break
+                    target.write(chunk)
+                    copied += len(chunk)
+                    remaining -= len(chunk)
+                extra = stream.read(1)
+            if (
+                remaining != 0
+                or bool(extra)
+                or copied != opened_size
+                or os.fstat(stream.fileno()).st_size != opened_size
+                or not _destination_still_names(root, path, opened)
+            ):
+                raise PublicationError(f"artifact deliverable changed during binding: {path}")
+            return verify.git_normalized_blob_oid(repo, rel, snapshot)
 
 
 class _DestinationObservation(NamedTuple):
@@ -374,6 +407,7 @@ def capture(task: StoryTask, paths: ProjectPaths) -> None:
     task.artifact_baseline = inventory
     task.artifact_destination = str(root)
     task.artifact_source_digests = None
+    task.artifact_tracked_source_oids = None
     task.artifact_acceptance_identity = None
     task.artifact_payload = None
     task.artifact_publication_complete = False
@@ -381,6 +415,7 @@ def capture(task: StoryTask, paths: ProjectPaths) -> None:
 
 class _SelectedSources(NamedTuple):
     contents: dict[str, bytes]
+    tracked_oids: dict[str, str]
 
 
 def _selected_sources(
@@ -388,10 +423,11 @@ def _selected_sources(
     source: ProjectPaths,
     *,
     allow_pending_tracked: bool = False,
+    collect_tracked_identities: bool = False,
     file_max_bytes: int = DEFAULT_FILE_MAX_BYTES,
     payload_max_bytes: int = DEFAULT_PAYLOAD_MAX_BYTES,
 ) -> _SelectedSources:
-    """Read the exact ignored selection under the shared admission rules."""
+    """Read the exact ignored selection and optionally bind Git identities."""
     if file_max_bytes < 1 or payload_max_bytes < 1:
         raise ValueError("artifact publication byte limits must be positive")
     if not task.spec_file:
@@ -440,9 +476,20 @@ def _selected_sources(
         selected.add(implicit_rel)
 
     inputs: list[tuple[str, Path, int]] = []
+    tracked_oids: dict[str, str] = {}
     for rel in sorted(selected):
         path = root / rel
-        if verify.path_tracked(source.repo_root, path.relative_to(source.repo_root).as_posix()):
+        repo_rel = path.relative_to(source.repo_root).as_posix()
+        if verify.path_tracked(source.repo_root, repo_rel):
+            if collect_tracked_identities:
+                if path == spec:
+                    tracked_oids[rel] = verify.git_normalized_blob_oid_for_bytes(
+                        source.repo_root, repo_rel, spec_data
+                    )
+                else:
+                    tracked_oids[rel] = _git_identity_from_confined_file(
+                        root, path, source.repo_root, repo_rel
+                    )
             continue  # tracked deliverables ride Git
         ignored = verify.path_ignored(source.repo_root, path)
         size = _file_size(root, path)
@@ -453,6 +500,15 @@ def _selected_sources(
                 # Binding runs before the orchestrator's final `git add -A`.
                 # Preparation must later prove this path became tracked; a path
                 # an embedded repository kept untracked must not vanish silently.
+                if collect_tracked_identities:
+                    if path == spec:
+                        tracked_oids[rel] = verify.git_normalized_blob_oid_for_bytes(
+                            source.repo_root, repo_rel, spec_data
+                        )
+                    else:
+                        tracked_oids[rel] = _git_identity_from_confined_file(
+                            root, path, source.repo_root, repo_rel
+                        )
                 continue
             raise PublicationError(f"artifact deliverable was not tracked by commit: {path}")
         if size > file_max_bytes:
@@ -495,7 +551,7 @@ def _selected_sources(
         raw_payload[rel] = data
         actual_total += len(data)
 
-    return _SelectedSources(raw_payload)
+    return _SelectedSources(raw_payload, tracked_oids)
 
 
 def arm_binding(task: StoryTask, acceptance_identity: str) -> bool:
@@ -511,6 +567,7 @@ def arm_binding(task: StoryTask, acceptance_identity: str) -> bool:
         return False
     task.artifact_acceptance_identity = acceptance_identity
     task.artifact_source_digests = None
+    task.artifact_tracked_source_oids = None
     task.artifact_payload = None
     task.artifact_publication_complete = False
     return True
@@ -523,19 +580,119 @@ def bind_armed(
     file_max_bytes: int = DEFAULT_FILE_MAX_BYTES,
     payload_max_bytes: int = DEFAULT_PAYLOAD_MAX_BYTES,
 ) -> None:
-    """Bind an already-armed newly accepted result to exact ignored bytes."""
+    """Bind an already-armed result to exact ignored and Git-backed bytes."""
     if task.artifact_acceptance_identity is None:
         raise PublicationError("artifact acceptance identity is missing")
-    if task.artifact_source_digests is not None:
+    if task.artifact_source_digests is not None and task.artifact_tracked_source_oids is not None:
         return
+    if task.artifact_source_digests is not None or task.artifact_tracked_source_oids is not None:
+        raise PublicationError("accepted artifact source binding is incomplete")
     selected = _selected_sources(
         task,
         source,
         allow_pending_tracked=True,
+        collect_tracked_identities=True,
         file_max_bytes=file_max_bytes,
         payload_max_bytes=payload_max_bytes,
     )
     task.artifact_source_digests = {rel: _digest(data) for rel, data in selected.contents.items()}
+    task.artifact_tracked_source_oids = dict(selected.tracked_oids)
+
+
+def _validated_source_maps(task: StoryTask) -> tuple[dict[str, str], dict[str, str]]:
+    ignored = task.artifact_source_digests
+    tracked = task.artifact_tracked_source_oids
+    if not isinstance(ignored, dict) or not all(
+        isinstance(rel, str) and isinstance(identity, str) for rel, identity in ignored.items()
+    ):
+        raise PublicationError("accepted ignored artifact source binding is missing or malformed")
+    if not isinstance(tracked, dict) or not all(
+        isinstance(rel, str) and isinstance(identity, str) for rel, identity in tracked.items()
+    ):
+        raise PublicationError("accepted tracked artifact source binding is missing or malformed")
+    if ignored.keys() & tracked.keys():
+        raise PublicationError("accepted artifact source classifications are ambiguous")
+    return ignored, tracked
+
+
+def _validate_git_snapshot(
+    ignored: dict[str, str], tracked: dict[str, str], observed: dict[str, str]
+) -> None:
+    differing = [rel for rel, oid in tracked.items() if observed.get(rel) != oid]
+    differing.extend(rel for rel in ignored if rel in observed)
+    if differing:
+        raise PublicationError(
+            "Git artifact deliverables differ from accepted verification: "
+            + ", ".join(sorted(differing))
+        )
+
+
+def validate_staged(task: StoryTask, source: ProjectPaths) -> dict[str, str]:
+    """Require every accepted deliverable classification and staged blob.
+
+    The mapping is the complete accepted tracked/pending-tracked path set. It is
+    never rebuilt here: replay keeps the original acceptance authority, and a
+    missing legacy/incomplete proof fails closed before commit.
+    """
+    ignored, tracked = _validated_source_maps(task)
+    rels = tuple(ignored) + tuple(tracked)
+    if rels:
+        _root(source)
+    repo_rels = {
+        rel: (source.implementation_artifacts / _relative(rel))
+        .relative_to(source.repo_root)
+        .as_posix()
+        for rel in rels
+    }
+    try:
+        staged = verify.staged_blob_oids(source.repo_root, repo_rels.values())
+    except verify.GitError as exc:
+        raise PublicationError(
+            "Git artifact deliverables have unavailable index evidence: "
+            + ", ".join(sorted(repo_rels))
+        ) from exc
+    observed = {rel: staged[repo_rel] for rel, repo_rel in repo_rels.items() if repo_rel in staged}
+    _validate_git_snapshot(ignored, tracked, observed)
+    return observed
+
+
+def validate_committed(
+    task: StoryTask,
+    source: ProjectPaths,
+    revision: str,
+    staged_snapshot: dict[str, str],
+) -> None:
+    """Require the committed tree to equal the already-validated index snapshot."""
+    ignored, tracked = _validated_source_maps(task)
+    rels = tuple(ignored) + tuple(tracked)
+    if rels:
+        _root(source)
+    repo_rels = {
+        rel: (source.implementation_artifacts / _relative(rel))
+        .relative_to(source.repo_root)
+        .as_posix()
+        for rel in rels
+    }
+    try:
+        committed = verify.revision_blob_oids(source.repo_root, revision, repo_rels.values())
+    except verify.GitError as exc:
+        raise PublicationError(
+            "Git artifact deliverables have unavailable commit evidence: "
+            + ", ".join(sorted(repo_rels))
+        ) from exc
+    observed = {
+        rel: committed[repo_rel] for rel, repo_rel in repo_rels.items() if repo_rel in committed
+    }
+    if observed != staged_snapshot:
+        differing = sorted(
+            rel
+            for rel in observed.keys() | staged_snapshot.keys()
+            if observed.get(rel) != staged_snapshot.get(rel)
+        )
+        raise PublicationError(
+            "committed Git artifact deliverables differ from the validated index: "
+            + ", ".join(differing)
+        )
 
 
 def prepare(
@@ -551,7 +708,11 @@ def prepare(
     # that predate accepted-source binding. Never reread its source on replay.
     if task.artifact_payload is not None:
         return
-    if task.artifact_acceptance_identity is None or task.artifact_source_digests is None:
+    if (
+        task.artifact_acceptance_identity is None
+        or task.artifact_source_digests is None
+        or task.artifact_tracked_source_oids is None
+    ):
         raise PublicationError("accepted artifact source binding is missing")
     selected = _selected_sources(
         task,

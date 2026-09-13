@@ -10,6 +10,7 @@ import tracemalloc
 from contextlib import contextmanager
 
 import pytest
+from conftest import git
 
 from bmad_loop import artifact_publication as publication
 from bmad_loop.journal import save_state
@@ -1468,9 +1469,172 @@ def test_unignored_declaration_is_left_to_the_pending_git_commit(publication_cas
     publication.arm_binding(task, "dev:0")
     publication.bind_armed(task, source)
     assert task.artifact_source_digests == {}
+    assert set(task.artifact_tracked_source_oids) == {"report.bin", "spec.md"}
     monkeypatch.setattr(publication.verify, "path_tracked", lambda *_: True)
     publication.prepare(task, paths, source)
     assert task.artifact_payload == {}
+
+
+def test_binding_records_git_normalized_tracked_and_pending_identities(project):
+    root = project.implementation_artifacts
+    root.mkdir(parents=True, exist_ok=True)
+    spec = root / "tracked-spec.md"
+    tracked = root / "tracked.txt"
+    pending = root / "pending.txt"
+    spec.write_text("---\nstatus: done\nartifact_deliverables: [tracked.txt, pending.txt]\n---\n")
+    tracked.write_bytes(b"accepted\r\n")
+    (project.project / ".gitattributes").write_text("*.txt text eol=lf\n")
+    git(project.project, "add", ".gitattributes", spec, tracked)
+    git(project.project, "commit", "-q", "-m", "tracked publication inputs")
+    pending.write_bytes(b"pending\r\n")
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"], spec_file=str(spec))
+    publication.capture(task, project)
+
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, project)
+
+    assert task.artifact_source_digests == {}
+    assert set(task.artifact_tracked_source_oids) == {
+        "pending.txt",
+        "tracked-spec.md",
+        "tracked.txt",
+    }
+    tracked_rel = tracked.relative_to(project.repo_root).as_posix()
+    assert task.artifact_tracked_source_oids["tracked.txt"] == git(
+        project.project, "hash-object", f"--path={tracked_rel}", tracked
+    )
+
+    first = dict(task.artifact_tracked_source_oids)
+    tracked.write_bytes(b"accepted repair\r\n")
+    pending.write_bytes(b"pending repair\r\n")
+    assert publication.arm_binding(task, "review:1")
+    publication.bind_armed(task, project)
+    assert task.artifact_tracked_source_oids["tracked.txt"] != first["tracked.txt"]
+    assert task.artifact_tracked_source_oids["pending.txt"] != first["pending.txt"]
+
+
+def test_non_spec_git_deliverable_binding_hashes_a_streamed_confined_snapshot(project, monkeypatch):
+    root = project.implementation_artifacts
+    root.mkdir(parents=True, exist_ok=True)
+    spec = root / "spec.md"
+    report = root / "large-report.bin"
+    spec.write_text("---\nstatus: done\nartifact_deliverables: [large-report.bin]\n---\n")
+    report.write_bytes(b"tracked bytes")
+    git(project.repo_root, "add", "-A")
+    git(project.repo_root, "commit", "-q", "-m", "tracked publication inputs")
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"], spec_file=str(spec))
+    publication.capture(task, project)
+    publication.arm_binding(task, "dev:0")
+    path_hash = publication.verify.git_normalized_blob_oid
+    bytes_hash = publication.verify.git_normalized_blob_oid_for_bytes
+    path_calls = []
+    bytes_calls = []
+
+    def record_path_hash(repo, rel, path):
+        assert path != report
+        assert path.is_file() and path.read_bytes() == b"tracked bytes"
+        path_calls.append(path)
+        return path_hash(repo, rel, path)
+
+    def record_bytes_hash(repo, rel, data):
+        bytes_calls.append(data)
+        return bytes_hash(repo, rel, data)
+
+    monkeypatch.setattr(publication.verify, "git_normalized_blob_oid", record_path_hash)
+    monkeypatch.setattr(publication.verify, "git_normalized_blob_oid_for_bytes", record_bytes_hash)
+
+    publication.bind_armed(task, project)
+
+    assert len(path_calls) == 1
+    assert path_calls[0] != report and not path_calls[0].exists()
+    assert bytes_calls == [spec.read_bytes()]
+
+    publication.arm_binding(task, "dev:1")
+    open_regular = publication._open_regular
+
+    class GrowingStream:
+        def __init__(self, stream):
+            self.stream = stream
+            self.grew = False
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, size):
+            chunk = self.stream.read(size)
+            if not self.grew:
+                self.grew = True
+                with report.open("ab") as writer:
+                    writer.write(b"growth")
+            return chunk
+
+    @contextmanager
+    def grow_report_during_copy(open_root, path):
+        with open_regular(open_root, path) as stream:
+            if path == report and stream is not None:
+                yield GrowingStream(stream)
+            else:
+                yield stream
+
+    monkeypatch.setattr(publication, "_open_regular", grow_report_during_copy)
+
+    with pytest.raises(publication.PublicationError, match="changed during binding"):
+        publication.bind_armed(task, project)
+
+    assert len(path_calls) == 1
+
+
+def test_staged_validation_refuses_sorted_paths_without_exposing_object_ids(project):
+    root = project.implementation_artifacts
+    root.mkdir(parents=True, exist_ok=True)
+    spec = root / "spec.md"
+    first = root / "z-last.txt"
+    second = root / "a-first.txt"
+    spec.write_text("---\nstatus: done\nartifact_deliverables: [z-last.txt, a-first.txt]\n---\n")
+    first.write_text("accepted z\n")
+    second.write_text("accepted a\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "accepted publication inputs")
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"], spec_file=str(spec))
+    publication.capture(task, project)
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, project)
+    accepted_oids = set(task.artifact_tracked_source_oids.values())
+    first.write_text("later z\n")
+    second.write_text("later a\n")
+    git(project.project, "add", "-A")
+
+    with pytest.raises(publication.PublicationError) as raised:
+        publication.validate_staged(task, project)
+
+    assert str(raised.value).endswith("a-first.txt, z-last.txt")
+    assert not any(oid in str(raised.value) for oid in accepted_oids)
+
+
+def test_staged_validation_refuses_an_ignored_deliverable_that_becomes_tracked(
+    publication_case,
+):
+    task, _paths, source = publication_case
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, source)
+    report = source.implementation_artifacts / "report.bin"
+    report_rel = report.relative_to(source.repo_root).as_posix()
+    git(source.repo_root, "add", "-f", "--", report_rel)
+
+    with pytest.raises(publication.PublicationError, match=r"report\.bin"):
+        publication.validate_staged(task, source)
+
+
+def test_staged_validation_refuses_missing_or_malformed_persisted_maps(project):
+    incomplete = StoryTask(story_key="dw-fix", epic=0)
+    with pytest.raises(publication.PublicationError, match="binding is missing"):
+        publication.validate_staged(incomplete, project)
+
+    malformed = StoryTask(story_key="dw-fix", epic=0)
+    malformed.artifact_source_digests = {}  # type: ignore[reportAssignmentType]
+    malformed.artifact_tracked_source_oids = []  # type: ignore[reportAssignmentType]
+    with pytest.raises(publication.PublicationError, match="malformed"):
+        publication.validate_staged(malformed, project)
 
 
 def test_unignored_untracked_declaration_must_be_tracked_by_preparation(

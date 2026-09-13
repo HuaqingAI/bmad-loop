@@ -2342,7 +2342,11 @@ class WorktreeFlow:
         repo = self.paths.repo_root
         target = self.state.target_branch
         source = task.commit_sha or verify.rev_parse_head(unit.path)
-        merge_ref = unit.branch
+        # The completed task's recorded commit is the only source revision this
+        # run accepted.  A pre_merge plugin (or another process) may advance the
+        # unit branch after final verification, so never let the movable branch
+        # name choose bytes for either the collision probe or the merge itself.
+        merge_ref = source
         if replay:
             current_source = verify.rev_parse_head(unit.path)
             if current_source != source:
@@ -2354,10 +2358,8 @@ class WorktreeFlow:
                 )
                 self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
                 return
-            # Pin both the collision allowlist and the merge operand to the
-            # write-ahead SHA. The branch can move after the check; replay must
-            # integrate only the commit the completed session actually proved.
-            merge_ref = source
+            # ``merge_ref`` stays pinned to the write-ahead SHA even after this
+            # diagnostic check; the branch can move again before Git runs.
         # A per_worktree Unity Editor can leak asset writes into the *main*
         # checkout (see the unity plugin's worktree setup), dirtying the target with the very
         # files this branch already committed. Reconcile that first: clean only
@@ -2726,7 +2728,7 @@ class WorktreeFlow:
         present after restart.
         """
         if task.artifact_acceptance_identity == acceptance_identity:
-            if task.artifact_source_digests is None:
+            if task.artifact_source_digests is None or task.artifact_tracked_source_oids is None:
                 exc = artifact_publication.PublicationError(
                     "accepted artifact source binding is unavailable for replay"
                 )
@@ -2769,6 +2771,49 @@ class WorktreeFlow:
             )
             self._save()
             self._pause(f"artifact publication binding failed: {exc}", task.story_key, cause=exc)
+
+    def validate_staged_publication(self, task: StoryTask, source: ProjectPaths) -> dict[str, str]:
+        """Validate final staged Git deliverables or retain the unit mount."""
+        try:
+            return artifact_publication.validate_staged(task, source)
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            self._save()
+            self._pause(
+                f"artifact publication staging failed: {exc}",
+                task.story_key,
+                cause=exc,
+            )
+
+    def validate_committed_publication(
+        self,
+        task: StoryTask,
+        source: ProjectPaths,
+        revision: str,
+        staged_snapshot: object,
+    ) -> None:
+        """Validate the committed tree or roll back while retaining the mount."""
+        try:
+            if not isinstance(staged_snapshot, dict) or not all(
+                isinstance(rel, str) and isinstance(identity, str)
+                for rel, identity in staged_snapshot.items()
+            ):
+                raise artifact_publication.PublicationError(
+                    "validated staged artifact snapshot is missing or malformed"
+                )
+            artifact_publication.validate_committed(task, source, revision, staged_snapshot)
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            self._save()
+            self._pause(
+                f"artifact publication commit validation failed: {exc}",
+                task.story_key,
+                cause=exc,
+            )
 
     def finish_publication(self, task: StoryTask, unit: UnitWorkspace | None) -> None:
         """Publish and latch before successful teardown, including merge replay."""

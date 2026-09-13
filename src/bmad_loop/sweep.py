@@ -2759,6 +2759,7 @@ class SweepEngine(Engine):
         task.artifact_baseline = None
         task.artifact_destination = None
         task.artifact_source_digests = None
+        task.artifact_tracked_source_oids = None
         task.artifact_acceptance_identity = None
         task.artifact_payload = None
         task.artifact_publication_complete = False

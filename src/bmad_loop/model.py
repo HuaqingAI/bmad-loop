@@ -317,7 +317,13 @@ class StoryTask:
     # None means legacy/unarmed or an acceptance whose binding was refused; an
     # empty mapping proves the accepted selection contained no ignored files.
     artifact_source_digests: dict[str, str] | None = None
-    # Stable owner of ``artifact_source_digests``. Session-list indexes are
+    # Git-clean-filter-normalized blob ids accepted for every tracked or
+    # pending-tracked declared deliverable. These authorize only the exact
+    # staged bytes at the final commit boundary; modes remain Git's concern.
+    # None means legacy/unarmed or an incomplete/refused binding, while an
+    # empty mapping proves the accepted selection contained no Git deliverables.
+    artifact_tracked_source_oids: dict[str, str] | None = None
+    # Stable owner of both accepted-source maps. Session-list indexes are
     # append-only, unlike attempt/cycle counters after a human re-arm. The
     # identity is persisted before source bytes are read so a crash in that
     # window cannot replay the same accepted result and mint new authority.
@@ -495,6 +501,7 @@ class StoryTask:
             "artifact_baseline": deepcopy(self.artifact_baseline),
             "artifact_destination": self.artifact_destination,
             "artifact_source_digests": deepcopy(self.artifact_source_digests),
+            "artifact_tracked_source_oids": deepcopy(self.artifact_tracked_source_oids),
             "artifact_acceptance_identity": self.artifact_acceptance_identity,
             "artifact_payload": deepcopy(self.artifact_payload),
             "artifact_publication_complete": self.artifact_publication_complete,
@@ -602,6 +609,7 @@ class StoryTask:
         self.artifact_baseline = None
         self.artifact_destination = None
         self.artifact_source_digests = None
+        self.artifact_tracked_source_oids = None
         self.artifact_acceptance_identity = None
         self.artifact_payload = None
         self.artifact_publication_complete = False
@@ -730,6 +738,7 @@ class StoryTask:
             artifact_baseline=deepcopy(d.get("artifact_baseline")),
             artifact_destination=d.get("artifact_destination"),
             artifact_source_digests=deepcopy(d.get("artifact_source_digests")),
+            artifact_tracked_source_oids=deepcopy(d.get("artifact_tracked_source_oids")),
             artifact_acceptance_identity=(
                 str(d["artifact_acceptance_identity"])
                 if d.get("artifact_acceptance_identity") is not None

@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISLNK, S_ISREG
@@ -1467,6 +1467,104 @@ def _blob_oid_for_file(repo: Path, rel: str, path: Path) -> str:
         detail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
         raise GitError(f"git hash-object --path={rel} for {path} failed in {repo}: {detail}")
     return proc.stdout.decode("ascii", "strict").strip()
+
+
+def git_normalized_blob_oid(repo: Path, rel: str, path: Path) -> str:
+    """Return the blob id Git would stage for ``path`` at literal ``rel``.
+
+    This public seam lets publication binding use the same clean-filter-aware
+    identity as the existing content guards without reproducing Git mechanics.
+    """
+    return _blob_oid_for_file(repo, rel, path)
+
+
+def git_normalized_blob_oid_for_bytes(repo: Path, rel: str, data: bytes) -> str:
+    """Return Git's clean-filter-normalized blob id for a confined byte snapshot."""
+    return _blob_oid_for_bytes(repo, rel, data)
+
+
+def _valid_object_id(value: bytes) -> bool:
+    return len(value) in (40, 64) and all(byte in b"0123456789abcdef" for byte in value)
+
+
+def staged_blob_oids(repo: Path, rels: Iterable[str]) -> dict[str, str]:
+    """Read one strict snapshot of stage-zero regular-file blobs for ``rels``.
+
+    Requested paths absent from the index are omitted so callers can distinguish
+    accepted ignored paths (which must stay absent) from accepted tracked paths
+    (which must be present). Ambiguous, unmerged, malformed, or non-blob index
+    evidence raises a path-only ``GitError``. Object ids and Git output are
+    deliberately omitted because callers surface this at the publication
+    integrity boundary.
+    """
+    ordered = tuple(dict.fromkeys(rels))
+    if not ordered:
+        return {}
+    try:
+        proc = git_bytes(repo, "ls-files", "-s", "-z", "--", *_literal_specs(list(ordered)))
+    except (GitError, OSError) as exc:
+        raise GitError(f"git index blob probe failed for declared paths in {repo}") from exc
+    if proc.returncode != 0:
+        raise GitError(f"git index blob probe failed for declared paths in {repo}")
+    requested = {os.fsencode(rel): rel for rel in ordered}
+    observed: dict[str, str] = {}
+    for record in (item for item in proc.stdout.split(b"\0") if item):
+        try:
+            header, actual_path = record.split(b"\t", 1)
+            mode, oid, stage = header.split()
+            rel = requested[actual_path]
+            oid_text = oid.decode("ascii", "strict")
+        except (KeyError, ValueError, UnicodeDecodeError) as exc:
+            raise GitError(f"git index evidence is malformed for declared paths in {repo}") from exc
+        if (
+            stage != b"0"
+            or mode not in {b"100644", b"100755"}
+            or not _valid_object_id(oid)
+            or rel in observed
+        ):
+            raise GitError(f"git index evidence is not a regular stage-zero blob in {repo}")
+        observed[rel] = oid_text
+    return observed
+
+
+def staged_blob_oid(repo: Path, rel: str) -> str:
+    """Return the exact regular stage-zero blob id for one literal path."""
+    observed = staged_blob_oids(repo, (rel,))
+    if rel not in observed:
+        raise GitError(f"git index has no exact unambiguous entry for {rel!r} in {repo}")
+    return observed[rel]
+
+
+def revision_blob_oids(repo: Path, revision: str, rels: Iterable[str]) -> dict[str, str]:
+    """Read exact regular-file blob identities from one committed tree snapshot."""
+    ordered = tuple(dict.fromkeys(rels))
+    if not ordered:
+        return {}
+    try:
+        proc = git_bytes(repo, "ls-tree", "-rz", revision, "--", *_literal_specs(list(ordered)))
+    except (GitError, OSError) as exc:
+        raise GitError(f"git tree blob probe failed for declared paths in {repo}") from exc
+    if proc.returncode != 0:
+        raise GitError(f"git tree blob probe failed for declared paths in {repo}")
+    requested = {os.fsencode(rel): rel for rel in ordered}
+    observed: dict[str, str] = {}
+    for record in (item for item in proc.stdout.split(b"\0") if item):
+        try:
+            header, actual_path = record.split(b"\t", 1)
+            mode, kind, oid = header.split()
+            rel = requested[actual_path]
+            oid_text = oid.decode("ascii", "strict")
+        except (KeyError, ValueError, UnicodeDecodeError) as exc:
+            raise GitError(f"git tree evidence is malformed for declared paths in {repo}") from exc
+        if (
+            kind != b"blob"
+            or mode not in {b"100644", b"100755"}
+            or not _valid_object_id(oid)
+            or rel in observed
+        ):
+            raise GitError(f"git tree evidence is not a regular blob in {repo}")
+        observed[rel] = oid_text
+    return observed
 
 
 def file_holds_content(repo: Path, rel: str, path: Path, data: bytes) -> bool:
@@ -5090,7 +5188,14 @@ def commit_story(repo: Path, message: str) -> str:
     return rev_parse_head(repo)
 
 
-def finalize_commit(repo: Path, baseline: str | None, message: str) -> str | None:
+def finalize_commit(
+    repo: Path,
+    baseline: str | None,
+    message: str,
+    *,
+    staged_validator: Callable[[], object] | None = None,
+    committed_validator: Callable[[str, object], None] | None = None,
+) -> str | None:
     """Collapse everything since `baseline` into ONE commit with `message`.
 
     bmad-build-auto now commits its own work at the end of each iteration (one
@@ -5103,9 +5208,12 @@ def finalize_commit(repo: Path, baseline: str | None, message: str) -> str | Non
     per-story invariant and the message template / pre_commit hook stay
     authoritative regardless of how many times the skill committed.
 
-    Mechanics: stage the working tree (`add -A`), move HEAD back to `baseline`
-    keeping the index (`reset --soft`), then commit the accumulated index. The
-    working tree is never touched, so a failure leaves the chain intact.
+    Mechanics: stage the working tree (`add -A`), invoke the optional exact-index
+    validator, move HEAD back to `baseline` keeping that same index (`reset
+    --soft`), then commit the accumulated index without restaging. An optional
+    committed-tree validator detects hook or concurrent-index mutation and rolls
+    HEAD back to the original chain before refusing. The working tree is never
+    touched, so a failure leaves the chain intact.
 
     Residual-artifacts note (BMAD-METHOD #2563): the skill now commits every file
     of the reviewed diff and deliberately leaves unrelated `git status` residue
@@ -5125,6 +5233,7 @@ def finalize_commit(repo: Path, baseline: str | None, message: str) -> str | Non
     rc, out = _git(repo, "add", "-A")
     if rc != 0:
         raise GitError(f"git add failed: {out}")
+    staged_snapshot = staged_validator() if staged_validator is not None else None
     rc, out = _git(repo, "reset", "--soft", baseline)
     if rc != 0:
         raise GitError(f"git reset --soft {baseline} failed: {out}")
@@ -5144,7 +5253,23 @@ def finalize_commit(repo: Path, baseline: str | None, message: str) -> str | Non
                 f"to {original_head[:12]}: {restore_out}"
             )
         raise GitError(f"git commit failed: {out}")
-    return rev_parse_head(repo)
+    committed_head = rev_parse_head(repo)
+    if committed_validator is not None:
+        try:
+            committed_validator(committed_head, staged_snapshot)
+        except BaseException as exc:
+            # Restore the accepted skill chain and its index while leaving the
+            # working tree untouched.  A soft reset would retain an ignored path
+            # that a hook force-added, making every replay fail staged validation
+            # even after the accepted bytes were restored.
+            restore_rc, restore_out = _git(repo, "reset", "--mixed", original_head)
+            if restore_rc != 0:
+                raise GitError(
+                    "committed tree validation failed; additionally failed to restore "
+                    f"HEAD to {original_head[:12]}: {restore_out}"
+                ) from exc
+            raise
+    return committed_head
 
 
 def resolve_restore_path(raw: str, root: Path) -> Path:

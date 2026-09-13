@@ -3578,11 +3578,43 @@ class Engine:
             # the workspace ahead of the `git add -A`, it reaches every clone the
             # story's commit does — including through the worktree merge-back.
             park_record = self._write_park_record(task)
+
             # bmad-build-auto commits its own work each iteration; the orchestrator
             # squashes that chain plus its uncommitted bookkeeping back onto the
             # pre-dev baseline as one commit carrying `message`. None means there
             # was nothing to finalize (NO_VCS, or the tree already at baseline).
-            sha = verify.finalize_commit(self.workspace.root, task.baseline_commit, message)
+            def validate_staged_publication() -> object:
+                return self._worktree_flow.validate_staged_publication(task, self.workspace.paths)
+
+            def validate_committed_publication(revision: str, staged_snapshot: object) -> None:
+                self._worktree_flow.validate_committed_publication(
+                    task, self.workspace.paths, revision, staged_snapshot
+                )
+
+            staged_validator = (
+                validate_staged_publication if task.dw_ids and task.worktree_path else None
+            )
+            committed_validator = (
+                validate_committed_publication if task.dw_ids and task.worktree_path else None
+            )
+            legacy_commit_replay = bool(
+                task.dw_ids
+                and task.worktree_path
+                and task.artifact_tracked_source_oids is None
+                and task.artifact_payload is not None
+                and task.commit_sha is not None
+                and verify.rev_parse_head(self.workspace.root) == task.commit_sha
+            )
+            if legacy_commit_replay:
+                sha = task.commit_sha
+            else:
+                sha = verify.finalize_commit(
+                    self.workspace.root,
+                    task.baseline_commit,
+                    message,
+                    staged_validator=staged_validator,
+                    committed_validator=committed_validator,
+                )
             task.commit_sha = sha or task.baseline_commit
             # the corrected spec is now durable in HEAD; later attempts need no
             # special preservation, so drop the re-drive latch. The restored diff
