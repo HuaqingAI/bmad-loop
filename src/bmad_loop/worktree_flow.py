@@ -2677,9 +2677,33 @@ class WorktreeFlow:
     def prepare_publication(self, task: StoryTask, source: ProjectPaths) -> None:
         """Persist accepted bytes before merge can consume the unit."""
         try:
-            artifact_publication.prepare(task, self.paths, source)
+            limits = self.policy.limits
+            artifact_publication.prepare(
+                task,
+                self.paths,
+                source,
+                file_max_bytes=limits.artifact_file_max_mb * 1_048_576,
+                payload_max_bytes=limits.artifact_payload_max_mb * 1_048_576,
+            )
             self._save()
+        except artifact_publication.PublicationSizeError as exc:
+            self.journal.append(
+                "artifact-publication-refused",
+                story_key=task.story_key,
+                error=str(exc),
+                publication_cause=exc.cause,
+                measured_bytes=exc.measured_bytes,
+                limit_bytes=exc.limit_bytes,
+                measurement_is_lower_bound=exc.measurement_is_lower_bound,
+            )
+            self._save()
+            self._pause(
+                f"artifact publication preparation failed: {exc}", task.story_key, cause=exc
+            )
         except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
             self._save()
             self._pause(
                 f"artifact publication preparation failed: {exc}", task.story_key, cause=exc

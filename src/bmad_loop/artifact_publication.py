@@ -18,6 +18,7 @@ import hashlib
 import os
 import stat
 from pathlib import Path, PureWindowsPath
+from typing import BinaryIO, Literal
 
 from . import verify
 from .bmadconfig import ProjectPaths
@@ -35,6 +36,42 @@ from .platform_util import (
 
 class PublicationError(Exception):
     """Publication refused; the mounted source and persisted payload must survive."""
+
+
+class PublicationSizeError(PublicationError):
+    """A measured ignored-file payload exceeded a configured admission limit."""
+
+    def __init__(
+        self,
+        cause: Literal["file-limit", "payload-limit"],
+        measured_bytes: int,
+        limit_bytes: int,
+        *,
+        path: Path | None = None,
+        at_least: bool = False,
+    ) -> None:
+        self.cause = cause
+        self.measured_bytes = measured_bytes
+        self.limit_bytes = limit_bytes
+        self.measurement_is_lower_bound = at_least
+        measurement = f"at least {measured_bytes}" if at_least else str(measured_bytes)
+        if cause == "file-limit":
+            message = (
+                f"artifact deliverable exceeds per-file publication limit: {path}; "
+                f"measured {measurement} bytes, limit {limit_bytes} bytes"
+            )
+        else:
+            location = f" while reading {path}" if path is not None else ""
+            message = (
+                f"artifact payload exceeds aggregate publication limit{location}; "
+                f"measured {measurement} bytes, limit {limit_bytes} bytes"
+            )
+        super().__init__(message)
+
+
+DEFAULT_FILE_MAX_BYTES = 5 * 1_048_576
+DEFAULT_PAYLOAD_MAX_BYTES = 10 * 1_048_576
+_BOUNDED_READ_CHUNK_BYTES = 64 * 1024
 
 
 def _digest(data: bytes) -> str:
@@ -76,7 +113,23 @@ def _confined(root: Path, path: Path) -> None:
             raise PublicationError(f"artifact parent is not a directory: {part}")
 
 
-def _contents(root: Path, path: Path) -> bytes | None:
+def _read_bytes(stream: BinaryIO, max_bytes: int | None) -> bytes:
+    """Read through fixed-size requests, stopping one byte beyond a bound."""
+    if max_bytes is None:
+        return stream.read()
+    remaining = max_bytes + 1
+    chunks: list[bytes] = []
+    while remaining:
+        chunk = stream.read(min(_BOUNDED_READ_CHUNK_BYTES, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _contents(root: Path, path: Path, *, max_bytes: int | None = None) -> bytes | None:
+    """Read a regular file, optionally stopping after one bounded sentinel byte."""
     _confined(root, path)
     try:
         mode = path.lstat().st_mode
@@ -85,7 +138,9 @@ def _contents(root: Path, path: Path) -> bytes | None:
     if not stat.S_ISREG(mode):
         raise PublicationError(f"artifact is not a regular file: {path}")
     if not DIR_FD_ANCHORED_WRITES:
-        return path.read_bytes()  # checked fallback; no descriptor-relative API
+        # checked fallback; no descriptor-relative API
+        with path.open("rb") as stream:
+            return _read_bytes(stream, max_bytes)
     parent_fd = open_dir_confined(root, path.parent)
     if parent_fd is None:
         raise PublicationError(f"artifact parent was redirected: {path}")
@@ -94,7 +149,34 @@ def _contents(root: Path, path: Path) -> bytes | None:
         with os.fdopen(fd, "rb") as stream:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 raise PublicationError(f"artifact is not a regular file: {path}")
-            return stream.read()
+            return _read_bytes(stream, max_bytes)
+    finally:
+        os.close(parent_fd)
+
+
+def _file_size(root: Path, path: Path) -> int | None:
+    """Measure a confined regular file without following a replaced leaf."""
+    _confined(root, path)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        raise PublicationError(f"artifact is not a regular file: {path}")
+    if not DIR_FD_ANCHORED_WRITES:
+        return metadata.st_size  # checked fallback; no descriptor-relative API
+    parent_fd = open_dir_confined(root, path.parent)
+    if parent_fd is None:
+        raise PublicationError(f"artifact parent was redirected: {path}")
+    try:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise PublicationError(f"artifact is not a regular file: {path}")
+            return opened.st_size
+        finally:
+            os.close(fd)
     finally:
         os.close(parent_fd)
 
@@ -154,10 +236,19 @@ def capture(task: StoryTask, paths: ProjectPaths) -> None:
     task.artifact_publication_complete = False
 
 
-def prepare(task: StoryTask, paths: ProjectPaths, source: ProjectPaths) -> None:
+def prepare(
+    task: StoryTask,
+    paths: ProjectPaths,
+    source: ProjectPaths,
+    *,
+    file_max_bytes: int = DEFAULT_FILE_MAX_BYTES,
+    payload_max_bytes: int = DEFAULT_PAYLOAD_MAX_BYTES,
+) -> None:
     """Freeze only explicit ignored regular deliverables from the accepted spec."""
     if task.artifact_payload is not None:
         return
+    if file_max_bytes < 1 or payload_max_bytes < 1:
+        raise ValueError("artifact publication byte limits must be positive")
     if not task.spec_file:
         raise PublicationError("accepted bundle spec is missing")
     spec = verify.resolve_spec_path(task.spec_file, source)
@@ -165,9 +256,34 @@ def prepare(task: StoryTask, paths: ProjectPaths, source: ProjectPaths) -> None:
     # Specs outside implementation_artifacts are not automatically published,
     # but their explicit declaration is still subject to the same confinement.
     spec_root = source.project if spec.is_relative_to(source.project) else root
-    spec_data = _contents(spec_root, spec)
+    implicit_rel: str | None = None
+    if _local(source) and spec != root and spec.is_relative_to(root):
+        implicit_rel = _relative(spec.relative_to(root).as_posix())
+        _root(source)
+    spec_tracked = False
+    spec_ignored = False
+    if implicit_rel is not None:
+        repo_rel = spec.relative_to(source.repo_root).as_posix()
+        spec_tracked = verify.path_tracked(source.repo_root, repo_rel)
+        if not spec_tracked:
+            spec_ignored = verify.path_ignored(source.repo_root, spec)
+            if not spec_ignored:
+                raise PublicationError(f"artifact deliverable is not ignored: {spec}")
+    spec_read_limit = min(file_max_bytes, payload_max_bytes)
+    spec_data = _contents(spec_root, spec, max_bytes=spec_read_limit if spec_ignored else None)
     if spec_data is None:
         raise PublicationError(f"accepted bundle spec is missing: {spec}")
+    if spec_ignored and len(spec_data) > spec_read_limit:
+        cause: Literal["file-limit", "payload-limit"] = (
+            "file-limit" if file_max_bytes <= payload_max_bytes else "payload-limit"
+        )
+        raise PublicationSizeError(
+            cause,
+            len(spec_data),
+            spec_read_limit,
+            path=spec,
+            at_least=True,
+        )
     fm = parse_frontmatter(spec_data.decode("utf-8"))
     if not fm:
         raise PublicationError(f"invalid accepted spec frontmatter: {spec}")
@@ -177,20 +293,62 @@ def prepare(task: StoryTask, paths: ProjectPaths, source: ProjectPaths) -> None:
     selected = {_relative(item) for item in declarations}
     if selected:
         _root(source)  # explicit unsafe external declarations must fail
-    if _local(source) and spec != root and spec.is_relative_to(root):
-        selected.add(_relative(spec.relative_to(root).as_posix()))
-    payload: dict[str, str] = {}
+    if implicit_rel is not None:
+        selected.add(implicit_rel)
+
+    inputs: list[tuple[str, Path, int]] = []
     for rel in sorted(selected):
         path = root / rel
-        data = spec_data if path == spec else _contents(root, path)
-        if data is None:
-            raise PublicationError(f"artifact deliverable is missing: {path}")
         if verify.path_tracked(source.repo_root, path.relative_to(source.repo_root).as_posix()):
             continue  # tracked deliverables ride Git
         if not verify.path_ignored(source.repo_root, path):
             raise PublicationError(f"artifact deliverable is not ignored: {path}")
-        payload[rel] = base64.b64encode(data).decode("ascii")
-    task.artifact_payload = payload
+        size = _file_size(root, path)
+        if size is None:
+            raise PublicationError(f"artifact deliverable is missing: {path}")
+        if size > file_max_bytes:
+            raise PublicationSizeError("file-limit", size, file_max_bytes, path=path)
+        inputs.append((rel, path, size))
+
+    preflight_total = sum(size for _, _, size in inputs)
+    if preflight_total > payload_max_bytes:
+        raise PublicationSizeError("payload-limit", preflight_total, payload_max_bytes)
+
+    # Read every admitted source before encoding any of it. The bound uses both
+    # the per-file cap and the aggregate bytes still available, so a growing file
+    # is stopped at the first sentinel byte beyond either budget.
+    raw_payload: dict[str, bytes] = {}
+    actual_total = 0
+    for rel, path, _ in inputs:
+        remaining = payload_max_bytes - actual_total
+        read_limit = min(file_max_bytes, remaining)
+        data = _contents(root, path, max_bytes=read_limit)
+        if data is None:
+            raise PublicationError(f"artifact deliverable is missing: {path}")
+        if len(data) > read_limit:
+            if file_max_bytes <= remaining:
+                raise PublicationSizeError(
+                    "file-limit",
+                    len(data),
+                    file_max_bytes,
+                    path=path,
+                    at_least=True,
+                )
+            raise PublicationSizeError(
+                "payload-limit",
+                actual_total + len(data),
+                payload_max_bytes,
+                path=path,
+                at_least=True,
+            )
+        if path == spec and data != spec_data:
+            raise PublicationError(f"accepted bundle spec changed during preparation: {spec}")
+        raw_payload[rel] = data
+        actual_total += len(data)
+
+    task.artifact_payload = {
+        rel: base64.b64encode(data).decode("ascii") for rel, data in raw_payload.items()
+    }
     # Store intended bytes even for a legacy task: refusal must retain recovery
     # material, and a later resume must never read changed source bytes as intent.
     if task.artifact_destination is None:

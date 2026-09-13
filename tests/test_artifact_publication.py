@@ -1,12 +1,17 @@
 """Publication authority and byte preservation without involving receipt proof."""
 
 import base64
+import json
 import os
+import sys
+import time
+import tracemalloc
 
 import pytest
 
 from bmad_loop import artifact_publication as publication
-from bmad_loop.model import StoryTask
+from bmad_loop.journal import save_state
+from bmad_loop.model import RunState, StoryTask
 
 
 @pytest.fixture
@@ -35,6 +40,291 @@ def test_exact_selection_and_frozen_binary_payload(publication_case):
     ).read_bytes()
     assert not (paths.implementation_artifacts / "unrelated.md").exists()
     assert task.artifact_publication_complete
+
+
+def test_default_per_file_limit_is_inclusive(publication_case):
+    task, _paths, source = publication_case
+    data = b"x" * publication.DEFAULT_FILE_MAX_BYTES
+    (source.implementation_artifacts / "report.bin").write_bytes(data)
+
+    publication.prepare(task, _paths, source)
+
+    assert base64.b64decode(task.artifact_payload["report.bin"]) == data
+
+
+def test_default_per_file_limit_plus_one_refuses_before_encoding(publication_case, monkeypatch):
+    task, paths, source = publication_case
+    report = source.implementation_artifacts / "report.bin"
+    report.write_bytes(b"x" * (publication.DEFAULT_FILE_MAX_BYTES + 1))
+    encoded = []
+    monkeypatch.setattr(publication.base64, "b64encode", lambda data: encoded.append(data))
+
+    with pytest.raises(publication.PublicationSizeError) as exc:
+        publication.prepare(task, paths, source)
+
+    assert exc.value.cause == "file-limit"
+    assert exc.value.measured_bytes == publication.DEFAULT_FILE_MAX_BYTES + 1
+    assert exc.value.limit_bytes == publication.DEFAULT_FILE_MAX_BYTES
+    assert encoded == []
+    assert task.artifact_payload is None
+
+
+def test_implicit_spec_preliminary_read_obeys_smaller_aggregate_limit(publication_case):
+    task, paths, source = publication_case
+    spec = source.implementation_artifacts / "spec.md"
+    spec.write_bytes(b"---\nstatus: done\n---\n" + b"x" * 200)
+
+    with pytest.raises(publication.PublicationSizeError) as exc:
+        publication.prepare(task, paths, source, file_max_bytes=300, payload_max_bytes=100)
+
+    assert exc.value.cause == "payload-limit"
+    assert exc.value.measured_bytes == 101
+    assert exc.value.limit_bytes == 100
+    assert task.artifact_payload is None
+
+
+def test_extreme_positive_limits_use_fixed_size_read_requests(publication_case):
+    task, paths, source = publication_case
+    extreme_legal_limit = sys.maxsize * 1_048_576
+
+    publication.prepare(
+        task,
+        paths,
+        source,
+        file_max_bytes=extreme_legal_limit,
+        payload_max_bytes=extreme_legal_limit,
+    )
+
+    assert base64.b64decode(task.artifact_payload["report.bin"]) == b"\xff\x00\r\nreport"
+
+
+@pytest.mark.parametrize("cause", ["file-limit", "payload-limit"])
+def test_metadata_preflight_refuses_before_any_payload_read(publication_case, monkeypatch, cause):
+    task, paths, source = publication_case
+    spec = source.implementation_artifacts / "spec.md"
+    if cause == "file-limit":
+        (source.implementation_artifacts / "report.bin").write_bytes(
+            b"x" * (publication.DEFAULT_FILE_MAX_BYTES + 1)
+        )
+    else:
+        spec.write_text("---\nstatus: done\nartifact_deliverables: [a.bin, z.bin]\n---\n")
+        (source.implementation_artifacts / "a.bin").write_bytes(
+            b"a" * publication.DEFAULT_FILE_MAX_BYTES
+        )
+        second = (
+            publication.DEFAULT_PAYLOAD_MAX_BYTES
+            - len(spec.read_bytes())
+            - publication.DEFAULT_FILE_MAX_BYTES
+        )
+        (source.implementation_artifacts / "z.bin").write_bytes(b"z" * (second + 1))
+    read = publication._contents
+    preliminary_reads = 0
+
+    def reject_payload_read(root, path, **kwargs):
+        nonlocal preliminary_reads
+        if path == spec and preliminary_reads == 0:
+            preliminary_reads += 1
+            return read(root, path, **kwargs)
+        pytest.fail(f"payload read started before {cause} metadata preflight completed: {path}")
+
+    monkeypatch.setattr(publication, "_contents", reject_payload_read)
+
+    with pytest.raises(publication.PublicationSizeError) as exc:
+        publication.prepare(task, paths, source)
+
+    assert exc.value.cause == cause
+    assert preliminary_reads == 1
+    assert task.artifact_payload is None
+
+
+@pytest.mark.parametrize("over", [0, 1], ids=["exact", "plus-one"])
+def test_default_aggregate_limit_counts_unique_ignored_inputs(publication_case, monkeypatch, over):
+    task, paths, source = publication_case
+    spec = source.implementation_artifacts / "spec.md"
+    spec.write_text(
+        "---\nstatus: done\n" "artifact_deliverables: [spec.md, a.bin, z.bin, spec.md]\n---\n"
+    )
+    first = publication.DEFAULT_FILE_MAX_BYTES
+    last = publication.DEFAULT_PAYLOAD_MAX_BYTES - first - len(spec.read_bytes()) + over
+    (source.implementation_artifacts / "a.bin").write_bytes(b"a" * first)
+    (source.implementation_artifacts / "z.bin").write_bytes(b"z" * last)
+    encoded = []
+    original_encode = publication.base64.b64encode
+
+    def record_encode(data):
+        encoded.append(len(data))
+        return original_encode(data)
+
+    monkeypatch.setattr(publication.base64, "b64encode", record_encode)
+    if over:
+        with pytest.raises(publication.PublicationSizeError) as exc:
+            publication.prepare(task, paths, source)
+        assert exc.value.cause == "payload-limit"
+        assert exc.value.measured_bytes == publication.DEFAULT_PAYLOAD_MAX_BYTES + 1
+        assert encoded == []
+        assert task.artifact_payload is None
+    else:
+        publication.prepare(task, paths, source)
+        assert sum(len(base64.b64decode(value)) for value in task.artifact_payload.values()) == (
+            publication.DEFAULT_PAYLOAD_MAX_BYTES
+        )
+        assert len(encoded) == 3  # duplicate spec declarations count once
+
+
+def test_tracked_oversize_declaration_does_not_consume_payload_budget(
+    publication_case, monkeypatch
+):
+    task, paths, source = publication_case
+    report = source.implementation_artifacts / "report.bin"
+    report.write_bytes(b"x" * (publication.DEFAULT_FILE_MAX_BYTES + 1))
+    monkeypatch.setattr(
+        publication.verify,
+        "path_tracked",
+        lambda _repo, rel: rel.endswith("report.bin"),
+    )
+
+    publication.prepare(task, paths, source)
+
+    assert set(task.artifact_payload) == {"spec.md"}
+
+
+def test_tracked_oversize_implicit_spec_does_not_consume_payload_budget(
+    publication_case, monkeypatch
+):
+    task, paths, source = publication_case
+    spec = source.implementation_artifacts / "spec.md"
+    spec.write_bytes(
+        b"---\nstatus: done\nartifact_deliverables: [report.bin]\n---\n"
+        + b"x" * publication.DEFAULT_FILE_MAX_BYTES
+    )
+    monkeypatch.setattr(
+        publication.verify,
+        "path_tracked",
+        lambda _repo, rel: rel.endswith("spec.md"),
+    )
+
+    publication.prepare(task, paths, source)
+
+    assert set(task.artifact_payload) == {"report.bin"}
+
+
+@pytest.mark.parametrize("cause", ["file-limit", "payload-limit"])
+def test_growth_after_preflight_is_bounded_and_nothing_is_encoded(
+    publication_case, monkeypatch, cause
+):
+    task, paths, source = publication_case
+    spec = source.implementation_artifacts / "spec.md"
+    report = source.implementation_artifacts / "report.bin"
+    if cause == "file-limit":
+        report.write_bytes(b"x")
+    else:
+        spec.write_text("---\nstatus: done\nartifact_deliverables: [a.bin, z.bin]\n---\n")
+        (source.implementation_artifacts / "a.bin").write_bytes(
+            b"a" * publication.DEFAULT_FILE_MAX_BYTES
+        )
+        remaining = (
+            publication.DEFAULT_PAYLOAD_MAX_BYTES
+            - publication.DEFAULT_FILE_MAX_BYTES
+            - len(spec.read_bytes())
+            - 1
+        )
+        report = source.implementation_artifacts / "z.bin"
+        report.write_bytes(b"z" * remaining)
+    measured = publication._file_size
+    grew = False
+
+    def grow_after_measurement(root, path):
+        nonlocal grew
+        size = measured(root, path)
+        if path == report and not grew:
+            grew = True
+            if cause == "file-limit":
+                path.write_bytes(b"x" * (publication.DEFAULT_FILE_MAX_BYTES + 50_000))
+            else:
+                with path.open("ab") as stream:
+                    stream.write(b"zz")
+        return size
+
+    monkeypatch.setattr(publication, "_file_size", grow_after_measurement)
+    monkeypatch.setattr(
+        publication.base64,
+        "b64encode",
+        lambda _data: pytest.fail("encoding started before every bounded read passed"),
+    )
+
+    with pytest.raises(publication.PublicationSizeError) as exc:
+        publication.prepare(task, paths, source)
+
+    assert exc.value.cause == cause
+    assert exc.value.measured_bytes == exc.value.limit_bytes + 1
+    assert exc.value.measurement_is_lower_bound is True
+    assert task.artifact_payload is None
+
+
+def test_legacy_frozen_oversize_payload_still_publishes(publication_case):
+    task, paths, _source = publication_case
+    intended = b"x" * (publication.DEFAULT_FILE_MAX_BYTES + 1)
+    task.artifact_payload = {"report.bin": base64.b64encode(intended).decode("ascii")}
+
+    publication.publish(task, paths)
+
+    assert (paths.implementation_artifacts / "report.bin").read_bytes() == intended
+    assert task.artifact_publication_complete
+
+
+def _ten_mib_payload_five_save_capacity_envelope(tmp_path):
+    raw_size = publication.DEFAULT_PAYLOAD_MAX_BYTES
+    started_tracing = not tracemalloc.is_tracing()
+    if started_tracing:
+        tracemalloc.start()
+    started = time.perf_counter()
+    peak = None
+    try:
+        raw = b"x" * raw_size
+        encoded = base64.b64encode(raw).decode("ascii")
+        task = StoryTask(story_key="dw-capacity", epic=0, artifact_payload={"bundle.bin": encoded})
+        state = RunState(
+            run_id="capacity",
+            project=str(tmp_path),
+            started_at="now",
+            tasks={task.story_key: task},
+        )
+        run_dir = tmp_path / "run"
+        for _ in range(5):
+            save_state(run_dir, state)
+        elapsed = time.perf_counter() - started
+        if started_tracing:
+            _, peak = tracemalloc.get_traced_memory()
+    finally:
+        if started_tracing:
+            tracemalloc.stop()
+
+    structural_base64 = 4 * ((raw_size + 2) // 3)
+    assert len(encoded) == structural_base64
+    state_bytes = (run_dir / "state.json").read_bytes()
+    assert len(state_bytes) <= structural_base64 + 64 * 1024
+    assert json.loads(state_bytes)["tasks"]["dw-capacity"]["artifact_payload"]["bundle.bin"] == (
+        encoded
+    )
+    if peak is not None:
+        assert peak < 160 * 1_048_576
+    assert elapsed < 20
+
+
+def test_ten_mib_payload_five_save_capacity_envelope(tmp_path):
+    _ten_mib_payload_five_save_capacity_envelope(tmp_path)
+
+
+def test_capacity_envelope_preserves_an_existing_tracemalloc_session(tmp_path):
+    was_tracing = tracemalloc.is_tracing()
+    if not was_tracing:
+        tracemalloc.start()
+    try:
+        _ten_mib_payload_five_save_capacity_envelope(tmp_path)
+        assert tracemalloc.is_tracing()
+    finally:
+        if not was_tracing:
+            tracemalloc.stop()
 
 
 def test_late_declaration_does_not_capture_late_destination(publication_case):
@@ -227,10 +517,10 @@ def test_read_fault_retains_baseline_and_refuses_payload(publication_case, monke
     report = source.implementation_artifacts / "report.bin"
     read = publication._contents
 
-    def unreadable(root, path):
+    def unreadable(root, path, **kwargs):
         if path == report:
             raise OSError("unreadable report.bin")
-        return read(root, path)
+        return read(root, path, **kwargs)
 
     monkeypatch.setattr(publication, "_contents", unreadable)
     with pytest.raises(OSError, match="unreadable"):

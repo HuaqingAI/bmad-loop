@@ -24205,7 +24205,14 @@ def test_a_no_open_resume_with_persisted_doubt_repeats_the_repair_notice(project
         assert "repair" not in attention
 
 
-def _ignored_publication_bundle(project, *, artifact_only=False, conflict=False):
+def _ignored_publication_bundle(
+    project,
+    *,
+    artifact_only=False,
+    conflict=False,
+    report_bytes=b"\xff\x00\r\ndeliverable",
+    payload_total_bytes=None,
+):
     """Scripted accepted bundle with explicit binary output and unrelated residue."""
     ignore_before_commit(project, "_bmad-output/")
     git(project.project, "add", "-A")
@@ -24224,9 +24231,15 @@ def _ignored_publication_bundle(project, *, artifact_only=False, conflict=False)
         accepted.write_text(
             accepted.read_text().replace("---\n", "---\nartifact_deliverables: [report.bin]\n", 1)
         )
-        (paths.implementation_artifacts / "report.bin").write_bytes(b"\xff\x00\r\ndeliverable")
+        spec_bytes = accepted.read_bytes()
+        output = report_bytes
+        if payload_total_bytes is not None:
+            if payload_total_bytes < len(spec_bytes):
+                raise ValueError("payload total is smaller than the accepted spec")
+            output = b"x" * (payload_total_bytes - len(spec_bytes))
+        (paths.implementation_artifacts / "report.bin").write_bytes(output)
         (paths.implementation_artifacts / "unrelated.md").write_text("private scratch")
-        expected["spec"] = accepted.read_bytes()
+        expected["spec"] = spec_bytes
         if conflict:
             (project.implementation_artifacts / "report.bin").write_bytes(b"operator edit")
         return result
@@ -24281,6 +24294,194 @@ def test_isolated_publication_conflict_retains_source_when_keep_failed_false(pro
     assert not summary.paused and not summary.crashed
     assert adapter.sessions == []
     assert not Path(task.worktree_path).exists()
+
+
+@pytest.mark.parametrize("remedy", ["reduce", "raise-policy"])
+def test_isolated_oversize_pause_can_resume_without_redispatch(project, remedy):
+    from bmad_loop import artifact_publication
+
+    oversized = b"x" * (artifact_publication.DEFAULT_FILE_MAX_BYTES + 1)
+    effect, _ = _ignored_publication_bundle(
+        project,
+        report_bytes=oversized,
+    )
+    engine, _ = make_sweep(
+        project, [triage_effect(bundle_plan()), effect], policy=isolated_policy(keep_failed=False)
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix"]
+    assert task.artifact_payload is None
+    assert Path(task.worktree_path).is_dir()
+    assert not (project.implementation_artifacts / "report.bin").exists()
+    [refusal] = [
+        entry
+        for entry in engine.journal.entries()
+        if entry["kind"] == "artifact-publication-refused"
+    ]
+    assert refusal["publication_cause"] == "file-limit"
+    assert refusal["measured_bytes"] == artifact_publication.DEFAULT_FILE_MAX_BYTES + 1
+    assert refusal["limit_bytes"] == artifact_publication.DEFAULT_FILE_MAX_BYTES
+    assert refusal["measurement_is_lower_bound"] is False
+
+    if remedy == "reduce":
+        expected = b"reduced"
+        source = project.rebased(Path(task.worktree_path))
+        (source.implementation_artifacts / "report.bin").write_bytes(expected)
+    else:
+        expected = oversized
+        engine.policy = replace(
+            engine.policy,
+            limits=replace(engine.policy.limits, artifact_file_max_mb=6),
+        )
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert (project.implementation_artifacts / "report.bin").read_bytes() == expected
+    assert resumed.state.tasks["dw-fix"].artifact_publication_complete
+    assert not Path(task.worktree_path).exists()
+
+
+def test_configured_aggregate_limit_admits_exact_raw_byte_total(project):
+    aggregate_limit = 1_048_576
+    effect, expected = _ignored_publication_bundle(
+        project,
+        payload_total_bytes=aggregate_limit,
+    )
+    configured = replace(
+        isolated_policy(),
+        limits=LimitsPolicy(artifact_file_max_mb=2, artifact_payload_max_mb=1),
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=configured,
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert (
+        len(expected["spec"]) + len((project.implementation_artifacts / "report.bin").read_bytes())
+        == aggregate_limit
+    )
+    assert engine.state.tasks["dw-fix"].artifact_publication_complete
+
+
+def test_configured_per_file_limit_admits_exact_binary_mib(project):
+    file_limit = 1_048_576
+    effect, _ = _ignored_publication_bundle(project, report_bytes=b"x" * file_limit)
+    configured = replace(
+        isolated_policy(),
+        limits=LimitsPolicy(artifact_file_max_mb=1, artifact_payload_max_mb=2),
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=configured,
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert len((project.implementation_artifacts / "report.bin").read_bytes()) == file_limit
+    assert engine.state.tasks["dw-fix"].artifact_publication_complete
+
+
+def test_configured_aggregate_refusal_resumes_after_only_payload_limit_is_raised(project):
+    aggregate_limit = 1_048_576
+    effect, expected = _ignored_publication_bundle(
+        project,
+        payload_total_bytes=aggregate_limit + 1,
+    )
+    configured = replace(
+        isolated_policy(keep_failed=False),
+        limits=LimitsPolicy(artifact_file_max_mb=2, artifact_payload_max_mb=1),
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=configured,
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix"]
+    assert task.artifact_payload is None
+    assert Path(task.worktree_path).is_dir()
+    [refusal] = [
+        entry
+        for entry in engine.journal.entries()
+        if entry["kind"] == "artifact-publication-refused"
+    ]
+    assert refusal["publication_cause"] == "payload-limit"
+    assert refusal["measured_bytes"] == aggregate_limit + 1
+    assert refusal["limit_bytes"] == aggregate_limit
+    assert refusal["measurement_is_lower_bound"] is False
+
+    engine.policy = replace(
+        engine.policy,
+        limits=replace(engine.policy.limits, artifact_payload_max_mb=2),
+    )
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert (
+        len(expected["spec"]) + len((project.implementation_artifacts / "report.bin").read_bytes())
+        == aggregate_limit + 1
+    )
+    assert resumed.state.tasks["dw-fix"].artifact_publication_complete
+    assert not Path(task.worktree_path).exists()
+
+
+def test_generic_publication_preparation_fault_is_recorded_before_retained_source_pause(
+    project, monkeypatch
+):
+    from bmad_loop import artifact_publication
+
+    effect, _ = _ignored_publication_bundle(project)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False),
+    )
+
+    def refuse_prepare(*_args, **_kwargs):
+        raise artifact_publication.PublicationError("synthetic preparation fault")
+
+    monkeypatch.setattr(artifact_publication, "prepare", refuse_prepare)
+    pause = engine._worktree_flow._pause
+    observed_before_pause = []
+
+    def pause_after_record(*args, **kwargs):
+        task = engine.state.tasks["dw-fix"]
+        records = [
+            entry
+            for entry in engine.journal.entries()
+            if entry["kind"] == "artifact-publication-refused"
+        ]
+        assert len(records) == 1
+        assert records[0]["error"] == "synthetic preparation fault"
+        assert Path(task.worktree_path).is_dir()
+        observed_before_pause.append(True)
+        return pause(*args, **kwargs)
+
+    monkeypatch.setattr(engine._worktree_flow, "_pause", pause_after_record)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert observed_before_pause == [True]
+    task = engine.state.tasks["dw-fix"]
+    assert task.artifact_payload is None
+    assert Path(task.worktree_path).is_dir()
 
 
 def test_isolated_publication_oserror_pauses_and_retains_source(project, monkeypatch):
@@ -24352,6 +24553,9 @@ def test_publication_replays_after_git_merge_before_completion_record(
     merge = verify.merge_branch
 
     def crash_after_merge(*args, **kwargs):
+        durable = load_state(engine.run_dir).tasks["dw-fix"]
+        assert durable.artifact_payload is not None
+        assert not durable.artifact_publication_complete
         merge(*args, **kwargs)
         raise RuntimeError("host lost after git merge")
 

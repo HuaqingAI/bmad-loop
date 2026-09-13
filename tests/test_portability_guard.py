@@ -582,6 +582,12 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "located",
         "log_pos",
         "malformed",
+        # `artifact-publication-refused` size-admission diagnostics. Both are raw
+        # byte counts derived by the bounded publication reader, never authored
+        # text or identifiers; the refused path remains inside dropped `error`.
+        "limit_bytes",
+        "measured_bytes",
+        "measurement_is_lower_bound",
         "mode",
         "model",
         "name",
@@ -621,6 +627,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "policy_changed",
         "preserve_ref",
         "problem",
+        # A closed two-value enum (`file-limit` | `payload-limit`) emitted only
+        # for measured artifact publication admission refusals. The arbitrary
+        # path and exception prose ride `error`, which diagnostics drops.
+        "publication_cause",
         # `question` is NOT here any more: it moved to `_JOURNAL_DROP_FIELDS`
         # (schema v3) once a one-token `decision-pending` question was shown to
         # ship verbatim. Left as a note rather than a silent deletion, because a
