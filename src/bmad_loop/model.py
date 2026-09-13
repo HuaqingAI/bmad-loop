@@ -307,6 +307,12 @@ class StoryTask:
     accepted_dev_session_index: int | None = None
     harvest_carry_commit_pending: bool = False
     isolated_ledger_carried: bool = False
+    # Publication evidence is independent of the artifact-only receipt. None
+    # means legacy/unarmed; an empty baseline proves all paths were absent.
+    artifact_baseline: dict[str, str] | None = None
+    artifact_destination: str | None = None
+    artifact_payload: dict[str, str] | None = None
+    artifact_publication_complete: bool = False
     spec_file: str | None = None
     # The spec owned by the current/last dispatched dev attempt. Unlike
     # ``spec_file`` (the accepted/result artifact), this is bound before launch
@@ -475,6 +481,10 @@ class StoryTask:
             "accepted_dev_session_index": self.accepted_dev_session_index,
             "harvest_carry_commit_pending": self.harvest_carry_commit_pending,
             "isolated_ledger_carried": self.isolated_ledger_carried,
+            "artifact_baseline": deepcopy(self.artifact_baseline),
+            "artifact_destination": self.artifact_destination,
+            "artifact_payload": deepcopy(self.artifact_payload),
+            "artifact_publication_complete": self.artifact_publication_complete,
             "spec_file": self._serialized_worktree_path(self.spec_file),
             "dispatched_spec_file": self._serialized_worktree_path(self.dispatched_spec_file),
             "dispatched_spec_snapshot": (
@@ -576,6 +586,10 @@ class StoryTask:
         relativization is measured against it.
         """
         self.release_spec_paths_from_mount()
+        self.artifact_baseline = None
+        self.artifact_destination = None
+        self.artifact_payload = None
+        self.artifact_publication_complete = False
         self.baseline_commit = None
         self.baseline_untracked = None
 
@@ -698,6 +712,10 @@ class StoryTask:
             ),
             harvest_carry_commit_pending=bool(d.get("harvest_carry_commit_pending", False)),
             isolated_ledger_carried=bool(d.get("isolated_ledger_carried", False)),
+            artifact_baseline=deepcopy(d.get("artifact_baseline")),
+            artifact_destination=d.get("artifact_destination"),
+            artifact_payload=deepcopy(d.get("artifact_payload")),
+            artifact_publication_complete=bool(d.get("artifact_publication_complete", False)),
             spec_file=d.get("spec_file"),
             dispatched_spec_file=d.get("dispatched_spec_file"),
             dispatched_spec_snapshot=dispatched_spec_snapshot,

@@ -801,3 +801,55 @@ def test_setup_mcp_agent_id_mapping():
     assert _setup_mcp_agent_id("gemini") == "gemini"
     assert _setup_mcp_agent_id("cursor") == "cursor"
     assert _setup_mcp_agent_id("some-custom-profile") == "some-custom-profile"
+
+
+def test_gc_retains_unpublished_bundle_sources(project, tmp_path):
+    mount = tmp_path / "mounted-unit"
+    mount.mkdir()
+    task = StoryTask(
+        story_key="dw-fix", epic=0, phase=Phase.DONE, dw_ids=["DW-1"], worktree_path=str(mount)
+    )
+    state = SimpleNamespace(target_branch="main", run_id="run-1", tasks={task.story_key: task})
+    flow = _make_flow(tmp_path, paths=project, state=state, policy=_policy(isolation="worktree"))
+    with pytest.raises(_Pause, match="publication incomplete"):
+        flow.gc_run_worktrees()
+    assert mount.is_dir()
+
+
+def test_gc_reclaims_published_awaiting_operator_source(project, tmp_path, monkeypatch):
+    import bmad_loop.worktree_flow as worktree_flow
+
+    mount = tmp_path / "mounted-unit"
+    mount.mkdir()
+    task = StoryTask(
+        story_key="dw-fix",
+        epic=0,
+        phase=Phase.AWAITING_OPERATOR,
+        dw_ids=["DW-1"],
+        worktree_path=str(mount),
+        artifact_publication_complete=True,
+    )
+    state = SimpleNamespace(target_branch="main", run_id="run-1", tasks={task.story_key: task})
+    flow = _make_flow(tmp_path, paths=project, state=state, policy=_policy(isolation="worktree"))
+
+    def discard(_repo, path, _branch, **_kwargs):
+        Path(path).rmdir()
+
+    monkeypatch.setattr(worktree_flow, "discard_worktree", discard)
+    monkeypatch.setattr(worktree_flow.verify, "worktree_prune", lambda *_: None)
+    flow.gc_run_worktrees()
+    assert not mount.exists()
+
+
+def test_gc_legacy_bundle_with_already_removed_mount_stays_compatible(project, tmp_path):
+    task = StoryTask(
+        story_key="dw-old",
+        epic=0,
+        phase=Phase.DONE,
+        dw_ids=["DW-1"],
+        worktree_path=str(tmp_path / "removed-before-upgrade"),
+    )
+    state = SimpleNamespace(target_branch="main", run_id="run-1", tasks={task.story_key: task})
+    flow = _make_flow(tmp_path, paths=project, state=state, policy=_policy(isolation="worktree"))
+    flow.gc_run_worktrees()
+    assert flow.calls.pauses == []

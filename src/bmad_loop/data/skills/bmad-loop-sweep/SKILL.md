@@ -112,9 +112,16 @@ current session, outside fenced blocks and without an orchestrator repair note; 
 not assert it, and the value must be the strict boolean `true`. The ordinary
 proof-of-work probe must first positively find no changes, and the receipt gate
 requires a positive ignored-file listing scoped to that directory. All other
-verification and ledger-close checks still apply. In an isolated worktree, ignored
-files do not ride the branch merge and are not automatically copied back; accepting
-a receipt does not publish them. Account for that limitation in the bundle's intent.
+verification and ledger-close checks still apply. In an isolated worktree, successful
+integration publishes the accepted ignored bundle spec before teardown. Additional
+ignored regular files must be named in the accepted spec's `artifact_deliverables`
+frontmatter list, using exact paths relative to `implementation_artifacts`. Describe
+these intended outputs in the bundle's `intent` so the executing session can declare
+them. Directories, globs, absolute paths, traversal, symlinks, and the orchestrator-owned
+ledger and sprint board are forbidden; undeclared files are not copied. Publication
+checks destination baselines captured before execution. Conflicting main-checkout
+changes pause publication and retain source artifacts for recovery. The receipt
+alone does not publish files.
 
 ### Step 4: Write the result and end your turn
 

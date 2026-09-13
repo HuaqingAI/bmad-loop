@@ -1607,6 +1607,7 @@ JOURNAL_KINDS = frozenset(
         "worktree-seed-dropped",
         "worktree-seed-skipped",
         "worktree-teardown-degraded",
+        "artifact-publication-refused",
     }
 )
 

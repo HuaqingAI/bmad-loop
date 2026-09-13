@@ -73,6 +73,7 @@ CANARIES = [
     "CANARY_RESULT",
     "CANARY_FEEDBACK",
     "CANARY_PATCH",
+    "cHJpdmF0ZSBhcnRpZmFjdCBieXRlcw==",
     SHA,
     "AcmeVaultRotation",
 ]
@@ -114,6 +115,9 @@ def _seed_run(
         baseline_untracked=["AcmeSecret.py", "src/secret/thing.py"],
         worktree_path=f"{HOME_PATH}/worktrees/{BRANCH}",
         dw_ids=["DW-1", "DW-2"],
+        artifact_destination=HOME_PATH,
+        artifact_baseline={"AcmeSecret.py": SHA},
+        artifact_payload={"AcmeSecret.py": "cHJpdmF0ZSBhcnRpZmFjdCBieXRlcw=="},
     )
     task.record_session(
         SessionRecord(

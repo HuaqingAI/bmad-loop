@@ -7298,9 +7298,9 @@ def test_bundle_prompt_conditions_artifact_only_receipt_on_session_deliverables(
         "receipt gate then requires a positive ignored-file listing scoped to that directory",
         "listing cannot prove which files you wrote",
         "All other verification and ledger-close checks still apply",
-        "In an isolated worktree, ignored files do not ride the branch merge",
-        "not automatically copied back",
-        "accepting a receipt does not publish them",
+        "successful integration publishes the accepted ignored bundle spec before teardown",
+        "accepted spec's `artifact_deliverables` frontmatter list",
+        "Accepting the receipt alone does not publish files",
     ):
         assert clause in prompt
 
@@ -22848,6 +22848,10 @@ def test_run_bundle_clears_superseded_bundle_state_on_divergent_adoption(
     task.review_cycle = 3
     task.followup_reviews_spent = 2
     task.defer_reason = "superseded bundle ran out of review budget"
+    task.artifact_baseline = {"report.bin": "old-baseline"}
+    task.artifact_destination = "/old/artifacts"
+    task.artifact_payload = {"report.bin": "b2xk"}
+    task.artifact_publication_complete = True
     task.resolved_redrive = True
     generation = task.generation
     dispatched = _stub_run_story(engine, monkeypatch)
@@ -22865,6 +22869,10 @@ def test_run_bundle_clears_superseded_bundle_state_on_divergent_adoption(
     assert task.review_cycle == 0
     assert task.followup_reviews_spent == 0
     assert task.defer_reason is None
+    assert task.artifact_baseline is None
+    assert task.artifact_destination is None
+    assert task.artifact_payload is None
+    assert not task.artifact_publication_complete
     # a HUMAN resolved this task; that is not a claim about which spec it owns
     assert task.resolved_redrive is True
     # ...and the prompt now names the replacement intent, not the superseded spec
@@ -23904,3 +23912,258 @@ def test_a_no_open_resume_with_persisted_doubt_repeats_the_repair_notice(project
         assert git(project.project, "rev-parse", "HEAD") != head
         assert headline not in attention
         assert "repair" not in attention
+
+
+def _ignored_publication_bundle(project, *, artifact_only=False, conflict=False):
+    """Scripted accepted bundle with explicit binary output and unrelated residue."""
+    ignore_before_commit(project, "_bmad-output/")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ignore bundle artifacts")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    expected = {}
+
+    def effect(spec):
+        before = (spec.cwd / "src.txt").read_bytes()
+        result = wt_bundle_dev(project)(spec)
+        if artifact_only:
+            (spec.cwd / "src.txt").write_bytes(before)
+            result.result_json["artifact_only"] = True
+        paths = project.rebased(spec.cwd)
+        accepted = Path(result.result_json["spec_file"])
+        accepted.write_text(
+            accepted.read_text().replace("---\n", "---\nartifact_deliverables: [report.bin]\n", 1)
+        )
+        (paths.implementation_artifacts / "report.bin").write_bytes(b"\xff\x00\r\ndeliverable")
+        (paths.implementation_artifacts / "unrelated.md").write_text("private scratch")
+        expected["spec"] = accepted.read_bytes()
+        if conflict:
+            (project.implementation_artifacts / "report.bin").write_bytes(b"operator edit")
+        return result
+
+    return effect, expected
+
+
+@pytest.mark.parametrize("artifact_only", [False, True])
+@pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
+def test_isolated_bundle_publishes_explicit_files_before_teardown(project, artifact_only, strategy):
+    effect, expected = _ignored_publication_bundle(project, artifact_only=artifact_only)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(merge_strategy=strategy),
+    )
+    summary = engine.run()
+    assert not summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix"]
+    assert task.phase == Phase.DONE and task.artifact_publication_complete
+    assert task.commit_sha is not None
+    assert (project.implementation_artifacts / "spec-dw-fix.md").read_bytes() == expected["spec"]
+    assert (
+        project.implementation_artifacts / "report.bin"
+    ).read_bytes() == b"\xff\x00\r\ndeliverable"
+    assert not (project.implementation_artifacts / "unrelated.md").exists()
+    assert not Path(task.worktree_path).exists()
+    assert ("bundle-artifact-only-accepted" in journal_kinds(engine)) is artifact_only
+    if artifact_only:
+        assert task.commit_sha == task.baseline_commit
+    else:
+        assert "change for dw-fix" in (project.project / "src.txt").read_text()
+
+
+def test_isolated_publication_conflict_retains_source_when_keep_failed_false(project):
+    effect, _ = _ignored_publication_bundle(project, conflict=True)
+    engine, _ = make_sweep(
+        project, [triage_effect(bundle_plan()), effect], policy=isolated_policy(keep_failed=False)
+    )
+    summary = engine.run()
+    assert summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix"]
+    assert not task.artifact_publication_complete
+    assert Path(task.worktree_path).is_dir()
+    assert (project.implementation_artifacts / "report.bin").read_bytes() == b"operator edit"
+    assert task.artifact_payload is not None
+    assert "artifact-publication-refused" in journal_kinds(engine)
+    # Resolve by placing intended bytes; replay must recognize them and finish.
+    (project.implementation_artifacts / "report.bin").write_bytes(b"\xff\x00\r\ndeliverable")
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+    assert not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert not Path(task.worktree_path).exists()
+
+
+def test_isolated_publication_oserror_pauses_and_retains_source(project, monkeypatch):
+    from bmad_loop import artifact_publication
+
+    effect, _ = _ignored_publication_bundle(project)
+    engine, _ = make_sweep(
+        project, [triage_effect(bundle_plan()), effect], policy=isolated_policy(keep_failed=False)
+    )
+
+    def disk_full(*_):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(artifact_publication, "publish", disk_full)
+    summary = engine.run()
+    assert summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix"]
+    assert Path(task.worktree_path).is_dir()
+    assert not task.artifact_publication_complete
+    assert "artifact-publication-refused" in journal_kinds(engine)
+
+
+@pytest.mark.parametrize("artifact_only", [False, True])
+def test_isolated_publication_crash_replays_frozen_bytes_before_sweep(
+    project, monkeypatch, artifact_only
+):
+    from bmad_loop import artifact_publication
+
+    effect, expected = _ignored_publication_bundle(project, artifact_only=artifact_only)
+    engine, _ = make_sweep(
+        project, [triage_effect(bundle_plan()), effect], policy=isolated_policy()
+    )
+    write = artifact_publication.atomic_write_bytes_confined
+
+    def crash_after_replace(path, data, **kwargs):
+        write(path, data, **kwargs)
+        raise RuntimeError("host lost after artifact replacement")
+
+    monkeypatch.setattr(artifact_publication, "atomic_write_bytes_confined", crash_after_replace)
+    assert engine.run().crashed
+    saved = load_state(engine.run_dir).tasks["dw-fix"]
+    assert not saved.artifact_publication_complete
+    assert saved.artifact_payload is not None
+    # Source edits after the verified snapshot must not become replay authority.
+    (
+        project.rebased(Path(saved.worktree_path)).implementation_artifacts / "spec-dw-fix.md"
+    ).write_text("unverified later edit")
+    monkeypatch.setattr(artifact_publication, "atomic_write_bytes_confined", write)
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+    assert not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert (project.implementation_artifacts / "spec-dw-fix.md").read_bytes() == expected["spec"]
+    assert resumed.state.tasks["dw-fix"].artifact_publication_complete
+    assert not Path(saved.worktree_path).exists()
+
+
+@pytest.mark.parametrize("artifact_only", [False, True])
+@pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
+def test_publication_replays_after_git_merge_before_completion_record(
+    project, monkeypatch, artifact_only, strategy
+):
+    effect, expected = _ignored_publication_bundle(project, artifact_only=artifact_only)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(merge_strategy=strategy),
+    )
+    merge = verify.merge_branch
+
+    def crash_after_merge(*args, **kwargs):
+        merge(*args, **kwargs)
+        raise RuntimeError("host lost after git merge")
+
+    monkeypatch.setattr(verify, "merge_branch", crash_after_merge)
+    assert engine.run().crashed
+    task = load_state(engine.run_dir).tasks["dw-fix"]
+    assert task.commit_sha is not None
+    assert task.artifact_payload is not None and not task.artifact_publication_complete
+    assert "unit-merged" not in journal_kinds(engine)
+    monkeypatch.setattr(verify, "merge_branch", merge)
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+    assert not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert (project.implementation_artifacts / "spec-dw-fix.md").read_bytes() == expected["spec"]
+    assert not Path(task.worktree_path).exists()
+    assert "resume-unit-merge" in journal_kinds(resumed)
+
+
+def test_isolated_ordinary_bundle_keeps_shared_external_artifact_directory(project, tmp_path):
+    from dataclasses import replace
+
+    external = replace(project, implementation_artifacts=tmp_path / "shared-artifacts")
+    external.implementation_artifacts.mkdir()
+    write_ledger(external, {"DW-1": "open"}, commit=False)
+    engine, _ = make_sweep(
+        external,
+        [triage_effect(bundle_plan()), wt_bundle_dev(external)],
+        policy=isolated_policy(),
+    )
+    summary = engine.run()
+    assert not summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix"]
+    assert task.artifact_payload == {} and task.artifact_publication_complete
+    assert "change for dw-fix" in (project.project / "src.txt").read_text()
+    assert (external.implementation_artifacts / "spec-dw-fix.md").is_file()
+    assert not Path(task.worktree_path).exists()
+
+
+@pytest.mark.parametrize("merged", [False, True])
+def test_publication_missing_mount_needs_merge_proof(project, monkeypatch, merged):
+    effect, expected = _ignored_publication_bundle(project)
+    engine, _ = make_sweep(
+        project, [triage_effect(bundle_plan()), effect], policy=isolated_policy()
+    )
+
+    def crash(*_):
+        raise RuntimeError("lost source mount")
+
+    boundary = "finish_publication" if merged else "integrate_unit"
+    monkeypatch.setattr(engine._worktree_flow, boundary, crash)
+    assert engine.run().crashed
+    task = load_state(engine.run_dir).tasks["dw-fix"]
+    assert task.artifact_payload is not None
+    git(project.repo_root, "worktree", "remove", "--force", task.worktree_path)
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+    assert summary.paused is not merged
+    assert not summary.crashed
+    assert adapter.sessions == []
+    if merged:
+        assert (project.implementation_artifacts / "spec-dw-fix.md").read_bytes() == expected[
+            "spec"
+        ]
+        assert resumed.state.tasks["dw-fix"].artifact_publication_complete
+    else:
+        assert not (project.implementation_artifacts / "spec-dw-fix.md").exists()
+
+
+def test_first_integration_after_terminal_crash_keeps_merge_hooks_and_commit_pin(
+    project, monkeypatch
+):
+    effect, _ = _ignored_publication_bundle(project)
+    engine, _ = make_sweep(
+        project, [triage_effect(bundle_plan()), effect], policy=isolated_policy()
+    )
+
+    def crash(*_):
+        raise RuntimeError("before first integration")
+
+    monkeypatch.setattr(engine._worktree_flow, "integrate_unit", crash)
+    assert engine.run().crashed
+    task = load_state(engine.run_dir).tasks["dw-fix"]
+    assert "unit-merge-started" not in journal_kinds(engine)
+    resumed, _ = resume_sweep(project, engine, [])
+    hooks = []
+    emit = resumed._worktree_flow._emit
+
+    def record_hook(stage, *args, **kwargs):
+        if stage in ("pre_integrate", "pre_merge", "post_merge"):
+            hooks.append(stage)
+        return emit(stage, *args, **kwargs)
+
+    monkeypatch.setattr(resumed._worktree_flow, "_emit", record_hook)
+    operands = []
+    merge = verify.merge_branch
+
+    def record_merge(repo, operand, **kwargs):
+        operands.append(operand)
+        return merge(repo, operand, **kwargs)
+
+    monkeypatch.setattr(verify, "merge_branch", record_merge)
+    summary = resumed.run()
+    assert not summary.paused and not summary.crashed
+    assert hooks == ["pre_integrate", "pre_merge", "post_merge"]
+    assert operands == [task.commit_sha]

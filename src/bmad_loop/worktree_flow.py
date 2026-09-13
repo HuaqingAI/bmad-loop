@@ -28,7 +28,7 @@ from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, NoReturn
 
-from . import gates, verify
+from . import artifact_publication, gates, verify
 from .install import (
     _REVIEW_LAYER_SKILLS,
     BASE_SKILLS,
@@ -1913,6 +1913,12 @@ class WorktreeFlow:
             "worktree-opened", story_key=task.story_key, branch=unit.branch, path=str(unit.path)
         )
         task.branch = unit.branch
+        if task.dw_ids:
+            try:
+                artifact_publication.capture(task, self.paths)
+            except (artifact_publication.PublicationError, OSError, ValueError) as exc:
+                self._save()
+                self._pause(f"artifact baseline capture failed: {exc}", task.story_key, cause=exc)
         # A worktree checks out tracked files only, but the bmad-loop-* skill
         # trees + signal-hook config are typically gitignored, so they are absent
         # from the fresh checkout. Re-lay them into the worktree so the bundled
@@ -2316,9 +2322,14 @@ class WorktreeFlow:
         *,
         replay: bool = False,
         replay_strategy: str | None = None,
+        first_integration: bool = False,
     ) -> None:
         """Merge a DONE unit's branch into the target branch from the main repo."""
-        if not replay:
+        if first_integration:
+            self._emit("pre_integrate", task)
+        if task.dw_ids:
+            self.prepare_publication(task, unit.workspace.paths)
+        if not replay or first_integration:
             self._emit("pre_merge", task)
         scm = self.policy.scm
         merge_strategy = scm.merge_strategy if replay_strategy is None else replay_strategy
@@ -2421,7 +2432,7 @@ class WorktreeFlow:
                 branch=unit.branch,
                 paths=cleaned,
             )
-        if not replay:
+        if not replay or first_integration:
             # The task is already terminal and durable here. Record integration
             # intent immediately before git so a host loss after merge success but
             # before `unit-merged` can safely re-run the merge instead of losing a
@@ -2440,7 +2451,9 @@ class WorktreeFlow:
                 merge_ref,
                 strategy=merge_strategy,
                 message=self.merge_message(task),
-                allow_empty_squash=replay,
+                allow_empty_squash=(
+                    replay or (bool(task.dw_ids) and source == task.baseline_commit)
+                ),
             )
         except verify.MergePreflightError as e:
             # Subclass arm, so it must precede the GitError one below. git declined
@@ -2659,6 +2672,43 @@ class WorktreeFlow:
             source=source,
         )
         self._emit("post_merge", task)
+        self.finish_publication(task, unit)
+
+    def prepare_publication(self, task: StoryTask, source: ProjectPaths) -> None:
+        """Persist accepted bytes before merge can consume the unit."""
+        try:
+            artifact_publication.prepare(task, self.paths, source)
+            self._save()
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self._save()
+            self._pause(
+                f"artifact publication preparation failed: {exc}", task.story_key, cause=exc
+            )
+
+    def finish_publication(self, task: StoryTask, unit: UnitWorkspace | None) -> None:
+        """Publish and latch before successful teardown, including merge replay."""
+        if task.dw_ids:
+            try:
+                artifact_publication.publish(task, self.paths)
+                self._save()
+            except (
+                artifact_publication.PublicationError,
+                verify.GitError,
+                OSError,
+                ValueError,
+            ) as exc:
+                self.journal.append(
+                    "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+                )
+                self._save()
+                self._pause(
+                    f"artifact publication failed: {exc}; source retained at {task.worktree_path}",
+                    task.story_key,
+                    cause=exc,
+                )
+        if unit is None:
+            return  # journal-proven merge can publish from durable bytes alone
+        scm = self.policy.scm
         close_unit_workspace(
             unit,
             success=True,
@@ -2711,18 +2761,24 @@ class WorktreeFlow:
     def gc_run_worktrees(self) -> None:
         """Reclaim this run's worktree scaffolding once it finishes cleanly.
 
-        DONE units drop their worktree at merge time; this is a safety net for a
-        worktree leaked by a crash between merge and teardown, plus it prunes
-        stale git admin entries and removes the now-empty run worktree dir.
+        DONE and AWAITING_OPERATOR units drop their worktree at merge time; this
+        is a safety net for a worktree leaked by a crash between merge and
+        teardown, plus it prunes stale git admin entries and removes the now-empty
+        run worktree dir.
         Worktrees deliberately kept for inspection (a kept-failed/escalated unit)
         are left in place and journaled so the operator can find them."""
         if not self.isolated:
             return
         repo = self.paths.repo_root
         for task in self.state.tasks.values():
-            if task.phase == Phase.DONE and task.worktree_path:
+            if task.phase in (Phase.DONE, Phase.AWAITING_OPERATOR) and task.worktree_path:
                 wt = Path(task.worktree_path)
                 if wt.is_dir():
+                    if task.dw_ids and not task.artifact_publication_complete:
+                        self._pause(
+                            f"artifact publication incomplete; source retained at {task.worktree_path}",
+                            task.story_key,
+                        )
                     discard_worktree(repo, task.worktree_path, task.branch, run_dir=self.run_dir)
             elif task.terminal and task.worktree_path and Path(task.worktree_path).is_dir():
                 # kept on purpose (keep_failed): leave it, but surface where.

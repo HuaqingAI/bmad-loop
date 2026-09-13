@@ -1208,12 +1208,14 @@ class Engine:
         *,
         replay: bool = False,
         replay_strategy: str | None = None,
+        first_integration: bool = False,
     ) -> None:
         self._worktree_flow.merge_local(
             task,
             unit,
             replay=replay,
             replay_strategy=replay_strategy,
+            first_integration=first_integration,
         )
 
     def _keep_branch_and_escalate(self, task: StoryTask, unit: UnitWorkspace, reason: str) -> None:
@@ -1694,7 +1696,16 @@ class Engine:
                 # invisible to every later sweep.
                 self._carry_harvested_deferrals(task)
                 continue
-            if task.isolated_ledger_carried or task.phase not in (
+            publication_pending = (
+                bool(task.dw_ids)
+                and not task.artifact_publication_complete
+                and (
+                    task.artifact_baseline is not None
+                    or task.artifact_payload is not None
+                    or (bool(task.worktree_path) and Path(task.worktree_path).exists())
+                )
+            )
+            if (task.isolated_ledger_carried and not publication_pending) or task.phase not in (
                 Phase.DONE,
                 Phase.AWAITING_OPERATOR,
             ):
@@ -1720,6 +1731,7 @@ class Engine:
                 or task.bundle_closes_intended
                 or task.story_closes_intended
                 or task.board_advance_intended
+                or publication_pending
             ):
                 continue
             if merged_key not in merged_units:
@@ -1727,27 +1739,51 @@ class Engine:
                 started_key = (*merged_key, source)
                 replay_strategy = started_units.get(started_key)
                 if not source or replay_strategy is None:
-                    continue
-                # The write-ahead record is intent, never merge proof. Re-run the
-                # exact merge and latch completion only after git confirms it;
-                # merge/ff are naturally idempotent, while squash enables its
-                # recovery-only clean-tree success arm.
-                self.journal.append(
-                    "resume-unit-merge",
-                    story_key=task.story_key,
-                    branch=task.branch,
-                    target=self.state.target_branch,
-                    strategy=replay_strategy,
-                    source=source,
-                )
-                unit = self._reopen_unit(task)
-                self._merge_local(
-                    task,
-                    unit,
-                    replay=True,
-                    replay_strategy=replay_strategy,
-                )
-                merged_units.add(merged_key)
+                    if not publication_pending:
+                        continue
+                    # Terminal bundle persisted before merge intent: integrate it
+                    # before sweep can re-triage or GC can remove its sources.
+                    self._merge_local(
+                        task, self._reopen_unit(task), replay=True, first_integration=True
+                    )
+                    merged_units.add(merged_key)
+                    replay_strategy = None
+                else:
+                    replay_strategy = str(replay_strategy)
+                if merged_key not in merged_units:
+                    # The write-ahead record is intent, never merge proof. Re-run the
+                    # exact merge and latch completion only after git confirms it;
+                    # merge/ff are naturally idempotent, while squash enables its
+                    # recovery-only clean-tree success arm.
+                    self.journal.append(
+                        "resume-unit-merge",
+                        story_key=task.story_key,
+                        branch=task.branch,
+                        target=self.state.target_branch,
+                        strategy=replay_strategy,
+                        source=source,
+                    )
+                    unit = self._reopen_unit(task)
+                    self._merge_local(
+                        task,
+                        unit,
+                        replay=True,
+                        replay_strategy=replay_strategy,
+                    )
+                    merged_units.add(merged_key)
+            if publication_pending and not task.artifact_publication_complete:
+                if task.artifact_payload is None:
+                    unit = self._reopen_unit(task)
+                    self._worktree_flow.prepare_publication(task, unit.workspace.paths)
+                    self._worktree_flow.finish_publication(task, unit)
+                else:
+                    # unit-merged proves integration; saved bytes are the source.
+                    # A removed original mount cannot invalidate this payload.
+                    self._worktree_flow.finish_publication(task, None)
+                    if Path(task.worktree_path).is_dir() and verify.worktree_is_registered(
+                        self.paths.repo_root, Path(task.worktree_path)
+                    ):
+                        self._worktree_flow.finish_publication(task, self._reopen_unit(task))
             self.journal.append("resume-ledger-carry", story_key=task.story_key)
             self._carry_isolated_ledger_writes(task)
             task.isolated_ledger_carried = True
@@ -3534,6 +3570,8 @@ class Engine:
             self._restore_deferred_closes(task, snapshot)
             self._restore_park_record(task, park_record)
             raise
+        if task.dw_ids and task.worktree_path:
+            self._worktree_flow.prepare_publication(task, self.workspace.paths)
         # Final-phase rule: AWAITING_OPERATOR iff the task carries actions,
         # otherwise DONE. Derived from PERSISTED task state, never from a local
         # flag, so the crash-resume arm that re-enters this method reaches the

@@ -2756,6 +2756,10 @@ class SweepEngine(Engine):
         closes are rightfully its own.
         """
         task.bundle_closes_intended = []
+        task.artifact_baseline = None
+        task.artifact_destination = None
+        task.artifact_payload = None
+        task.artifact_publication_complete = False
         task.spec_file = None
         task.restore_patch = None
         task.attempt = 0
@@ -6270,8 +6274,15 @@ class SweepEngine(Engine):
             "the receipt gate then requires a positive ignored-file listing scoped "
             "to that directory. The listing cannot prove which files you wrote. "
             "All other verification and ledger-close checks still apply. In an "
-            "isolated worktree, ignored files do not ride the branch merge and are "
-            "not automatically copied back; accepting a receipt does not publish them."
+            "isolated worktree, successful integration publishes the accepted ignored "
+            "bundle spec before teardown. To publish additional ignored regular files, "
+            "list their exact paths relative to `implementation_artifacts` in the "
+            "accepted spec's `artifact_deliverables` frontmatter list. Directories, "
+            "globs, absolute paths, traversal, symlinks, and the orchestrator-owned "
+            "ledger and sprint board are forbidden. Undeclared files are not copied. "
+            "Publication checks destination baselines captured before execution; "
+            "conflicting main-checkout changes pause publication and retain source "
+            "artifacts for recovery. Accepting the receipt alone does not publish files."
         )
         if feedback is None:
             if task.restore_patch and task.spec_file:
