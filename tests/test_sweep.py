@@ -6971,13 +6971,13 @@ def test_preanswered_keep_open_whose_option_was_re_authored_stops_suppressing(pr
 #
 # `sweep.atomic_write_text_confined` (#593) is the binding the two `_decisions_phase`
 # writes below share — and, since DW-269, the `_ensure_triage` cache write-back and
-# `_write_intent` too. Of the module's `atomic_write_text` callers only the
-# `_ensure_migration` ledger restore keeps the plain helper (a project-level ledger
-# write with its own symlink policy, DW-188); the migration's two run-dir JSON
-# records, `migrate-manifest.json` and `migrate-result.json`, are bare `Path.write_text`
-# and go through neither binding. The FILENAME filter and the delegate-otherwise arm
-# are therefore load-bearing: a bare module-wide boom would make the "revert this
-# site" ablation pass for the WRONG REASON — the triage cache write-back DEGRADES
+# `_write_intent` too, and since DW-288 the two `_ensure_migration` run-dir JSON
+# records, `migrate-manifest.json` and `migrate-result.json`. Of the module's
+# `atomic_write_text` callers only the `_ensure_migration` ledger restore keeps the
+# plain helper (a project-level ledger write with its own symlink policy, DW-188).
+# The FILENAME filter and the delegate-otherwise arm are therefore load-bearing: a
+# bare module-wide boom would make the "revert this site" ablation pass for the WRONG
+# REASON — the triage cache write-back DEGRADES
 # (DW-247), so a module-wide boom would leave a stray `sweep-triage-cache-write-failed`
 # row with the plan still acted on, and would crash the intent write wherever a plan
 # carries a bundle — and the filter is what keeps each row graded on its own site.
@@ -19756,8 +19756,10 @@ def test_sweep_migrates_legacy_then_triages_and_runs_bundle(project):
     # the migration session was prompted with the manifest path
     assert "--migrate" in adapter.sessions[0].prompt
     manifest_path = adapter.sessions[0].prompt.split("--migrate ", 1)[1].split()[0]
-    written = json.loads(open(manifest_path).read())
-    assert [m["key"] for m in written] == [m["key"] for m in manifest]
+    assert Path(manifest_path).read_text(encoding="utf-8") == json.dumps(manifest, indent=2)
+    assert (engine.run_dir / "migrate-result.json").read_text(encoding="utf-8") == json.dumps(
+        migrate_result(mapping), indent=2
+    )
     # triage ran against the post-migration open set, strict check intact
     assert "--migrate" not in adapter.sessions[1].prompt
 
@@ -22054,6 +22056,140 @@ def _redirect_the_run_dir(project, tmp_path):
     outside.mkdir()
     run_dir.symlink_to(outside, target_is_directory=True)
     return outside
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_migration_manifest_write_refuses_a_redirected_run_dir(project, tmp_path, monkeypatch):
+    """DW-288's first migration record is published before a session runs.
+
+    The helper spy is the reached-site precondition: this test must exercise the
+    manifest publication itself, not pass merely because some earlier run setup
+    failed. The task baseline proves migration setup reached the publication, and
+    the empty session list pins the required manifest-before-dispatch ordering.
+
+    Ablation: restore this site to `Path.write_text` and the helper is not reached,
+    the migration session runs, and `outside/migrate-manifest.json` lands."""
+    outside = _redirect_the_run_dir(project, tmp_path)
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    manifest = legacy_manifest()
+    mapping = [
+        {"key": manifest[0]["key"], "dw_id": "DW-1"},
+        {"key": manifest[1]["key"], "dw_id": "DW-2"},
+    ]
+    engine, adapter = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real = sweep_mod.atomic_write_text_confined
+    reached: list[Path] = []
+
+    def observe(path, text, **kwargs):
+        reached.append(path)
+        return real(path, text, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", observe)
+
+    summary = engine.run()
+
+    assert summary.crashed and not summary.paused
+    assert not (outside / "migrate-manifest.json").exists()
+    assert list(outside.glob("migrate-manifest*")) == []  # no staged temp either
+    assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
+    assert reached == [engine.run_dir / "migrate-manifest.json"]  # PRECONDITION: site reached
+    assert engine.state.tasks["sweep-migrate"].baseline_commit == git(
+        project.project, "rev-parse", "HEAD"
+    )
+    assert len(adapter.sessions) == 0  # refusal precedes migration dispatch
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_the_migration_result_write_refuses_a_redirected_run_dir(project, tmp_path, monkeypatch):
+    """DW-288's successful-result publication refuses a post-session redirect.
+
+    The scripted migration consumes the safely published manifest before replacing
+    the run directory with a link. This isolates the second write: one session ran,
+    the expected manifest was observed, and the ledger commit boundary is not
+    reached after the refusal.
+
+    Ablation: restore this site to `Path.write_text` and the result lands outside
+    before the commit-boundary sentinel raises."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    manifest = legacy_manifest()
+    mapping = [
+        {"key": manifest[0]["key"], "dw_id": "DW-1"},
+        {"key": manifest[1]["key"], "dw_id": "DW-2"},
+    ]
+    expected_result = migrate_result(mapping)
+    consumed: list[list[dict]] = []
+    parked = tmp_path / "run-before-redirect"
+    outside = tmp_path / "outside"
+
+    def migrate_then_redirect(spec):
+        manifest_path = Path(spec.prompt.split("--migrate ", 1)[1].split()[0])
+        consumed.append(json.loads(manifest_path.read_text(encoding="utf-8")))
+        project.deferred_work.write_text(migrated_ledger(), encoding="utf-8")
+        engine.run_dir.rename(parked)
+        outside.mkdir()
+        engine.run_dir.symlink_to(outside, target_is_directory=True)
+        return SessionResult(status="completed", result_json=expected_result)
+
+    engine, adapter = make_sweep(project, [migrate_then_redirect])
+    commit_reached: list[bool] = []
+
+    def refuse_commit(*_args, **_kwargs):
+        commit_reached.append(True)
+        raise AssertionError("migration ledger commit reached")
+
+    monkeypatch.setattr(engine, "_commit_ledger", refuse_commit)
+
+    summary = engine.run()
+
+    assert summary.crashed and not summary.paused
+    assert not (outside / "migrate-result.json").exists()
+    assert list(outside.glob("migrate-result*")) == []  # no staged temp either
+    assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
+    assert consumed == [manifest]  # PRECONDITION: the session consumed the manifest
+    assert len(adapter.sessions) == 1
+    assert commit_reached == []  # refusal precedes the ledger commit
+    assert (parked / "migrate-manifest.json").read_text(encoding="utf-8") == json.dumps(
+        manifest, indent=2
+    )
+
+
+def test_the_confined_migration_records_land_under_a_disjoint_repo_root(project, tmp_path):
+    """DW-288 roots both records at the project that owns the run directory.
+
+    Under the supported `repo_root` override the workspace is a separate code repo,
+    disjoint from the project where run records live. Rooting either publication at
+    `self.workspace.root` would refuse a healthy migration before that record lands."""
+    elsewhere = tmp_path / "code-repo"
+    shutil.copytree(project.project, elsewhere)
+    paths = replace(project, repo_root=elsewhere)
+    write_legacy_ledger(paths, LEGACY_LEDGER)
+    manifest = legacy_manifest()
+    mapping = [
+        {"key": manifest[0]["key"], "dw_id": "DW-1"},
+        {"key": manifest[1]["key"], "dw_id": "DW-2"},
+    ]
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    engine, adapter = make_sweep(
+        paths,
+        [migrate_effect(paths, migrated_ledger(), mapping), triage_effect(plan)],
+    )
+    workspace_root, project_root = engine.workspace.root.resolve(), paths.project.resolve()
+    assert workspace_root != project_root
+    assert project_root not in workspace_root.parents
+    assert workspace_root not in project_root.parents
+    assert engine.run_dir.resolve().is_relative_to(project_root)
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.DONE
+    assert len(adapter.sessions) == 2  # migration completed, then triage ran
+    expected_records = {
+        engine.run_dir / "migrate-manifest.json",
+        engine.run_dir / "migrate-result.json",
+    }
+    assert set(paths.project.rglob("migrate-*.json")) == expected_records
+    assert list(elsewhere.rglob("migrate-*.json")) == []
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")

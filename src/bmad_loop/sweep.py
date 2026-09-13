@@ -3044,7 +3044,11 @@ class SweepEngine(Engine):
             for e in legacy
         ]
         manifest_path = self.run_dir / "migrate-manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        atomic_write_text_confined(
+            manifest_path,
+            json.dumps(manifest, indent=2),
+            confine_root=_project_of_run_dir(self.run_dir),
+        )
 
         feedback: Path | None = None
         while True:
@@ -3099,8 +3103,10 @@ class SweepEngine(Engine):
             if not errors:
                 advance(task, Phase.DONE)
                 self._save()
-                (self.run_dir / "migrate-result.json").write_text(
-                    json.dumps(result.result_json, indent=2), encoding="utf-8"
+                atomic_write_text_confined(
+                    self.run_dir / "migrate-result.json",
+                    json.dumps(result.result_json, indent=2),
+                    confine_root=_project_of_run_dir(self.run_dir),
                 )
                 # the ledger file: the migration rewrote the ledger
                 self._commit_ledger(
