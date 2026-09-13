@@ -7,8 +7,9 @@ write because each destination must still equal its baseline or intended bytes.
 Files are created privately (0600); modes and xattrs are not preserved. The
 check after staging is not a lock or atomic compare-and-swap: a noncooperating
 filesystem writer can still race the final check and replacement. On platforms
-without descriptor-relative reads, source and destination reads use the checked fallback and
-retain its check/read race.
+without descriptor-relative reads, source and destination reads plus destination
+pathname-identity observations use the checked fallback and retain its check/read
+race.
 """
 
 from __future__ import annotations
@@ -176,12 +177,58 @@ class _DestinationProbe(NamedTuple):
     matches_expected: bool
 
 
+class _FileIdentity(NamedTuple):
+    device: int
+    inode: int
+    regular: bool
+
+
+def _file_identity(metadata: os.stat_result) -> _FileIdentity | None:
+    inode = getattr(metadata, "st_ino", 0)
+    if not inode:
+        return None
+    return _FileIdentity(metadata.st_dev, inode, stat.S_ISREG(metadata.st_mode))
+
+
+def _destination_path_identity(root: Path, path: Path) -> _FileIdentity | None:
+    """Freshly observe one destination leaf without following a redirect."""
+    if not DIR_FD_ANCHORED_WRITES:
+        try:
+            _confined(root, path)
+        except PublicationError:
+            return None
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return None
+        return _file_identity(metadata)
+
+    parent_fd = open_dir_confined(root, path.parent)
+    if parent_fd is None:
+        return None
+    try:
+        try:
+            metadata = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        return _file_identity(metadata)
+    finally:
+        os.close(parent_fd)
+
+
+def _destination_still_names(root: Path, path: Path, opened: os.stat_result) -> bool:
+    """Whether a fresh confined lookup still names the opened regular file."""
+    opened_identity = _file_identity(opened)
+    return opened_identity is not None and _destination_path_identity(root, path) == opened_identity
+
+
 def _probe_destination(root: Path, path: Path, expected: bytes | None = None) -> _DestinationProbe:
     """Bound one destination probe to its opened size plus one growth check."""
     with _open_regular(root, path) as stream:
         if stream is None:
             return _DestinationProbe(observation=None, matches_expected=False)
-        opened_size = os.fstat(stream.fileno()).st_size
+        opened = os.fstat(stream.fileno())
+        opened_size = opened.st_size
         remaining = opened_size
         size = 0
         digest = hashlib.sha256()
@@ -203,7 +250,12 @@ def _probe_destination(root: Path, path: Path, expected: bytes | None = None) ->
         if extra:
             digest.update(extra)
             size += len(extra)
-        complete = remaining == 0 and not extra and os.fstat(stream.fileno()).st_size == size
+        complete = (
+            remaining == 0
+            and not extra
+            and os.fstat(stream.fileno()).st_size == size
+            and _destination_still_names(root, path, opened)
+        )
         observation = _DestinationObservation(
             size=size,
             digest=digest.hexdigest(),
@@ -225,7 +277,8 @@ def _destination_equals(root: Path, path: Path, expected: bytes) -> bool:
     with _open_regular(root, path) as stream:
         if stream is None:
             return False
-        if os.fstat(stream.fileno()).st_size != len(expected):
+        opened = os.fstat(stream.fileno())
+        if opened.st_size != len(expected):
             return False
         offset = 0
         while offset < len(expected):
@@ -236,6 +289,7 @@ def _destination_equals(root: Path, path: Path, expected: bytes) -> bool:
         return (
             not stream.read(_BOUNDED_READ_CHUNK_BYTES)
             and os.fstat(stream.fileno()).st_size == offset
+            and _destination_still_names(root, path, opened)
         )
 
 

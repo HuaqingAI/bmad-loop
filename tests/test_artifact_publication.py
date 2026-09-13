@@ -810,6 +810,115 @@ def test_destination_streaming_propagates_read_fault(publication_case, monkeypat
         publication._destination_equals(paths.implementation_artifacts, destination, b"expected")
 
 
+@pytest.mark.parametrize("fallback", [False, True], ids=["descriptor", "fallback"])
+@pytest.mark.parametrize("helper", ["observation", "equals"])
+@pytest.mark.parametrize("replacement", ["missing", "directory", "symlink"])
+def test_destination_streaming_rejects_detached_descriptor_shape(
+    publication_case, monkeypatch, fallback, helper, replacement
+):
+    _task, paths, _source = publication_case
+    if sys.platform == "win32":
+        pytest.skip("Windows refuses rename of an open destination")
+    if not fallback and not publication.DIR_FD_ANCHORED_WRITES:
+        pytest.skip("descriptor-relative reads are unavailable")
+    if fallback:
+        monkeypatch.setattr(publication, "DIR_FD_ANCHORED_WRITES", False)
+    root = paths.implementation_artifacts
+    destination = root / "detached.bin"
+    detached = root / "detached-old.bin"
+    expected = b"expected"
+    destination.write_bytes(expected)
+    open_regular = publication._open_regular
+    replaced = False
+
+    class ReplacingStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, size=-1):
+            nonlocal replaced
+            data = self.stream.read(size)
+            if not data and not replaced:
+                replaced = True
+                destination.rename(detached)
+                if replacement == "directory":
+                    destination.mkdir()
+                elif replacement == "symlink":
+                    destination.symlink_to(detached)
+            return data
+
+    @contextmanager
+    def replacing_open(root, path):
+        with open_regular(root, path) as stream:
+            yield None if stream is None else ReplacingStream(stream)
+
+    monkeypatch.setattr(publication, "_open_regular", replacing_open)
+
+    if helper == "observation":
+        observed = publication._destination_observation(root, destination)
+        assert observed is not None
+        assert not observed.complete
+    else:
+        assert not publication._destination_equals(root, destination, expected)
+    assert replaced
+    assert detached.read_bytes() == expected
+
+
+@pytest.mark.parametrize("helper", ["observation", "equals"])
+def test_destination_streaming_propagates_identity_fault(publication_case, monkeypatch, helper):
+    _task, paths, _source = publication_case
+    root = paths.implementation_artifacts
+    destination = root / "identity-fault.bin"
+    expected = b"expected"
+    destination.write_bytes(expected)
+
+    def faulting_identity(*_args):
+        raise OSError("destination identity fault")
+
+    monkeypatch.setattr(publication, "_destination_path_identity", faulting_identity)
+
+    with pytest.raises(OSError, match="destination identity fault"):
+        if helper == "observation":
+            publication._destination_observation(root, destination)
+        else:
+            publication._destination_equals(root, destination, expected)
+
+
+@pytest.mark.parametrize("inode_available", [True, False], ids=["zero", "unavailable"])
+def test_destination_streaming_rejects_indeterminate_inode(
+    publication_case, monkeypatch, inode_available
+):
+    _task, paths, _source = publication_case
+    root = paths.implementation_artifacts
+    destination = root / "indeterminate-inode.bin"
+    expected = b"expected"
+    destination.write_bytes(expected)
+    real_fstat = os.fstat
+
+    class IndeterminateInode:
+        def __init__(self, metadata):
+            self.st_dev = metadata.st_dev
+            self.st_mode = metadata.st_mode
+            self.st_size = metadata.st_size
+            if inode_available:
+                self.st_ino = 0
+
+    monkeypatch.setattr(os, "fstat", lambda fd: IndeterminateInode(real_fstat(fd)))
+    monkeypatch.setattr(
+        publication,
+        "_destination_path_identity",
+        lambda *_args: publication._file_identity(IndeterminateInode(destination.stat())),
+    )
+
+    observed = publication._destination_observation(root, destination)
+    assert observed is not None
+    assert not observed.complete
+    assert not publication._destination_equals(root, destination, expected)
+
+
 @pytest.mark.parametrize("case", ["idempotent", "authorized", "conflict"])
 def test_publication_destination_decisions_never_materialize_contents(
     publication_case, monkeypatch, case
@@ -893,6 +1002,75 @@ def test_initial_idempotence_probe_refuses_file_mutation(publication_case, monke
 
     assert mutated
     assert destination.read_bytes() != intended
+    assert not task.artifact_publication_complete
+
+
+@pytest.mark.parametrize("fallback", [False, True], ids=["descriptor", "fallback"])
+def test_initial_idempotence_probe_refuses_leaf_replacement(
+    publication_case, monkeypatch, fallback
+):
+    task, paths, source = publication_case
+    if sys.platform == "win32":
+        pytest.skip("Windows refuses rename of an open destination")
+    if not fallback and not publication.DIR_FD_ANCHORED_WRITES:
+        pytest.skip("descriptor-relative reads are unavailable")
+    if fallback:
+        monkeypatch.setattr(publication, "DIR_FD_ANCHORED_WRITES", False)
+    intended = b"intended"
+    report = source.implementation_artifacts / "report.bin"
+    report.write_bytes(intended)
+    bind_and_prepare(task, paths, source)
+    destination = paths.implementation_artifacts / "report.bin"
+    detached = paths.implementation_artifacts / "detached-report.bin"
+    replacement = b"operator replacement"
+    destination.write_bytes(intended)
+    open_regular = publication._open_regular
+    writer = publication.atomic_write_bytes_confined
+    replaced = False
+
+    class ReplacingStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, size=-1):
+            nonlocal replaced
+            data = self.stream.read(size)
+            if not data and not replaced:
+                replaced = True
+                destination.rename(detached)
+                destination.write_bytes(replacement)
+            return data
+
+    @contextmanager
+    def replacing_open(root, path):
+        with open_regular(root, path) as stream:
+            if stream is not None and path == destination:
+                yield ReplacingStream(stream)
+            else:
+                yield stream
+
+    monkeypatch.setattr(publication, "_open_regular", replacing_open)
+
+    def refuse_destination_write(path, data, **kwargs):
+        if path == destination:
+            pytest.fail("detached destination reached replacement")
+        writer(path, data, **kwargs)
+
+    monkeypatch.setattr(
+        publication,
+        "atomic_write_bytes_confined",
+        refuse_destination_write,
+    )
+
+    with pytest.raises(publication.PublicationError, match="destination conflict"):
+        publication.publish(task, paths)
+
+    assert replaced
+    assert destination.read_bytes() == replacement
+    assert detached.read_bytes() == intended
     assert not task.artifact_publication_complete
 
 
@@ -1006,6 +1184,65 @@ def test_post_write_visibility_refuses_file_mutation_during_read(
         publication.publish(task, paths)
 
     assert mutated
+    assert not task.artifact_publication_complete
+
+
+@pytest.mark.parametrize("fallback", [False, True], ids=["descriptor", "fallback"])
+def test_post_write_visibility_refuses_leaf_replacement(publication_case, monkeypatch, fallback):
+    task, paths, source = publication_case
+    if sys.platform == "win32":
+        pytest.skip("Windows refuses rename of an open destination")
+    if not fallback and not publication.DIR_FD_ANCHORED_WRITES:
+        pytest.skip("descriptor-relative reads are unavailable")
+    if fallback:
+        monkeypatch.setattr(publication, "DIR_FD_ANCHORED_WRITES", False)
+    intended = b"intended"
+    report = source.implementation_artifacts / "report.bin"
+    report.write_bytes(intended)
+    bind_and_prepare(task, paths, source)
+    destination = paths.implementation_artifacts / "report.bin"
+    detached = paths.implementation_artifacts / "detached-report.bin"
+    replacement = b"operator replacement"
+    open_regular = publication._open_regular
+    replaced = False
+
+    class ReplacingStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, size=-1):
+            nonlocal replaced
+            data = self.stream.read(size)
+            if not data and not replaced:
+                replaced = True
+                destination.rename(detached)
+                destination.write_bytes(replacement)
+            return data
+
+    @contextmanager
+    def replacing_open(root, path):
+        with open_regular(root, path) as stream:
+            if stream is not None and path == destination:
+                yield ReplacingStream(stream)
+            else:
+                yield stream
+
+    def write_then_check(path, data, **kwargs):
+        kwargs["_before_replace"]()
+        path.write_bytes(data)
+
+    monkeypatch.setattr(publication, "_open_regular", replacing_open)
+    monkeypatch.setattr(publication, "atomic_write_bytes_confined", write_then_check)
+
+    with pytest.raises(publication.PublicationError, match="not visible at destination"):
+        publication.publish(task, paths)
+
+    assert replaced
+    assert destination.read_bytes() == replacement
+    assert detached.read_bytes() == intended
     assert not task.artifact_publication_complete
 
 
