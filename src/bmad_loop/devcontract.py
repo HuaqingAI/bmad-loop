@@ -65,9 +65,9 @@ STATUS_LINE_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 # The bundle leg's artifact-only assertion (DW-273): an `Artifact only: true` /
-# `artifact_only: true` / `Artifact-only: true` line (any run of space/underscore/
-# hyphen between the words, case-insensitive) inside the SAME marker. It takes the
-# same bulleted/bolded label and value shapes `STATUS_LINE_RE` tolerates
+# `artifact_only: true` / `Artifact-only: true` line (a non-empty run of space/
+# underscore/hyphen between the words, case-insensitive) inside the SAME marker.
+# It takes the same bulleted/bolded label and value shapes `STATUS_LINE_RE` tolerates
 # (`**Artifact only:** **true**`, `- **Artifact only: true**`): every `**` is
 # optional and the closing one is consumed before the end-of-line anchor. Only
 # the literal value `true` ALONE on the line asserts — anchored to end of line so
@@ -81,7 +81,7 @@ STATUS_LINE_RE = re.compile(
 # read through `_artifact_only_asserted`, which skips a match inside a fenced
 # block (a pasted example within the marker).
 ARTIFACT_ONLY_LINE_RE = re.compile(
-    r"^[^\S\r\n]*(?:[-*][^\S\r\n]*)?(?:\*\*)?artifact[ _-]*only(?:\*\*)?[^\S\r\n]*:"
+    r"^[^\S\r\n]*(?:[-*][^\S\r\n]*)?(?:\*\*)?artifact[ _-]+only(?:\*\*)?[^\S\r\n]*:"
     r"(?:\*\*)?[^\S\r\n]*(?:\*\*)?[^\S\r\n]*true(?:\*\*)?[^\S\r\n]*$",
     re.IGNORECASE | re.MULTILINE,
 )

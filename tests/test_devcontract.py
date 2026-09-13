@@ -594,6 +594,22 @@ def test_synth_mints_artifact_only_from_a_genuine_session_authored_marker(tmp_pa
     assert rj["park_asserted"] is False  # a done marker is no park
 
 
+def test_synth_artifact_only_missing_separator_fails_closed(tmp_path):
+    """The public grammar requires a separator between ``Artifact`` and ``only``.
+
+    Ablation: restore ``[ _-]*`` in ``ARTIFACT_ONLY_LINE_RE`` and both assertions
+    fail because the concatenated label mints an artifact-only receipt again.
+    """
+    sp = _artifact_only_spec(tmp_path, line="Artifactonly: true")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert devcontract._artifact_only_asserted("Artifactonly: true") is False
+    assert rj is not None and rj["artifact_only"] is False
+
+
 def test_synth_artifact_only_balanced_bold_shapes_mint(tmp_path):
     """The advertised Status-like bold shapes include a closing delimiter after
     the value (`**Artifact only:** **true**`, `- **Artifact only: true**`); the
