@@ -5630,9 +5630,12 @@ class Engine:
             return ledger.relative_to(root).as_posix(), None
         except ValueError:
             try:
-                return ledger.resolve().relative_to(root.resolve()).as_posix(), None
-            except (OSError, RuntimeError) as e:
+                resolved_ledger = ledger.resolve()
+                resolved_root = root.resolve()
+            except (OSError, RuntimeError, ValueError) as e:
                 return None, e
+            try:
+                return resolved_ledger.relative_to(resolved_root).as_posix(), None
             except ValueError:
                 return None, None
 
@@ -5949,18 +5952,22 @@ class Engine:
         paths = self.workspace.paths
         root = paths.repo_root
         try:
-            rel = paths.deferred_work.resolve().relative_to(root.resolve())
-        except ValueError:
-            # The proof-of-work gate only sees the code tree, so a ledger outside it
-            # cannot satisfy the gate and needs no exclusion.
-            return ()
-        except (OSError, RuntimeError):
+            resolved_ledger = paths.deferred_work.resolve()
+            resolved_root = root.resolve()
+        except (OSError, RuntimeError, ValueError):
             # ProjectPaths are normalized when loaded. If filesystem resolution
             # nevertheless faults, keep a lexically in-tree ledger excluded:
             # uncertainty must not turn the engine's append into session proof.
             try:
                 rel = paths.deferred_work.relative_to(root)
             except ValueError:
+                return ()
+        else:
+            try:
+                rel = resolved_ledger.relative_to(resolved_root)
+            except ValueError:
+                # The proof-of-work gate only sees the code tree, so a ledger outside it
+                # cannot satisfy the gate and needs no exclusion.
                 return ()
         return (rel.as_posix(),)
 
@@ -7797,9 +7804,12 @@ class Engine:
         """
         repo = self.paths.repo_root
         try:
-            rel = ledger.resolve().relative_to(repo.resolve()).as_posix()
-        except (OSError, RuntimeError):
+            resolved_ledger = ledger.resolve()
+            resolved_repo = repo.resolve()
+        except (OSError, RuntimeError, ValueError):
             return False
+        try:
+            rel = resolved_ledger.relative_to(resolved_repo).as_posix()
         except ValueError:
             return True  # a proven external ledger is an advisory artifact
         if verify.path_tracked(repo, rel):
@@ -8128,11 +8138,14 @@ class Engine:
         was down, and nothing git holds could prove otherwise."""
         repo = self.paths.repo_root
         try:
-            rel = board.resolve().relative_to(repo.resolve()).as_posix()
+            resolved_board = board.resolve()
+            resolved_repo = repo.resolve()
+        except (OSError, RuntimeError, ValueError):
+            return True
+        try:
+            rel = resolved_board.relative_to(resolved_repo).as_posix()
         except ValueError:
             return False  # external board — never git's to commit in the first place
-        except (OSError, RuntimeError):
-            return True
         try:
             return rel in verify.dirty_paths(repo)
         except (verify.GitError, OSError, RuntimeError):

@@ -2802,6 +2802,23 @@ def test_harvest_gate_exclude_degrade_arm_is_rooted_on_the_code_tree(
     assert engine._harvest_gate_exclude(task) == ()
 
 
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("refused_operand", ["ledger", "repo-root"])
+def test_harvest_gate_value_error_family_resolution_fault_uses_lexical_exclusion(
+    project, monkeypatch, resolve_fault, refused_operand
+):
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.harvest_wrote_ledger = True
+    paths = engine.workspace.paths
+    refused = paths.deferred_work if refused_operand == "ledger" else paths.repo_root
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    assert engine._harvest_gate_exclude(task) == (
+        "_bmad-output/implementation-artifacts/deferred-work.md",
+    )
+
+
 def test_harvest_gate_exclude_names_the_prefixed_path_under_the_monorepo_shape(project):
     """The VALUE claim the two sibling rows above cannot make (DW-64).
 
@@ -15772,6 +15789,76 @@ def test_ledger_rel_derives_lexically_before_resolving(project, monkeypatch):
     assert engine._ledger_rel() == ("_bmad-output/implementation-artifacts/deferred-work.md", None)
     # and the anchor stays authoritative rather than degrading to no-anchor
     assert engine._ledger_baseline_text(task) == (_LedgerAnchor.BASELINE, committed)
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("refused_operand", ["ledger", "workspace-root"])
+def test_ledger_rel_value_error_family_resolution_fault_is_uncertain(
+    project, tmp_path, monkeypatch, resolve_fault, refused_operand
+):
+    from bmad_loop.workspace import Workspace
+
+    engine, _ = make_engine(project, [])
+    lexical_alias = tmp_path / "workspace-alias"
+    engine.workspace = Workspace(root=lexical_alias, paths=project)
+    ledger = project.deferred_work
+    refused = ledger if refused_operand == "ledger" else lexical_alias
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    rel, fault = engine._ledger_rel()
+
+    assert rel is None
+    assert fault is not None
+    assert type(fault) is type(resolve_fault)
+    assert fault.args == resolve_fault.args
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("refused_operand", ["ledger", "repo-root"])
+def test_harvest_carry_value_error_family_resolution_fault_cannot_degrade(
+    project, monkeypatch, resolve_fault, refused_operand
+):
+    engine, _ = make_engine(project, [])
+    ledger = project.deferred_work
+    refused = ledger if refused_operand == "ledger" else project.repo_root
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    assert engine._harvest_carry_commit_may_degrade(ledger) is False
+
+
+def test_harvest_carry_degrades_only_for_a_successfully_resolved_external_ledger(project, tmp_path):
+    engine, _ = make_engine(project, [])
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text("# Deferred Work\n", encoding="utf-8")
+
+    assert engine._harvest_carry_commit_may_degrade(ledger) is False
+    assert engine._harvest_carry_commit_may_degrade(tmp_path / "external-ledger.md") is True
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize("refused_operand", ["board", "repo-root"])
+def test_board_carry_value_error_family_resolution_fault_requires_ownership_proof(
+    project, monkeypatch, resolve_fault, refused_operand
+):
+    engine, _ = make_engine(project, [])
+    board = project.sprint_status
+    refused = board if refused_operand == "board" else project.repo_root
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    assert engine._board_carry_must_prove_ownership(board) is True
+
+
+def test_board_carry_distinguishes_in_repo_dirt_from_a_resolved_external_board(project, tmp_path):
+    engine, _ = make_engine(project, [])
+    board = project.sprint_status
+    write_sprint(project, {"1-1-a": "in-progress"})
+
+    assert engine._board_carry_must_prove_ownership(board) is True
+    git(project.project, "add", board.relative_to(project.project).as_posix())
+    git(project.project, "commit", "-q", "-m", "track sprint board")
+    assert engine._board_carry_must_prove_ownership(board) is False
+    assert engine._board_carry_must_prove_ownership(tmp_path / "external-board.yaml") is False
 
 
 def test_ledger_baseline_text_reads_the_committed_blob(project, monkeypatch):
