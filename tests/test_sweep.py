@@ -58,6 +58,7 @@ from bmad_loop.model import (
     RunState,
     StoryTask,
     TokenUsage,
+    VerifyOutcome,
 )
 from bmad_loop.policy import (
     AdapterPolicy,
@@ -23141,6 +23142,8 @@ def test_run_bundle_clears_superseded_bundle_state_on_divergent_adoption(
     task.defer_reason = "superseded bundle ran out of review budget"
     task.artifact_baseline = {"report.bin": "old-baseline"}
     task.artifact_destination = "/old/artifacts"
+    task.artifact_source_digests = {"report.bin": "old-accepted"}
+    task.artifact_acceptance_identity = "dev:4"
     task.artifact_payload = {"report.bin": "b2xk"}
     task.artifact_publication_complete = True
     task.resolved_redrive = True
@@ -23162,6 +23165,8 @@ def test_run_bundle_clears_superseded_bundle_state_on_divergent_adoption(
     assert task.defer_reason is None
     assert task.artifact_baseline is None
     assert task.artifact_destination is None
+    assert task.artifact_source_digests is None
+    assert task.artifact_acceptance_identity is None
     assert task.artifact_payload is None
     assert not task.artifact_publication_complete
     # a HUMAN resolved this task; that is not a claim about which spec it owns
@@ -24274,6 +24279,47 @@ def test_isolated_bundle_publishes_explicit_files_before_teardown(project, artif
         assert "change for dw-fix" in (project.project / "src.txt").read_text()
 
 
+def test_isolated_unignored_declaration_rides_git_while_ignored_spec_uses_payload(project):
+    ignore_before_commit(
+        project,
+        "_bmad-output/implementation-artifacts/spec-dw-fix.md",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ignore accepted bundle spec")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    expected = b"tracked through merge\x00\xff"
+
+    def dev(spec):
+        result = wt_bundle_dev(project)(spec)
+        paths = project.rebased(spec.cwd)
+        accepted = Path(result.result_json["spec_file"])
+        accepted.write_text(
+            accepted.read_text().replace("---\n", "---\nartifact_deliverables: [report.bin]\n", 1)
+        )
+        (paths.implementation_artifacts / "report.bin").write_bytes(expected)
+        return result
+
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), dev],
+        policy=isolated_policy(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix"]
+    assert task.artifact_source_digests is not None
+    assert set(task.artifact_source_digests) == {"spec-dw-fix.md"}
+    assert task.artifact_payload is not None
+    assert set(task.artifact_payload) == {"spec-dw-fix.md"}
+    assert (project.implementation_artifacts / "report.bin").read_bytes() == expected
+    assert verify.path_tracked(
+        project.repo_root,
+        "_bmad-output/implementation-artifacts/report.bin",
+    )
+
+
 def test_isolated_publication_conflict_retains_source_when_keep_failed_false(project):
     effect, _ = _ignored_publication_bundle(project, conflict=True)
     engine, _ = make_sweep(
@@ -24296,8 +24342,328 @@ def test_isolated_publication_conflict_retains_source_when_keep_failed_false(pro
     assert not Path(task.worktree_path).exists()
 
 
+def test_post_verification_source_writer_refuses_then_replays_without_a_session(
+    project, monkeypatch
+):
+    effect, _ = _ignored_publication_bundle(project)
+    engine, adapter = make_sweep(
+        project, [triage_effect(bundle_plan()), effect], policy=isolated_policy(keep_failed=False)
+    )
+    commit = engine._commit
+    wrote = False
+
+    def write_after_accepted_verification(task):
+        nonlocal wrote
+        if not wrote:
+            wrote = True
+            source = project.rebased(Path(task.worktree_path))
+            (source.implementation_artifacts / "report.bin").write_bytes(b"post-verify writer")
+        commit(task)
+
+    monkeypatch.setattr(engine, "_commit", write_after_accepted_verification)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix"]
+    accepted = dict(task.artifact_source_digests)
+    identity = task.artifact_acceptance_identity
+    assert identity is not None and accepted
+    assert task.artifact_payload is None
+    assert not (project.implementation_artifacts / "report.bin").exists()
+    assert Path(task.worktree_path).is_dir()
+    [refusal] = [
+        entry
+        for entry in engine.journal.entries()
+        if entry["kind"] == "artifact-publication-refused"
+    ]
+    assert "changed since accepted verification" in refusal["error"]
+
+    source = project.rebased(Path(task.worktree_path))
+    (source.implementation_artifacts / "report.bin").write_bytes(b"\xff\x00\r\ndeliverable")
+    resumed, resumed_adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert resumed_adapter.sessions == []
+    durable = resumed.state.tasks["dw-fix"]
+    assert durable.artifact_source_digests == accepted
+    assert durable.artifact_acceptance_identity == identity
+    assert (project.implementation_artifacts / "report.bin").read_bytes() == (
+        b"\xff\x00\r\ndeliverable"
+    )
+    assert durable.artifact_publication_complete
+    assert not Path(durable.worktree_path).exists()
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+
+
+def test_crash_replay_of_accepted_result_does_not_refresh_source_binding(project, monkeypatch):
+    effect, _ = _ignored_publication_bundle(project)
+    engine, _ = make_sweep(
+        project, [triage_effect(bundle_plan()), effect], policy=isolated_policy(keep_failed=False)
+    )
+
+    def crash_after_acceptance(_task):
+        raise RuntimeError("host died after accepted verification")
+
+    monkeypatch.setattr(engine, "_commit", crash_after_acceptance)
+    assert engine.run().crashed
+    task = engine.state.tasks["dw-fix"]
+    accepted = dict(task.artifact_source_digests)
+    identity = task.artifact_acceptance_identity
+    assert identity is not None and accepted
+    source = project.rebased(Path(task.worktree_path))
+    (source.implementation_artifacts / "report.bin").write_bytes(b"changed while down")
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    durable = resumed.state.tasks["dw-fix"]
+    assert durable.artifact_source_digests == accepted
+    assert durable.artifact_acceptance_identity == identity
+    assert durable.artifact_payload is None
+    assert not (project.implementation_artifacts / "report.bin").exists()
+    assert Path(durable.worktree_path).is_dir()
+    assert "changed since accepted verification" in summary.paused_reason
+
+
+def test_accepted_repair_refreshes_the_dev_source_binding(project, monkeypatch):
+    from bmad_loop import artifact_publication
+
+    dev, _ = _ignored_publication_bundle(project)
+
+    def review(spec):
+        paths = project.rebased(spec.cwd)
+        accepted = paths.implementation_artifacts / "spec-dw-fix.md"
+        accepted.write_text(
+            re.sub(r"(?m)^status: .*$", "status: done", accepted.read_text()),
+            encoding="utf-8",
+        )
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": "dw-fix",
+                "spec_file": str(accepted),
+                "baseline_commit": _spec_baseline(accepted),
+                "status": "done",
+                "followup_review_recommended": False,
+                "escalations": [],
+            },
+        )
+
+    def dev_with_passing_gate(spec):
+        result = dev(spec)
+        (spec.cwd / "verify-green").write_text("initial\n", encoding="utf-8")
+        return result
+
+    def review_breaks_gate(spec):
+        paths = project.rebased(spec.cwd)
+        (paths.implementation_artifacts / "report.bin").write_bytes(b"rejected review")
+        (spec.cwd / "verify-green").unlink()
+        return review(spec)
+
+    def repair_deliverable(spec):
+        paths = project.rebased(spec.cwd)
+        (paths.implementation_artifacts / "report.bin").write_bytes(b"repair accepted")
+        (spec.cwd / "verify-green").write_text("repaired\n", encoding="utf-8")
+        return SessionResult(
+            status="completed", result_json={"workflow": "auto-dev", "escalations": []}
+        )
+
+    policy = replace(
+        isolated_policy(),
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        verify=VerifyPolicy(commands=(_file_exists_cmd("verify-green"),)),
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(bundle_plan()),
+            dev_with_passing_gate,
+            review_breaks_gate,
+            repair_deliverable,
+            review,
+        ],
+        policy=policy,
+    )
+    bind_publication = engine._worktree_flow.bind_publication
+    accepted = []
+
+    def record_binding(task, source, identity):
+        bind_publication(task, source, identity)
+        accepted.append((identity, dict(task.artifact_source_digests)))
+
+    monkeypatch.setattr(engine._worktree_flow, "bind_publication", record_binding)
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert [identity for identity, _digests in accepted] == ["dev:0", "dev:2", "review:3"]
+    assert accepted[0][1]["report.bin"] == artifact_publication._digest(b"\xff\x00\r\ndeliverable")
+    assert accepted[1][1]["report.bin"] == artifact_publication._digest(b"repair accepted")
+    assert accepted[2][1]["report.bin"] == accepted[1][1]["report.bin"]
+    assert (project.implementation_artifacts / "report.bin").read_bytes() == b"repair accepted"
+
+
+def test_accepted_review_refreshes_the_dev_source_binding(project):
+    dev, _ = _ignored_publication_bundle(project)
+
+    def review_correction(spec):
+        paths = project.rebased(spec.cwd)
+        accepted = paths.implementation_artifacts / "spec-dw-fix.md"
+        (paths.implementation_artifacts / "report.bin").write_bytes(b"review accepted")
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": "dw-fix",
+                "spec_file": str(accepted),
+                "baseline_commit": _spec_baseline(accepted),
+                "status": "done",
+                "followup_review_recommended": False,
+                "escalations": [],
+            },
+        )
+
+    policy = replace(
+        isolated_policy(),
+        review=ReviewPolicy(enabled=True, trigger="always"),
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), dev, review_correction],
+        policy=policy,
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix"]
+    assert task.artifact_acceptance_identity == "review:1"
+    assert (project.implementation_artifacts / "report.bin").read_bytes() == b"review accepted"
+
+
+def test_final_no_session_review_gate_refreshes_provisional_dev_binding(project, monkeypatch):
+    dev, _ = _ignored_publication_bundle(project)
+    engine, _ = make_sweep(project, [triage_effect(bundle_plan()), dev], policy=isolated_policy())
+    verify_review = engine._verify_review
+    observed = {}
+
+    def accept_changed_bytes_at_final_gate(task):
+        observed["provisional_identity"] = task.artifact_acceptance_identity
+        observed["provisional_digests"] = dict(task.artifact_source_digests)
+        paths = project.rebased(Path(task.worktree_path))
+        (paths.implementation_artifacts / "report.bin").write_bytes(b"final gate accepted")
+        return verify_review(task)
+
+    monkeypatch.setattr(engine, "_verify_review", accept_changed_bytes_at_final_gate)
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix"]
+    assert observed["provisional_identity"] == "dev:0"
+    assert task.artifact_acceptance_identity == "review:dev:0"
+    assert task.artifact_source_digests != observed["provisional_digests"]
+    assert (project.implementation_artifacts / "report.bin").read_bytes() == (
+        b"final gate accepted"
+    )
+
+
+def test_final_binding_failure_is_durable_and_same_result_resume_cannot_refresh(
+    project, monkeypatch
+):
+    from bmad_loop import artifact_publication
+
+    dev, _ = _ignored_publication_bundle(project)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), dev],
+        policy=isolated_policy(keep_failed=False),
+    )
+    bind_armed = artifact_publication.bind_armed
+    calls = []
+
+    def fail_first_final_binding(task, *args, **kwargs):
+        calls.append(task.artifact_acceptance_identity)
+        if task.artifact_acceptance_identity == "review:dev:0":
+            raise artifact_publication.PublicationError("synthetic final binding fault")
+        return bind_armed(task, *args, **kwargs)
+
+    monkeypatch.setattr(artifact_publication, "bind_armed", fail_first_final_binding)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    saved = load_state(engine.run_dir).tasks["dw-fix"]
+    assert saved.artifact_acceptance_identity == "review:dev:0"
+    assert saved.artifact_source_digests is None
+    assert saved.artifact_payload is None
+    assert Path(saved.worktree_path).is_dir()
+    [refusal] = [
+        entry
+        for entry in engine.journal.entries()
+        if entry["kind"] == "artifact-publication-refused"
+    ]
+    assert "synthetic final binding fault" in refusal["error"]
+    assert calls == ["dev:0", "review:dev:0"]
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    durable = load_state(resumed.run_dir).tasks["dw-fix"]
+    assert durable.artifact_acceptance_identity == "review:dev:0"
+    assert durable.artifact_source_digests is None
+    assert durable.artifact_payload is None
+    assert Path(durable.worktree_path).is_dir()
+    assert calls == ["dev:0", "review:dev:0"]
+
+
+def test_legacy_unarmed_no_review_resume_refuses_without_losing_source(project, monkeypatch):
+    from bmad_loop.engine import RunPaused
+
+    engine, _ = make_sweep(project, [], policy=isolated_policy(keep_failed=False))
+    retained = project.project / "retained-source"
+    retained.mkdir()
+    task = StoryTask(
+        story_key="dw-fix",
+        epic=0,
+        phase=Phase.DEV_VERIFY,
+        dw_ids=["DW-1"],
+        worktree_path=str(retained),
+    )
+    engine.state.tasks[task.story_key] = task
+    monkeypatch.setattr(
+        verify,
+        "verify_review_bundle",
+        lambda *_args, **_kwargs: VerifyOutcome.passed(),
+    )
+
+    with pytest.raises(RunPaused) as raised:
+        engine._verify_review(task)
+
+    assert raised.value.stage == PAUSE_ESCALATION
+    assert task.artifact_acceptance_identity is None
+    assert task.artifact_source_digests is None
+    assert task.artifact_payload is None
+    assert retained.is_dir()
+    [refusal] = [
+        entry
+        for entry in engine.journal.entries()
+        if entry["kind"] == "artifact-publication-refused"
+    ]
+    assert "acceptance identity must be non-empty" in refusal["error"]
+
+
 @pytest.mark.parametrize("remedy", ["reduce", "raise-policy"])
-def test_isolated_oversize_pause_can_resume_without_redispatch(project, remedy):
+def test_isolated_oversize_provisional_binding_is_replaced_by_final_gate(project, remedy):
+    """A remedy is accepted by the distinct no-session final review boundary."""
     from bmad_loop import artifact_publication
 
     oversized = b"x" * (artifact_publication.DEFAULT_FILE_MAX_BYTES + 1)
@@ -24342,7 +24708,10 @@ def test_isolated_oversize_pause_can_resume_without_redispatch(project, remedy):
     assert not summary.paused and not summary.crashed
     assert adapter.sessions == []
     assert (project.implementation_artifacts / "report.bin").read_bytes() == expected
-    assert resumed.state.tasks["dw-fix"].artifact_publication_complete
+    durable = resumed.state.tasks["dw-fix"]
+    assert durable.artifact_source_digests is not None
+    assert durable.artifact_acceptance_identity == "review:dev:0"
+    assert durable.artifact_publication_complete
     assert not Path(task.worktree_path).exists()
 
 
@@ -24392,7 +24761,8 @@ def test_configured_per_file_limit_admits_exact_binary_mib(project):
     assert engine.state.tasks["dw-fix"].artifact_publication_complete
 
 
-def test_configured_aggregate_refusal_resumes_after_only_payload_limit_is_raised(project):
+def test_aggregate_provisional_binding_is_replaced_after_final_gate_policy_remedy(project):
+    """The final gate accepts the same dev record under its distinct identity."""
     aggregate_limit = 1_048_576
     effect, expected = _ignored_publication_bundle(
         project,
@@ -24437,7 +24807,10 @@ def test_configured_aggregate_refusal_resumes_after_only_payload_limit_is_raised
         len(expected["spec"]) + len((project.implementation_artifacts / "report.bin").read_bytes())
         == aggregate_limit + 1
     )
-    assert resumed.state.tasks["dw-fix"].artifact_publication_complete
+    durable = resumed.state.tasks["dw-fix"]
+    assert durable.artifact_source_digests is not None
+    assert durable.artifact_acceptance_identity == "review:dev:0"
+    assert durable.artifact_publication_complete
     assert not Path(task.worktree_path).exists()
 
 

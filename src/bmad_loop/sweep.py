@@ -2758,6 +2758,8 @@ class SweepEngine(Engine):
         task.bundle_closes_intended = []
         task.artifact_baseline = None
         task.artifact_destination = None
+        task.artifact_source_digests = None
+        task.artifact_acceptance_identity = None
         task.artifact_payload = None
         task.artifact_publication_complete = False
         task.spec_file = None
@@ -6700,12 +6702,15 @@ class SweepEngine(Engine):
                 kind="sweep-bundle-reclosed",
                 site="bundle-reclose-locked",
             )
-        return verify.verify_review_bundle(
+        outcome = verify.verify_review_bundle(
             task,
             self.workspace.paths,
             self.policy,
             on_results=self._review_command_sink(task),
         )
+        if outcome.ok:
+            self._accept_review_artifact_source(task)
+        return outcome
 
     def _operator_park_enabled(self) -> bool:
         # A bundle carries no sprint-status entry, so the pair a park is verified

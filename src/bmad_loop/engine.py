@@ -2017,12 +2017,49 @@ class Engine:
                 return index
         return None
 
+    def _current_review_session_index(self, task: StoryTask) -> int | None:
+        """Index of the newest review record for the current cycle."""
+        task_id = _session_task_id(task.story_key, "review", task.review_cycle, task.generation)
+        for index in range(len(task.sessions) - 1, -1, -1):
+            if task.sessions[index].task_id == task_id:
+                return index
+        return None
+
+    def _bind_accepted_artifact_source(self, task: StoryTask, identity: str) -> None:
+        """Bind isolated bundle deliverables at an accepted verify boundary."""
+        if not task.dw_ids or not task.worktree_path:
+            return
+        self._worktree_flow.bind_publication(task, self.workspace.paths, identity)
+
     def _accept_current_dev_session(self, task: StoryTask) -> None:
         """Latch the current dev or repair record as the accepted tree owner."""
         accepted_index = self._current_dev_session_index(task)
         if accepted_index is None:
             raise RuntimeError(f"accepted dev decision for {task.story_key} has no session record")
         task.accepted_dev_session_index = accepted_index
+        self._bind_accepted_artifact_source(task, f"dev:{accepted_index}")
+
+    def _accept_review_artifact_source(self, task: StoryTask) -> None:
+        """Bind the result whose final review verification just passed."""
+        if not task.dw_ids or not task.worktree_path:
+            return
+        if task.phase == Phase.REVIEW_VERIFY:
+            accepted_index = self._current_review_session_index(task)
+            if accepted_index is None:
+                raise RuntimeError(
+                    f"accepted review decision for {task.story_key} has no session record"
+                )
+            self._bind_accepted_artifact_source(task, f"review:{accepted_index}")
+            return
+        accepted_index = task.accepted_dev_session_index
+        if accepted_index is None:
+            self._bind_accepted_artifact_source(task, "")
+            return
+        # No separate review session ran, but this deterministic final review
+        # gate is still a newly accepted boundary. Derive a distinct identity
+        # from the append-only dev record so it supersedes the provisional dev
+        # binding once, while crash replay of this same gate stays idempotent.
+        self._bind_accepted_artifact_source(task, f"review:dev:{accepted_index}")
 
     def _accepted_dev_session_matches(self, task: StoryTask) -> bool:
         """Whether the current primary dev record owns the PROCEED receipt."""
@@ -6023,7 +6060,7 @@ class Engine:
         # targeted "done" and verify_dev asserted the board got there, so a board
         # now short of done is a review revoking that sign-off, not a stage never
         # reached (#334).
-        return verify.verify_review(
+        outcome = verify.verify_review(
             task,
             self.workspace.paths,
             self.policy,
@@ -6031,6 +6068,9 @@ class Engine:
             operator_park=self._operator_park_enabled(),
             on_results=self._review_command_sink(task),
         )
+        if outcome.ok:
+            self._accept_review_artifact_source(task)
+        return outcome
 
     def _review_prompt(self, task: StoryTask) -> str:
         # Re-invoking bmad-build-auto on a `done` spec resets review_loop_iteration

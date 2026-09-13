@@ -117,6 +117,8 @@ def _seed_run(
         dw_ids=["DW-1", "DW-2"],
         artifact_destination=HOME_PATH,
         artifact_baseline={"AcmeSecret.py": SHA},
+        artifact_source_digests={"AcmeSecret.py": SHA},
+        artifact_acceptance_identity="review:1",
         artifact_payload={"AcmeSecret.py": "cHJpdmF0ZSBhcnRpZmFjdCBieXRlcw=="},
     )
     task.record_session(

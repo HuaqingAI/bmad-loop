@@ -18,7 +18,7 @@ import hashlib
 import os
 import stat
 from pathlib import Path, PureWindowsPath
-from typing import BinaryIO, Literal
+from typing import BinaryIO, Literal, NamedTuple
 
 from . import verify
 from .bmadconfig import ProjectPaths
@@ -232,21 +232,25 @@ def capture(task: StoryTask, paths: ProjectPaths) -> None:
             walk(root)
     task.artifact_baseline = inventory
     task.artifact_destination = str(root)
+    task.artifact_source_digests = None
+    task.artifact_acceptance_identity = None
     task.artifact_payload = None
     task.artifact_publication_complete = False
 
 
-def prepare(
+class _SelectedSources(NamedTuple):
+    contents: dict[str, bytes]
+
+
+def _selected_sources(
     task: StoryTask,
-    paths: ProjectPaths,
     source: ProjectPaths,
     *,
+    allow_pending_tracked: bool = False,
     file_max_bytes: int = DEFAULT_FILE_MAX_BYTES,
     payload_max_bytes: int = DEFAULT_PAYLOAD_MAX_BYTES,
-) -> None:
-    """Freeze only explicit ignored regular deliverables from the accepted spec."""
-    if task.artifact_payload is not None:
-        return
+) -> _SelectedSources:
+    """Read the exact ignored selection under the shared admission rules."""
     if file_max_bytes < 1 or payload_max_bytes < 1:
         raise ValueError("artifact publication byte limits must be positive")
     if not task.spec_file:
@@ -267,8 +271,6 @@ def prepare(
         spec_tracked = verify.path_tracked(source.repo_root, repo_rel)
         if not spec_tracked:
             spec_ignored = verify.path_ignored(source.repo_root, spec)
-            if not spec_ignored:
-                raise PublicationError(f"artifact deliverable is not ignored: {spec}")
     spec_read_limit = min(file_max_bytes, payload_max_bytes)
     spec_data = _contents(spec_root, spec, max_bytes=spec_read_limit if spec_ignored else None)
     if spec_data is None:
@@ -301,11 +303,17 @@ def prepare(
         path = root / rel
         if verify.path_tracked(source.repo_root, path.relative_to(source.repo_root).as_posix()):
             continue  # tracked deliverables ride Git
-        if not verify.path_ignored(source.repo_root, path):
-            raise PublicationError(f"artifact deliverable is not ignored: {path}")
+        ignored = verify.path_ignored(source.repo_root, path)
         size = _file_size(root, path)
         if size is None:
             raise PublicationError(f"artifact deliverable is missing: {path}")
+        if not ignored:
+            if allow_pending_tracked:
+                # Binding runs before the orchestrator's final `git add -A`.
+                # Preparation must later prove this path became tracked; a path
+                # an embedded repository kept untracked must not vanish silently.
+                continue
+            raise PublicationError(f"artifact deliverable was not tracked by commit: {path}")
         if size > file_max_bytes:
             raise PublicationSizeError("file-limit", size, file_max_bytes, path=path)
         inputs.append((rel, path, size))
@@ -346,8 +354,82 @@ def prepare(
         raw_payload[rel] = data
         actual_total += len(data)
 
+    return _SelectedSources(raw_payload)
+
+
+def arm_binding(task: StoryTask, acceptance_identity: str) -> bool:
+    """Durably arm a distinct accepted result before any source bytes are read.
+
+    The caller must save immediately when this returns True. Re-arming the same
+    identity is forbidden: a crash replay must keep the original authority (or
+    the original refusal), never derive it again from potentially changed bytes.
+    """
+    if not acceptance_identity:
+        raise ValueError("artifact acceptance identity must be non-empty")
+    if task.artifact_acceptance_identity == acceptance_identity:
+        return False
+    task.artifact_acceptance_identity = acceptance_identity
+    task.artifact_source_digests = None
+    task.artifact_payload = None
+    task.artifact_publication_complete = False
+    return True
+
+
+def bind_armed(
+    task: StoryTask,
+    source: ProjectPaths,
+    *,
+    file_max_bytes: int = DEFAULT_FILE_MAX_BYTES,
+    payload_max_bytes: int = DEFAULT_PAYLOAD_MAX_BYTES,
+) -> None:
+    """Bind an already-armed newly accepted result to exact ignored bytes."""
+    if task.artifact_acceptance_identity is None:
+        raise PublicationError("artifact acceptance identity is missing")
+    if task.artifact_source_digests is not None:
+        return
+    selected = _selected_sources(
+        task,
+        source,
+        allow_pending_tracked=True,
+        file_max_bytes=file_max_bytes,
+        payload_max_bytes=payload_max_bytes,
+    )
+    task.artifact_source_digests = {rel: _digest(data) for rel, data in selected.contents.items()}
+
+
+def prepare(
+    task: StoryTask,
+    paths: ProjectPaths,
+    source: ProjectPaths,
+    *,
+    file_max_bytes: int = DEFAULT_FILE_MAX_BYTES,
+    payload_max_bytes: int = DEFAULT_PAYLOAD_MAX_BYTES,
+) -> None:
+    """Freeze ignored bytes only when they match final accepted verification."""
+    # A frozen payload is the durable publication intent, including legacy runs
+    # that predate accepted-source binding. Never reread its source on replay.
+    if task.artifact_payload is not None:
+        return
+    if task.artifact_acceptance_identity is None or task.artifact_source_digests is None:
+        raise PublicationError("accepted artifact source binding is missing")
+    selected = _selected_sources(
+        task,
+        source,
+        file_max_bytes=file_max_bytes,
+        payload_max_bytes=payload_max_bytes,
+    )
+    current = {rel: _digest(data) for rel, data in selected.contents.items()}
+    if current != task.artifact_source_digests:
+        differing = sorted(
+            rel
+            for rel in current.keys() | task.artifact_source_digests.keys()
+            if current.get(rel) != task.artifact_source_digests.get(rel)
+        )
+        raise PublicationError(
+            "artifact deliverables changed since accepted verification: " + ", ".join(differing)
+        )
     task.artifact_payload = {
-        rel: base64.b64encode(data).decode("ascii") for rel, data in raw_payload.items()
+        rel: base64.b64encode(data).decode("ascii") for rel, data in selected.contents.items()
     }
     # Store intended bytes even for a legacy task: refusal must retain recovery
     # material, and a later resume must never read changed source bytes as intent.

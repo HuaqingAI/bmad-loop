@@ -2709,6 +2709,61 @@ class WorktreeFlow:
                 f"artifact publication preparation failed: {exc}", task.story_key, cause=exc
             )
 
+    def bind_publication(
+        self, task: StoryTask, source: ProjectPaths, acceptance_identity: str
+    ) -> None:
+        """Persist final-verification source authority for one accepted result.
+
+        Arm and save the append-only session identity before reading source
+        bytes. If the process dies during the read, replay sees the same identity
+        with no digest map and refuses rather than blessing whatever bytes are
+        present after restart.
+        """
+        if task.artifact_acceptance_identity == acceptance_identity:
+            if task.artifact_source_digests is None:
+                exc = artifact_publication.PublicationError(
+                    "accepted artifact source binding is unavailable for replay"
+                )
+                self.journal.append(
+                    "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+                )
+                self._save()
+                self._pause(
+                    f"artifact publication binding failed: {exc}",
+                    task.story_key,
+                    cause=exc,
+                )
+            return
+        try:
+            artifact_publication.arm_binding(task, acceptance_identity)
+            self._save()
+            limits = self.policy.limits
+            artifact_publication.bind_armed(
+                task,
+                source,
+                file_max_bytes=limits.artifact_file_max_mb * 1_048_576,
+                payload_max_bytes=limits.artifact_payload_max_mb * 1_048_576,
+            )
+            self._save()
+        except artifact_publication.PublicationSizeError as exc:
+            self.journal.append(
+                "artifact-publication-refused",
+                story_key=task.story_key,
+                error=str(exc),
+                publication_cause=exc.cause,
+                measured_bytes=exc.measured_bytes,
+                limit_bytes=exc.limit_bytes,
+                measurement_is_lower_bound=exc.measurement_is_lower_bound,
+            )
+            self._save()
+            self._pause(f"artifact publication binding failed: {exc}", task.story_key, cause=exc)
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            self._save()
+            self._pause(f"artifact publication binding failed: {exc}", task.story_key, cause=exc)
+
     def finish_publication(self, task: StoryTask, unit: UnitWorkspace | None) -> None:
         """Publish and latch before successful teardown, including merge replay."""
         if task.dw_ids:

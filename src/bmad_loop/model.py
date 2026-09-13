@@ -311,6 +311,17 @@ class StoryTask:
     # means legacy/unarmed; an empty baseline proves all paths were absent.
     artifact_baseline: dict[str, str] | None = None
     artifact_destination: str | None = None
+    # Exact ignored source bytes accepted by deterministic verification, as
+    # relpath -> sha256. Separate from ``artifact_baseline`` (destination
+    # overwrite authority) and ``artifact_payload`` (frozen replay bytes).
+    # None means legacy/unarmed or an acceptance whose binding was refused; an
+    # empty mapping proves the accepted selection contained no ignored files.
+    artifact_source_digests: dict[str, str] | None = None
+    # Stable owner of ``artifact_source_digests``. Session-list indexes are
+    # append-only, unlike attempt/cycle counters after a human re-arm. The
+    # identity is persisted before source bytes are read so a crash in that
+    # window cannot replay the same accepted result and mint new authority.
+    artifact_acceptance_identity: str | None = None
     artifact_payload: dict[str, str] | None = None
     artifact_publication_complete: bool = False
     spec_file: str | None = None
@@ -483,6 +494,8 @@ class StoryTask:
             "isolated_ledger_carried": self.isolated_ledger_carried,
             "artifact_baseline": deepcopy(self.artifact_baseline),
             "artifact_destination": self.artifact_destination,
+            "artifact_source_digests": deepcopy(self.artifact_source_digests),
+            "artifact_acceptance_identity": self.artifact_acceptance_identity,
             "artifact_payload": deepcopy(self.artifact_payload),
             "artifact_publication_complete": self.artifact_publication_complete,
             "spec_file": self._serialized_worktree_path(self.spec_file),
@@ -588,6 +601,8 @@ class StoryTask:
         self.release_spec_paths_from_mount()
         self.artifact_baseline = None
         self.artifact_destination = None
+        self.artifact_source_digests = None
+        self.artifact_acceptance_identity = None
         self.artifact_payload = None
         self.artifact_publication_complete = False
         self.baseline_commit = None
@@ -714,6 +729,12 @@ class StoryTask:
             isolated_ledger_carried=bool(d.get("isolated_ledger_carried", False)),
             artifact_baseline=deepcopy(d.get("artifact_baseline")),
             artifact_destination=d.get("artifact_destination"),
+            artifact_source_digests=deepcopy(d.get("artifact_source_digests")),
+            artifact_acceptance_identity=(
+                str(d["artifact_acceptance_identity"])
+                if d.get("artifact_acceptance_identity") is not None
+                else None
+            ),
             artifact_payload=deepcopy(d.get("artifact_payload")),
             artifact_publication_complete=bool(d.get("artifact_publication_complete", False)),
             spec_file=d.get("spec_file"),

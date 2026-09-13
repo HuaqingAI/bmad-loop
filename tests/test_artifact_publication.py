@@ -14,6 +14,13 @@ from bmad_loop.journal import save_state
 from bmad_loop.model import RunState, StoryTask
 
 
+def bind_and_prepare(task, paths, source, **limits):
+    """Exercise the production sequence: arm, bind at acceptance, then freeze."""
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, source, **limits)
+    publication.prepare(task, paths, source, **limits)
+
+
 @pytest.fixture
 def publication_case(project, monkeypatch):
     source = project.rebased(project.project / "unit")
@@ -31,7 +38,7 @@ def publication_case(project, monkeypatch):
 def test_exact_selection_and_frozen_binary_payload(publication_case):
     task, paths, source = publication_case
     (source.implementation_artifacts / "unrelated.md").write_text("unrelated")
-    publication.prepare(task, paths, source)
+    bind_and_prepare(task, paths, source)
     (source.implementation_artifacts / "report.bin").write_bytes(b"later source edit")
     publication.publish(task, paths)
     assert (paths.implementation_artifacts / "report.bin").read_bytes() == b"\xff\x00\r\nreport"
@@ -42,12 +49,112 @@ def test_exact_selection_and_frozen_binary_payload(publication_case):
     assert task.artifact_publication_complete
 
 
+def test_binding_records_the_exact_ignored_selection_before_payload_freeze(publication_case):
+    task, paths, source = publication_case
+
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, source)
+
+    assert task.artifact_acceptance_identity == "dev:0"
+    assert task.artifact_source_digests == {
+        "report.bin": publication._digest(b"\xff\x00\r\nreport"),
+        "spec.md": publication._digest((source.implementation_artifacts / "spec.md").read_bytes()),
+    }
+    assert task.artifact_payload is None
+
+    publication.prepare(task, paths, source)
+    assert set(task.artifact_payload) == set(task.artifact_source_digests)
+
+
+def test_changed_accepted_bytes_refuse_before_any_payload_is_encoded(publication_case, monkeypatch):
+    task, paths, source = publication_case
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, source)
+    accepted = dict(task.artifact_source_digests)
+    (source.implementation_artifacts / "report.bin").write_bytes(b"post-verify writer")
+    monkeypatch.setattr(
+        publication.base64,
+        "b64encode",
+        lambda _data: pytest.fail("payload encoding started before binding comparison"),
+    )
+
+    with pytest.raises(publication.PublicationError, match="report\\.bin") as exc:
+        publication.prepare(task, paths, source)
+
+    assert "post-verify writer" not in str(exc.value)
+    assert accepted["report.bin"] not in str(exc.value)
+    assert task.artifact_source_digests == accepted
+    assert task.artifact_payload is None
+
+
+def test_declaration_set_drift_is_an_exact_mapping_mismatch(publication_case, monkeypatch):
+    task, paths, source = publication_case
+    spec = source.implementation_artifacts / "spec.md"
+    monkeypatch.setattr(
+        publication.verify,
+        "path_tracked",
+        lambda _repo, rel: rel.endswith("spec.md"),
+    )
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, source)
+    assert set(task.artifact_source_digests) == {"report.bin"}
+    spec.write_text("---\nstatus: done\nartifact_deliverables: []\n---\n")
+
+    with pytest.raises(publication.PublicationError, match="report\\.bin"):
+        publication.prepare(task, paths, source)
+
+    assert task.artifact_payload is None
+
+
+def test_added_ignored_path_is_named_by_complete_map_refusal(publication_case, monkeypatch):
+    task, paths, source = publication_case
+    spec = source.implementation_artifacts / "spec.md"
+    monkeypatch.setattr(
+        publication.verify,
+        "path_tracked",
+        lambda _repo, rel: rel.endswith("spec.md"),
+    )
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, source)
+    (source.implementation_artifacts / "added.bin").write_bytes(b"secret payload")
+    spec.write_text("---\nstatus: done\nartifact_deliverables: [report.bin, added.bin]\n---\n")
+
+    with pytest.raises(publication.PublicationError, match="added\\.bin") as exc:
+        publication.prepare(task, paths, source)
+
+    assert "report.bin" not in str(exc.value)
+    assert "secret payload" not in str(exc.value)
+
+
+def test_distinct_accepted_result_refreshes_binding_but_same_result_does_not(
+    publication_case,
+):
+    task, paths, source = publication_case
+    report = source.implementation_artifacts / "report.bin"
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, source)
+    first = dict(task.artifact_source_digests)
+    report.write_bytes(b"accepted repair")
+
+    assert publication.arm_binding(task, "dev:0") is False
+    publication.bind_armed(task, source)
+    assert task.artifact_source_digests == first
+    with pytest.raises(publication.PublicationError, match="changed since accepted verification"):
+        publication.prepare(task, paths, source)
+
+    assert publication.arm_binding(task, "dev:1") is True
+    publication.bind_armed(task, source)
+    assert task.artifact_source_digests != first
+    publication.prepare(task, paths, source)
+    assert base64.b64decode(task.artifact_payload["report.bin"]) == b"accepted repair"
+
+
 def test_default_per_file_limit_is_inclusive(publication_case):
     task, _paths, source = publication_case
     data = b"x" * publication.DEFAULT_FILE_MAX_BYTES
     (source.implementation_artifacts / "report.bin").write_bytes(data)
 
-    publication.prepare(task, _paths, source)
+    bind_and_prepare(task, _paths, source)
 
     assert base64.b64decode(task.artifact_payload["report.bin"]) == data
 
@@ -56,6 +163,12 @@ def test_default_per_file_limit_plus_one_refuses_before_encoding(publication_cas
     task, paths, source = publication_case
     report = source.implementation_artifacts / "report.bin"
     report.write_bytes(b"x" * (publication.DEFAULT_FILE_MAX_BYTES + 1))
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(
+        task,
+        source,
+        file_max_bytes=publication.DEFAULT_FILE_MAX_BYTES + 1,
+    )
     encoded = []
     monkeypatch.setattr(publication.base64, "b64encode", lambda data: encoded.append(data))
 
@@ -73,6 +186,8 @@ def test_implicit_spec_preliminary_read_obeys_smaller_aggregate_limit(publicatio
     task, paths, source = publication_case
     spec = source.implementation_artifacts / "spec.md"
     spec.write_bytes(b"---\nstatus: done\n---\n" + b"x" * 200)
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, source)
 
     with pytest.raises(publication.PublicationSizeError) as exc:
         publication.prepare(task, paths, source, file_max_bytes=300, payload_max_bytes=100)
@@ -87,7 +202,7 @@ def test_extreme_positive_limits_use_fixed_size_read_requests(publication_case):
     task, paths, source = publication_case
     extreme_legal_limit = sys.maxsize * 1_048_576
 
-    publication.prepare(
+    bind_and_prepare(
         task,
         paths,
         source,
@@ -117,6 +232,21 @@ def test_metadata_preflight_refuses_before_any_payload_read(publication_case, mo
             - publication.DEFAULT_FILE_MAX_BYTES
         )
         (source.implementation_artifacts / "z.bin").write_bytes(b"z" * (second + 1))
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(
+        task,
+        source,
+        file_max_bytes=(
+            publication.DEFAULT_FILE_MAX_BYTES + 1
+            if cause == "file-limit"
+            else publication.DEFAULT_FILE_MAX_BYTES
+        ),
+        payload_max_bytes=(
+            publication.DEFAULT_PAYLOAD_MAX_BYTES + 1
+            if cause == "payload-limit"
+            else publication.DEFAULT_PAYLOAD_MAX_BYTES
+        ),
+    )
     read = publication._contents
     preliminary_reads = 0
 
@@ -155,6 +285,12 @@ def test_default_aggregate_limit_counts_unique_ignored_inputs(publication_case, 
         encoded.append(len(data))
         return original_encode(data)
 
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(
+        task,
+        source,
+        payload_max_bytes=publication.DEFAULT_PAYLOAD_MAX_BYTES + over,
+    )
     monkeypatch.setattr(publication.base64, "b64encode", record_encode)
     if over:
         with pytest.raises(publication.PublicationSizeError) as exc:
@@ -183,7 +319,7 @@ def test_tracked_oversize_declaration_does_not_consume_payload_budget(
         lambda _repo, rel: rel.endswith("report.bin"),
     )
 
-    publication.prepare(task, paths, source)
+    bind_and_prepare(task, paths, source)
 
     assert set(task.artifact_payload) == {"spec.md"}
 
@@ -203,7 +339,7 @@ def test_tracked_oversize_implicit_spec_does_not_consume_payload_budget(
         lambda _repo, rel: rel.endswith("spec.md"),
     )
 
-    publication.prepare(task, paths, source)
+    bind_and_prepare(task, paths, source)
 
     assert set(task.artifact_payload) == {"report.bin"}
 
@@ -230,6 +366,8 @@ def test_growth_after_preflight_is_bounded_and_nothing_is_encoded(
         )
         report = source.implementation_artifacts / "z.bin"
         report.write_bytes(b"z" * remaining)
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, source)
     measured = publication._file_size
     grew = False
 
@@ -331,7 +469,7 @@ def test_late_declaration_does_not_capture_late_destination(publication_case):
     task, paths, source = publication_case
     destination = paths.implementation_artifacts / "report.bin"
     destination.write_bytes(b"operator")
-    publication.prepare(task, paths, source)
+    bind_and_prepare(task, paths, source)
     with pytest.raises(publication.PublicationError, match="conflict.*report.bin"):
         publication.publish(task, paths)
     assert destination.read_bytes() == b"operator"
@@ -352,14 +490,14 @@ def test_existing_baseline_allows_replace(publication_case, relative):
         f"---\nstatus: done\nartifact_deliverables: [{relative}]\n---\n"
     )
     publication.capture(task, paths)
-    publication.prepare(task, paths, source)
+    bind_and_prepare(task, paths, source)
     publication.publish(task, paths)
     assert destination.read_bytes() == b"\xff\x00\r\nreport"
 
 
 def test_partial_write_replays_saved_intent(publication_case, monkeypatch):
     task, paths, source = publication_case
-    publication.prepare(task, paths, source)
+    bind_and_prepare(task, paths, source)
     writer = publication.atomic_write_bytes_confined
 
     def interrupted(path, data, **kw):
@@ -405,7 +543,7 @@ def test_invalid_paths_refused(publication_case, declaration):
         f"---\nartifact_deliverables: ['{declaration}']\n---\n"
     )
     with pytest.raises(publication.PublicationError, match="invalid artifact|reserved"):
-        publication.prepare(task, paths, source)
+        bind_and_prepare(task, paths, source)
     assert task.artifact_payload is None
 
 
@@ -416,7 +554,7 @@ def test_malformed_list_refused(publication_case, declaration):
         f"---\nartifact_deliverables: {declaration}\n---\n"
     )
     with pytest.raises(publication.PublicationError):
-        publication.prepare(task, paths, source)
+        bind_and_prepare(task, paths, source)
 
 
 @pytest.mark.parametrize("kind", ["directory", "symlink", "parent-symlink", "missing"])
@@ -436,13 +574,34 @@ def test_nonregular_sources_refused(publication_case, kind):
             "---\nartifact_deliverables: [linked/report.bin]\n---\n"
         )
     with pytest.raises(publication.PublicationError):
-        publication.prepare(task, paths, source)
+        bind_and_prepare(task, paths, source)
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "symlink"])
+def test_future_tracked_declaration_still_validates_source_shape(
+    publication_case, monkeypatch, kind
+):
+    task, paths, source = publication_case
+    report = source.implementation_artifacts / "report.bin"
+    report.unlink()
+    if kind == "directory":
+        report.mkdir()
+    elif kind == "symlink":
+        report.symlink_to(source.implementation_artifacts / "spec.md")
+    monkeypatch.setattr(publication.verify, "path_tracked", lambda *_: False)
+    monkeypatch.setattr(publication.verify, "path_ignored", lambda *_: False)
+
+    with pytest.raises(publication.PublicationError, match="missing|regular file|symlink"):
+        bind_and_prepare(task, paths, source)
+
+    assert task.artifact_source_digests is None
+    assert task.artifact_payload is None
 
 
 def test_old_state_cannot_create_overwrite_authority(publication_case):
     task, paths, source = publication_case
     task.artifact_baseline = None
-    publication.prepare(task, paths, source)
+    bind_and_prepare(task, paths, source)
     with pytest.raises(publication.PublicationError, match="no pre-execution"):
         publication.publish(task, paths)
     assert task.artifact_payload is not None
@@ -451,7 +610,7 @@ def test_old_state_cannot_create_overwrite_authority(publication_case):
 
 def test_destination_symlink_refused_even_when_equal(publication_case):
     task, paths, source = publication_case
-    publication.prepare(task, paths, source)
+    bind_and_prepare(task, paths, source)
     destination = paths.implementation_artifacts / "report.bin"
     destination.symlink_to(source.implementation_artifacts / "report.bin")
     with pytest.raises(publication.PublicationError, match="symlink"):
@@ -461,7 +620,7 @@ def test_destination_symlink_refused_even_when_equal(publication_case):
 
 def test_destination_changed_during_git_probe_is_preserved(publication_case, monkeypatch):
     task, paths, source = publication_case
-    publication.prepare(task, paths, source)
+    bind_and_prepare(task, paths, source)
     destination = paths.implementation_artifacts / "report.bin"
 
     def operator_edit(*_):
@@ -477,7 +636,7 @@ def test_destination_changed_during_git_probe_is_preserved(publication_case, mon
 def test_tracked_deliverables_ride_git(publication_case, monkeypatch):
     task, paths, source = publication_case
     monkeypatch.setattr(publication.verify, "path_tracked", lambda *_: True)
-    publication.prepare(task, paths, source)
+    bind_and_prepare(task, paths, source)
     assert task.artifact_payload == {}
     publication.publish(task, paths)
     assert task.artifact_publication_complete
@@ -485,7 +644,7 @@ def test_tracked_deliverables_ride_git(publication_case, monkeypatch):
 
 def test_destination_that_becomes_tracked_is_refused(publication_case, monkeypatch):
     task, paths, source = publication_case
-    publication.prepare(task, paths, source)
+    bind_and_prepare(task, paths, source)
     destination = paths.implementation_artifacts / "report.bin"
     monkeypatch.setattr(publication.verify, "path_tracked", lambda *_: True)
     with pytest.raises(publication.PublicationError, match="became tracked"):
@@ -496,7 +655,7 @@ def test_destination_that_becomes_tracked_is_refused(publication_case, monkeypat
 
 def test_destination_that_becomes_unignored_is_refused(publication_case, monkeypatch):
     task, paths, source = publication_case
-    publication.prepare(task, paths, source)
+    bind_and_prepare(task, paths, source)
     destination = paths.implementation_artifacts / "report.bin"
     monkeypatch.setattr(publication.verify, "path_ignored", lambda *_: False)
     with pytest.raises(publication.PublicationError, match="no longer ignored"):
@@ -505,11 +664,43 @@ def test_destination_that_becomes_unignored_is_refused(publication_case, monkeyp
     assert not task.artifact_publication_complete
 
 
-def test_unignored_declaration_refused(publication_case, monkeypatch):
+def test_unignored_declaration_is_left_to_the_pending_git_commit(publication_case, monkeypatch):
     task, paths, source = publication_case
     monkeypatch.setattr(publication.verify, "path_ignored", lambda *_: False)
-    with pytest.raises(publication.PublicationError, match="not ignored"):
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, source)
+    assert task.artifact_source_digests == {}
+    monkeypatch.setattr(publication.verify, "path_tracked", lambda *_: True)
+    publication.prepare(task, paths, source)
+    assert task.artifact_payload == {}
+
+
+def test_unignored_untracked_declaration_must_be_tracked_by_preparation(
+    publication_case, monkeypatch
+):
+    task, paths, source = publication_case
+    nested = source.implementation_artifacts / "embedded"
+    (nested / ".git").mkdir(parents=True)
+    output = nested / "output.bin"
+    output.write_bytes(b"nested repository output")
+    (source.implementation_artifacts / "spec.md").write_text(
+        "---\nstatus: done\nartifact_deliverables: [embedded/output.bin]\n---\n"
+    )
+    monkeypatch.setattr(publication.verify, "path_tracked", lambda *_: False)
+    monkeypatch.setattr(
+        publication.verify,
+        "path_ignored",
+        lambda _repo, path: path.name == "spec.md",
+    )
+
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, source)
+    assert set(task.artifact_source_digests) == {"spec.md"}
+
+    with pytest.raises(publication.PublicationError, match="was not tracked.*embedded"):
         publication.prepare(task, paths, source)
+
+    assert task.artifact_payload is None
 
 
 def test_read_fault_retains_baseline_and_refuses_payload(publication_case, monkeypatch):
@@ -524,7 +715,7 @@ def test_read_fault_retains_baseline_and_refuses_payload(publication_case, monke
 
     monkeypatch.setattr(publication, "_contents", unreadable)
     with pytest.raises(OSError, match="unreadable"):
-        publication.prepare(task, paths, source)
+        bind_and_prepare(task, paths, source)
     assert task.artifact_baseline is not None
     assert task.artifact_payload is None
 
@@ -535,7 +726,7 @@ def test_accepted_spec_parent_traversal_refused_before_read(publication_case, mo
     escaped = source.project.parent / "escaped.md"
     escaped.write_text("---\nstatus: done\n---\n")
     with pytest.raises(publication.PublicationError, match="parent traversal"):
-        publication.prepare(task, paths, source)
+        bind_and_prepare(task, paths, source)
     assert task.artifact_payload is None
 
 
@@ -553,7 +744,7 @@ def test_malformed_frontmatter_refuses_publication_intent(publication_case, text
     task, paths, source = publication_case
     (source.implementation_artifacts / "spec.md").write_text(text)
     with pytest.raises(publication.PublicationError, match="invalid accepted spec frontmatter"):
-        publication.prepare(task, paths, source)
+        bind_and_prepare(task, paths, source)
     assert task.artifact_payload is None
 
 
@@ -564,7 +755,7 @@ def test_external_declaration_is_refused(publication_case, tmp_path):
     external = replace(source, implementation_artifacts=tmp_path / "external")
     external.implementation_artifacts.mkdir()
     with pytest.raises(publication.PublicationError, match="strictly inside"):
-        publication.prepare(task, paths, external)
+        bind_and_prepare(task, paths, external)
     assert task.artifact_payload is None
 
 
@@ -573,7 +764,7 @@ def test_destination_edit_during_fsync_refuses_replace(publication_case, monkeyp
     from bmad_loop import platform_util
 
     task, paths, source = publication_case
-    publication.prepare(task, paths, source)
+    bind_and_prepare(task, paths, source)
     destination = paths.implementation_artifacts / "report.bin"
     fsync = os.fsync
 
@@ -594,7 +785,7 @@ def test_destination_edit_during_fsync_refuses_replace(publication_case, monkeyp
 
 def test_publication_refuses_when_confined_write_is_not_visible(publication_case, monkeypatch):
     task, paths, source = publication_case
-    publication.prepare(task, paths, source)
+    bind_and_prepare(task, paths, source)
     destination = paths.implementation_artifacts / "report.bin"
 
     def detached_write(path, data, **kwargs):
@@ -668,5 +859,5 @@ def test_undecodable_accepted_spec_refuses_intent(publication_case):
     task, paths, source = publication_case
     (source.implementation_artifacts / "spec.md").write_bytes(b"---\nstatus: done\n\xff\n---\n")
     with pytest.raises(UnicodeDecodeError):
-        publication.prepare(task, paths, source)
+        bind_and_prepare(task, paths, source)
     assert task.artifact_payload is None
