@@ -7,7 +7,7 @@ write because each destination must still equal its baseline or intended bytes.
 Files are created privately (0600); modes and xattrs are not preserved. The
 check after staging is not a lock or atomic compare-and-swap: a noncooperating
 filesystem writer can still race the final check and replacement. On platforms
-without descriptor-relative reads, source reads use the checked fallback and
+without descriptor-relative reads, source and destination reads use the checked fallback and
 retain its check/read race.
 """
 
@@ -17,6 +17,8 @@ import base64
 import hashlib
 import os
 import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
 from typing import BinaryIO, Literal, NamedTuple
 
@@ -128,19 +130,22 @@ def _read_bytes(stream: BinaryIO, max_bytes: int | None) -> bytes:
     return b"".join(chunks)
 
 
-def _contents(root: Path, path: Path, *, max_bytes: int | None = None) -> bytes | None:
-    """Read a regular file, optionally stopping after one bounded sentinel byte."""
+@contextmanager
+def _open_regular(root: Path, path: Path) -> Iterator[BinaryIO | None]:
+    """Open one confined regular file without following its leaf on POSIX."""
     _confined(root, path)
     try:
         mode = path.lstat().st_mode
     except FileNotFoundError:
-        return None
+        yield None
+        return
     if not stat.S_ISREG(mode):
         raise PublicationError(f"artifact is not a regular file: {path}")
     if not DIR_FD_ANCHORED_WRITES:
         # checked fallback; no descriptor-relative API
         with path.open("rb") as stream:
-            return _read_bytes(stream, max_bytes)
+            yield stream
+        return
     parent_fd = open_dir_confined(root, path.parent)
     if parent_fd is None:
         raise PublicationError(f"artifact parent was redirected: {path}")
@@ -149,9 +154,89 @@ def _contents(root: Path, path: Path, *, max_bytes: int | None = None) -> bytes 
         with os.fdopen(fd, "rb") as stream:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 raise PublicationError(f"artifact is not a regular file: {path}")
-            return _read_bytes(stream, max_bytes)
+            yield stream
     finally:
         os.close(parent_fd)
+
+
+def _contents(root: Path, path: Path, *, max_bytes: int | None = None) -> bytes | None:
+    """Read a regular file, optionally stopping after one bounded sentinel byte."""
+    with _open_regular(root, path) as stream:
+        return None if stream is None else _read_bytes(stream, max_bytes)
+
+
+class _DestinationObservation(NamedTuple):
+    size: int
+    digest: str
+    complete: bool = True
+
+
+class _DestinationProbe(NamedTuple):
+    observation: _DestinationObservation | None
+    matches_expected: bool
+
+
+def _probe_destination(root: Path, path: Path, expected: bytes | None = None) -> _DestinationProbe:
+    """Bound one destination probe to its opened size plus one growth check."""
+    with _open_regular(root, path) as stream:
+        if stream is None:
+            return _DestinationProbe(observation=None, matches_expected=False)
+        opened_size = os.fstat(stream.fileno()).st_size
+        remaining = opened_size
+        size = 0
+        digest = hashlib.sha256()
+        matches_expected = expected is not None and opened_size == len(expected)
+        while remaining:
+            chunk = stream.read(min(_BOUNDED_READ_CHUNK_BYTES, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            if (
+                matches_expected
+                and expected is not None
+                and chunk != expected[size : size + len(chunk)]
+            ):
+                matches_expected = False
+            size += len(chunk)
+            remaining -= len(chunk)
+        extra = stream.read(_BOUNDED_READ_CHUNK_BYTES)
+        if extra:
+            digest.update(extra)
+            size += len(extra)
+        complete = remaining == 0 and not extra and os.fstat(stream.fileno()).st_size == size
+        observation = _DestinationObservation(
+            size=size,
+            digest=digest.hexdigest(),
+            complete=complete,
+        )
+        return _DestinationProbe(
+            observation=observation,
+            matches_expected=matches_expected and complete,
+        )
+
+
+def _destination_observation(root: Path, path: Path) -> _DestinationObservation | None:
+    """Stream one confined destination into a bounded size/digest observation."""
+    return _probe_destination(root, path).observation
+
+
+def _destination_equals(root: Path, path: Path, expected: bytes) -> bool:
+    """Compare a confined destination to expected bytes without materializing it."""
+    with _open_regular(root, path) as stream:
+        if stream is None:
+            return False
+        if os.fstat(stream.fileno()).st_size != len(expected):
+            return False
+        offset = 0
+        while offset < len(expected):
+            chunk = stream.read(min(_BOUNDED_READ_CHUNK_BYTES, len(expected) - offset))
+            if not chunk or chunk != expected[offset : offset + len(chunk)]:
+                return False
+            offset += len(chunk)
+        return (
+            not stream.read(_BOUNDED_READ_CHUNK_BYTES)
+            and os.fstat(stream.fileno()).st_size == offset
+        )
 
 
 def _file_size(root: Path, path: Path) -> int | None:
@@ -214,10 +299,12 @@ def capture(task: StoryTask, paths: ProjectPaths) -> None:
                         inventory[rel] = "directory"
                         walk(path)
                     elif stat.S_ISREG(mode):
-                        data = _contents(root, path)
-                        if data is None:
+                        observed = _destination_observation(root, path)
+                        if observed is None:
                             raise PublicationError(f"artifact disappeared during inventory: {path}")
-                        inventory[rel] = _digest(data)
+                        if not observed.complete:
+                            raise PublicationError(f"artifact changed during inventory: {path}")
+                        inventory[rel] = observed.digest
                     else:
                         inventory[rel] = "nonregular"
         finally:
@@ -451,13 +538,16 @@ def publish(task: StoryTask, paths: ProjectPaths) -> None:
     for rel, encoded in task.artifact_payload.items():
         path = root / _relative(rel)
         intended = base64.b64decode(encoded, validate=True)
-        current = _contents(root, path)
-        if current == intended:
+        probe = _probe_destination(root, path, intended)
+        if probe.matches_expected:
             continue
+        current = probe.observation
         if task.artifact_baseline is None:
             raise PublicationError(f"no pre-execution artifact baseline for {path}")
         before = (task.artifact_baseline or {}).get(rel)
-        now = None if current is None else _digest(current)
+        if current is not None and not current.complete:
+            raise PublicationError(f"artifact destination conflict: {path}")
+        now = None if current is None else current.digest
         if now != before:
             raise PublicationError(f"artifact destination conflict: {path}")
         if verify.path_tracked(paths.repo_root, path.relative_to(paths.repo_root).as_posix()):
@@ -466,16 +556,16 @@ def publish(task: StoryTask, paths: ProjectPaths) -> None:
             raise PublicationError(f"artifact destination is no longer ignored: {path}")
         _confined(root, path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        if _contents(root, path) != current:
+        if _destination_observation(root, path) != current:
             raise PublicationError(f"artifact destination changed during publication: {path}")
 
         def validate_destination() -> None:
-            if _contents(root, path) != current:
+            if _destination_observation(root, path) != current:
                 raise PublicationError(f"artifact destination changed during publication: {path}")
 
         atomic_write_bytes_confined(
             path, intended, confine_root=root, _before_replace=validate_destination
         )
-        if _contents(root, path) != intended:
+        if not _destination_equals(root, path, intended):
             raise PublicationError(f"published artifact is not visible at destination: {path}")
     task.artifact_publication_complete = True

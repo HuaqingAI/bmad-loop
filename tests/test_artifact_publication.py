@@ -1,11 +1,13 @@
 """Publication authority and byte preservation without involving receipt proof."""
 
 import base64
+import hashlib
 import json
 import os
 import sys
 import time
 import tracemalloc
+from contextlib import contextmanager
 
 import pytest
 
@@ -475,6 +477,565 @@ def test_late_declaration_does_not_capture_late_destination(publication_case):
     assert destination.read_bytes() == b"operator"
     assert not task.artifact_publication_complete
     assert task.artifact_payload is not None
+
+
+def test_large_destination_baseline_is_streamed_without_contents_materialization(
+    publication_case, monkeypatch
+):
+    task, paths, _source = publication_case
+    destination = paths.implementation_artifacts / "unrelated-large.bin"
+    block = b"baseline" * 8192
+    digest = hashlib.sha256()
+    with destination.open("wb") as stream:
+        for _ in range(192):
+            stream.write(block)
+            digest.update(block)
+    directory = paths.implementation_artifacts / "baseline-directory"
+    directory.mkdir()
+    link = paths.implementation_artifacts / "baseline-link"
+    link.symlink_to(destination)
+
+    monkeypatch.setattr(
+        publication,
+        "_contents",
+        lambda *_args, **_kwargs: pytest.fail("capture materialized destination contents"),
+    )
+    started_tracing = not tracemalloc.is_tracing()
+    if started_tracing:
+        tracemalloc.start()
+    traced_before = tracemalloc.get_traced_memory()[0]
+    try:
+        tracemalloc.reset_peak()
+        publication.capture(task, paths)
+        peak_growth = tracemalloc.get_traced_memory()[1] - traced_before
+    finally:
+        if started_tracing:
+            tracemalloc.stop()
+
+    assert task.artifact_baseline["unrelated-large.bin"] == digest.hexdigest()
+    assert task.artifact_baseline["baseline-directory"] == "directory"
+    assert task.artifact_baseline["baseline-link"] == "nonregular"
+    assert peak_growth < 2 * 1_048_576
+
+
+def test_destination_helpers_use_size_first_fixed_chunk_reads(publication_case, monkeypatch):
+    _task, paths, _source = publication_case
+    destination = paths.implementation_artifacts / "bounded.bin"
+    expected = b"a" * 96
+    destination.write_bytes(expected)
+    chunk_size = 32
+    requests = []
+    open_regular = publication._open_regular
+
+    class GuardedStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, size=-1):
+            requests.append(size)
+            assert 0 < size <= chunk_size
+            return self.stream.read(size)
+
+    @contextmanager
+    def guarded_open(root, path):
+        with open_regular(root, path) as stream:
+            yield None if stream is None else GuardedStream(stream)
+
+    monkeypatch.setattr(publication, "_BOUNDED_READ_CHUNK_BYTES", chunk_size)
+    monkeypatch.setattr(publication, "_open_regular", guarded_open)
+    monkeypatch.setattr(
+        publication,
+        "_contents",
+        lambda *_args, **_kwargs: pytest.fail("destination helper called _contents"),
+    )
+
+    observed = publication._destination_observation(paths.implementation_artifacts, destination)
+    assert observed == publication._DestinationObservation(
+        size=len(expected), digest=hashlib.sha256(expected).hexdigest()
+    )
+    assert requests == [chunk_size, chunk_size, chunk_size, chunk_size]
+
+    requests.clear()
+    assert publication._destination_equals(paths.implementation_artifacts, destination, expected)
+    assert requests == [chunk_size, chunk_size, chunk_size, chunk_size]
+
+    empty = paths.implementation_artifacts / "empty.bin"
+    empty.write_bytes(b"")
+    requests.clear()
+    assert publication._destination_equals(paths.implementation_artifacts, empty, b"")
+    assert requests == [chunk_size]
+
+    requests.clear()
+    assert not publication._destination_equals(
+        paths.implementation_artifacts, destination, expected + b"x"
+    )
+    assert requests == []
+
+    requests.clear()
+    assert not publication._destination_equals(
+        paths.implementation_artifacts, destination, b"z" + expected[1:]
+    )
+    assert requests == [chunk_size]
+
+
+def test_destination_observation_stops_after_one_growth_chunk(publication_case, monkeypatch):
+    _task, paths, _source = publication_case
+    destination = paths.implementation_artifacts / "continuous-growth.bin"
+    destination.write_bytes(b"x")
+    open_regular = publication._open_regular
+    requests = []
+
+    class GrowingStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, size=-1):
+            requests.append(size)
+            return b"g" * size
+
+    @contextmanager
+    def growing_open(root, path):
+        with open_regular(root, path) as stream:
+            yield None if stream is None else GrowingStream(stream)
+
+    monkeypatch.setattr(publication, "_open_regular", growing_open)
+
+    observed = publication._destination_observation(paths.implementation_artifacts, destination)
+
+    assert observed is not None
+    assert not observed.complete
+    assert requests == [1, publication._BOUNDED_READ_CHUNK_BYTES]
+
+
+def test_capture_refuses_incomplete_destination_observation(publication_case, monkeypatch):
+    task, paths, _source = publication_case
+    destination = paths.implementation_artifacts / "growing-capture.bin"
+    destination.write_bytes(b"x")
+    task.artifact_baseline = None
+    open_regular = publication._open_regular
+
+    class GrowingStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, size=-1):
+            return b"g" * size
+
+    @contextmanager
+    def growing_open(root, path):
+        with open_regular(root, path) as stream:
+            if stream is not None and path == destination:
+                yield GrowingStream(stream)
+            else:
+                yield stream
+
+    monkeypatch.setattr(publication, "_open_regular", growing_open)
+
+    with pytest.raises(publication.PublicationError, match="changed during inventory"):
+        publication.capture(task, paths)
+
+    assert task.artifact_baseline is None
+
+
+def test_capture_refuses_destination_truncated_before_first_read(publication_case, monkeypatch):
+    task, paths, _source = publication_case
+    destination = paths.implementation_artifacts / "truncated-capture.bin"
+    destination.write_bytes(b"operator baseline")
+    task.artifact_baseline = None
+    open_regular = publication._open_regular
+    mutated = False
+
+    class TruncatingStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, size=-1):
+            nonlocal mutated
+            if not mutated:
+                mutated = True
+                destination.write_bytes(b"")
+            return self.stream.read(size)
+
+    @contextmanager
+    def truncating_open(root, path):
+        with open_regular(root, path) as stream:
+            if stream is not None and path == destination:
+                yield TruncatingStream(stream)
+            else:
+                yield stream
+
+    monkeypatch.setattr(publication, "_open_regular", truncating_open)
+
+    with pytest.raises(publication.PublicationError, match="changed during inventory"):
+        publication.capture(task, paths)
+
+    assert mutated
+    assert task.artifact_baseline is None
+
+
+def test_large_exact_destination_publication_has_bounded_extra_allocation(
+    publication_case, monkeypatch
+):
+    task, paths, _source = publication_case
+    intended = b"visible" * (2 * 1_048_576)
+    destination = paths.implementation_artifacts / "report.bin"
+    destination.write_bytes(b"before")
+    publication.capture(task, paths)
+    task.artifact_payload = {"report.bin": "frozen-large-payload"}
+    monkeypatch.setattr(publication.base64, "b64decode", lambda *_args, **_kwargs: intended)
+    started_tracing = not tracemalloc.is_tracing()
+    if started_tracing:
+        tracemalloc.start()
+    traced_before = tracemalloc.get_traced_memory()[0]
+    try:
+        tracemalloc.reset_peak()
+        publication.publish(task, paths)
+        peak_growth = tracemalloc.get_traced_memory()[1] - traced_before
+    finally:
+        if started_tracing:
+            tracemalloc.stop()
+
+    assert task.artifact_publication_complete
+    assert peak_growth < 2 * 1_048_576
+
+
+@pytest.mark.parametrize("case", ["authorized", "conflict"])
+def test_large_baseline_publication_decisions_have_bounded_extra_allocation(publication_case, case):
+    task, paths, source = publication_case
+    destination = paths.implementation_artifacts / "report.bin"
+    large = b"operator" * (2 * 1_048_576)
+    if case == "authorized":
+        destination.write_bytes(large)
+        publication.capture(task, paths)
+    bind_and_prepare(task, paths, source)
+    if case == "conflict":
+        destination.write_bytes(large)
+    started_tracing = not tracemalloc.is_tracing()
+    if started_tracing:
+        tracemalloc.start()
+    traced_before = tracemalloc.get_traced_memory()[0]
+    try:
+        tracemalloc.reset_peak()
+        if case == "conflict":
+            with pytest.raises(publication.PublicationError, match="destination conflict"):
+                publication.publish(task, paths)
+        else:
+            publication.publish(task, paths)
+        peak_growth = tracemalloc.get_traced_memory()[1] - traced_before
+    finally:
+        if started_tracing:
+            tracemalloc.stop()
+
+    if case == "authorized":
+        assert destination.read_bytes() == b"\xff\x00\r\nreport"
+        assert task.artifact_publication_complete
+    else:
+        assert destination.read_bytes() == large
+        assert not task.artifact_publication_complete
+    assert peak_growth < 2 * 1_048_576
+
+
+@pytest.mark.parametrize("fallback", [False, True], ids=["descriptor", "fallback"])
+@pytest.mark.parametrize("kind", ["missing", "directory", "symlink", "parent-symlink"])
+def test_destination_streaming_preserves_shape_checks(
+    publication_case, monkeypatch, fallback, kind
+):
+    _task, paths, source = publication_case
+    if not fallback and not publication.DIR_FD_ANCHORED_WRITES:
+        pytest.skip("descriptor-relative reads are unavailable")
+    if fallback:
+        monkeypatch.setattr(publication, "DIR_FD_ANCHORED_WRITES", False)
+    root = paths.implementation_artifacts
+    destination = root / "shape.bin"
+    if kind == "directory":
+        destination.mkdir()
+    elif kind == "symlink":
+        destination.symlink_to(source.implementation_artifacts / "report.bin")
+    elif kind == "parent-symlink":
+        outside = paths.project / "outside-shape"
+        outside.mkdir()
+        (outside / "shape.bin").write_bytes(b"outside")
+        linked = root / "linked"
+        linked.symlink_to(outside, target_is_directory=True)
+        destination = linked / "shape.bin"
+
+    if kind == "missing":
+        assert publication._destination_observation(root, destination) is None
+        assert not publication._destination_equals(root, destination, b"")
+    else:
+        with pytest.raises(publication.PublicationError, match="symlink|regular file"):
+            publication._destination_observation(root, destination)
+        with pytest.raises(publication.PublicationError, match="symlink|regular file"):
+            publication._destination_equals(root, destination, b"outside")
+
+
+def test_destination_streaming_propagates_read_fault(publication_case, monkeypatch):
+    _task, paths, _source = publication_case
+    destination = paths.implementation_artifacts / "fault.bin"
+    destination.write_bytes(b"expected")
+    open_regular = publication._open_regular
+
+    class FaultingStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, _size=-1):
+            raise OSError("destination read fault")
+
+    @contextmanager
+    def faulting_open(root, path):
+        with open_regular(root, path) as stream:
+            yield None if stream is None else FaultingStream(stream)
+
+    monkeypatch.setattr(publication, "_open_regular", faulting_open)
+
+    with pytest.raises(OSError, match="destination read fault"):
+        publication._destination_observation(paths.implementation_artifacts, destination)
+    with pytest.raises(OSError, match="destination read fault"):
+        publication._destination_equals(paths.implementation_artifacts, destination, b"expected")
+
+
+@pytest.mark.parametrize("case", ["idempotent", "authorized", "conflict"])
+def test_publication_destination_decisions_never_materialize_contents(
+    publication_case, monkeypatch, case
+):
+    task, paths, source = publication_case
+    destination = paths.implementation_artifacts / "report.bin"
+    if case == "authorized":
+        destination.write_bytes(b"before")
+        publication.capture(task, paths)
+    bind_and_prepare(task, paths, source)
+    if case == "idempotent":
+        destination.write_bytes(b"\xff\x00\r\nreport")
+    elif case == "conflict":
+        destination.write_bytes(b"operator")
+    monkeypatch.setattr(
+        publication,
+        "_contents",
+        lambda *_args, **_kwargs: pytest.fail("publish materialized destination contents"),
+    )
+
+    if case == "conflict":
+        with pytest.raises(publication.PublicationError, match="conflict.*report.bin"):
+            publication.publish(task, paths)
+        assert destination.read_bytes() == b"operator"
+        assert not task.artifact_publication_complete
+    else:
+        publication.publish(task, paths)
+        assert destination.read_bytes() == b"\xff\x00\r\nreport"
+        assert task.artifact_publication_complete
+
+
+@pytest.mark.parametrize("mutation", ["grow", "shrink"])
+def test_initial_idempotence_probe_refuses_file_mutation(publication_case, monkeypatch, mutation):
+    task, paths, source = publication_case
+    report = source.implementation_artifacts / "report.bin"
+    intended = b"i" * (publication._BOUNDED_READ_CHUNK_BYTES * 2)
+    report.write_bytes(intended)
+    bind_and_prepare(task, paths, source)
+    destination = paths.implementation_artifacts / "report.bin"
+    destination.write_bytes(intended)
+    open_regular = publication._open_regular
+    mutated = False
+
+    class MutatingStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, size=-1):
+            nonlocal mutated
+            data = self.stream.read(size)
+            if data and not mutated:
+                mutated = True
+                if mutation == "grow":
+                    with destination.open("ab") as writer:
+                        writer.write(b"operator growth")
+                else:
+                    with destination.open("r+b") as writer:
+                        writer.truncate(0)
+            return data
+
+    @contextmanager
+    def mutating_open(root, path):
+        with open_regular(root, path) as stream:
+            if stream is not None and path == destination:
+                yield MutatingStream(stream)
+            else:
+                yield stream
+
+    monkeypatch.setattr(publication, "_open_regular", mutating_open)
+    monkeypatch.setattr(
+        publication,
+        "atomic_write_bytes_confined",
+        lambda *_args, **_kwargs: pytest.fail("unstable destination reached replacement"),
+    )
+
+    with pytest.raises(publication.PublicationError, match="destination conflict"):
+        publication.publish(task, paths)
+
+    assert mutated
+    assert destination.read_bytes() != intended
+    assert not task.artifact_publication_complete
+
+
+def test_growing_destination_between_observations_refuses_replace(publication_case, monkeypatch):
+    task, paths, source = publication_case
+    destination = paths.implementation_artifacts / "report.bin"
+    destination.write_bytes(b"before")
+    publication.capture(task, paths)
+    bind_and_prepare(task, paths, source)
+
+    def operator_growth(*_args):
+        with destination.open("ab") as stream:
+            stream.write(b"g" * (publication._BOUNDED_READ_CHUNK_BYTES * 3))
+        return False
+
+    monkeypatch.setattr(publication.verify, "path_tracked", operator_growth)
+    monkeypatch.setattr(
+        publication,
+        "atomic_write_bytes_confined",
+        lambda *_args, **_kwargs: pytest.fail("replacement staged before destination recheck"),
+    )
+    monkeypatch.setattr(
+        publication,
+        "_contents",
+        lambda *_args, **_kwargs: pytest.fail("publish materialized growing destination"),
+    )
+
+    with pytest.raises(publication.PublicationError, match="changed during publication"):
+        publication.publish(task, paths)
+
+    assert destination.read_bytes().startswith(b"before")
+    assert destination.stat().st_size > publication._BOUNDED_READ_CHUNK_BYTES
+    assert not task.artifact_publication_complete
+
+
+def test_initial_equality_and_baseline_identity_share_one_probe(publication_case, monkeypatch):
+    task, paths, source = publication_case
+    destination = paths.implementation_artifacts / "report.bin"
+    destination.write_bytes(b"before")
+    publication.capture(task, paths)
+    bind_and_prepare(task, paths, source)
+    destination.write_bytes(b"conflicting operator bytes")
+    probe_destination = publication._probe_destination
+    probes = 0
+
+    def probe_then_restore_baseline(root, path, expected=None):
+        nonlocal probes
+        result = probe_destination(root, path, expected)
+        if path == destination:
+            probes += 1
+            if probes == 1:
+                destination.write_bytes(b"before")
+        return result
+
+    monkeypatch.setattr(publication, "_probe_destination", probe_then_restore_baseline)
+
+    with pytest.raises(publication.PublicationError, match="destination conflict"):
+        publication.publish(task, paths)
+
+    assert probes == 1
+    assert destination.read_bytes() == b"before"
+    assert not task.artifact_publication_complete
+
+
+@pytest.mark.parametrize("mutation", ["grow", "shrink"])
+def test_post_write_visibility_refuses_file_mutation_during_read(
+    publication_case, monkeypatch, mutation
+):
+    task, paths, source = publication_case
+    bind_and_prepare(task, paths, source)
+    destination = paths.implementation_artifacts / "report.bin"
+    open_regular = publication._open_regular
+    mutated = False
+
+    class MutatingStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, size=-1):
+            nonlocal mutated
+            data = self.stream.read(size)
+            if data and not mutated:
+                mutated = True
+                if mutation == "grow":
+                    with destination.open("ab") as writer:
+                        writer.write(b"operator growth")
+                else:
+                    with destination.open("r+b") as writer:
+                        writer.truncate(0)
+            return data
+
+    @contextmanager
+    def mutating_open(root, path):
+        with open_regular(root, path) as stream:
+            if stream is not None and path == destination:
+                yield MutatingStream(stream)
+            else:
+                yield stream
+
+    def write_then_mutate(path, data, **kwargs):
+        kwargs["_before_replace"]()
+        path.write_bytes(data)
+
+    monkeypatch.setattr(publication, "_open_regular", mutating_open)
+    monkeypatch.setattr(publication, "atomic_write_bytes_confined", write_then_mutate)
+
+    with pytest.raises(publication.PublicationError, match="not visible at destination"):
+        publication.publish(task, paths)
+
+    assert mutated
+    assert not task.artifact_publication_complete
+
+
+@pytest.mark.parametrize(
+    "visible",
+    [None, b"short", b"\xff\x00\r\nreport-more", b"\x00\x00\r\nreport"],
+    ids=["missing", "truncated", "extended", "different"],
+)
+def test_visibility_check_streams_and_refuses_inexact_destination(
+    publication_case, monkeypatch, visible
+):
+    task, paths, source = publication_case
+    bind_and_prepare(task, paths, source)
+
+    def inexact_write(path, _data, **kwargs):
+        kwargs["_before_replace"]()
+        if visible is not None:
+            path.write_bytes(visible)
+
+    monkeypatch.setattr(publication, "atomic_write_bytes_confined", inexact_write)
+    monkeypatch.setattr(
+        publication,
+        "_contents",
+        lambda *_args, **_kwargs: pytest.fail("visibility check materialized destination"),
+    )
+
+    with pytest.raises(publication.PublicationError, match="not visible at destination"):
+        publication.publish(task, paths)
+
+    assert not task.artifact_publication_complete
 
 
 @pytest.mark.parametrize("relative", ["report.bin", "errata/correction.md"])
