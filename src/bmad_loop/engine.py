@@ -5363,7 +5363,9 @@ class Engine:
         own compare-and-set probe — and none of them is about to publish the
         text. The two reads that DO precede a publish (the harvest append and
         the isolated carry) call ``read_for_write`` directly and pause through
-        :meth:`_pause_for_ledger_repair` instead.
+        :meth:`_pause_for_ledger_repair` instead, except for a sweep's terminal
+        post-merge harvest carry, whose caller-sensitive dispatch selects the
+        sweep-owned story-gate repair route.
 
         Undecodable bytes DEGRADE to the typed :class:`_UndecodableLedger`
         (DW-231), which carries the raw bytes' digest so "did the ledger change"
@@ -7742,7 +7744,7 @@ class Engine:
         sprint-status.yaml, which shares no state with the deferred-work ledger, so
         the appends-before-closes contract has nothing to say about it.
         """
-        self._carry_harvested_deferrals(task)
+        self._carry_harvested_deferrals(task, terminal_composite=True)
         self._carry_story_deferred_closes(task)
         self._carry_board_advance(task)
 
@@ -7764,8 +7766,34 @@ class Engine:
             return False
         return rel not in verify.untracked_files(repo)
 
-    def _carry_harvested_deferrals(self, task: StoryTask) -> None:
-        """Re-file an isolated unit's harvested findings into the main ledger."""
+    def _pause_for_harvest_carry_repair(
+        self,
+        task: StoryTask,
+        ledger: Path,
+        error: str,
+        *,
+        site: str,
+        terminal_composite: bool,
+    ) -> NoReturn:
+        """Dispatch a harvested-carry read refusal to its owning run route.
+
+        The base route is deliberately invariant across call contexts: ordinary
+        story runs pause at escalation. ``SweepEngine`` may use the context bit to
+        redirect only the terminal post-merge composite carry; the direct
+        pre-terminal carry from :meth:`_defer` must retain this route.
+        """
+        self._pause_for_ledger_repair(task, ledger, error, site=site)
+
+    def _carry_harvested_deferrals(
+        self, task: StoryTask, *, terminal_composite: bool = False
+    ) -> None:
+        """Re-file an isolated unit's harvested findings into the main ledger.
+
+        ``terminal_composite`` identifies the call from
+        :meth:`_carry_isolated_ledger_writes`; direct defer and deferred-replay
+        calls leave it false so subclasses cannot mistake a pre-terminal carry
+        for the merged-unit recovery path.
+        """
         if not task.harvested_deferrals:
             return
         ledger = self.paths.deferred_work
@@ -7779,8 +7807,12 @@ class Engine:
         try:
             text = deferredwork.read_for_write(ledger) or ""
         except (deferredwork.LedgerReadError, OSError) as e:
-            self._pause_for_ledger_repair(
-                task, ledger, _ledger_fault_text(ledger, e), site="harvest-carry"
+            self._pause_for_harvest_carry_repair(
+                task,
+                ledger,
+                _ledger_fault_text(ledger, e),
+                site="harvest-carry",
+                terminal_composite=terminal_composite,
             )
         seen = deferredwork.parse_ledger(text)
         specs: list[deferredwork.EntrySpec] = []
@@ -7832,8 +7864,12 @@ class Engine:
         try:
             appended = deferredwork.append_entries(ledger, specs)
         except deferredwork.LedgerReadError as e:
-            self._pause_for_ledger_repair(
-                task, ledger, _ledger_fault_text(ledger, e), site="harvest-carry-append-locked"
+            self._pause_for_harvest_carry_repair(
+                task,
+                ledger,
+                _ledger_fault_text(ledger, e),
+                site="harvest-carry-append-locked",
+                terminal_composite=terminal_composite,
             )
         carried = [dw_id for dw_id in appended if dw_id]
         commit_needed = bool(carried) or task.harvest_carry_commit_pending

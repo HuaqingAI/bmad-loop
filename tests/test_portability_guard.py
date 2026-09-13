@@ -1258,20 +1258,21 @@ JOURNAL_KINDS = frozenset(
         # target before spawning any git for it.
         "sweep-bundle-close-carry-refused",
         "sweep-bundle-close-carry-uncommitted",
-        # DW-280. A bundle-close mutator's own locked read refused — undecodable
-        # bytes inside the window before `mark_done_many_reopenable`'s
-        # `read_for_write` — at one of the sweep's three sites (`site`, each
-        # ending in `-locked`: `bundle-close-locked` for the accepted-dev close,
-        # `bundle-reclose-locked` for the review-leg reclose,
-        # `bundle-close-carry-locked` for the isolated carry). Bare, the raise
-        # crashed the run; now the run PAUSES at the story gate on the task with
-        # its phase and `bundle_closes_intended` untouched, so `bmad-loop resume`
-        # re-drives the close. The sweep's own route beside
+        # DW-280/DW-286. A bundle-close mutator's own locked read refused at one
+        # of the sweep's three close sites (`bundle-close-locked`,
+        # `bundle-reclose-locked`, `bundle-close-carry-locked`), or the terminal
+        # post-merge harvested append refused at `harvest-carry` or
+        # `harvest-carry-append-locked`. Bare, these raises crashed or selected
+        # the engine escalation route; now the run PAUSES at the story gate on
+        # the task with its phase and carry intent untouched, so
+        # `bmad-loop resume` re-drives the composite carry. Direct pre-terminal
+        # sweep defer carries retain the engine route. The sweep's own row beside
         # `sweep-bundle-close-carry-refused`, not the engine's
         # `ledger-read-refused`. No new diagnostics routing: `story_key` is an
-        # alias, `dw_ids` (the ids the close was about to publish) is a keylist,
+        # alias, `dw_ids` (empty for the append, otherwise the ids the close was
+        # about to publish) is a keylist,
         # `site` and `ledger` are benign, and `reason` (the fixed token
-        # `ledger-unreadable`) and `error` (the decode detail) are both in
+        # `ledger-unreadable`) and `error` (the ledger-read fault detail) are both in
         # `diagnostics._JOURNAL_DROP_FIELDS`.
         "sweep-bundle-close-refused",
         "sweep-bundle-closed",

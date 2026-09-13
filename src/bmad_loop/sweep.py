@@ -5973,22 +5973,26 @@ class SweepEngine(Engine):
         *,
         site: str,
         dw_ids: list[str],
+        operation: Literal["bundle-close", "harvested-deferral-append"] = "bundle-close",
     ) -> NoReturn:
-        """Pause the run over a ledger a bundle-close mutator could not read under
-        its own lock (DW-280): journal `sweep-bundle-close-refused`, notify with
-        the RESUME route, save, and raise `RunPaused` at the story gate on the
-        task, its phase and `bundle_closes_intended` exactly as they were.
+        """Pause a sweep bundle over a ledger its terminal write could not read.
 
-        The sweep's own route for the two calls `Engine._pause_for_ledger_repair`
-        names as NOT covered — `_close_bundle_ledger_when_spec_status` (the
-        accepted-dev close and the review-leg reclose) and the sweep half of
+        Bundle-close mutators (DW-280) and the terminal post-merge harvested
+        append (DW-286) share ``sweep-bundle-close-refused``, the RESUME route,
+        and a story-gate pause. The operation argument keeps both the transient
+        notice and durable pause reason truthful while ``site`` remains the
+        machine-readable discriminator.
+
+        The close sites are `_close_bundle_ledger_when_spec_status` (the
+        accepted-dev close and review-leg reclose) and the sweep half of
         `_carry_isolated_ledger_writes`. Each is a bare
         `deferredwork.mark_done_many_reopenable`, and every mutator takes its own
         locked `read_for_write` ahead of every write, so a `LedgerReadError` from
         the call itself — including `LedgerReadFault` for OS metadata/text-read
-        faults since DW-279 — proves nothing flipped: the pause costs no work. `site`
-        ends in `-locked` like the engine's, and names which of the three calls
-        raised.
+        faults since DW-279 — proves nothing flipped: the pause costs no work.
+        The terminal harvest carry also arrives here from the engine dispatch at
+        either its pre-read or locked-append site. The direct pre-terminal defer
+        carry deliberately stays on the engine escalation route.
 
         NOT `_pause_on_intent_refusal`: that tail clears the task's baseline pair,
         which is right for a task whose attempt was already rolled back and wrong
@@ -6001,7 +6005,7 @@ class SweepEngine(Engine):
 
         PAUSE_STORY_GATE, not PAUSE_ESCALATION, for the reason `_pause_on_intent_refusal`
         gives: every escalation action requires Phase.ESCALATED, which none of the
-        three sites' tasks are (DEV_VERIFY, REVIEW_VERIFY, DONE), and the gate
+        affected tasks are (DEV_VERIFY, REVIEW_VERIFY, DONE), and the gate
         stage's single action is "resume", which is the whole remedy once the
         ledger reads again. `runs.unreadable_sweep_ledger` fronts that resume for
         the MAIN checkout's ledger — the in-place sites and the carry; under
@@ -6017,7 +6021,9 @@ class SweepEngine(Engine):
         arm, so the pause takes its restart arm — `_rollback_or_pause` resets the
         attempt to baseline (rollback policy governing) and the bundle is
         re-driven from dev, whose accepted close then lands. That last is the
-        pre-existing sweep resume shape, not widened here."""
+        pre-existing sweep resume shape, not widened here. A terminal harvested
+        append pauses at DONE and replays through the same unlatched-carry
+        pre-pass, which appends before attempting the close again."""
         self.journal.append(
             "sweep-bundle-close-refused",
             story_key=task.story_key,
@@ -6028,39 +6034,80 @@ class SweepEngine(Engine):
             error=error,
         )
         ids = ", ".join(dw_ids)
-        # `error` is `LedgerReadError`'s text and already begins with the ledger's
-        # path, so neither string names the path a second time (the engine's
-        # `_pause_for_ledger_repair` does the same). One wording for all three
-        # sites, no per-site branch. No "COMMIT the fix" steer, unlike
+        # `error` already begins with the ledger's path, so neither string names
+        # the path a second time. No "COMMIT the fix" steer, unlike
         # `_pause_on_intent_refusal`: at the accepted-dev site the session's
         # uncommitted work sits beside the ledger, and a whole-tree commit by hand
         # would swallow it under the repair. The bundle's own commit carries a
         # tracked ledger's repair once it lands.
+        if operation == "harvested-deferral-append":
+            attempted = "publish a harvested-deferral append"
+            resume_detail = (
+                "the harvested-deferral append and then the isolated bundle close "
+                "with no session spent"
+            )
+            paused_operation = "harvested-deferral append"
+        else:
+            attempted = (
+                f"publish a bundle close for {ids} "
+                "(a close, or a re-assertion of one after review)"
+            )
+            resume_detail = (
+                "the recorded dev result at the accepted-dev close and the isolated "
+                "carry with no session spent, and restarting the bundle from dev at "
+                "the review-leg reclose, rollback policy governing"
+            )
+            paused_operation = f"bundle close for {ids}"
         notice = (
             "**ACTION REQUIRED — deferred-work ledger unreadable**\n"
-            f"Bundle **{task.story_key}** was about to publish a ledger close for "
-            f"{ids} (a close, or a re-assertion of one after review), but the "
-            f"orchestrator could not decode the deferred-work ledger to publish it: "
+            f"Bundle **{task.story_key}** was about to {attempted}, but the "
+            "orchestrator could not read the deferred-work ledger to publish it: "
             f"{error}.\n"
             "This write did not land and no work was discarded. Repair the ledger by "
-            "hand (it must be valid UTF-8)"
+            "hand (it must be valid UTF-8, and the path's permissions or storage must "
+            "let it be read)"
         )
         gates.notify(
             self.policy,
             self.run_dir,
             f"ACTION REQUIRED: repair the deferred-work ledger for {task.story_key}",
             f"{notice} — then `bmad-loop resume {self.state.run_id}`, which re-drives "
-            "the write: replaying the recorded dev result at the accepted-dev close "
-            "and the isolated carry with no session spent, and restarting the bundle "
-            "from dev at the review-leg reclose, rollback policy governing",
+            f"{resume_detail}",
         )
         self._save()
         raise RunPaused(
-            f"bundle {task.story_key}: its ledger close for {ids} could not be "
-            f"published because the ledger could not be decoded ({error}); repair "
+            f"bundle {task.story_key}: its {paused_operation} could not be "
+            f"published because the ledger could not be read ({error}); repair "
             "the ledger by hand, then resume",
             PAUSE_STORY_GATE,
             task.story_key,
+        )
+
+    def _pause_for_harvest_carry_repair(
+        self,
+        task: StoryTask,
+        ledger: Path,
+        error: str,
+        *,
+        site: str,
+        terminal_composite: bool,
+    ) -> NoReturn:
+        """Use the sweep repair gate only for the terminal composite carry."""
+        if not terminal_composite:
+            super()._pause_for_harvest_carry_repair(
+                task,
+                ledger,
+                error,
+                site=site,
+                terminal_composite=terminal_composite,
+            )
+        self._pause_for_bundle_close_repair(
+            task,
+            ledger,
+            error,
+            site=site,
+            dw_ids=[],
+            operation="harvested-deferral-append",
         )
 
     def _ensure_bundle_intent(self, task: StoryTask) -> bool:
@@ -6521,8 +6568,11 @@ class SweepEngine(Engine):
         catches it). It now routes to ``_pause_for_bundle_close_repair`` under
         ``bundle-close-carry-locked``, the latch left False by the call site — so
         ``bmad-loop resume`` replays the whole hook through
-        ``_replay_unlatched_ledger_carries`` once the ledger reads. The base half's
-        harvest carry routes its own locked read through the engine (DW-259).
+        ``_replay_unlatched_ledger_carries`` once the ledger reads. Since DW-286
+        the base half's harvest carry routes both its pre-read and locked append
+        through the same sweep-owned story-gate repair route. The direct
+        pre-terminal carry from ``Engine._defer`` retains the engine escalation
+        route.
 
         A publication REFUSAL (DW-237) is best effort on strictly stronger terms.
         ``verify.unpublishable_target`` answers a different question from a

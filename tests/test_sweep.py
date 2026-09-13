@@ -51,7 +51,14 @@ from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.engine import RunPaused
 from bmad_loop.journal import Journal, load_state, save_state
-from bmad_loop.model import PAUSE_STORY_GATE, Phase, RunState, StoryTask, TokenUsage
+from bmad_loop.model import (
+    PAUSE_ESCALATION,
+    PAUSE_STORY_GATE,
+    Phase,
+    RunState,
+    StoryTask,
+    TokenUsage,
+)
 from bmad_loop.policy import (
     AdapterPolicy,
     DevPolicy,
@@ -3365,6 +3372,149 @@ def test_isolated_bundle_carry_files_the_harvest_before_closing_the_bundle(proje
     assert titles.count(_BUNDLE_HARVEST["summary"]) == 1
 
 
+@pytest.mark.parametrize(
+    ("fault_site", "expected_site", "commit_pending"),
+    [
+        ("pre-read", "harvest-carry", False),
+        ("locked-append", "harvest-carry-append-locked", True),
+    ],
+)
+def test_isolated_bundle_harvest_carry_pauses_at_story_gate_and_resumes_before_close(
+    project, monkeypatch, fault_site, expected_site, commit_pending
+):
+    """DW-286: both harvested-carry read windows use the terminal sweep route.
+
+    The merged bundle remains DONE and unlatched. Repair + resume replays the
+    composite carry with no sessions, appending the finding before closing the
+    bundle id. Ablating the sweep dispatch to the base implementation changes the
+    pause to escalation and emits ``ledger-read-refused``, reddening this test.
+    """
+    ignored_ledger(project, {"DW-1": "open"})
+    dev = wt_bundle_dev(project, deferred=[_BUNDLE_HARVEST])
+    if fault_site == "pre-read":
+
+        def dev_then_corrupt_main(spec):
+            result = dev(spec)
+            project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
+            return result
+
+        effect = dev_then_corrupt_main
+    else:
+        effect = dev
+        real_append = deferredwork.append_entries
+
+        def corrupt_main_then_append(ledger, *args, **kwargs):
+            if Path(ledger) == project.deferred_work:
+                Path(ledger).write_bytes(_UNDECODABLE_LEDGER)
+            return real_append(ledger, *args, **kwargs)
+
+        monkeypatch.setattr(deferredwork, "append_entries", corrupt_main_then_append)
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan(["DW-1"])), effect],
+        policy=isolated_seeded_policy(project),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+    assert engine.state.paused_stage == PAUSE_STORY_GATE
+    assert engine.state.paused_story_key == "dw-fix"
+    assert "harvested-deferral append" in summary.paused_reason
+    assert engine.state.paused_reason == summary.paused_reason
+    [paused_row] = _gate_pauses(engine)
+    assert paused_row["reason"] == summary.paused_reason
+    refused = _assert_bundle_close_pause(engine, "dw-fix", site=expected_site, dw_ids=[])
+    assert refused["site"] == expected_site
+    assert _records(engine, "run-crash") == []
+    assert _records(engine, "ledger-read-refused") == []
+    pause_kinds = journal_kinds(engine)
+    assert pause_kinds.index("unit-merged") < pause_kinds.index("sweep-bundle-close-refused")
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "harvested-deferral append" in attention
+    assert "permissions or storage" in attention
+    on_disk = load_state(engine.run_dir)
+    assert on_disk.paused_reason == summary.paused_reason
+    task = on_disk.tasks["dw-fix"]
+    assert task.phase == Phase.DONE
+    assert not task.isolated_ledger_carried
+    assert task.harvest_carry_commit_pending is commit_pending
+    assert task.bundle_closes_intended == ["DW-1"]
+    assert task.baseline_commit is not None
+    assert task.baseline_untracked is not None
+    assert task.worktree_path
+    assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER
+
+    monkeypatch.undo()
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert adapter.sessions == []
+    kinds = journal_kinds(resumed)
+    assert kinds.index("harvest-carried") < kinds.index("sweep-bundle-close-carried")
+    entries = ledger_entries(project)
+    assert entries["DW-1"].status.startswith("done")
+    assert [entry.title for entry in entries.values()].count(_BUNDLE_HARVEST["summary"]) == 1
+    assert load_state(resumed.run_dir).tasks["dw-fix"].isolated_ledger_carried
+
+
+@pytest.mark.parametrize(
+    ("fault_site", "expected_site", "commit_pending"),
+    [
+        ("pre-read", "harvest-carry", False),
+        ("locked-append", "harvest-carry-append-locked", True),
+    ],
+)
+def test_preterminal_sweep_defer_harvest_keeps_the_engine_repair_route(
+    project, monkeypatch, fault_site, expected_site, commit_pending
+):
+    """Both direct-defer read windows remain outside the terminal sweep route."""
+    from bmad_loop.engine import RunPaused
+
+    if fault_site == "pre-read":
+        project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
+    else:
+        project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+        real_append = deferredwork.append_entries
+
+        def corrupt_main_then_append(ledger, *args, **kwargs):
+            if Path(ledger) == project.deferred_work:
+                Path(ledger).write_bytes(_UNDECODABLE_LEDGER)
+            return real_append(ledger, *args, **kwargs)
+
+        monkeypatch.setattr(deferredwork, "append_entries", corrupt_main_then_append)
+    engine, _ = make_sweep(project, [], policy=isolated_seeded_policy(project))
+    task = StoryTask(
+        story_key="dw-fix",
+        epic=0,
+        harvested_deferrals=[
+            {
+                "origin": "spec-deferred abc123",
+                "title": _BUNDLE_HARVEST["summary"],
+                "reason": _BUNDLE_HARVEST["evidence"],
+                "location": _BUNDLE_HARVEST["location"],
+                "severity": _BUNDLE_HARVEST["severity"],
+                "source_spec": "spec-dw-fix.md",
+            }
+        ],
+    )
+    engine.state.tasks[task.story_key] = task
+    phase = task.phase
+
+    with pytest.raises(RunPaused) as raised:
+        engine._defer(task, "verification failed")
+
+    assert raised.value.stage == PAUSE_ESCALATION
+    assert task.phase == phase
+    assert task.harvest_carry_commit_pending is commit_pending
+    [refused] = _records(engine, "ledger-read-refused")
+    assert refused["site"] == expected_site
+    assert _records(engine, "sweep-bundle-close-refused") == []
+
+
 def test_isolated_bundle_close_replays_after_a_crash_between_the_carry_and_its_latch(project):
     """`isolated_ledger_carried` is latched by the CALL SITE, never by the base
     hook. A hook-side latch would be durable the moment the base half returned, so
@@ -4406,6 +4556,7 @@ def _assert_bundle_close_pause(engine, task_key, *, site, dw_ids, fault_mode="de
     attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
     assert "ACTION REQUIRED" in attention
     assert str(engine.paths.deferred_work) in attention
+    assert ("harvested-deferral append" if not dw_ids else "bundle close") in attention
     assert f"then `bmad-loop resume {engine.state.run_id}`" in attention
     assert "re-run `bmad-loop sweep`" not in attention  # the fresh-sweep route is wrong here
     return refused
@@ -4539,11 +4690,15 @@ def test_isolated_bundle_close_carry_pauses_when_the_main_ledger_is_undecodable_
     assert "sweep-bundle-close-carried" not in kinds
     assert engine.state.paused_stage == PAUSE_STORY_GATE
     assert engine.state.paused_story_key == "dw-fix"
+    assert "bundle close" in summary.paused_reason
     _assert_bundle_close_pause(
         engine, "dw-fix", fault_mode=fault_mode, site="bundle-close-carry-locked", dw_ids=["DW-1"]
     )
     assert project.deferred_work.read_bytes() == expected  # main: nothing flipped
-    paused = load_state(engine.run_dir).tasks["dw-fix"]
+    on_disk = load_state(engine.run_dir)
+    assert on_disk.paused_reason == summary.paused_reason
+    assert "bundle close" in on_disk.paused_reason
+    paused = on_disk.tasks["dw-fix"]
     assert paused.phase == Phase.DONE
     assert not paused.isolated_ledger_carried
     assert paused.bundle_closes_intended == ["DW-1"]

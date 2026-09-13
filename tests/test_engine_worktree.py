@@ -51,7 +51,7 @@ from bmad_loop.install import (
     MODULE_SKILLS,
 )
 from bmad_loop.journal import Journal, load_state, save_state
-from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
+from bmad_loop.model import PAUSE_ESCALATION, Phase, RunState, SessionRecord, StoryTask, TokenUsage
 from bmad_loop.policy import (
     GatesPolicy,
     LimitsPolicy,
@@ -2255,11 +2255,13 @@ def test_done_unit_carry_over_undecodable_main_ledger_pauses_and_resume_recarrie
 
     task = engine.state.tasks["1-1-a"]
     assert summary.paused and not summary.crashed
+    assert engine.state.paused_stage == PAUSE_ESCALATION
     assert task.phase == Phase.DONE and task.isolated_ledger_carried is False
     assert [item["title"] for item in task.harvested_deferrals] == [_HARVEST_CARRY["summary"]]
     (refused,) = _rows(engine, "ledger-read-refused")
     assert refused["site"] == "harvest-carry" and refused["story_key"] == "1-1-a"
     assert _harvest_carry_events(engine) == []
+    assert _rows(engine, "sweep-bundle-close-refused") == []
     assert "run-crash" not in journal_kinds(engine)
     assert project.deferred_work.read_bytes() == bad
 
