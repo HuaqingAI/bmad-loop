@@ -6278,6 +6278,107 @@ def test_finalize_commit_restores_original_chain_when_hook_mutates_validated_ind
     assert git(project.project, "show", "HEAD:src.txt") == "skill commit bytes"
 
 
+def test_finalize_commit_restores_original_chain_when_head_probe_fails(project, monkeypatch):
+    """The squash is not accepted until its HEAD identity is known; a failed
+    post-commit probe restores the skill chain and clean index without discarding
+    the accepted working-tree bytes staged by the one allowed add pass.
+
+    Ablation: move the post-commit ``rev_parse_head`` above the recovery ``try``;
+    the injected fault leaves the squash at HEAD and the accepted bytes staged.
+    """
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    path = repo / "src.txt"
+    path.write_text("skill commit bytes\n")
+    git(repo, "add", "--", "src.txt")
+    git(repo, "commit", "-q", "-m", "skill: implementation")
+    original_head = verify.rev_parse_head(repo)
+    path.write_text("accepted bytes\n")
+    marker = repo / "commit-hook-ran"
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nprintf ran > commit-hook-ran\n")
+    hook.chmod(0o755)
+
+    real_rev_parse_head = verify.rev_parse_head
+    rev_parse_calls = 0
+
+    def fail_second_head_probe(probe_repo):
+        nonlocal rev_parse_calls
+        rev_parse_calls += 1
+        if rev_parse_calls == 2:
+            raise RuntimeError("HEAD identity probe failed")
+        return real_rev_parse_head(probe_repo)
+
+    real_git = verify._git
+    git_calls = []
+
+    def spy_git(git_repo, *args):
+        git_calls.append(args)
+        return real_git(git_repo, *args)
+
+    monkeypatch.setattr(verify, "rev_parse_head", fail_second_head_probe)
+    monkeypatch.setattr(verify, "_git", spy_git)
+
+    with pytest.raises(RuntimeError, match="HEAD identity probe failed"):
+        verify.finalize_commit(repo, baseline, "story: via bmad-loop")
+
+    assert rev_parse_calls == 2
+    assert verify.rev_parse_head(repo) == original_head
+    assert git(repo, "diff", "--cached", "--quiet") == ""
+    assert git(repo, "show", "HEAD:src.txt") == "skill commit bytes"
+    assert path.read_text() == "accepted bytes\n"
+    assert marker.read_text() == "ran"
+    assert [args for args in git_calls if args[:1] == ("add",)] == [("add", "-A")]
+
+
+@pytest.mark.parametrize("raised_restore_fault", [False, True], ids=["nonzero", "raised"])
+def test_finalize_commit_reports_head_probe_and_restore_failures(
+    project, monkeypatch, raised_restore_fault
+):
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    (repo / "src.txt").write_text("skill commit bytes\n")
+    git(repo, "add", "--", "src.txt")
+    git(repo, "commit", "-q", "-m", "skill: implementation")
+    (repo / "src.txt").write_text("accepted bytes\n")
+
+    real_rev_parse_head = verify.rev_parse_head
+    rev_parse_calls = 0
+
+    def fail_second_head_probe(probe_repo):
+        nonlocal rev_parse_calls
+        rev_parse_calls += 1
+        if rev_parse_calls == 2:
+            raise RuntimeError("HEAD identity probe failed")
+        return real_rev_parse_head(probe_repo)
+
+    real_git = verify._git
+
+    def refuse_mixed_restore(git_repo, *args):
+        if args[:2] == ("reset", "--mixed"):
+            if raised_restore_fault:
+                raise verify.GitTimeoutError("restore timed out")
+            return 1, "restore refused"
+        return real_git(git_repo, *args)
+
+    monkeypatch.setattr(verify, "rev_parse_head", fail_second_head_probe)
+    monkeypatch.setattr(verify, "_git", refuse_mixed_restore)
+
+    with pytest.raises(
+        verify.GitError,
+        match=(
+            r"post-commit finalization failed \(RuntimeError: HEAD identity probe failed\); "
+            r"additionally failed to restore HEAD"
+        ),
+    ) as caught:
+        verify.finalize_commit(repo, baseline, "story: via bmad-loop")
+
+    expected_restore_diagnostic = "restore timed out" if raised_restore_fault else "restore refused"
+    assert expected_restore_diagnostic in str(caught.value)
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert str(caught.value.__cause__) == "HEAD identity probe failed"
+
+
 def test_staged_blob_oid_requires_an_exact_literal_stage_zero_blob(project):
     literal = project.project / "artifact[1].txt"
     neighbour = project.project / "artifact1.txt"

@@ -6985,10 +6985,11 @@ def finalize_commit(
 
     Mechanics: stage the working tree (`add -A`), invoke the optional exact-index
     validator, move HEAD back to `baseline` keeping that same index (`reset
-    --soft`), then commit the accumulated index without restaging. An optional
-    committed-tree validator detects hook or concurrent-index mutation and rolls
-    HEAD back to the original chain before refusing. The working tree is never
-    touched, so a failure leaves the chain intact.
+    --soft`), then commit the accumulated index without restaging. A post-commit
+    HEAD probe and optional committed-tree validator detect an uncertain commit
+    identity, hook mutation, or concurrent-index mutation and roll HEAD back to
+    the original chain before refusing. The rollback leaves working-tree contents
+    untouched, including changes made by hooks before the refusal.
 
     Residual-artifacts note (BMAD-METHOD #2563): the skill now commits every file
     of the reviewed diff and deliberately leaves unrelated `git status` residue
@@ -7028,22 +7029,26 @@ def finalize_commit(
                 f"to {original_head[:12]}: {restore_out}"
             )
         raise GitError(f"git commit failed: {out}")
-    committed_head = rev_parse_head(repo)
-    if committed_validator is not None:
-        try:
+    try:
+        committed_head = rev_parse_head(repo)
+        if committed_validator is not None:
             committed_validator(committed_head, staged_snapshot)
-        except BaseException as exc:
-            # Restore the accepted skill chain and its index while leaving the
-            # working tree untouched.  A soft reset would retain an ignored path
-            # that a hook force-added, making every replay fail staged validation
-            # even after the accepted bytes were restored.
+    except BaseException as exc:
+        # Restore the accepted skill chain and its index while leaving the
+        # working tree untouched.  A soft reset would retain an ignored path
+        # that a hook force-added, making every replay fail staged validation
+        # even after the accepted bytes were restored.
+        try:
             restore_rc, restore_out = _git(repo, "reset", "--mixed", original_head)
-            if restore_rc != 0:
-                raise GitError(
-                    "committed tree validation failed; additionally failed to restore "
-                    f"HEAD to {original_head[:12]}: {restore_out}"
-                ) from exc
-            raise
+        except GitError as restore_exc:
+            restore_rc, restore_out = 1, str(restore_exc)
+        if restore_rc != 0:
+            raise GitError(
+                f"post-commit finalization failed ({type(exc).__name__}: {exc}); "
+                "additionally failed to restore "
+                f"HEAD to {original_head[:12]}: {restore_out}"
+            ) from exc
+        raise
     return committed_head
 
 
