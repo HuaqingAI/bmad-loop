@@ -1734,11 +1734,46 @@ class Engine:
                 or publication_pending
             ):
                 continue
+            if task.dw_ids and merged_key in merged_units and task.integration_attempt is not None:
+                # unit-merged is written only after target validation.  A crash
+                # between that append and the following atomic state save may
+                # leave rollback authority behind; retire it without touching Git.
+                completed_attempt = task.integration_attempt
+                task.integration_attempt = None
+                self._save()
+                verify.discard_integration_state(self.run_dir, completed_attempt)
             if merged_key not in merged_units:
                 source = task.commit_sha or ""
                 started_key = (*merged_key, source)
-                replay_strategy = started_units.get(started_key)
-                if not source or replay_strategy is None:
+                attempt = task.integration_attempt if task.dw_ids else None
+                if attempt is not None:
+                    replay_strategy = (
+                        str(attempt.get("strategy", "")) if isinstance(attempt, dict) else ""
+                    )
+                    self.journal.append(
+                        "resume-unit-merge",
+                        story_key=task.story_key,
+                        branch=task.branch,
+                        target=self.state.target_branch,
+                        strategy=replay_strategy,
+                        source=source,
+                        operation_id=(
+                            str(attempt.get("operation_identity", ""))
+                            if isinstance(attempt, dict)
+                            else ""
+                        ),
+                    )
+                    self._merge_local(
+                        task,
+                        self._reopen_unit(task),
+                        replay=True,
+                        replay_strategy=replay_strategy,
+                    )
+                    merged_units.add(merged_key)
+                    replay_strategy = None
+                else:
+                    replay_strategy = started_units.get(started_key)
+                if merged_key not in merged_units and (not source or replay_strategy is None):
                     if not publication_pending:
                         continue
                     # Terminal bundle persisted before merge intent: integrate it

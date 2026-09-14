@@ -5,6 +5,8 @@ Exercised against the conftest `project` sandbox (a real git repo at
 helpers carry no engine wiring yet — they are the plumbing Phase 3 builds on.
 """
 
+import os
+import shutil
 import subprocess
 import sys
 
@@ -303,6 +305,958 @@ def test_merge_squash_no_merge_commit(project, tmp_path):
     assert (repo / "f.txt").exists() and (repo / "g.txt").exists()
     assert git(repo, "log", "--oneline", "--merges") == ""  # squash → linear history
     assert "squash feat" in git(repo, "log", "-1", "--pretty=%s")
+
+
+@pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
+def test_merge_operation_identity_resolves_exact_reflog_transition(project, tmp_path, strategy):
+    repo = project.project
+    wt = tmp_path / "receipt-wt"
+    verify.worktree_add(repo, wt, "receipt-feat", "main")
+    commit(wt, "receipt.txt", "feature\n", "receipt feature")
+    if strategy != "ff":
+        commit(repo, "target.txt", "target\n", "target advance")
+    old = verify.rev_parse_head(repo)
+    operation = f"operation-{strategy}"
+
+    verify.merge_branch(
+        repo,
+        "receipt-feat",
+        strategy=strategy,
+        message="ordinary message",
+        reflog_action=f"bmad-loop-integrate:{operation}",
+    )
+
+    update = verify.integration_ref_update(repo, "refs/heads/main", operation)
+    assert update is not None
+    assert update.old_revision == old
+    assert update.new_revision == verify.rev_parse_head(repo)
+
+
+def test_receipt_guarded_restore_preserves_unrelated_target_dirt(project, tmp_path):
+    repo = project.project
+    notes = repo / "operator-notes.txt"
+    notes.write_text("baseline\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "tracked operator notes")
+    wt = tmp_path / "restore-wt"
+    verify.worktree_add(repo, wt, "restore-feat", "main")
+    commit(wt, "feature.txt", "feature\n", "feature work")
+    old = verify.rev_parse_head(repo)
+    notes.write_text("unrelated dirt\n")
+    operation = "restore-operation"
+    verify.merge_branch(
+        repo,
+        "restore-feat",
+        strategy="merge",
+        reflog_action=f"bmad-loop-integrate:{operation}",
+    )
+    update = verify.integration_ref_update(repo, "refs/heads/main", operation)
+    assert update is not None
+
+    verify.restore_integration_ref(
+        repo,
+        "refs/heads/main",
+        old_revision=update.old_revision,
+        new_revision=update.new_revision,
+    )
+
+    assert verify.rev_parse_head(repo) == old
+    assert notes.read_text() == "unrelated dirt\n"
+    assert not (repo / "feature.txt").exists()
+
+
+def test_receipt_guarded_restore_never_discards_a_later_target_commit(project, tmp_path):
+    repo = project.project
+    wt = tmp_path / "moved-wt"
+    verify.worktree_add(repo, wt, "moved-feat", "main")
+    commit(wt, "feature.txt", "feature\n", "feature work")
+    operation = "moved-operation"
+    verify.merge_branch(
+        repo,
+        "moved-feat",
+        strategy="merge",
+        reflog_action=f"bmad-loop-integrate:{operation}",
+    )
+    update = verify.integration_ref_update(repo, "refs/heads/main", operation)
+    assert update is not None
+    commit(repo, "later.txt", "later\n", "later target commit")
+    later = verify.rev_parse_head(repo)
+
+    with pytest.raises(verify.IntegrationRestoreError, match="no restoration"):
+        verify.restore_integration_ref(
+            repo,
+            "refs/heads/main",
+            old_revision=update.old_revision,
+            new_revision=update.new_revision,
+        )
+
+    assert verify.rev_parse_head(repo) == later
+    assert (repo / "later.txt").read_text() == "later\n"
+
+
+def test_receipt_restore_cas_preserves_commit_winning_after_checkout_preparation(
+    project, tmp_path, monkeypatch
+):
+    repo = project.project
+    wt = tmp_path / "cas-race-wt"
+    verify.worktree_add(repo, wt, "cas-race-feat", "main")
+    commit(wt, "feature.txt", "feature\n", "feature work")
+    operation = "cas-race-operation"
+    verify.merge_branch(
+        repo,
+        "cas-race-feat",
+        strategy="merge",
+        reflog_action=f"bmad-loop-integrate:{operation}",
+    )
+    update = verify.integration_ref_update(repo, "refs/heads/main", operation)
+    assert update is not None
+    real_git = verify._git
+    raced = []
+
+    def concurrent_commit_before_cas(r, *args):
+        if args[:2] == ("update-ref", "-m") and not raced:
+            tree = git(repo, "rev-parse", f"{update.new_revision}^{{tree}}")
+            later = git(
+                repo,
+                "commit-tree",
+                tree,
+                "-p",
+                update.new_revision,
+                "-m",
+                "concurrent target commit",
+            )
+            git(repo, "update-ref", "refs/heads/main", later, update.new_revision)
+            raced.append(later)
+        return real_git(r, *args)
+
+    monkeypatch.setattr(verify, "_git", concurrent_commit_before_cas)
+
+    with pytest.raises(verify.IntegrationRestoreError, match="later commit was preserved"):
+        verify.restore_integration_ref(
+            repo,
+            "refs/heads/main",
+            old_revision=update.old_revision,
+            new_revision=update.new_revision,
+        )
+
+    assert raced
+    assert verify.ref_revision(repo, "refs/heads/main") == raced[0]
+    assert git(repo, "cat-file", "-t", raced[0]) == "commit"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows paths are Unicode")
+def test_receipt_restore_round_trips_non_utf8_changed_path(project):
+    repo = project.project
+    name = os.fsdecode(b"artifact-\xff.bin")
+    artifact = repo / name
+    artifact.write_bytes(b"old\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "non-utf8 baseline")
+    old = verify.rev_parse_head(repo)
+    artifact.write_bytes(b"integrated\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "non-utf8 integration")
+    new = verify.rev_parse_head(repo)
+
+    verify.restore_integration_ref(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+    )
+
+    assert verify.rev_parse_head(repo) == old
+    assert artifact.read_bytes() == b"old\n"
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+
+
+def test_receipt_sidecars_restore_bytes_trackedness_absence_and_dirty_state(project, tmp_path):
+    repo = project.project
+    tracked = repo / "tracked-dirt.txt"
+    feature = repo / "feature.txt"
+    tracked.write_bytes(b"tracked baseline\n")
+    feature.write_bytes(b"feature baseline\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "receipt baseline")
+    tracked.write_bytes(b"operator tracked dirt\x00")
+    ignored = repo / "ignored.bin"
+    ignored.write_bytes(b"operator ignored bytes\xff")
+    absent = repo / "missing-parent" / "expected-absent.bin"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    operation = "a" * 32
+    snapshots, submodules = verify.capture_integration_state(
+        repo,
+        run_dir,
+        operation,
+        ("tracked-dirt.txt", "ignored.bin", "missing-parent/expected-absent.bin"),
+    )
+    old = verify.rev_parse_head(repo)
+    feature.write_bytes(b"integrated feature\n")
+    git(repo, "add", "--", feature)
+    git(repo, "commit", "-q", "-m", "integrated target")
+    new = verify.rev_parse_head(repo)
+    tracked.write_bytes(b"hook rewrite\n")
+    ignored.write_bytes(b"hook ignored rewrite\n")
+    absent.parent.mkdir()
+    absent.write_bytes(b"hook created\n")
+    git(repo, "add", "-f", "--", tracked, ignored)
+
+    verify.restore_integration_ref(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+    )
+
+    assert verify.rev_parse_head(repo) == old
+    assert tracked.read_bytes() == b"operator tracked dirt\x00"
+    assert ignored.read_bytes() == b"operator ignored bytes\xff"
+    assert git(repo, "ls-files", "--", "ignored.bin") == ""
+    assert not absent.exists()
+    assert feature.read_bytes() == b"feature baseline\n"
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+    assert git(repo, "diff", "--name-only") == "tracked-dirt.txt"
+    assert verify.integration_restoration_complete(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+    )
+    absent.parent.mkdir()
+    absent.write_bytes(b"reappeared after restore")
+    assert not verify.integration_restoration_complete(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+    )
+
+
+def test_receipt_snapshot_metadata_stays_bounded_for_large_target_file(project, tmp_path):
+    target = project.project / "large.bin"
+    target.write_bytes(b"x" * (2 * 1024 * 1024))
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    snapshots, _submodules = verify.capture_integration_state(
+        project.project, run_dir, "b" * 32, ("large.bin",)
+    )
+
+    [entry] = snapshots
+    assert entry["size"] == 2 * 1024 * 1024
+    assert len(repr(entry)) < 500
+    sidecar = run_dir / str(entry["sidecar"])
+    assert sidecar.stat().st_size == 2 * 1024 * 1024
+
+
+def test_receipt_capture_enforces_aggregate_sidecar_limit_before_mutation(project, tmp_path):
+    repo = project.project
+    (repo / "one.bin").write_bytes(b"a" * 8)
+    (repo / "two.bin").write_bytes(b"b" * 8)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    operation = "9" * 32
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="aggregate artifact payload"):
+        verify.capture_integration_state(
+            repo,
+            run_dir,
+            operation,
+            ("one.bin", "two.bin"),
+            payload_max_bytes=15,
+        )
+
+    assert not (run_dir / "integration-snapshots" / operation).exists()
+
+
+def test_receipt_restores_exact_staged_index_and_worktree_bytes(project, tmp_path):
+    repo = project.project
+    owned = repo / "owned.txt"
+    owned.write_text("committed\n")
+    git(repo, "add", "--", "owned.txt")
+    git(repo, "commit", "-q", "-m", "index baseline")
+    owned.write_text("operator staged\n")
+    git(repo, "add", "--", "owned.txt")
+    owned.write_text("operator worktree\n")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    operation = "8" * 32
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, operation, ("owned.txt",)
+    )
+    old = verify.rev_parse_head(repo)
+    (repo / "feature.txt").write_text("integrated\n")
+    git(repo, "add", "--", "feature.txt")
+    git(repo, "commit", "-q", "-m", "integrated")
+    new = verify.rev_parse_head(repo)
+    owned.write_text("hook staged\n")
+    git(repo, "add", "--", "owned.txt")
+
+    verify.restore_integration_ref(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity=operation,
+    )
+
+    assert git(repo, "show", ":owned.txt") == "operator staged"
+    assert owned.read_text() == "operator worktree\n"
+    assert git(repo, "diff", "--cached", "--name-only") == "owned.txt"
+    assert verify.integration_restoration_complete(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity=operation,
+    )
+
+
+def test_receipt_restores_intent_to_add_index_entry(project, tmp_path):
+    repo = project.project
+    candidate = repo / "intent.txt"
+    candidate.write_text("operator bytes\n")
+    git(repo, "add", "-N", "--", "intent.txt")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    operation = "7" * 32
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, operation, ("intent.txt",)
+    )
+    git(repo, "add", "--", "intent.txt")
+
+    verify.restore_integration_nonref_state(
+        repo,
+        "refs/heads/main",
+        revision=verify.rev_parse_head(repo),
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity=operation,
+    )
+
+    debug = git(repo, "ls-files", "--debug", "--", "intent.txt")
+    assert "flags: 20004000" in debug
+    assert candidate.read_text() == "operator bytes\n"
+
+
+@pytest.mark.parametrize("flag", ["assume-unchanged", "skip-worktree"])
+def test_receipt_restores_extended_index_flags(project, tmp_path, flag):
+    repo = project.project
+    candidate = repo / "flagged.txt"
+    candidate.write_text("tracked\n")
+    git(repo, "add", "--", "flagged.txt")
+    git(repo, "commit", "-q", "-m", "flag baseline")
+    git(repo, "update-index", f"--{flag}", "--", "flagged.txt")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    operation = ("a" if flag == "assume-unchanged" else "b") * 32
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, operation, ("flagged.txt",)
+    )
+    git(repo, "update-index", f"--no-{flag}", "--", "flagged.txt")
+
+    verify.restore_integration_nonref_state(
+        repo,
+        "refs/heads/main",
+        revision=verify.rev_parse_head(repo),
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity=operation,
+    )
+
+    assert verify.integration_nonref_state_unchanged(
+        repo,
+        run_dir,
+        snapshots,
+        submodules,
+        operation_identity=operation,
+    )
+
+
+def test_receipt_restores_conflicted_index_stages(project, tmp_path):
+    repo = project.project
+    conflict = repo / "conflict.txt"
+    conflict.write_text("base\n")
+    git(repo, "add", "--", "conflict.txt")
+    git(repo, "commit", "-q", "-m", "conflict base")
+    git(repo, "checkout", "-q", "-b", "other")
+    conflict.write_text("theirs\n")
+    git(repo, "commit", "-q", "-am", "theirs")
+    git(repo, "checkout", "-q", "main")
+    conflict.write_text("ours\n")
+    git(repo, "commit", "-q", "-am", "ours")
+    subprocess.run(["git", "-C", str(repo), "merge", "other"], capture_output=True, check=False)
+    before = verify.git_bytes(repo, "ls-files", "--stage", "-z", "--", "conflict.txt").stdout
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    operation = "6" * 32
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, operation, ("conflict.txt",)
+    )
+    conflict.write_text("resolved by hook\n")
+    git(repo, "add", "--", "conflict.txt")
+
+    verify.restore_integration_nonref_state(
+        repo,
+        "refs/heads/main",
+        revision=verify.rev_parse_head(repo),
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity=operation,
+    )
+
+    after = verify.git_bytes(repo, "ls-files", "--stage", "-z", "--", "conflict.txt").stdout
+    assert after == before
+    assert "<<<<<<< HEAD" in conflict.read_text()
+
+
+def test_receipt_restore_transports_wide_pathsets_through_nul_stdin(project, monkeypatch):
+    repo = project.project
+    paths = [f"wide/{number:04d}-{'x' * 80}.txt" for number in range(300)]
+    for rel in paths:
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("old\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "wide baseline")
+    old = verify.rev_parse_head(repo)
+    for rel in paths:
+        (repo / rel).write_text("new\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "wide integration")
+    new = verify.rev_parse_head(repo)
+    real_run_git = verify._run_git
+    pathspec_calls = []
+
+    def observe_pathspec_stdin(cmd, repo_path, **kwargs):
+        if kwargs.get("input_data") is not None:
+            pathspec_calls.append((list(cmd), kwargs["input_data"]))
+        return real_run_git(cmd, repo_path, **kwargs)
+
+    monkeypatch.setattr(verify, "_run_git", observe_pathspec_stdin)
+
+    verify.restore_integration_ref(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+    )
+
+    assert len(pathspec_calls) == 1
+    argv, payload = pathspec_calls[0]
+    assert "--pathspec-from-file=-" in argv and "--pathspec-file-nul" in argv
+    assert all(rel not in argv for rel in paths)
+    assert payload.count(b"\0") == len(paths)
+    assert all((repo / rel).read_text() == "old\n" for rel in paths)
+
+
+def test_collision_cleanup_rechecks_identity_at_each_mutation(project):
+    repo = project.project
+    collision = repo / "collision.txt"
+    collision.write_bytes(b"captured")
+    plan = verify.IncomingCollisionPlan(
+        cleaned=("collision.txt",), tolerated=(), untracked=("collision.txt",)
+    )
+
+    def concurrent_writer(_path):
+        collision.write_bytes(b"new operator bytes")
+        return False
+
+    with pytest.raises(verify.IntegrationCleanupChangedError):
+        verify.apply_incoming_collision_plan(repo, plan, before_mutate=concurrent_writer)
+
+    assert collision.read_bytes() == b"new operator bytes"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../escape",
+        "/absolute",
+        "C:drive-relative",
+        "NUL",
+        "line\nfeed",
+        "back\\slash",
+        "nested/bad?.txt",
+    ],
+)
+def test_receipt_schema_refuses_nonportable_paths_before_restore(project, tmp_path, path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    before = verify.rev_parse_head(project.project)
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="path is malformed"):
+        verify.validate_integration_state_schema(
+            run_dir,
+            [{"path": path, "state": "absent", "tracked": False}],
+            [],
+        )
+
+    assert verify.rev_parse_head(project.project) == before
+
+
+def _add_test_submodule(repo, tmp_path):
+    origin = tmp_path / "sub-origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    commit(origin, "payload.txt", "submodule old\n", "submodule baseline")
+    old = verify.rev_parse_head(origin)
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(origin), "module")
+    git(repo, "commit", "-q", "-m", "add populated submodule")
+    return origin, repo / "module", old
+
+
+def test_receipt_restores_populated_submodule_checkout(project, tmp_path):
+    repo = project.project
+    origin, checkout, old_submodule = _add_test_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ())
+    assert submodules == [{"path": "module", "head": old_submodule, "gitlink": old_submodule}]
+    old = verify.rev_parse_head(repo)
+    commit(origin, "payload.txt", "submodule new\n", "advance submodule")
+    new_submodule = verify.rev_parse_head(origin)
+    git(checkout, "fetch", "-q", "origin")
+    git(checkout, "checkout", "-q", "--detach", new_submodule)
+    git(repo, "add", "--", "module")
+    git(repo, "commit", "-q", "-m", "integrated submodule")
+    new = verify.rev_parse_head(repo)
+
+    verify.restore_integration_ref(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+    )
+
+    assert verify.rev_parse_head(repo) == old
+    assert verify.rev_parse_head(checkout) == old_submodule
+    assert git(repo, "status", "--porcelain") == ""
+
+
+def test_receipt_detects_index_only_submodule_gitlink_drift(project, tmp_path):
+    repo = project.project
+    origin, checkout, old_submodule = _add_test_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    operation = "c" * 32
+    snapshots, submodules = verify.capture_integration_state(repo, run_dir, operation, ())
+    commit(origin, "payload.txt", "new gitlink\n", "advance gitlink")
+    new_submodule = verify.rev_parse_head(origin)
+    git(repo, "update-index", "--cacheinfo", "160000", new_submodule, "module")
+
+    assert verify.rev_parse_head(checkout) == old_submodule
+    assert not verify.integration_nonref_state_unchanged(
+        repo,
+        run_dir,
+        snapshots,
+        submodules,
+        operation_identity=operation,
+    )
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_receipt_restores_deleted_or_replaced_old_submodule_from_old_revision(
+    project, tmp_path, replacement
+):
+    repo = project.project
+    _origin, checkout, old_submodule = _add_test_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    operation = "5" * 32
+    snapshots, submodules = verify.capture_integration_state(repo, run_dir, operation, ("module",))
+    old = verify.rev_parse_head(repo)
+    git(repo, "rm", "-q", "-f", "--", "module")
+    if replacement:
+        (repo / "module").write_text("replacement file\n")
+        git(repo, "add", "--", "module")
+    git(repo, "commit", "-q", "-m", "delete or replace submodule")
+    new = verify.rev_parse_head(repo)
+
+    verify.restore_integration_ref(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity=operation,
+    )
+
+    assert checkout.is_dir()
+    assert verify.rev_parse_head(checkout) == old_submodule
+    assert git(repo, "status", "--porcelain") == ""
+
+
+def test_receipt_removes_newly_introduced_submodule_checkout(project, tmp_path):
+    repo = project.project
+    origin = tmp_path / "new-sub-origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    commit(origin, "payload.txt", "new checkout\n", "new submodule")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    operation = "4" * 32
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, operation, ("new-module",)
+    )
+    old = verify.rev_parse_head(repo)
+    git(
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(origin),
+        "new-module",
+    )
+    git(repo, "commit", "-q", "-m", "introduce submodule")
+    new = verify.rev_parse_head(repo)
+
+    verify.restore_integration_ref(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity=operation,
+    )
+
+    assert not (repo / "new-module").exists()
+    assert git(repo, "ls-files", "--", "new-module") == ""
+
+
+def test_receipt_refuses_redirected_submodule_before_external_mutation(project, tmp_path):
+    repo = project.project
+    origin, checkout, _old_submodule = _add_test_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "d" * 32, ())
+    old = verify.rev_parse_head(repo)
+    commit(repo, "feature.txt", "integrated\n", "integrated target")
+    new = verify.rev_parse_head(repo)
+    sibling = repo / "sibling-checkout"
+    git(repo, "-c", "protocol.file.allow=always", "clone", "-q", str(origin), str(sibling))
+    parked = repo / "module-parked"
+    checkout.rename(parked)
+    checkout.symlink_to(sibling, target_is_directory=True)
+    external_head = verify.rev_parse_head(sibling)
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="indexed location"):
+        verify.restore_integration_ref(
+            repo,
+            "refs/heads/main",
+            old_revision=old,
+            new_revision=new,
+            run_dir=run_dir,
+            snapshots=snapshots,
+            submodules=submodules,
+        )
+
+    assert verify.rev_parse_head(repo) == new
+    assert verify.rev_parse_head(sibling) == external_head
+    checkout.unlink()
+    shutil.move(parked, checkout)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="dirfd restoration is POSIX-only")
+def test_receipt_restore_parent_redirect_never_writes_outside_or_moves_ref(
+    project, tmp_path, monkeypatch
+):
+    repo = project.project
+    owned = repo / "nested" / "owned.bin"
+    owned.parent.mkdir()
+    owned.write_bytes(b"operator bytes")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "redirect baseline")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    operation = "3" * 32
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, operation, ("nested/owned.bin",)
+    )
+    old = verify.rev_parse_head(repo)
+    (repo / "feature.txt").write_text("integrated\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "redirect integration")
+    new = verify.rev_parse_head(repo)
+    owned.write_bytes(b"hook rewrite")
+    external = tmp_path / "external"
+    external.mkdir()
+    outside = external / "owned.bin"
+    outside.write_bytes(b"outside sentinel")
+    real_copy = verify._copy_sidecar_to_target
+    swapped = []
+
+    def redirect_after_preflight(*args, **kwargs):
+        if not swapped:
+            parked = repo / "nested-parked"
+            (repo / "nested").rename(parked)
+            (repo / "nested").symlink_to(external, target_is_directory=True)
+            swapped.append(parked)
+        return real_copy(*args, **kwargs)
+
+    monkeypatch.setattr(verify, "_copy_sidecar_to_target", redirect_after_preflight)
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="escaped"):
+        verify.restore_integration_ref(
+            repo,
+            "refs/heads/main",
+            old_revision=old,
+            new_revision=new,
+            run_dir=run_dir,
+            snapshots=snapshots,
+            submodules=submodules,
+            operation_identity=operation,
+        )
+
+    assert verify.rev_parse_head(repo) == new
+    assert outside.read_bytes() == b"outside sentinel"
+    (repo / "nested").unlink()
+    swapped[0].rename(repo / "nested")
+
+
+@pytest.mark.parametrize("tracked", [False, True])
+def test_receipt_snapshots_and_restores_tolerated_symlink_identity(project, tmp_path, tracked):
+    repo = project.project
+    link = repo / "operator-link"
+    link.symlink_to("baseline-target")
+    if tracked:
+        git(repo, "add", "--", "operator-link")
+        git(repo, "commit", "-q", "-m", "track operator symlink")
+        link.unlink()
+        link.symlink_to("operator-target")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    operation = "e" * 32
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, operation, ("operator-link",)
+    )
+    link.unlink()
+    link.symlink_to("hook-target")
+
+    verify.restore_integration_nonref_state(
+        repo,
+        "refs/heads/main",
+        revision=verify.rev_parse_head(repo),
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity=operation,
+    )
+
+    assert link.is_symlink()
+    assert os.readlink(link) == ("operator-target" if tracked else "baseline-target")
+    assert verify.path_tracked(repo, "operator-link") is tracked
+
+
+def test_receipt_capture_rejects_redirected_roots_without_external_writes(project, tmp_path):
+    run_dir = tmp_path / "run"
+    external = tmp_path / "external"
+    run_dir.mkdir()
+    external.mkdir()
+    (run_dir / "integration-snapshots").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="redirected"):
+        verify.capture_integration_state(project.project, run_dir, "f" * 32, ())
+
+    assert not any(external.iterdir())
+    (run_dir / "integration-snapshots").unlink()
+    parent = run_dir / "integration-snapshots"
+    parent.mkdir()
+    (parent / ("f" * 32)).symlink_to(external, target_is_directory=True)
+    with pytest.raises(verify.IntegrationEvidenceError, match="already exists"):
+        verify.capture_integration_state(project.project, run_dir, "f" * 32, ())
+    assert not any(external.iterdir())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="dirfd capture is POSIX-only")
+def test_receipt_capture_parent_redirect_never_writes_outside(project, tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    external = tmp_path / "external"
+    run_dir.mkdir()
+    external.mkdir()
+    (project.project / "captured.bin").write_bytes(b"captured")
+    operation = "2" * 32
+    real_replace = verify.os.replace
+    swapped = []
+
+    def redirect_before_publish(source, destination, *args, **kwargs):
+        if str(source).startswith(".capture-") and not swapped:
+            root = run_dir / "integration-snapshots" / operation
+            parked = root.with_name(operation + "-parked")
+            root.rename(parked)
+            root.symlink_to(external, target_is_directory=True)
+            swapped.append(parked)
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(verify.os, "replace", redirect_before_publish)
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="changed during capture"):
+        verify.capture_integration_state(project.project, run_dir, operation, ("captured.bin",))
+
+    assert not any(external.iterdir())
+
+
+def test_receipt_discard_refuses_redirected_snapshot_parent(tmp_path):
+    run_dir = tmp_path / "run"
+    redirected = run_dir / "redirected" / "integration-snapshots"
+    operation = "f" * 32
+    (redirected / operation).mkdir(parents=True)
+    marker = redirected / operation / "keep.bin"
+    marker.write_bytes(b"keep")
+    (run_dir / "integration-snapshots").symlink_to(
+        redirected.relative_to(run_dir), target_is_directory=True
+    )
+
+    verify.discard_integration_state(run_dir, {"operation_identity": operation})
+
+    assert marker.read_bytes() == b"keep"
+
+
+def test_receipt_capture_removes_partial_operation_directory(project, tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (project.project / "captured.txt").write_text("captured\n")
+    (project.project / "not-a-file").mkdir()
+    operation = "1" * 32
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="not a file"):
+        verify.capture_integration_state(
+            project.project,
+            run_dir,
+            operation,
+            ("captured.txt", "not-a-file"),
+        )
+
+    assert not (run_dir / "integration-snapshots" / operation).exists()
+
+
+def test_receipt_schema_binds_sidecar_to_operation_and_path(project, tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (project.project / "one.txt").write_text("one\n")
+    (project.project / "two.txt").write_text("two\n")
+    operation = "2" * 32
+    snapshots, submodules = verify.capture_integration_state(
+        project.project, run_dir, operation, ("one.txt", "two.txt")
+    )
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="another operation"):
+        verify.validate_integration_state_schema(run_dir, snapshots, submodules, "3" * 32)
+
+    swapped = [dict(entry) for entry in snapshots]
+    swapped[0]["sidecar"], swapped[1]["sidecar"] = (
+        swapped[1]["sidecar"],
+        swapped[0]["sidecar"],
+    )
+    with pytest.raises(verify.IntegrationEvidenceError, match="another operation"):
+        verify.validate_integration_state_schema(run_dir, swapped, submodules, operation)
+
+
+def test_receipt_schema_refuses_git_administration_operands(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    with pytest.raises(verify.IntegrationEvidenceError, match="path is malformed"):
+        verify.validate_integration_state_schema(
+            run_dir,
+            [{"path": ".git/config", "state": "absent", "tracked": False}],
+            [],
+        )
+
+
+def test_receipt_capture_fsyncs_sidecar_directory(project, tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (project.project / "durable.txt").write_text("durable\n")
+    fsynced = []
+    real_fsync = verify._fsync_directory
+
+    def record(directory):
+        fsynced.append(directory)
+        real_fsync(directory)
+
+    monkeypatch.setattr(verify, "_fsync_directory", record)
+    operation = "4" * 32
+    verify.capture_integration_state(project.project, run_dir, operation, ("durable.txt",))
+
+    assert run_dir / "integration-snapshots" / operation in fsynced
+
+
+def test_duplicate_operation_tagged_reflog_updates_are_ambiguous(project):
+    repo = project.project
+    operation = "duplicate-operation"
+    first_old = verify.rev_parse_head(repo)
+    (repo / "first.txt").write_text("first\n")
+    git(repo, "add", "-A")
+    tree = git(repo, "write-tree")
+    first_new = git(repo, "commit-tree", tree, "-p", first_old, "-m", "first")
+    action = f"bmad-loop-integrate:{operation}"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "update-ref",
+            "-m",
+            action,
+            "refs/heads/main",
+            first_new,
+            first_old,
+        ],
+        check=True,
+    )
+    (repo / "second.txt").write_text("second\n")
+    git(repo, "add", "-A")
+    tree = git(repo, "write-tree")
+    second_new = git(repo, "commit-tree", tree, "-p", first_new, "-m", "second")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "update-ref",
+            "-m",
+            action,
+            "refs/heads/main",
+            second_new,
+            first_new,
+        ],
+        check=True,
+    )
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="ambiguous"):
+        verify.integration_ref_update(repo, "refs/heads/main", operation)
 
 
 def test_merge_conflict_raises_and_restores(project, tmp_path):

@@ -338,6 +338,13 @@ class StoryTask:
     artifact_acceptance_identity: str | None = None
     artifact_payload: dict[str, str] | None = None
     artifact_publication_complete: bool = False
+    # Durable authority for one target-side integration attempt.  The append
+    # journal is allowed to lose a torn final record, so it cannot be the source
+    # of truth for crash replay.  This JSON-native receipt is saved atomically
+    # before Git may move the target ref.  Its operation identity is coupled to
+    # Git's reflog action; ``old_revision``/``new_revision`` are filled from that
+    # ref update after it is observed.  None is legacy/no active integration.
+    integration_attempt: dict[str, Any] | None = None
     spec_file: str | None = None
     # The spec owned by the current/last dispatched dev attempt. Unlike
     # ``spec_file`` (the accepted/result artifact), this is bound before launch
@@ -515,6 +522,7 @@ class StoryTask:
             "artifact_acceptance_identity": self.artifact_acceptance_identity,
             "artifact_payload": deepcopy(self.artifact_payload),
             "artifact_publication_complete": self.artifact_publication_complete,
+            "integration_attempt": deepcopy(self.integration_attempt),
             "spec_file": self._serialized_worktree_path(self.spec_file),
             "dispatched_spec_file": self._serialized_worktree_path(self.dispatched_spec_file),
             "dispatched_spec_snapshot": (
@@ -623,6 +631,7 @@ class StoryTask:
         self.artifact_acceptance_identity = None
         self.artifact_payload = None
         self.artifact_publication_complete = False
+        self.integration_attempt = None
         self.baseline_commit = None
         self.baseline_untracked = None
 
@@ -758,6 +767,7 @@ class StoryTask:
             ),
             artifact_payload=deepcopy(d.get("artifact_payload")),
             artifact_publication_complete=bool(d.get("artifact_publication_complete", False)),
+            integration_attempt=deepcopy(d.get("integration_attempt")),
             spec_file=d.get("spec_file"),
             dispatched_spec_file=d.get("dispatched_spec_file"),
             dispatched_spec_snapshot=dispatched_spec_snapshot,

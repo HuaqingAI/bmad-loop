@@ -295,6 +295,7 @@ REFUSAL_HELPER_DEFS = {
     ("runs.py", "_refuse_live_session"),
     ("runs.py", "_refuse_uncontained_run_dir"),
     ("workspace.py", "_refuse_foreign_checkout"),
+    ("worktree_flow.py", "_refuse_integrated_artifacts"),
 }
 
 # Every #414-family call site — `bmadconfig.worktree_isolation_conflict`, sole

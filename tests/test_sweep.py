@@ -25336,6 +25336,35 @@ def _git_bound_publication_bundle(project, kind):
 
 
 @pytest.mark.parametrize("kind", ["tracked", "pending-tracked"])
+@pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
+def test_stable_target_integration_preserves_accepted_blob_and_tears_down_source(
+    project, kind, strategy
+):
+    effect, destination, accepted = _git_bound_publication_bundle(project, kind)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix"]
+    repo_rel = destination.relative_to(project.repo_root).as_posix()
+    target_oids = verify.revision_blob_oids(project.repo_root, "HEAD", (repo_rel,))
+    assert task.artifact_tracked_source_oids is not None
+    assert target_oids[repo_rel] == task.artifact_tracked_source_oids["report.bin"]
+    assert destination.read_bytes() == accepted
+    assert task.artifact_publication_complete
+    assert "unit-merged" in journal_kinds(engine)
+    assert not Path(task.worktree_path).exists()
+    assert not verify.branch_exists(project.repo_root, task.branch)
+    snapshots = engine.run_dir / "integration-snapshots"
+    assert not snapshots.exists() or not any(snapshots.iterdir())
+
+
+@pytest.mark.parametrize("kind", ["tracked", "pending-tracked"])
 def test_pre_staging_git_deliverable_writer_refuses_and_resumes_without_session(
     project, monkeypatch, kind
 ):
@@ -25585,6 +25614,1349 @@ def test_commit_hook_force_added_ignored_deliverable_rolls_back_and_resumes_with
         b"\xff\x00\r\ndeliverable"
     )
     assert not Path(final.worktree_path).exists()
+
+
+@pytest.mark.parametrize(
+    ("strategy", "hook_name"),
+    [
+        ("merge", "pre-merge-commit"),
+        ("squash", "pre-commit"),
+        ("ff", "post-merge"),
+    ],
+)
+@pytest.mark.parametrize("kind", ["tracked", "pending-tracked"])
+def test_target_commit_hook_artifact_drift_restores_and_retains_source(
+    project, strategy, hook_name, kind
+):
+    effect, destination, _accepted = _git_bound_publication_bundle(project, kind)
+    target_head = verify.rev_parse_head(project.repo_root)
+    before = destination.read_bytes() if destination.exists() else None
+    hook = project.project / ".git" / "hooks" / hook_name
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        "  printf 'target hook mutation' > "
+        "_bmad-output/implementation-artifacts/report.bin\n"
+        "  git add -- _bmad-output/implementation-artifacts/report.bin\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert (destination.read_bytes() if destination.exists() else None) == before
+    assert Path(durable.worktree_path).is_dir()
+    assert verify.branch_exists(project.repo_root, durable.branch)
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt.get("outcome") == "refused-restored"
+    assert "unit-merged" not in journal_kinds(engine)
+    assert not durable.artifact_publication_complete
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert refusal["error"].endswith("report.bin")
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+
+
+@pytest.mark.parametrize(
+    ("strategy", "hook_name"),
+    [
+        ("merge", "pre-merge-commit"),
+        ("squash", "pre-commit"),
+        ("ff", "post-merge"),
+    ],
+)
+def test_target_hook_force_added_ignored_only_artifact_is_refused(project, strategy, hook_name):
+    effect, _expected = _ignored_publication_bundle(project)
+    destination = project.implementation_artifacts / "report.bin"
+    target_head = verify.rev_parse_head(project.repo_root)
+    hook = project.project / ".git" / "hooks" / hook_name
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        "  mkdir -p _bmad-output/implementation-artifacts\n"
+        "  printf 'force-added ignored target drift' > "
+        "_bmad-output/implementation-artifacts/report.bin\n"
+        "  git add -f -- _bmad-output/implementation-artifacts/report.bin\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert not destination.exists()
+    assert Path(durable.worktree_path).is_dir()
+    assert verify.branch_exists(project.repo_root, durable.branch)
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt.get("outcome") == "refused-restored"
+    assert "unit-merged" not in journal_kinds(engine)
+    assert not durable.artifact_publication_complete
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+
+
+@pytest.mark.parametrize(
+    ("strategy", "hook_name"),
+    [("merge", "pre-merge-commit"), ("squash", "pre-commit")],
+)
+def test_unvalidated_target_hook_drift_replay_restores_without_session(
+    project, monkeypatch, strategy, hook_name
+):
+    from bmad_loop import artifact_publication
+
+    effect, destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    target_head = verify.rev_parse_head(project.repo_root)
+    before = destination.read_bytes()
+    hook = project.project / ".git" / "hooks" / hook_name
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        "  printf 'unvalidated hook drift' > "
+        "_bmad-output/implementation-artifacts/report.bin\n"
+        "  git add -- _bmad-output/implementation-artifacts/report.bin\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    engine, original_adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+    validate = artifact_publication.validate_integrated
+
+    def host_loss_before_target_validation(*_args, **_kwargs):
+        raise SystemExit("host lost before target validation")
+
+    monkeypatch.setattr(
+        artifact_publication, "validate_integrated", host_loss_before_target_validation
+    )
+    with pytest.raises(SystemExit, match="host lost before target validation"):
+        engine.run()
+    crashed = load_state(engine.run_dir).tasks["dw-fix"]
+    assert crashed.integration_attempt is not None
+    assert verify.rev_parse_head(project.repo_root) != target_head
+    assert "unit-merged" not in journal_kinds(engine)
+    monkeypatch.setattr(artifact_publication, "validate_integrated", validate)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert [session.role for session in original_adapter.sessions] == ["triage", "dev"]
+    durable = load_state(resumed.run_dir).tasks["dw-fix"]
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert destination.read_bytes() == before
+    assert Path(durable.worktree_path).is_dir()
+    assert verify.branch_exists(project.repo_root, durable.branch)
+    assert "unit-merged" not in journal_kinds(resumed)
+    assert not durable.artifact_publication_complete
+
+
+@pytest.mark.parametrize("strategy", ["merge", "squash"])
+def test_target_commit_msg_index_delta_is_fully_restored(project, strategy):
+    root = project.implementation_artifacts
+    root.mkdir(parents=True, exist_ok=True)
+    report = root / "report.bin"
+    report.write_bytes(b"accepted baseline\n")
+    bystander = project.project / "bystander.txt"
+    bystander.write_text("bystander baseline\n")
+    ignore_before_commit(project, "_bmad-output/implementation-artifacts/spec-dw-fix.md")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "prepare index-delta publication")
+    target_head = verify.rev_parse_head(project.repo_root)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+
+    def effect(spec):
+        result = wt_bundle_dev(project)(spec)
+        accepted_spec = Path(result.result_json["spec_file"])
+        accepted_spec.write_text(
+            accepted_spec.read_text().replace(
+                "---\n", "---\nartifact_deliverables: [report.bin]\n", 1
+            )
+        )
+        return result
+
+    hook = project.project / ".git" / "hooks" / "commit-msg"
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        "  git rm -q -- _bmad-output/implementation-artifacts/report.bin\n"
+        "  printf 'hook-staged bystander\\n' > bystander.txt\n"
+        "  git add -- bystander.txt\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert git(project.project, "diff", "--cached", "--name-only") == ""
+    assert report.read_bytes() == b"accepted baseline\n"
+    assert bystander.read_text() == "bystander baseline\n"
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert Path(durable.worktree_path).is_dir()
+    assert verify.branch_exists(project.repo_root, durable.branch)
+    assert "unit-merged" not in journal_kinds(engine)
+    assert not durable.artifact_publication_complete
+
+
+@pytest.mark.parametrize("strategy", ["merge", "squash"])
+def test_clean_target_synthesis_drift_restores_actual_precommand_commit(
+    project, monkeypatch, strategy
+):
+    from bmad_loop import artifact_publication
+
+    root = project.implementation_artifacts
+    root.mkdir(parents=True, exist_ok=True)
+    report = root / "report.bin"
+    base_lines = [f"line {number:02d} base" for number in range(1, 21)]
+    source_lines = list(base_lines)
+    source_lines[17] = "line 18 source"
+    target_lines = list(base_lines)
+    target_lines[1] = "line 02 target"
+    synthesized_lines = list(target_lines)
+    synthesized_lines[17] = "line 18 source"
+    accepted_source = ("\n".join(source_lines) + "\n").encode()
+    pre_integration_target = ("\n".join(target_lines) + "\n").encode()
+    synthesized = ("\n".join(synthesized_lines) + "\n").encode()
+    report.write_bytes(("\n".join(base_lines) + "\n").encode())
+    notes = project.project / "operator-notes.txt"
+    notes.write_text("clean baseline\n")
+    ignore_before_commit(project, "_bmad-output/implementation-artifacts/spec-dw-fix.md")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "prepare synthesis publication")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+
+    def effect(spec):
+        result = wt_bundle_dev(project)(spec)
+        paths = project.rebased(spec.cwd)
+        accepted_spec = Path(result.result_json["spec_file"])
+        accepted_spec.write_text(
+            accepted_spec.read_text().replace(
+                "---\n", "---\nartifact_deliverables: [report.bin]\n", 1
+            )
+        )
+        (paths.implementation_artifacts / "report.bin").write_bytes(accepted_source)
+        return result
+
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+    emit = engine._worktree_flow._emit
+    target_commits = []
+    target_oids = []
+    observed_integrations = []
+    repo_rel = report.relative_to(project.repo_root).as_posix()
+    validate_integrated = artifact_publication.validate_integrated
+
+    def advance_target(stage, *args, **kwargs):
+        if stage == "pre_merge" and not target_commits:
+            report.write_bytes(pre_integration_target)
+            git(project.project, "add", "--", report)
+            git(project.project, "commit", "-q", "-m", "concurrent target edit")
+            target_commits.append(verify.rev_parse_head(project.repo_root))
+            target_oids.append(
+                verify.revision_blob_oids(project.repo_root, target_commits[0], (repo_rel,))[
+                    repo_rel
+                ]
+            )
+            notes.write_text("unrelated tolerated dirt\n")
+        return emit(stage, *args, **kwargs)
+
+    def observe_integrated_revision(task, target, revision):
+        oids = verify.revision_blob_oids(target.repo_root, revision, (repo_rel,))
+        shown = verify.git_bytes(target.repo_root, "show", f"{revision}:{repo_rel}")
+        assert shown.returncode == 0
+        observed_integrations.append((revision, oids[repo_rel], shown.stdout))
+        return validate_integrated(task, target, revision)
+
+    monkeypatch.setattr(engine._worktree_flow, "_emit", advance_target)
+    monkeypatch.setattr(artifact_publication, "validate_integrated", observe_integrated_revision)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert verify.rev_parse_head(project.repo_root) == target_commits[0]
+    assert report.read_bytes() == pre_integration_target
+    assert notes.read_text() == "unrelated tolerated dirt\n"
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert len(observed_integrations) == 1
+    integrated_revision, integrated_oid, integrated_bytes = observed_integrations[0]
+    assert integrated_revision != target_commits[0]
+    assert integrated_bytes == synthesized
+    assert integrated_bytes not in (accepted_source, pre_integration_target)
+    assert durable.artifact_tracked_source_oids is not None
+    assert integrated_oid != durable.artifact_tracked_source_oids["report.bin"]
+    assert integrated_oid != target_oids[0]
+    assert Path(durable.worktree_path).is_dir()
+    assert verify.branch_exists(project.repo_root, durable.branch)
+    assert "unit-merged" not in journal_kinds(engine)
+    assert not durable.artifact_publication_complete
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+
+
+def test_target_movement_during_validation_is_never_discarded(project, monkeypatch):
+    from bmad_loop import artifact_publication
+
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    validate = artifact_publication.validate_integrated
+    later = []
+
+    def advance_after_validation(task, target, revision):
+        result = validate(task, target, revision)
+        path = project.project / "later-target.txt"
+        path.write_text("later\n")
+        git(project.project, "add", "--", path)
+        git(project.project, "commit", "-q", "-m", "later target commit")
+        later.append(verify.rev_parse_head(project.repo_root))
+        return result
+
+    monkeypatch.setattr(artifact_publication, "validate_integrated", advance_after_validation)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert verify.rev_parse_head(project.repo_root) == later[0]
+    assert (project.project / "later-target.txt").read_text() == "later\n"
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert Path(durable.worktree_path).is_dir()
+    assert "unit-merged" not in journal_kinds(engine)
+
+
+def test_concurrent_precommand_target_commit_refuses_stale_snapshot_epoch(project, monkeypatch):
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    hook = project.project / ".git" / "hooks" / "pre-merge-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "printf 'target hook mutation' > "
+        "_bmad-output/implementation-artifacts/report.bin\n"
+        "git add -- _bmad-output/implementation-artifacts/report.bin\n"
+    )
+    hook.chmod(0o755)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    merge = verify.merge_branch
+    concurrent = []
+
+    def commit_target_then_merge(*args, **kwargs):
+        path = project.project / "concurrent-target.txt"
+        path.write_text("concurrent\n")
+        git(project.project, "add", "--", path)
+        git(project.project, "commit", "-q", "-m", "concurrent pre-command target")
+        concurrent.append(verify.rev_parse_head(project.repo_root))
+        return merge(*args, **kwargs)
+
+    monkeypatch.setattr(verify, "merge_branch", commit_target_then_merge)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    landed = verify.rev_parse_head(project.repo_root)
+    assert verify.is_ancestor(project.repo_root, concurrent[0], landed)
+    assert (project.project / "concurrent-target.txt").read_text() == "concurrent\n"
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt["pre_target_revision"] != concurrent[0]
+    assert "outcome" not in durable.integration_attempt
+
+
+def test_precleaned_untracked_collision_is_restored_after_identity_refusal(project):
+    effect, destination, accepted = _git_bound_publication_bundle(project, "pending-tracked")
+    destination.write_bytes(accepted)
+    hook = project.project / ".git" / "hooks" / "pre-merge-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "printf 'target hook mutation' > "
+        "_bmad-output/implementation-artifacts/report.bin\n"
+        "git add -- _bmad-output/implementation-artifacts/report.bin\n"
+    )
+    hook.chmod(0o755)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert destination.read_bytes() == accepted
+    assert git(project.project, "ls-files", "--", destination) == ""
+    task = load_state(engine.run_dir).tasks["dw-fix"]
+    assert task.integration_attempt is not None
+    assert task.integration_attempt["outcome"] == "refused-restored"
+
+
+def test_tolerated_tracked_dirt_staged_by_hook_is_restored_exactly(project):
+    notes = project.project / "operator-notes.txt"
+    notes.write_text("baseline\n")
+    git(project.project, "add", "--", notes)
+    git(project.project, "commit", "-q", "-m", "track operator notes")
+    effect, destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    notes.write_text("operator dirt\n")
+    before_report = destination.read_bytes()
+    hook = project.project / ".git" / "hooks" / "pre-merge-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "printf 'target hook mutation' > "
+        "_bmad-output/implementation-artifacts/report.bin\n"
+        "printf 'hook rewrite' > operator-notes.txt\n"
+        "git add -- _bmad-output/implementation-artifacts/report.bin operator-notes.txt\n"
+    )
+    hook.chmod(0o755)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert notes.read_text() == "operator dirt\n"
+    assert destination.read_bytes() == before_report
+    assert git(project.project, "diff", "--cached", "--name-only") == ""
+    assert git(project.project, "diff", "--name-only") == "operator-notes.txt"
+
+
+def test_hook_only_tolerated_dirt_drift_blocks_otherwise_accepted_integration(project):
+    notes = project.project / "operator-notes.txt"
+    notes.write_text("baseline\n")
+    git(project.project, "add", "--", notes)
+    git(project.project, "commit", "-q", "-m", "track operator notes")
+    effect, destination, accepted = _git_bound_publication_bundle(project, "tracked")
+    notes.write_text("operator dirt\n")
+    target_head = verify.rev_parse_head(project.project)
+    hook = project.project / ".git" / "hooks" / "pre-merge-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "printf 'hook rewrite' > operator-notes.txt\n"
+        "git add -- operator-notes.txt\n"
+    )
+    hook.chmod(0o755)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert verify.rev_parse_head(project.project) == target_head
+    assert notes.read_text() == "operator dirt\n"
+    assert git(project.project, "diff", "--cached", "--name-only") == ""
+    assert git(project.project, "diff", "--name-only") == "operator-notes.txt"
+    assert destination.read_bytes() != accepted
+    assert "unit-merged" not in journal_kinds(engine)
+
+
+def test_unstaged_ignored_and_expected_absence_restore_with_tracked_refusal(project):
+    ignore_before_commit(
+        project,
+        "_bmad-output/implementation-artifacts/ignored-side.bin",
+        "_bmad-output/implementation-artifacts/expected-absent.bin",
+    )
+    effect, destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    ignored = project.implementation_artifacts / "ignored-side.bin"
+    absent = project.implementation_artifacts / "expected-absent.bin"
+    ignored.write_bytes(b"operator ignored bytes\x00")
+
+    def declare_all(spec):
+        result = effect(spec)
+        accepted_spec = Path(result.result_json["spec_file"])
+        accepted_spec.write_text(
+            accepted_spec.read_text().replace(
+                "artifact_deliverables: [report.bin]",
+                "artifact_deliverables: [report.bin, ignored-side.bin, expected-absent.bin]",
+            )
+        )
+        paths = project.rebased(spec.cwd)
+        (paths.implementation_artifacts / "ignored-side.bin").write_bytes(b"accepted ignored")
+        (paths.implementation_artifacts / "expected-absent.bin").write_bytes(
+            b"accepted absent output"
+        )
+        return result
+
+    before_report = destination.read_bytes()
+    hook = project.project / ".git" / "hooks" / "pre-merge-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "printf 'target hook mutation' > "
+        "_bmad-output/implementation-artifacts/report.bin\n"
+        "git add -- _bmad-output/implementation-artifacts/report.bin\n"
+        "printf 'ignored hook drift' > "
+        "_bmad-output/implementation-artifacts/ignored-side.bin\n"
+        "printf 'unexpected hook output' > "
+        "_bmad-output/implementation-artifacts/expected-absent.bin\n"
+    )
+    hook.chmod(0o755)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), declare_all],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert destination.read_bytes() == before_report
+    assert ignored.read_bytes() == b"operator ignored bytes\x00"
+    assert not absent.exists()
+    task = load_state(engine.run_dir).tasks["dw-fix"]
+    assert task.integration_attempt is not None
+    assert task.integration_attempt["outcome"] == "refused-restored"
+
+
+def test_populated_submodule_checkout_is_captured_forwarded_and_restored(project, tmp_path):
+    origin = tmp_path / "sub-origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    (origin / "payload.txt").write_text("old\n")
+    git(origin, "add", "-A")
+    git(origin, "commit", "-q", "-m", "old submodule")
+    old_submodule = verify.rev_parse_head(origin)
+    (origin / "payload.txt").write_text("new\n")
+    git(origin, "add", "-A")
+    git(origin, "commit", "-q", "-m", "new submodule")
+    new_submodule = verify.rev_parse_head(origin)
+    git(
+        project.project,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(origin),
+        "module",
+    )
+    git(project.project / "module", "checkout", "-q", "--detach", old_submodule)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "add populated submodule")
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    hook = project.project / ".git" / "hooks" / "pre-merge-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f"git -C module checkout -q --detach {new_submodule}\n"
+        "printf 'target hook mutation' > "
+        "_bmad-output/implementation-artifacts/report.bin\n"
+        "git add -- _bmad-output/implementation-artifacts/report.bin\n"
+    )
+    hook.chmod(0o755)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert verify.rev_parse_head(project.project / "module") == old_submodule
+    task = load_state(engine.run_dir).tasks["dw-fix"]
+    assert task.integration_attempt is not None
+    assert task.integration_attempt["submodules"] == [
+        {"path": "module", "head": old_submodule, "gitlink": old_submodule}
+    ]
+    assert task.integration_attempt["outcome"] == "refused-restored"
+    assert "unit-merged" not in journal_kinds(engine)
+
+
+def test_missing_ref_update_evidence_never_authorizes_target_reset(project, monkeypatch):
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    before = verify.rev_parse_head(project.repo_root)
+    monkeypatch.setattr(verify, "integration_ref_update", lambda *_args, **_kwargs: None)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert verify.rev_parse_head(project.repo_root) != before
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert Path(durable.worktree_path).is_dir()
+    assert "unit-merged" not in journal_kinds(engine)
+
+
+def test_restore_crash_before_outcome_save_rearms_without_session(project, monkeypatch):
+    effect, destination, accepted = _git_bound_publication_bundle(project, "tracked")
+    target_head = verify.rev_parse_head(project.repo_root)
+    hook = project.project / ".git" / "hooks" / "pre-merge-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "printf 'target hook mutation' > "
+        "_bmad-output/implementation-artifacts/report.bin\n"
+        "git add -- _bmad-output/implementation-artifacts/report.bin\n"
+    )
+    hook.chmod(0o755)
+    engine, original_adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    restore = verify.restore_integration_ref
+
+    def host_loss_after_restore(*args, **kwargs):
+        restore(*args, **kwargs)
+        raise SystemExit("host lost after target restore")
+
+    monkeypatch.setattr(verify, "restore_integration_ref", host_loss_after_restore)
+    with pytest.raises(SystemExit, match="host lost after target restore"):
+        engine.run()
+    crashed = load_state(engine.run_dir).tasks["dw-fix"]
+    assert crashed.integration_attempt is not None
+    assert "outcome" not in crashed.integration_attempt
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert git(project.project, "diff", "--cached", "--name-only") == ""
+    hook.unlink()
+    monkeypatch.setattr(verify, "restore_integration_ref", restore)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert [session.role for session in original_adapter.sessions] == ["triage", "dev"]
+    final = resumed.state.tasks["dw-fix"]
+    assert destination.read_bytes() == accepted
+    assert final.integration_attempt is None
+    assert final.artifact_publication_complete
+    assert not Path(final.worktree_path).exists()
+
+
+def test_saved_restoration_rechecks_checkout_before_rearming(project, monkeypatch):
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    hook = project.project / ".git" / "hooks" / "pre-merge-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "printf 'target hook mutation' > "
+        "_bmad-output/implementation-artifacts/report.bin\n"
+        "git add -- _bmad-output/implementation-artifacts/report.bin\n"
+    )
+    hook.chmod(0o755)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+
+    assert engine.run().paused
+    hook.unlink()
+    monkeypatch.setattr(verify, "integration_restoration_complete", lambda *_a, **_k: False)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    durable = resumed.state.tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt["outcome"] == "refused-restored"
+    assert "unit-merged" not in journal_kinds(resumed)
+
+
+def test_saved_restoration_preserves_later_target_remedy_and_rearms(project):
+    effect, destination, accepted = _git_bound_publication_bundle(project, "tracked")
+    hook = project.project / ".git" / "hooks" / "pre-merge-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "printf 'target hook mutation' > "
+        "_bmad-output/implementation-artifacts/report.bin\n"
+        "git add -- _bmad-output/implementation-artifacts/report.bin\n"
+    )
+    hook.chmod(0o755)
+    engine, original_adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+
+    assert engine.run().paused
+    hook.unlink()
+    remedy = project.project / "operator-remedy.txt"
+    remedy.write_text("legitimate target advance\n")
+    git(project.project, "add", "--", remedy)
+    git(project.project, "commit", "-q", "-m", "operator target remedy")
+    remedy_head = verify.rev_parse_head(project.repo_root)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert [session.role for session in original_adapter.sessions] == ["triage", "dev"]
+    assert verify.is_ancestor(
+        project.repo_root, remedy_head, verify.rev_parse_head(project.repo_root)
+    )
+    final = resumed.state.tasks["dw-fix"]
+    assert destination.read_bytes() == accepted
+    assert final.integration_attempt is None
+    assert final.artifact_publication_complete
+
+
+def test_restoration_path_inventory_oserror_keeps_refusal_recoverable(project, monkeypatch):
+    from bmad_loop import artifact_publication
+
+    effect, destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    target_head = verify.rev_parse_head(project.repo_root)
+    before = destination.read_bytes()
+    hook = project.project / ".git" / "hooks" / "pre-merge-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "printf 'target hook mutation' > "
+        "_bmad-output/implementation-artifacts/report.bin\n"
+        "git add -- _bmad-output/implementation-artifacts/report.bin\n"
+    )
+    hook.chmod(0o755)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+
+    def fail_path_inventory(*_args, **_kwargs):
+        raise OSError("synthetic path fault")
+
+    monkeypatch.setattr(
+        artifact_publication,
+        "integrated_artifact_repo_paths",
+        fail_path_inventory,
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert destination.read_bytes() == before
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt["outcome"] == "refused-restored"
+    assert Path(durable.worktree_path).is_dir()
+
+
+def test_disabled_target_reflog_refuses_before_git_mutation(project):
+    effect, destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    target_head = verify.rev_parse_head(project.repo_root)
+    before = destination.read_bytes()
+    git(project.project, "config", "core.logAllRefUpdates", "false")
+    reflog = Path(git(project.project, "rev-parse", "--git-path", "logs/refs/heads/main"))
+    if not reflog.is_absolute():
+        reflog = project.project / reflog
+    reflog.unlink()
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert destination.read_bytes() == before
+    assert durable.integration_attempt is None
+    assert Path(durable.worktree_path).is_dir()
+    assert verify.branch_exists(project.repo_root, durable.branch)
+    assert "unit-merged" not in journal_kinds(engine)
+    assert not durable.artifact_publication_complete
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+
+
+def test_tampered_persisted_transition_never_overwrites_reflog_evidence(project, monkeypatch):
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    append = engine.journal.append
+
+    def host_loss_before_completion(kind, **fields):
+        if kind == "unit-merged":
+            raise SystemExit("host lost before completion")
+        return append(kind, **fields)
+
+    monkeypatch.setattr(engine.journal, "append", host_loss_before_completion)
+    with pytest.raises(SystemExit, match="host lost before completion"):
+        engine.run()
+    state = load_state(engine.run_dir)
+    crashed = state.tasks["dw-fix"]
+    assert crashed.integration_attempt is not None
+    landed = verify.rev_parse_head(project.repo_root)
+    crashed.integration_attempt["old_revision"] = landed
+    save_state(engine.run_dir, state)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert verify.rev_parse_head(project.repo_root) == landed
+    durable = resumed.state.tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt["old_revision"] == landed
+    assert Path(durable.worktree_path).is_dir()
+    assert "unit-merged" not in journal_kinds(resumed)
+
+
+def test_malformed_persisted_strategy_never_records_integration(project, monkeypatch):
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, original_adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+
+    def host_loss_before_git(*_args, **_kwargs):
+        raise RuntimeError("host lost before git")
+
+    monkeypatch.setattr(verify, "merge_branch", host_loss_before_git)
+    assert engine.run().crashed
+    state = load_state(engine.run_dir)
+    task = state.tasks["dw-fix"]
+    assert task.integration_attempt is not None
+    task.integration_attempt["strategy"] = "bogus"
+    save_state(engine.run_dir, state)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert [session.role for session in original_adapter.sessions] == ["triage", "dev"]
+    durable = resumed.state.tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt["strategy"] == "bogus"
+    assert "unit-merged" not in journal_kinds(resumed)
+    assert Path(durable.worktree_path).is_dir()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("outcome", "unknown"), ("version", 99)],
+)
+def test_malformed_persisted_receipt_shape_never_reaches_git(project, monkeypatch, field, value):
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+
+    def host_loss_before_git(*_args, **_kwargs):
+        raise RuntimeError("host lost before git")
+
+    monkeypatch.setattr(verify, "merge_branch", host_loss_before_git)
+    assert engine.run().crashed
+    state = load_state(engine.run_dir)
+    task = state.tasks["dw-fix"]
+    assert task.integration_attempt is not None
+    task.integration_attempt[field] = value
+    save_state(engine.run_dir, state)
+
+    def git_must_not_run(*_args, **_kwargs):
+        raise AssertionError("malformed receipt reached integration")
+
+    monkeypatch.setattr(verify, "merge_branch", git_must_not_run)
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    durable = resumed.state.tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt[field] == value
+    assert "unit-merged" not in journal_kinds(resumed)
+
+
+def test_no_ref_update_validation_refusal_keeps_ambiguous_receipt(project, monkeypatch):
+    from bmad_loop import artifact_publication
+
+    effect, destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+
+    monkeypatch.setattr(verify, "merge_branch", lambda *_args, **_kwargs: None)
+
+    def mutate_without_ref_update(*_args, **_kwargs):
+        destination.write_bytes(b"ambiguous no-ref writer")
+        raise artifact_publication.PublicationError("synthetic target refusal")
+
+    monkeypatch.setattr(artifact_publication, "validate_integrated", mutate_without_ref_update)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    task = load_state(engine.run_dir).tasks["dw-fix"]
+    assert task.integration_attempt is not None
+    assert task.integration_attempt["outcome"] == "refused-restored"
+    assert destination.read_bytes() == b"baseline"
+    assert "unit-merged" not in journal_kinds(engine)
+
+
+def test_typed_refusal_after_target_move_keeps_receipt_and_concurrent_commit(project, monkeypatch):
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    moved = []
+
+    def move_target_then_refuse(*_args, **_kwargs):
+        path = project.project / "hook-target-move.txt"
+        path.write_text("concurrent target state\n")
+        git(project.project, "add", "--", path)
+        git(project.project, "commit", "-q", "-m", "target moved before refusal")
+        moved.append(verify.rev_parse_head(project.project))
+        raise verify.MergePreflightError("synthetic typed refusal after target move")
+
+    monkeypatch.setattr(verify, "merge_branch", move_target_then_refuse)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert verify.rev_parse_head(project.project) == moved[0]
+    assert (project.project / "hook-target-move.txt").read_text() == "concurrent target state\n"
+    task = load_state(engine.run_dir).tasks["dw-fix"]
+    assert task.integration_attempt is not None
+    assert "outcome" not in task.integration_attempt
+    assert "unit-merged" not in journal_kinds(engine)
+
+
+def test_concurrent_nonref_change_after_snapshot_refuses_before_git(project, monkeypatch):
+    effect, destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    before_head = verify.rev_parse_head(project.project)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    apply_plan = verify.apply_incoming_collision_plan
+
+    def change_after_capture(repo, plan, **kwargs):
+        cleaned = apply_plan(repo, plan, **kwargs)
+        destination.write_bytes(b"concurrent non-ref state")
+        return cleaned
+
+    monkeypatch.setattr(verify, "apply_incoming_collision_plan", change_after_capture)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert verify.rev_parse_head(project.project) == before_head
+    assert destination.read_bytes() == b"concurrent non-ref state"
+    task = load_state(engine.run_dir).tasks["dw-fix"]
+    assert task.integration_attempt is not None
+    assert "outcome" not in task.integration_attempt
+    assert "unit-merged" not in journal_kinds(engine)
+
+
+def test_typed_refusal_restores_precleaned_collision_before_retiring_receipt(project, monkeypatch):
+    effect, destination, accepted = _git_bound_publication_bundle(project, "pending-tracked")
+    destination.write_bytes(accepted)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    monkeypatch.setattr(
+        verify,
+        "merge_branch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            verify.MergePreflightError("synthetic typed refusal")
+        ),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert "refused by git before it started" in summary.paused_reason
+    assert destination.read_bytes() == accepted
+    assert git(project.project, "ls-files", "--", destination) == ""
+    task = load_state(engine.run_dir).tasks["dw-fix"]
+    assert task.integration_attempt is None
+
+
+def test_replay_rearms_before_applying_new_collision_coverage(project, monkeypatch):
+    effect, destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    apply_plan = verify.apply_incoming_collision_plan
+    monkeypatch.setattr(
+        verify,
+        "apply_incoming_collision_plan",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("pause before cleanup")),
+    )
+    first = engine.run()
+    assert first.paused and not first.crashed
+    crashed = load_state(engine.run_dir).tasks["dw-fix"]
+    assert crashed.integration_attempt is not None
+    old_operation = crashed.integration_attempt["operation_identity"]
+    unit_src = (Path(crashed.worktree_path) / "src.txt").read_bytes()
+    (project.project / "src.txt").write_bytes(unit_src)
+    hook = project.project / ".git" / "hooks" / "pre-merge-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "printf 'target hook mutation' > "
+        "_bmad-output/implementation-artifacts/report.bin\n"
+        "git add -- _bmad-output/implementation-artifacts/report.bin\n"
+    )
+    hook.chmod(0o755)
+    monkeypatch.setattr(verify, "apply_incoming_collision_plan", apply_plan)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert (project.project / "src.txt").read_bytes() == unit_src
+    task = load_state(resumed.run_dir).tasks["dw-fix"]
+    assert task.integration_attempt is not None
+    assert task.integration_attempt["operation_identity"] != old_operation
+    assert any(entry["path"] == "src.txt" for entry in task.integration_attempt["snapshots"])
+    assert task.integration_attempt["outcome"] == "refused-restored"
+    assert destination.exists()
+
+
+def test_replay_refuses_changed_receipt_owned_collision_before_cleanup(project, monkeypatch):
+    effect, destination, accepted = _git_bound_publication_bundle(project, "pending-tracked")
+    destination.write_bytes(accepted)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    apply_plan = verify.apply_incoming_collision_plan
+    monkeypatch.setattr(
+        verify,
+        "apply_incoming_collision_plan",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("pause before cleanup")),
+    )
+    assert engine.run().paused
+    crashed = load_state(engine.run_dir).tasks["dw-fix"]
+    assert crashed.integration_attempt is not None
+    operation = crashed.integration_attempt["operation_identity"]
+    destination.write_bytes(b"new operator bytes")
+    monkeypatch.setattr(verify, "apply_incoming_collision_plan", apply_plan)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert destination.read_bytes() == b"new operator bytes"
+    task = load_state(resumed.run_dir).tasks["dw-fix"]
+    assert task.integration_attempt is not None
+    assert task.integration_attempt["operation_identity"] == operation
+    assert "outcome" not in task.integration_attempt
+    assert "unit-merged" not in journal_kinds(resumed)
+
+
+def test_partial_collision_cleanup_crash_restores_before_replanning(project, monkeypatch):
+    effect, destination, accepted = _git_bound_publication_bundle(project, "pending-tracked")
+    destination.write_bytes(accepted)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    emit = engine._worktree_flow._emit
+
+    def add_second_collision(stage, task, *args, **kwargs):
+        if stage == "pre_merge":
+            source = Path(task.worktree_path) / "src.txt"
+            (project.project / "src.txt").write_bytes(source.read_bytes())
+        return emit(stage, task, *args, **kwargs)
+
+    monkeypatch.setattr(engine._worktree_flow, "_emit", add_second_collision)
+    apply_plan = verify.apply_incoming_collision_plan
+
+    def crash_after_first_cleanup(repo, plan, **_kwargs):
+        assert len(plan.cleaned) >= 2
+        first = plan.cleaned[0]
+        apply_plan(
+            repo,
+            verify.IncomingCollisionPlan(
+                (first,),
+                tuple(path for path in plan.tolerated if path == first),
+                tuple(path for path in plan.untracked if path == first),
+            ),
+        )
+        raise SystemExit("host lost during collision cleanup")
+
+    monkeypatch.setattr(verify, "apply_incoming_collision_plan", crash_after_first_cleanup)
+    with pytest.raises(SystemExit, match="host lost during collision cleanup"):
+        engine.run()
+    crashed = load_state(engine.run_dir).tasks["dw-fix"]
+    assert crashed.integration_attempt is not None
+    operation = crashed.integration_attempt["operation_identity"]
+    live_root = engine.run_dir / "integration-snapshots" / operation
+    orphan = engine.run_dir / "integration-snapshots" / ("f" * 32)
+    orphan.mkdir()
+    (orphan / "orphan.bin").write_bytes(b"orphan")
+    observed_restoration = []
+    plan_collisions = verify.plan_incoming_collisions
+
+    def observe_restored_plan(repo, target, branch, **kwargs):
+        assert destination.read_bytes() == accepted
+        assert not verify.path_tracked(repo, destination.relative_to(repo).as_posix())
+        unit_src = (Path(crashed.worktree_path) / "src.txt").read_bytes()
+        assert (project.project / "src.txt").read_bytes() == unit_src
+        assert verify.path_tracked(repo, "src.txt")
+        observed_restoration.append(True)
+        return plan_collisions(repo, target, branch, **kwargs)
+
+    monkeypatch.setattr(verify, "apply_incoming_collision_plan", apply_plan)
+    monkeypatch.setattr(verify, "plan_incoming_collisions", observe_restored_plan)
+    resumed, adapter = resume_sweep(project, engine, [])
+    assert live_root.is_dir()
+    assert not orphan.exists()
+
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert observed_restoration
+    assert destination.read_bytes() == accepted
+    assert verify.path_tracked(project.project, destination.relative_to(project.project).as_posix())
+    assert "unit-merged" in journal_kinds(resumed)
+
+
+def test_guarded_restoration_filesystem_fault_pauses_with_durable_refusal(project, monkeypatch):
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    hook = project.project / ".git" / "hooks" / "pre-merge-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "printf 'target hook mutation' > "
+        "_bmad-output/implementation-artifacts/report.bin\n"
+        "git add -- _bmad-output/implementation-artifacts/report.bin\n"
+    )
+    hook.chmod(0o755)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    monkeypatch.setattr(
+        verify,
+        "restore_integration_ref",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("snapshot filesystem fault")),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    task = load_state(engine.run_dir).tasks["dw-fix"]
+    assert task.integration_attempt is not None
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert "target restoration failed" in refusal["error"]
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_damaged_receipt_sidecar_replay_refuses_without_git_or_session(
+    project, monkeypatch, damage
+):
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, original_adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    monkeypatch.setattr(
+        verify,
+        "merge_branch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("host loss before git")),
+    )
+    assert engine.run().crashed
+    task = load_state(engine.run_dir).tasks["dw-fix"]
+    assert task.integration_attempt is not None
+    regular = next(
+        entry for entry in task.integration_attempt["snapshots"] if entry["state"] == "regular"
+    )
+    sidecar = engine.run_dir / regular["sidecar"]
+    if damage == "missing":
+        sidecar.unlink()
+    else:
+        sidecar.write_bytes(b"corrupt")
+    before = verify.rev_parse_head(project.project)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert [session.role for session in original_adapter.sessions] == ["triage", "dev"]
+    assert verify.rev_parse_head(project.project) == before
+    assert "unit-merged" not in journal_kinds(resumed)
+    assert load_state(resumed.run_dir).tasks["dw-fix"].integration_attempt is not None
+
+
+def test_crash_after_unit_merged_retires_receipt_without_reintegration(project, monkeypatch):
+    effect, destination, accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, original_adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    append = engine.journal.append
+
+    def host_loss_after_unit_merged(kind, **fields):
+        result = append(kind, **fields)
+        if kind == "unit-merged":
+            raise SystemExit("host loss after unit-merged")
+        return result
+
+    monkeypatch.setattr(engine.journal, "append", host_loss_after_unit_merged)
+    with pytest.raises(SystemExit, match="host loss after unit-merged"):
+        engine.run()
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    landed = verify.rev_parse_head(project.project)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert [session.role for session in original_adapter.sessions] == ["triage", "dev"]
+    assert verify.is_ancestor(project.project, landed, verify.rev_parse_head(project.project))
+    final = resumed.state.tasks["dw-fix"]
+    assert final.integration_attempt is None
+    assert destination.read_bytes() == accepted
+    snapshots = resumed.run_dir / "integration-snapshots"
+    assert not snapshots.exists() or not any(snapshots.iterdir())
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        verify.MergePreflightError("synthetic target preflight refusal"),
+        verify.MergeHalfAppliedError("synthetic half-applied refusal"),
+        verify.MergeCommitRefusedError("synthetic commit refusal"),
+        verify.MergeConflictError("synthetic content conflict"),
+    ],
+    ids=("preflight", "half-applied", "commit-refused", "content-conflict"),
+)
+def test_typed_merge_refusal_retires_receipt_before_target_remedy(project, monkeypatch, refusal):
+    effect, destination, accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, original_adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    merge = verify.merge_branch
+
+    def refuse_before_merge(*_args, **_kwargs):
+        raise refusal
+
+    monkeypatch.setattr(verify, "merge_branch", refuse_before_merge)
+    summary = engine.run()
+    assert summary.paused and not summary.crashed
+    refused = load_state(engine.run_dir)
+    task = refused.tasks["dw-fix"]
+    assert task.integration_attempt is None
+    remedy = project.project / "operator-remedy.txt"
+    remedy.write_text("legitimate target advance\n")
+    git(project.project, "add", "--", remedy)
+    git(project.project, "commit", "-q", "-m", "operator target remedy")
+    remedy_head = verify.rev_parse_head(project.repo_root)
+    task.phase = Phase.DONE
+    save_state(engine.run_dir, refused)
+    monkeypatch.setattr(verify, "merge_branch", merge)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert [session.role for session in original_adapter.sessions] == ["triage", "dev"]
+    final = resumed.state.tasks["dw-fix"]
+    assert destination.read_bytes() == accepted
+    assert verify.is_ancestor(
+        project.repo_root, remedy_head, verify.rev_parse_head(project.repo_root)
+    )
+    assert final.integration_attempt is None
+    assert final.artifact_publication_complete
+    assert not Path(final.worktree_path).exists()
+
+
+def test_same_parent_and_message_impostor_cannot_satisfy_integration_receipt(project, monkeypatch):
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="squash"),
+    )
+
+    def crash_before_git(*_args, **_kwargs):
+        raise RuntimeError("host lost before git")
+
+    monkeypatch.setattr(verify, "merge_branch", crash_before_git)
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["dw-fix"]
+    assert crashed.integration_attempt is not None
+    impostor = project.project / "impostor.txt"
+    impostor.write_text("not the accepted source\n")
+    git(project.project, "add", "--", impostor)
+    git(project.project, "commit", "-q", "-m", engine._merge_message(crashed))
+    impostor_head = verify.rev_parse_head(project.repo_root)
+
+    def merge_must_not_run(*_args, **_kwargs):
+        raise AssertionError("shape impostor reached git replay")
+
+    monkeypatch.setattr(verify, "merge_branch", merge_must_not_run)
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert verify.rev_parse_head(project.repo_root) == impostor_head
+    assert impostor.read_text() == "not the accepted source\n"
+    assert "unit-merged" not in journal_kinds(resumed)
 
 
 def test_legacy_committing_replay_reuses_matching_finalized_commit_without_session(
@@ -26328,6 +27700,61 @@ def test_publication_replays_after_git_merge_before_completion_record(
     assert (project.implementation_artifacts / "spec-dw-fix.md").read_bytes() == expected["spec"]
     assert not Path(task.worktree_path).exists()
     assert "resume-unit-merge" in journal_kinds(resumed)
+
+
+@pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
+def test_tracked_target_integration_replays_from_task_receipt_without_started_journal(
+    project, monkeypatch, strategy
+):
+    effect, destination, accepted = _git_bound_publication_bundle(project, "tracked")
+    if strategy == "squash":
+        hook = project.project / ".git" / "hooks" / "commit-msg"
+        hook.write_text(
+            "#!/bin/sh\n"
+            'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+            "  printf 'rewritten target integration\\n' > \"$1\"\n"
+            "fi\n"
+        )
+        hook.chmod(0o755)
+    engine, original_adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+    merge = verify.merge_branch
+
+    def crash_after_merge(*args, **kwargs):
+        merge(*args, **kwargs)
+        raise RuntimeError("host lost after target integration")
+
+    monkeypatch.setattr(verify, "merge_branch", crash_after_merge)
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["dw-fix"]
+    assert crashed.integration_attempt is not None
+    assert "unit-merged" not in journal_kinds(engine)
+
+    journal = engine.run_dir / "journal.jsonl"
+    kept = [
+        line
+        for line in journal.read_text().splitlines()
+        if json.loads(line).get("kind") != "unit-merge-started"
+    ]
+    journal.write_text("\n".join(kept) + "\n")
+    monkeypatch.setattr(verify, "merge_branch", merge)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert destination.read_bytes() == accepted
+    final = resumed.state.tasks["dw-fix"]
+    assert final.integration_attempt is None
+    assert final.artifact_publication_complete
+    assert not Path(final.worktree_path).exists()
+    assert [session.role for session in original_adapter.sessions] == ["triage", "dev"]
+    if strategy == "squash":
+        assert git(project.project, "log", "-1", "--pretty=%s") == "rewritten target integration"
 
 
 def test_isolated_ordinary_bundle_keeps_shared_external_artifact_directory(project, tmp_path):
