@@ -1516,6 +1516,10 @@ JOURNAL_KINDS = frozenset(
         # already a `_JOURNAL_KEYLIST_FIELDS` name.
         "sweep-ledger-commit-withheld",
         "sweep-migrated",
+        # DW-296/DW-297. Current-format migration recovery evidence was absent,
+        # nonregular, unreadable, malformed, or mutually inconsistent. `detail`
+        # is already routed through diagnostics._JOURNAL_DROP_FIELDS.
+        "sweep-migration-recovery-invalid",
         "sweep-migration-restore-diverged",
         "sweep-nothing-open",
         # DW-176/DW-182/DW-197. `_prune_pre_answers` refusing to prune because the

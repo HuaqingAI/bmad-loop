@@ -259,6 +259,14 @@ class StoryTask:
     # over an unreadable ledger. Resume retries that current review's salvage,
     # including authoritative verification, instead of rebuilding the attempt.
     salvage_refile_pending: bool = False
+    # Sweep migration recovery format. 0 is a pre-upgrade task whose restart
+    # keeps the legacy reset-and-reread behavior; 1 requires the run-owned
+    # baseline/manifest (and, by phase, rewrite/result) records.
+    migration_recovery_format: int = 0
+    # True only when the migration publisher itself armed the run-scoped ledger
+    # doubt. A later successful idempotent replay may release that doubt, but
+    # must never release one inherited from another sweep phase.
+    migration_ledger_doubt_owned: bool = False
     baseline_commit: str | None = None
     # untracked, non-ignored paths present at baseline capture (repo-relative
     # posix). On rollback only paths NOT in this set are removed, so files the
@@ -483,6 +491,8 @@ class StoryTask:
             "escalations_resolved_upto": self.escalations_resolved_upto,
             "followup_review_recommended": self.followup_review_recommended,
             "salvage_refile_pending": self.salvage_refile_pending,
+            "migration_recovery_format": self.migration_recovery_format,
+            "migration_ledger_doubt_owned": self.migration_ledger_doubt_owned,
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
             "baseline_ledger_digest": self.baseline_ledger_digest,
@@ -696,6 +706,8 @@ class StoryTask:
             escalations_resolved_upto=int(d.get("escalations_resolved_upto", 0)),
             followup_review_recommended=bool(d.get("followup_review_recommended", False)),
             salvage_refile_pending=bool(d.get("salvage_refile_pending", False)),
+            migration_recovery_format=int(d.get("migration_recovery_format", 0)),
+            migration_ledger_doubt_owned=bool(d.get("migration_ledger_doubt_owned", False)),
             baseline_commit=d.get("baseline_commit"),
             baseline_untracked=(
                 [str(p) for p in d["baseline_untracked"]]

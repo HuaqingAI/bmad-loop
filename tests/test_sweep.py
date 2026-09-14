@@ -60,6 +60,8 @@ from bmad_loop.model import (
     TokenUsage,
     VerifyOutcome,
 )
+from bmad_loop.plugins import Plugin, PluginManifest, PluginRegistry
+from bmad_loop.plugins.model import LoadedPlugin
 from bmad_loop.policy import (
     AdapterPolicy,
     DevPolicy,
@@ -8796,12 +8798,13 @@ def test_a_clean_published_path_returns_before_git_add(project, monkeypatch):
 
     monkeypatch.setattr(verify, "commit_paths", no_commit)
 
-    engine._commit_ledger(
+    outcome = engine._commit_ledger(
         "chore(sweep): a publish with nothing to publish",
         path=project.deferred_work,
         family="ledger",
     )
 
+    assert outcome == "clean"
     assert _records(engine, "sweep-ledger-commit") == []  # no commit row...
     assert _records(engine, "sweep-ledger-commit-unavailable") == []  # ...and no degrade row
     [clean] = _records(engine, "sweep-ledger-commit-clean")  # the skip is announced (DW-191)
@@ -14506,8 +14509,11 @@ def test_the_ledger_commit_rows_name_the_file_they_are_about(project):
         project.deferred_work.read_text(encoding="utf-8") + "\n<!-- more -->\n", encoding="utf-8"
     )
     remove_tree(project.project / ".git")
-    engine._commit_ledger("chore(sweep): degraded", path=project.deferred_work, family="ledger")
+    outcome = engine._commit_ledger(
+        "chore(sweep): degraded", path=project.deferred_work, family="ledger"
+    )
 
+    assert outcome == "unavailable"
     [failed] = _records(engine, "sweep-ledger-commit-unavailable")
     assert failed["file"] == "deferred-work.md"
     assert failed["repo"] == str(project.implementation_artifacts)  # unchanged fields
@@ -14623,10 +14629,11 @@ def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, m
     # scoped to the published file: everything else in the frame still resolves
     refuse_to_resolve(monkeypatch, published)
 
-    engine._commit_ledger(
+    outcome = engine._commit_ledger(
         "chore(sweep): unresolvable", path=published, family=family
     )  # must not raise
 
+    assert outcome == "unavailable"
     [failed] = _records(engine, "sweep-ledger-commit-unavailable")
     assert failed["message"] == "chore(sweep): unresolvable"
     assert failed["file"] == tail  # bound before the try, so still here
@@ -17984,8 +17991,9 @@ def test_commit_ledger_refuses_an_unpublishable_target_without_reaching_git(
     engine.run_dir.mkdir(parents=True, exist_ok=True)
     engine._save()  # a clear flag on disk, so the store cases have a file to read
 
-    engine._commit_ledger("chore(sweep): publish", path=published_path, family=family)
+    outcome = engine._commit_ledger("chore(sweep): publish", path=published_path, family=family)
 
+    assert outcome == "refused"
     [refused] = _records(engine, "sweep-ledger-commit-refused")
     assert refused["refuse_cause"] == cause
     assert refused["message"] == "chore(sweep): publish"
@@ -19761,8 +19769,43 @@ def test_sweep_migrates_legacy_then_triages_and_runs_bundle(project):
     assert (engine.run_dir / "migrate-result.json").read_text(encoding="utf-8") == json.dumps(
         migrate_result(mapping), indent=2
     )
+    assert (engine.run_dir / "migrate-baseline.md").read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert (engine.run_dir / "migrate-rewrite.md").read_text(encoding="utf-8") == migrated_ledger()
+    assert load_state(engine.run_dir).tasks["sweep-migrate"].migration_recovery_format == 1
     # triage ran against the post-migration open set, strict check intact
     assert "--migrate" not in adapter.sessions[1].prompt
+
+
+@pytest.mark.parametrize("tampered_record", ["baseline", "manifest", "rewrite", "result"])
+def test_initial_migration_commit_refuses_tampered_durable_evidence(
+    project, monkeypatch, tampered_record
+):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, adapter = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real_write = sweep_mod.atomic_write_text_confined
+
+    def tamper_after_result(path, text, **kwargs):
+        result = real_write(path, text, **kwargs)
+        if path.name == "migrate-result.json":
+            targets = {
+                "baseline": (engine.run_dir / "migrate-baseline.md", "not the baseline\n"),
+                "manifest": (engine.run_dir / "migrate-manifest.json", "[]"),
+                "rewrite": (engine.run_dir / "migrate-rewrite.md", LEGACY_LEDGER),
+                "result": (engine.run_dir / "migrate-result.json", "[]"),
+            }
+            target, replacement = targets[tampered_record]
+            target.write_text(replacement, encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", tamper_after_result)
+    head = git(project.project, "rev-parse", "HEAD")
+    summary = engine.run()
+
+    assert summary.paused and len(adapter.sessions) == 1
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert "chore(sweep): migrate" not in git(project.project, "log", "--oneline")
 
 
 def test_severity_selector_applies_to_the_post_migration_ledger(project):
@@ -19855,6 +19898,892 @@ def test_migration_validation_failure_restores_ledger_then_escalates(project):
     assert "--feedback" not in prompts[0] and "--feedback" in prompts[1]
     feedback = open(prompts[1].split("--feedback ", 1)[1]).read()
     assert "still parse as legacy" in feedback and "not mapped" in feedback
+
+
+def _valid_migration_mapping():
+    manifest = legacy_manifest()
+    return [
+        {"key": manifest[0]["key"], "dw_id": "DW-1"},
+        {"key": manifest[1]["key"], "dw_id": "DW-2"},
+    ]
+
+
+def test_manifest_publication_fault_clears_baseline_and_retry_keeps_operator_repair(
+    project, monkeypatch
+):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(
+        project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
+    )
+    real_write = sweep_mod.atomic_write_text_confined
+    faulted = []
+
+    def fail_manifest_once(path, text, **kwargs):
+        if path.name == "migrate-manifest.json" and not faulted:
+            faulted.append(True)
+            raise OSError("manifest publication fault")
+        return real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", fail_manifest_once)
+    first = engine.run()
+
+    assert first.crashed and adapter.sessions == []
+    task = engine.state.tasks["sweep-migrate"]
+    assert task.phase == Phase.PENDING
+    assert task.baseline_commit is None and task.baseline_untracked is None
+
+    repaired = LEGACY_LEDGER + "\n<!-- operator repair -->\n"
+    project.deferred_work.write_text(repaired, encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "operator repair")
+    resumed, _ = resume_sweep(project, engine, [_half_migrated_effect(project)] * 2)
+    second = resumed.run()
+
+    assert second.paused
+    assert project.deferred_work.read_text(encoding="utf-8") == repaired
+    assert resumed.state.tasks["sweep-migrate"].baseline_commit == git(
+        project.project, "rev-parse", "HEAD"
+    )
+
+
+def test_predispatch_host_death_restamps_repaired_head_before_migration_retry(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(project, [])
+    interrupted = []
+
+    def die_before_manifest(_path):
+        interrupted.append(True)
+        raise SystemExit("simulated host death")
+
+    monkeypatch.setattr(engine, "_remove_migration_record", die_before_manifest)
+    with pytest.raises(SystemExit, match="simulated host death"):
+        engine.run()
+
+    persisted = load_state(engine.run_dir).tasks["sweep-migrate"]
+    stale_head = persisted.baseline_commit
+    assert interrupted == [True] and adapter.sessions == []
+    assert persisted.phase == Phase.PENDING and persisted.migration_recovery_format == 1
+    assert stale_head == git(project.project, "rev-parse", "HEAD")
+
+    repaired = LEGACY_LEDGER + "\n<!-- operator repair after interrupted publication -->\n"
+    project.deferred_work.write_text(repaired, encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "operator repair after interrupted publication")
+    repaired_head = git(project.project, "rev-parse", "HEAD")
+    assert repaired_head != stale_head
+
+    resumed, _ = resume_sweep(project, engine, [_half_migrated_effect(project)] * 2)
+    summary = resumed.run()
+
+    assert summary.paused
+    assert project.deferred_work.read_text(encoding="utf-8") == repaired
+    assert resumed.state.tasks["sweep-migrate"].baseline_commit == repaired_head
+
+
+def test_result_publication_fault_is_nonterminal_and_resume_restores_then_redispatches(
+    project, monkeypatch
+):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, first_adapter = make_sweep(
+        project, [migrate_effect(project, migrated_ledger(), mapping)]
+    )
+    real_write = sweep_mod.atomic_write_text_confined
+    faulted = []
+
+    def fail_result_once(path, text, **kwargs):
+        if path.name == "migrate-result.json" and not faulted:
+            faulted.append(True)
+            raise OSError("result publication fault")
+        return real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", fail_result_once)
+    first = engine.run()
+
+    assert first.crashed and len(first_adapter.sessions) == 1
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.TRIAGE_VERIFY
+    assert not (engine.run_dir / "migrate-result.json").exists()
+    assert "chore(sweep): migrate" not in git(project.project, "log", "--oneline")
+
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+
+    def migrate_after_observing_restored_baseline(spec):
+        assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+        return migrate_effect(project, migrated_ledger(), mapping)(spec)
+
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [migrate_after_observing_restored_baseline, triage_effect(plan)],
+    )
+    second = resumed.run()
+
+    assert not second.crashed and not second.paused
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.DONE
+    assert len(adapter.sessions) == 2
+    manifest_path = Path(adapter.sessions[0].prompt.split("--migrate ", 1)[1].split()[0])
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == legacy_manifest()
+
+
+@pytest.mark.parametrize("ledger_mode", ["ignored", "pre-existing-untracked"])
+def test_result_fault_recovery_supports_nontracked_ledgers(project, monkeypatch, ledger_mode):
+    if ledger_mode == "ignored":
+        ignore_before_commit(project, "_bmad-output/")
+        write_legacy_ledger(project, LEGACY_LEDGER)
+    else:
+        write_legacy_ledger(project, LEGACY_LEDGER, commit=False)
+    assert git(project.project, "ls-files", "--", ledger_rel(project)) == ""
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real_write = sweep_mod.atomic_write_text_confined
+    faulted = []
+
+    def fail_result_once(path, text, **kwargs):
+        if path.name == "migrate-result.json" and not faulted:
+            faulted.append(True)
+            raise OSError("result publication fault")
+        return real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", fail_result_once)
+    assert engine.run().crashed
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+
+    def migrate_after_observing_restored_baseline(spec):
+        assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+        return migrate_effect(project, migrated_ledger(), mapping)(spec)
+
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [migrate_after_observing_restored_baseline, triage_effect(plan)],
+    )
+
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.DONE
+    assert len(adapter.sessions) == 2
+
+
+def test_result_fault_resume_refuses_concurrent_ledger_edit(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real_write = sweep_mod.atomic_write_text_confined
+
+    def fail_result(path, text, **kwargs):
+        if path.name == "migrate-result.json":
+            raise OSError("result publication fault")
+        return real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", fail_result)
+    assert engine.run().crashed
+    rival = "\n### DW-99: rival\n\norigin: concurrent\nlocation: n/a\nreason: keep.\nstatus: open\n"
+    with project.deferred_work.open("a", encoding="utf-8") as stream:
+        stream.write(rival)
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.paused and adapter.sessions == []
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert "DW-99: rival" in project.deferred_work.read_text(encoding="utf-8")
+
+
+def test_result_fault_resume_refuses_a_rival_that_lands_after_reset(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real_write = sweep_mod.atomic_write_text_confined
+
+    def fail_result(path, text, **kwargs):
+        if path.name == "migrate-result.json":
+            raise OSError("result publication fault")
+        return real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", fail_result)
+    assert engine.run().crashed
+    resumed, adapter = resume_sweep(project, engine, [])
+    rival = "\n### DW-99: rival\n\norigin: concurrent\nlocation: n/a\nreason: keep.\nstatus: open\n"
+    with _rival_appending_safe_reset(monkeypatch, resumed, project.deferred_work, rival) as landed:
+        summary = resumed.run()
+
+    assert summary.paused and landed == [True] and adapter.sessions == []
+    assert "DW-99: rival" in project.deferred_work.read_text(encoding="utf-8")
+
+
+def test_rewrite_snapshot_publication_fault_escalates_on_resume_without_reset(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, adapter = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real_write = sweep_mod.atomic_write_text_confined
+
+    def fail_rewrite(path, text, **kwargs):
+        if path.name == "migrate-rewrite.md":
+            raise OSError("rewrite publication fault")
+        return real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", fail_rewrite)
+    first = engine.run()
+    accepted_live = project.deferred_work.read_text(encoding="utf-8")
+    head = git(project.project, "rev-parse", "HEAD")
+
+    assert first.crashed and len(adapter.sessions) == 1
+    resumed, resumed_adapter = resume_sweep(project, engine, [])
+    second = resumed.run()
+
+    assert second.paused and resumed_adapter.sessions == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert project.deferred_work.read_text(encoding="utf-8") == accepted_live
+
+
+def test_real_commit_refusal_owns_and_later_releases_ledger_doubt(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real_probe = verify.unpublishable_target
+    faulted = []
+
+    def refuse_once(target, family):
+        if family == "ledger" and not faulted:
+            faulted.append(True)
+            return "target-unreadable", "injected refusal"
+        return real_probe(target, family)
+
+    monkeypatch.setattr(verify, "unpublishable_target", refuse_once)
+    assert engine.run().crashed
+    persisted = load_state(engine.run_dir)
+    assert persisted.sweep_ledger_in_doubt
+    assert persisted.tasks["sweep-migrate"].migration_ledger_doubt_owned
+
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, _ = resume_sweep(project, engine, [triage_effect(plan)])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert not resumed.state.sweep_ledger_in_doubt
+    assert not resumed.state.tasks["sweep-migrate"].migration_ledger_doubt_owned
+
+
+def test_commit_replay_does_not_release_inherited_ledger_doubt(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: "unavailable")
+    assert engine.run().crashed
+    persisted = load_state(engine.run_dir)
+    persisted.sweep_ledger_in_doubt = True
+    persisted.tasks["sweep-migrate"].migration_ledger_doubt_owned = False
+    save_state(engine.run_dir, persisted)
+
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, _ = resume_sweep(project, engine, [triage_effect(plan)])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.DONE
+    assert resumed.state.sweep_ledger_in_doubt
+
+
+def test_committing_recovery_routes_an_unreadable_ledger_to_escalation(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: "unavailable")
+    assert engine.run().crashed
+    fault_read_text(monkeypatch, project.deferred_work)
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    assert not resumed.state.finished
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+
+
+@pytest.mark.parametrize("first_outcome", ["unavailable", "refused"])
+def test_unavailable_migration_commit_resumes_commit_only(project, monkeypatch, first_outcome):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, adapter = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: first_outcome)
+
+    first = engine.run()
+    assert first.crashed and not first.paused
+    assert not engine.state.finished
+    assert len(adapter.sessions) == 1
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.COMMITTING
+
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, resumed_adapter = resume_sweep(project, engine, [triage_effect(plan)])
+    second = resumed.run()
+
+    assert not second.crashed and not second.paused
+    assert len(resumed_adapter.sessions) == 1
+    assert "--migrate" not in resumed_adapter.sessions[0].prompt
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.DONE
+    assert "chore(sweep): migrate legacy" in git(project.project, "log", "--oneline")
+
+
+def test_commit_only_migration_resume_emits_post_migrate_once_after_publication(
+    project, monkeypatch
+):
+    seen = []
+
+    class RecordingPlugin(Plugin):
+        def on_post_migrate(self, context):
+            seen.append(context.story_key)
+
+    manifest = PluginManifest(name="migration-observer")
+    plugin = RecordingPlugin(manifest, {})
+    registry = PluginRegistry([LoadedPlugin(manifest=manifest, instance=plugin)])
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(
+        project,
+        [migrate_effect(project, migrated_ledger(), mapping)],
+        registry=registry,
+    )
+    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: "unavailable")
+
+    first = engine.run()
+
+    assert first.crashed and seen == []
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, _ = resume_sweep(
+        project,
+        engine,
+        [triage_effect(plan)],
+        registry=registry,
+    )
+    second = resumed.run()
+
+    assert not second.crashed and not second.paused
+    assert seen == ["sweep-migrate"]
+
+
+def test_crash_after_real_migration_commit_resumes_as_clean_commit_tail(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real_commit = engine._commit_ledger
+
+    def commit_then_crash(*args, **kwargs):
+        outcome = real_commit(*args, **kwargs)
+        assert outcome == "committed"
+        raise OSError("host died after commit")
+
+    monkeypatch.setattr(engine, "_commit_ledger", commit_then_crash)
+    first = engine.run()
+
+    assert first.crashed
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.COMMITTING
+    assert "chore(sweep): migrate legacy" in git(project.project, "log", "--oneline")
+
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, adapter = resume_sweep(project, engine, [triage_effect(plan)])
+    second = resumed.run()
+
+    assert not second.crashed and not second.paused
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.DONE
+    assert len(adapter.sessions) == 1 and "--migrate" not in adapter.sessions[0].prompt
+
+
+def test_result_durable_before_phase_save_resumes_commit_only(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real_save = engine._save
+    faulted = []
+
+    def fail_committing_save_once():
+        task = engine.state.tasks.get("sweep-migrate")
+        if task is not None and task.phase == Phase.COMMITTING and not faulted:
+            faulted.append(True)
+            task.phase = Phase.TRIAGE_VERIFY
+            raise OSError("state publication fault")
+        real_save()
+
+    monkeypatch.setattr(engine, "_save", fail_committing_save_once)
+    assert engine.run().crashed
+    persisted = load_state(engine.run_dir)
+    assert persisted.tasks["sweep-migrate"].phase == Phase.TRIAGE_VERIFY
+    assert (engine.run_dir / "migrate-result.json").is_file()
+
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, adapter = resume_sweep(project, engine, [triage_effect(plan)])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.DONE
+    assert len(adapter.sessions) == 1 and "--migrate" not in adapter.sessions[0].prompt
+
+
+def test_clean_migration_commit_outcome_reconfirms_the_live_rewrite(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, adapter = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    rival = migrated_ledger() + "\n<!-- changed after clean verdict -->\n"
+
+    def clean_then_change(*_args, **_kwargs):
+        project.deferred_work.write_text(rival, encoding="utf-8")
+        return "clean"
+
+    monkeypatch.setattr(engine, "_commit_ledger", clean_then_change)
+    summary = engine.run()
+
+    assert summary.paused and len(adapter.sessions) == 1
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert project.deferred_work.read_text(encoding="utf-8") == rival
+
+
+def test_committing_resume_refuses_live_ledger_drift_before_publication(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: "unavailable")
+    assert engine.run().crashed
+    rival = migrated_ledger() + "\n<!-- concurrent commit-tail edit -->\n"
+    project.deferred_work.write_text(rival, encoding="utf-8")
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    reached = []
+    monkeypatch.setattr(
+        resumed,
+        "_commit_ledger",
+        lambda *_args, **_kwargs: reached.append(True) or "committed",
+    )
+    summary = resumed.run()
+
+    assert summary.paused and adapter.sessions == [] and reached == []
+    assert project.deferred_work.read_text(encoding="utf-8") == rival
+
+
+def test_pending_migration_can_validate_an_already_canonical_operator_repair(project):
+    canonical = migrated_ledger()
+    write_legacy_ledger(project, canonical)
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    engine, adapter = make_sweep(
+        project,
+        [migrate_effect(project, canonical, []), triage_effect(plan)],
+    )
+    engine.state.tasks["sweep-migrate"] = StoryTask(story_key="sweep-migrate", epic=0)
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.DONE
+    assert len(adapter.sessions) == 2
+
+
+def test_result_fault_recovery_refuses_an_advanced_head_without_reset(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real_write = sweep_mod.atomic_write_text_confined
+
+    def fail_result(path, text, **kwargs):
+        if path.name == "migrate-result.json":
+            raise OSError("result publication fault")
+        return real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", fail_result)
+    assert engine.run().crashed
+    accepted_rewrite = project.deferred_work.read_text(encoding="utf-8")
+    repair = project.project / "operator-repair.txt"
+    repair.write_text("keep this commit\n", encoding="utf-8")
+    git(project.project, "add", "--", repair.name)
+    git(project.project, "commit", "-q", "-m", "operator advanced head")
+    advanced = git(project.project, "rev-parse", "HEAD")
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.paused and adapter.sessions == []
+    assert git(project.project, "rev-parse", "HEAD") == advanced
+    assert repair.read_text(encoding="utf-8") == "keep this commit\n"
+    assert project.deferred_work.read_text(encoding="utf-8") == accepted_rewrite
+
+
+def test_result_fault_recovery_clears_baseline_before_a_pending_restart(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real_write = sweep_mod.atomic_write_text_confined
+    result_faulted = []
+
+    def fail_result_once(path, text, **kwargs):
+        if path.name == "migrate-result.json" and not result_faulted:
+            result_faulted.append(True)
+            raise OSError("result publication fault")
+        return real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", fail_result_once)
+    assert engine.run().crashed
+    resumed, _ = resume_sweep(project, engine, [])
+    real_save = resumed._save
+    pending_faulted = []
+
+    def fail_once_after_pending_recovery():
+        task = resumed.state.tasks["sweep-migrate"]
+        if task.phase == Phase.PENDING and task.baseline_commit is None and not pending_faulted:
+            pending_faulted.append(True)
+            raise OSError("host died after pending recovery")
+        real_save()
+
+    monkeypatch.setattr(resumed, "_save", fail_once_after_pending_recovery)
+    assert resumed.run().crashed
+    persisted = load_state(engine.run_dir).tasks["sweep-migrate"]
+    assert persisted.phase == Phase.PENDING and persisted.baseline_commit is None
+
+    repair = project.project / "operator-repair.txt"
+    repair.write_text("survive retry reset\n", encoding="utf-8")
+    git(project.project, "add", "--", repair.name)
+    git(project.project, "commit", "-q", "-m", "repair after pending recovery")
+    repaired_head = git(project.project, "rev-parse", "HEAD")
+    retried, _ = resume_sweep(project, resumed, [_half_migrated_effect(project)] * 2)
+    summary = retried.run()
+
+    assert summary.paused
+    assert repair.read_text(encoding="utf-8") == "survive retry reset\n"
+    assert retried.state.tasks["sweep-migrate"].baseline_commit == repaired_head
+
+
+def test_marked_result_fault_with_missing_baseline_escalates_without_redispatch(
+    project, monkeypatch
+):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real_write = sweep_mod.atomic_write_text_confined
+
+    def fail_result(path, text, **kwargs):
+        if path.name == "migrate-result.json":
+            raise OSError("result publication fault")
+        return real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", fail_result)
+    assert engine.run().crashed
+    accepted_rewrite = project.deferred_work.read_text(encoding="utf-8")
+    (engine.run_dir / "migrate-baseline.md").unlink()
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.paused and adapter.sessions == []
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert project.deferred_work.read_text(encoding="utf-8") == accepted_rewrite
+
+
+def test_unmarked_preupgrade_triage_verify_restarts_without_snapshot_records(project):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    baseline = git(project.project, "rev-parse", "HEAD")
+    project.deferred_work.write_text(migrated_ledger(), encoding="utf-8")
+    mapping = _valid_migration_mapping()
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    engine, adapter = make_sweep(
+        project,
+        [migrate_effect(project, migrated_ledger(), mapping), triage_effect(plan)],
+    )
+    engine.state.tasks["sweep-migrate"] = StoryTask.from_dict(
+        {
+            "story_key": "sweep-migrate",
+            "epic": 0,
+            "phase": str(Phase.TRIAGE_VERIFY),
+            "baseline_commit": baseline,
+            "baseline_untracked": [],
+            # Deliberately no migration_recovery_format or
+            # migration_ledger_doubt_owned: this is a pre-upgrade state shape.
+        }
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.DONE
+    assert len(adapter.sessions) == 2
+
+
+def test_marked_triage_running_ignores_stale_accepted_rewrite(project, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real_write = sweep_mod.atomic_write_text_confined
+
+    def fail_result(path, text, **kwargs):
+        if path.name == "migrate-result.json":
+            raise OSError("result publication fault")
+        return real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", fail_result)
+    assert engine.run().crashed
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", real_write)
+    task = engine.state.tasks["sweep-migrate"]
+    task.phase = Phase.TRIAGE_RUNNING
+    save_state(engine.run_dir, engine.state)
+    project.deferred_work.write_text(migrated_ledger() + "\n<!-- partial retry -->\n")
+
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, adapter = resume_sweep(
+        project,
+        engine,
+        [migrate_effect(project, migrated_ledger(), mapping), triage_effect(plan)],
+    )
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 2
+    assert "--migrate" in adapter.sessions[0].prompt
+
+
+@pytest.mark.parametrize(
+    "result_text",
+    [
+        None,
+        "{",
+        "[]",
+        json.dumps(migrate_result([])),
+        "[" * 2000 + "0" + "]" * 2000,
+        "[" + "9" * 5000 + "]",
+    ],
+    ids=[
+        "missing",
+        "malformed",
+        "wrong-type",
+        "semantic-mismatch",
+        "recursive",
+        "oversized-integer",
+    ],
+)
+def test_committing_resume_rejects_bad_result_before_publication(project, monkeypatch, result_text):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: "unavailable")
+    assert engine.run().crashed
+    result_path = engine.run_dir / "migrate-result.json"
+    if result_text is None:
+        result_path.unlink()
+    else:
+        result_path.write_text(result_text, encoding="utf-8")
+    head = git(project.project, "rev-parse", "HEAD")
+    live = project.deferred_work.read_text(encoding="utf-8")
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    reached = []
+    monkeypatch.setattr(
+        resumed,
+        "_commit_ledger",
+        lambda *_args, **_kwargs: reached.append(True) or "committed",
+    )
+    summary = resumed.run()
+
+    assert summary.paused and adapter.sessions == []
+    assert reached == []
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert project.deferred_work.read_text(encoding="utf-8") == live
+
+
+@pytest.mark.parametrize(
+    "manifest_text",
+    ["[]", "[" * 2000 + "0" + "]" * 2000, "[" + "9" * 5000 + "]"],
+    ids=["baseline-mismatch", "recursive", "oversized-integer"],
+)
+def test_committing_resume_rejects_bad_manifest(project, monkeypatch, manifest_text):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: "unavailable")
+    assert engine.run().crashed
+    (engine.run_dir / "migrate-manifest.json").write_text(manifest_text, encoding="utf-8")
+    head = git(project.project, "rev-parse", "HEAD")
+    live = project.deferred_work.read_text(encoding="utf-8")
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    reached = []
+    monkeypatch.setattr(
+        resumed,
+        "_commit_ledger",
+        lambda *_args, **_kwargs: reached.append(True) or "committed",
+    )
+    summary = resumed.run()
+
+    assert summary.paused and adapter.sessions == [] and reached == []
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert project.deferred_work.read_text(encoding="utf-8") == live
+
+
+@pytest.mark.parametrize(
+    "record_name",
+    [
+        "migrate-baseline.md",
+        "migrate-manifest.json",
+        "migrate-rewrite.md",
+        "migrate-result.json",
+    ],
+)
+def test_committing_resume_rejects_invalid_utf8_recovery_record(project, monkeypatch, record_name):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, _ = make_sweep(
+        project,
+        [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())],
+    )
+    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: "unavailable")
+    assert engine.run().crashed
+    (engine.run_dir / record_name).write_bytes(b"invalid \xff record")
+    head = git(project.project, "rev-parse", "HEAD")
+    live = project.deferred_work.read_bytes()
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    reached = []
+    monkeypatch.setattr(
+        resumed,
+        "_commit_ledger",
+        lambda *_args, **_kwargs: reached.append(True) or "committed",
+    )
+    summary = resumed.run()
+
+    assert summary.paused and adapter.sessions == [] and reached == []
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert project.deferred_work.read_bytes() == live
+
+
+@pytest.mark.parametrize(
+    "record_name",
+    [
+        "migrate-baseline.md",
+        "migrate-manifest.json",
+        "migrate-rewrite.md",
+        "migrate-result.json",
+    ],
+)
+def test_committing_resume_escalates_when_recovery_record_read_raises(
+    project, monkeypatch, record_name
+):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, _ = make_sweep(
+        project,
+        [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())],
+    )
+    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: "unavailable")
+    assert engine.run().crashed
+    head = git(project.project, "rev-parse", "HEAD")
+    live = project.deferred_work.read_bytes()
+    real_open = sweep_mod.os.open
+
+    def refuse_record(path, flags, *args, **kwargs):
+        if Path(path).name == record_name:
+            raise OSError("injected recovery record read fault")
+        return real_open(path, flags, *args, **kwargs)
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    reached = []
+    monkeypatch.setattr(sweep_mod.os, "open", refuse_record)
+    monkeypatch.setattr(
+        resumed,
+        "_commit_ledger",
+        lambda *_args, **_kwargs: reached.append(True) or "committed",
+    )
+    summary = resumed.run()
+
+    assert summary.paused and adapter.sessions == [] and reached == []
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert project.deferred_work.read_bytes() == live
+
+
+def test_recovery_record_rejection_does_not_recategorize_escalation_io_fault(project, monkeypatch):
+    engine, _ = make_sweep(project, [])
+    task = StoryTask(story_key="sweep-migrate", epic=0)
+    record = engine.run_dir / "migrate-manifest.json"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text("[]", encoding="utf-8")
+    failures = []
+
+    def fail_escalation(_task, detail):
+        failures.append(detail)
+        raise OSError("injected escalation persistence fault")
+
+    monkeypatch.setattr(sweep_mod.stat, "S_ISREG", lambda _mode: False)
+    monkeypatch.setattr(engine, "_migration_evidence_failure", fail_escalation)
+
+    with pytest.raises(OSError, match="injected escalation persistence fault"):
+        engine._migration_record_text(task, record, "manifest")
+
+    assert failures == ["nonregular manifest record"]
+
+
+@pytest.mark.parametrize(
+    ("phase", "recovery_format"),
+    [
+        (Phase.COMMITTING, 0),
+        (Phase.COMMITTING, 2),
+        (Phase.TRIAGE_VERIFY, 2),
+    ],
+    ids=["markerless-committing", "unknown-committing", "unknown-triage-verify"],
+)
+def test_durable_migration_phase_rejects_bad_marker_before_cycle_ledger_read(
+    project, monkeypatch, phase, recovery_format
+):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: "unavailable")
+    assert engine.run().crashed
+    persisted = load_state(engine.run_dir)
+    task = persisted.tasks["sweep-migrate"]
+    task.phase = phase
+    task.migration_recovery_format = recovery_format
+    save_state(engine.run_dir, persisted)
+    fault_read_text(monkeypatch, project.deferred_work)
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
+    assert not resumed.state.finished
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+
+
+@pytest.mark.parametrize("snapshot_shape", ["directory", "symlink"])
+def test_committing_resume_rejects_a_nonregular_rewrite_snapshot(
+    project, monkeypatch, tmp_path, snapshot_shape
+):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, _ = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: "unavailable")
+    assert engine.run().crashed
+    rewrite = engine.run_dir / "migrate-rewrite.md"
+    rewrite.unlink()
+    if snapshot_shape == "directory":
+        rewrite.mkdir()
+    else:
+        external = tmp_path / "external-rewrite.md"
+        external.write_text(migrated_ledger(), encoding="utf-8")
+        try:
+            rewrite.symlink_to(external)
+        except OSError as exc:  # pragma: no cover - win32 without developer mode
+            pytest.skip(f"symlinks unavailable on this host: {exc}")
+    head = git(project.project, "rev-parse", "HEAD")
+    live = project.deferred_work.read_text(encoding="utf-8")
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    reached = []
+    monkeypatch.setattr(
+        resumed,
+        "_commit_ledger",
+        lambda *_args, **_kwargs: reached.append(True) or "committed",
+    )
+    summary = resumed.run()
+
+    assert summary.paused and adapter.sessions == [] and reached == []
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert project.deferred_work.read_text(encoding="utf-8") == live
 
 
 def test_migration_restore_write_failure_propagates_and_keeps_the_ledger(project, monkeypatch):
@@ -22061,7 +22990,7 @@ def _redirect_the_run_dir(project, tmp_path):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_the_migration_manifest_write_refuses_a_redirected_run_dir(project, tmp_path, monkeypatch):
-    """DW-288's first migration record is published before a session runs.
+    """The accepted-baseline record is published before manifest and dispatch.
 
     The helper spy is the reached-site precondition: this test must exercise the
     manifest publication itself, not pass merely because some earlier run setup
@@ -22093,16 +23022,46 @@ def test_the_migration_manifest_write_refuses_a_redirected_run_dir(project, tmp_
     assert not (outside / "migrate-manifest.json").exists()
     assert list(outside.glob("migrate-manifest*")) == []  # no staged temp either
     assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
-    assert reached == [engine.run_dir / "migrate-manifest.json"]  # PRECONDITION: site reached
-    assert engine.state.tasks["sweep-migrate"].baseline_commit == git(
-        project.project, "rev-parse", "HEAD"
-    )
+    assert reached == [engine.run_dir / "migrate-baseline.md"]  # PRECONDITION: site reached
+    assert engine.state.tasks["sweep-migrate"].baseline_commit is None
+    assert engine.state.tasks["sweep-migrate"].baseline_untracked is None
     assert len(adapter.sessions) == 0  # refusal precedes migration dispatch
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_manifest_publication_refuses_a_redirect_after_baseline_is_durable(
+    project, tmp_path, monkeypatch
+):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(
+        project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
+    )
+    real_save = engine._save
+    parked = tmp_path / "run-before-manifest-redirect"
+    outside = tmp_path / "outside"
+    redirected = []
+
+    def save_then_redirect():
+        real_save()
+        task = engine.state.tasks.get("sweep-migrate")
+        if task is not None and task.migration_recovery_format == 1 and not redirected:
+            redirected.append(True)
+            engine.run_dir.rename(parked)
+            outside.mkdir()
+            engine.run_dir.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(engine, "_save", save_then_redirect)
+    summary = engine.run()
+
+    assert summary.crashed and adapter.sessions == []
+    assert redirected == [True]
+    assert (parked / "migrate-baseline.md").read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert not (outside / "migrate-manifest.json").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_the_migration_result_write_refuses_a_redirected_run_dir(project, tmp_path, monkeypatch):
-    """DW-288's successful-result publication refuses a post-session redirect.
+    """The accepted-rewrite publication refuses a post-session redirect.
 
     The scripted migration consumes the safely published manifest before replacing
     the run directory with a link. This isolates the second write: one session ran,
@@ -22143,15 +23102,104 @@ def test_the_migration_result_write_refuses_a_redirected_run_dir(project, tmp_pa
     summary = engine.run()
 
     assert summary.crashed and not summary.paused
-    assert not (outside / "migrate-result.json").exists()
-    assert list(outside.glob("migrate-result*")) == []  # no staged temp either
+    assert not (outside / "migrate-rewrite.md").exists()
+    assert list(outside.glob("migrate-rewrite*")) == []  # no staged temp either
     assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
     assert consumed == [manifest]  # PRECONDITION: the session consumed the manifest
     assert len(adapter.sessions) == 1
     assert commit_reached == []  # refusal precedes the ledger commit
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.TRIAGE_VERIFY
     assert (parked / "migrate-manifest.json").read_text(encoding="utf-8") == json.dumps(
         manifest, indent=2
     )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_result_publication_refuses_a_redirect_after_rewrite_is_durable(
+    project, tmp_path, monkeypatch
+):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    engine, adapter = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
+    real_write = sweep_mod.atomic_write_text_confined
+    parked = tmp_path / "run-before-result-redirect"
+    outside = tmp_path / "outside"
+    redirected = []
+
+    def write_then_redirect(path, text, **kwargs):
+        result = real_write(path, text, **kwargs)
+        if path.name == "migrate-rewrite.md" and not redirected:
+            redirected.append(True)
+            engine.run_dir.rename(parked)
+            outside.mkdir()
+            engine.run_dir.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", write_then_redirect)
+    summary = engine.run()
+
+    assert summary.crashed and len(adapter.sessions) == 1
+    assert redirected == [True]
+    assert (parked / "migrate-rewrite.md").read_text(encoding="utf-8") == migrated_ledger()
+    assert not (outside / "migrate-result.json").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_fallback_migration_record_read_refuses_a_redirected_parent(project, tmp_path, monkeypatch):
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, _ = make_sweep(
+        project,
+        [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())],
+    )
+    monkeypatch.setattr(engine, "_commit_ledger", lambda *_args, **_kwargs: "unavailable")
+    assert engine.run().crashed
+    head = git(project.project, "rev-parse", "HEAD")
+    live = project.deferred_work.read_bytes()
+    resumed, adapter = resume_sweep(project, engine, [])
+    parked = tmp_path / "parked-run"
+    engine.run_dir.rename(parked)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    external_record = outside / "migrate-baseline.md"
+    external_record.write_text(LEGACY_LEDGER, encoding="utf-8")
+    engine.run_dir.symlink_to(outside, target_is_directory=True)
+    reached = []
+    monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", False)
+    monkeypatch.setattr(
+        resumed,
+        "_commit_ledger",
+        lambda *_args, **_kwargs: reached.append(True) or "committed",
+    )
+
+    summary = resumed.run()
+
+    assert summary.paused and adapter.sessions == [] and reached == []
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert _records(resumed, "sweep-migration-recovery-invalid")[-1]["detail"] == (
+        "unconfined baseline record"
+    )
+    assert external_record.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert project.deferred_work.read_bytes() == live
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_stale_migration_record_removal_refuses_a_redirected_parent(project, tmp_path, monkeypatch):
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    parked = tmp_path / "parked-run"
+    engine.run_dir.rename(parked)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    external_record = outside / "migrate-rewrite.md"
+    external_record.write_text("must survive\n", encoding="utf-8")
+    engine.run_dir.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", False)
+
+    with pytest.raises(OSError, match="confine"):
+        engine._remove_migration_record(engine.run_dir / "migrate-rewrite.md")
+
+    assert external_record.read_text(encoding="utf-8") == "must survive\n"
 
 
 def test_the_confined_migration_records_land_under_a_disjoint_repo_root(project, tmp_path):
@@ -22186,11 +23234,13 @@ def test_the_confined_migration_records_land_under_a_disjoint_repo_root(project,
     assert engine.state.tasks["sweep-migrate"].phase == Phase.DONE
     assert len(adapter.sessions) == 2  # migration completed, then triage ran
     expected_records = {
+        engine.run_dir / "migrate-baseline.md",
+        engine.run_dir / "migrate-rewrite.md",
         engine.run_dir / "migrate-manifest.json",
         engine.run_dir / "migrate-result.json",
     }
-    assert set(paths.project.rglob("migrate-*.json")) == expected_records
-    assert list(elsewhere.rglob("migrate-*.json")) == []
+    assert set(paths.project.rglob("migrate-*")) == expected_records
+    assert list(elsewhere.rglob("migrate-*")) == []
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
