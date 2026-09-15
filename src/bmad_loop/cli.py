@@ -2628,7 +2628,11 @@ def _sweep_dry_run(
             if entry.severity is not None and SEVERITY_ORDER[entry.severity] >= floor
         ]
         selected_keys = {entry.key for entry in legacy_selected}
-        legacy_excluded = [entry for entry in legacy_open if entry.key not in selected_keys]
+        legacy_excluded = [
+            entry
+            for entry in legacy_open
+            if entry.severity is not None and entry.key not in selected_keys
+        ]
         legacy_missing_severity = [entry for entry in legacy_open if entry.severity is None]
     if legacy:
         print(

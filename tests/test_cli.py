@@ -1728,6 +1728,7 @@ def test_sweep_dry_run_applies_severity_floor_to_legacy_entries(project, capsys)
     assert "legacy entries excluded by severity selector" in out and "Low legacy" in out
     assert "legacy entries excluded for missing or unrecognized severity" in out
     assert "Missing legacy" in out
+    assert out.count("Missing legacy") == 1
     assert "triage: after migration assigns canonical DW ids" in out
 
 
