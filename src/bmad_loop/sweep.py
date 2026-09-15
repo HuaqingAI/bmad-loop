@@ -521,6 +521,7 @@ def validate_migration(
     if not isinstance(mapping, list):
         return errors + ["mapping must be a list of {key, dw_id}"]
     seen_keys: set[str] = set()
+    sources_by_target: dict[str, list[dict[str, Any]]] = {}
     for item in mapping:
         key = str(item.get("key", "")) if isinstance(item, dict) else ""
         dw_id = str(item.get("dw_id", "")) if isinstance(item, dict) else ""
@@ -535,13 +536,26 @@ def validate_migration(
         if target is None:
             errors.append(f"mapping {key} -> {dw_id}: no such entry in the ledger")
         else:
+            sources_by_target.setdefault(dw_id, []).append(source)
             if (first_word(target.status) == "done") != bool(source["done"]):
                 want = "done" if source["done"] else "open"
                 errors.append(f"mapping {key} -> {dw_id}: manifest says {want}, ledger disagrees")
-            if target.severity != source.get("severity"):
+    for dw_id, sources in sources_by_target.items():
+        target = entries[dw_id]
+        source_severities = [source.get("severity") for source in sources]
+        present = [severity for severity in source_severities if severity is not None]
+        expected = max(present, key=SEVERITY_ORDER.__getitem__) if present else None
+        if target.severity != expected:
+            if len(sources) == 1:
+                key = str(sources[0]["key"])
                 errors.append(
                     f"mapping {key} -> {dw_id}: manifest severity "
-                    f"{source.get('severity')!r}, ledger has {target.severity!r}"
+                    f"{expected!r}, ledger has {target.severity!r}"
+                )
+            else:
+                errors.append(
+                    f"merged mapping -> {dw_id}: highest manifest severity "
+                    f"{expected!r}, ledger has {target.severity!r}"
                 )
     missing = sorted(set(manifest_by_key) - seen_keys)
     if missing:

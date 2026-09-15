@@ -1079,6 +1079,33 @@ def test_validate_migration_rejects_changed_manifest_severity():
     assert errors == ["mapping legacy-1 -> DW-1: manifest severity 'high', ledger has 'low'"]
 
 
+def test_validate_migration_uses_highest_severity_for_a_merged_target():
+    manifest = [
+        {"key": "low", "done": False, "severity": "low"},
+        {"key": "critical", "done": False, "severity": "critical"},
+        {"key": "missing", "done": False, "severity": None},
+    ]
+    rj = migrate_result(
+        [
+            {"key": "low", "dw_id": "DW-1"},
+            {"key": "critical", "dw_id": "DW-1"},
+            {"key": "missing", "dw_id": "DW-1"},
+        ]
+    )
+    correct = (
+        "# Deferred Work\n\n### DW-1: merged\n\norigin: migrated\n"
+        "severity: critical\nstatus: open\n"
+    )
+    weakened = correct.replace("severity: critical", "severity: high")
+
+    assert validate_migration(rj, manifest, {}, correct) == []
+    errors = validate_migration(rj, manifest, {}, weakened)
+
+    assert errors == [
+        "merged mapping -> DW-1: highest manifest severity 'critical', ledger has 'high'"
+    ]
+
+
 # ------------------------------------------------------------ engine flow
 
 

@@ -845,11 +845,17 @@ class SweepResumeOptions:
 def load_sweep_resume_options(run_dir: Path) -> SweepResumeOptions:
     """Load sweep.json, tolerating old files but refusing malformed selectors."""
     opts_path = run_dir / "sweep.json"
+    if not opts_path.is_file():
+        return SweepResumeOptions({}, None, None)
     try:
-        loaded = json.loads(opts_path.read_text(encoding="utf-8")) if opts_path.is_file() else {}
-    except (OSError, json.JSONDecodeError):
-        loaded = {}
-    opts: dict[str, Any] = loaded if isinstance(loaded, dict) else {}
+        loaded = json.loads(opts_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SweepOptionsError(f"sweep.json cannot be read: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SweepOptionsError("sweep.json is not valid JSON") from exc
+    if not isinstance(loaded, dict):
+        raise SweepOptionsError("sweep.json must contain a JSON object")
+    opts: dict[str, Any] = loaded
 
     raw_only = opts.get("only")
     only_present = "only" in opts

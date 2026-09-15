@@ -1735,11 +1735,13 @@ def test_sweep_dry_run_applies_severity_floor_to_legacy_entries(project, capsys)
 @pytest.mark.parametrize(
     "contents",
     [
+        "[]",
+        "{",
         '{"only": "DW-1", "min_severity": null}',
         '{"only": null, "min_severity": "urgent"}',
         '{"only": ["DW-1"], "min_severity": "high"}',
     ],
-    ids=["only-shape", "severity-value", "both"],
+    ids=["non-object", "invalid-json", "only-shape", "severity-value", "both"],
 )
 def test_public_resume_refuses_malformed_selectors_before_mutation(
     project, monkeypatch, capsys, contents
@@ -6043,12 +6045,10 @@ def test_resume_migrates_a_legacy_state_without_calling_it_a_move(project, monke
     assert "code root" not in capsys.readouterr().err
 
 
-def test_resume_tolerates_a_corrupt_sweep_json(project, monkeypatch):
-    """A torn/corrupt sweep.json (a crash mid-write on an older run) must not abort
-    resume — the recovery path. compose_resume guards the read and falls back to the
-    same launch defaults as the missing-file arm instead of letting json.loads raise."""
+def test_resume_tolerates_a_missing_legacy_sweep_json(project, monkeypatch):
+    """A pre-option sweep has no sweep.json and resumes unrestricted."""
     run_dir = _paused_run_for_resume(project, monkeypatch, run_type="sweep")
-    (run_dir / "sweep.json").write_text("{ not json", encoding="utf-8")
+    (run_dir / "sweep.json").unlink(missing_ok=True)
 
     captured: dict = {}
 

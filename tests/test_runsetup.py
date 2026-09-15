@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from conftest import fault_read_text
 
 from bmad_loop import bmadconfig
 from bmad_loop import journal as journal_mod
@@ -416,13 +417,14 @@ def test_compose_sweep_persists_and_wires_selectors(tmp_path, only_ids, min_seve
 
 @pytest.mark.parametrize(
     "contents",
-    ["{}", "[]", "{"],
-    ids=["old", "non-object", "invalid-json"],
+    [None, "{}"],
+    ids=["missing", "old-empty-object"],
 )
 def test_resume_defaults_old_sweep_options_to_unrestricted(tmp_path, monkeypatch, contents):
     run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
     run_dir.mkdir(parents=True)
-    (run_dir / "sweep.json").write_text(contents, encoding="utf-8")
+    if contents is not None:
+        (run_dir / "sweep.json").write_text(contents, encoding="utf-8")
     state = RunState(
         run_id=RUN_ID,
         project=str(tmp_path),
@@ -452,12 +454,14 @@ def test_resume_defaults_old_sweep_options_to_unrestricted(tmp_path, monkeypatch
 @pytest.mark.parametrize(
     "contents",
     [
+        "[]",
+        "{",
         '{"only": "DW-1", "min_severity": null}',
         '{"only": ["DW-١"], "min_severity": null}',
         '{"only": null, "min_severity": "urgent"}',
         '{"only": ["DW-1"], "min_severity": "high"}',
     ],
-    ids=["only-shape", "non-ascii-id", "severity-value", "both"],
+    ids=["non-object", "invalid-json", "only-shape", "non-ascii-id", "severity-value", "both"],
 )
 def test_resume_refuses_malformed_selector_bearing_options(tmp_path, monkeypatch, contents):
     run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
@@ -488,6 +492,17 @@ def test_resume_refuses_malformed_selector_bearing_options(tmp_path, monkeypatch
         )
 
     assert killed == []
+
+
+def test_resume_refuses_an_unreadable_existing_sweep_options_file(tmp_path, monkeypatch):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    options_path = run_dir / "sweep.json"
+    options_path.write_text("{}", encoding="utf-8")
+    fault_read_text(monkeypatch, options_path)
+
+    with pytest.raises(runsetup.SweepOptionsError, match="cannot be read"):
+        runsetup.load_sweep_resume_options(run_dir)
 
 
 def test_resume_reconstructs_persisted_sweep_selectors(tmp_path, monkeypatch):
