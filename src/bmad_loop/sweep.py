@@ -48,6 +48,8 @@ _BUNDLE_NAME_SAFE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
 # empty and the split stays unambiguous even for a bundle named "2fix".
 BUNDLE_KEY_RE = re.compile(r"^dw(\d*)-(.+)\Z")
 DECISION_EFFECTS = ("build", "close", "keep-open")
+SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+DW_ID_RE = re.compile(r"DW-[0-9]+\Z")
 
 
 @dataclass(frozen=True)
@@ -150,6 +152,59 @@ class TriagePlan:
     blocked: tuple[tuple[str, str], ...] = ()  # (id, blocker)
     skip: tuple[tuple[str, str], ...] = ()  # (id, reason)
     decisions: tuple[Decision, ...] = ()
+
+
+@dataclass(frozen=True)
+class SweepSelection:
+    selected: tuple[deferredwork.DWEntry, ...]
+    excluded: tuple[deferredwork.DWEntry, ...]
+    missing_severity: tuple[deferredwork.DWEntry, ...] = ()
+
+
+def select_entries(
+    entries: Iterable[deferredwork.DWEntry],
+    *,
+    only_ids: tuple[str, ...] | None = None,
+    min_severity: str | None = None,
+    validate_only: bool = False,
+) -> SweepSelection:
+    """Select from canonical open entries without changing the ledger parser's universe."""
+    if only_ids is not None and min_severity is not None:
+        raise ValueError("--only cannot combine with --min-severity")
+    if only_ids is not None:
+        if not only_ids:
+            raise ValueError("--only requires at least one DW-<n> id")
+        malformed = [dw_id for dw_id in only_ids if not DW_ID_RE.fullmatch(dw_id)]
+        if malformed:
+            raise ValueError("--only contains malformed ids: " + ", ".join(malformed))
+    if min_severity is not None and min_severity not in SEVERITY_ORDER:
+        raise ValueError("--min-severity must be one of: " + ", ".join(SEVERITY_ORDER))
+    open_entries = tuple(entry for entry in entries if entry.open)
+    if only_ids is not None:
+        open_ids = {entry.id for entry in open_entries}
+        unavailable = [dw_id for dw_id in only_ids if dw_id not in open_ids]
+        if validate_only and unavailable:
+            raise ValueError("--only ids must exist and be open: " + ", ".join(unavailable))
+        requested = set(only_ids)
+        return SweepSelection(
+            selected=tuple(entry for entry in open_entries if entry.id in requested),
+            excluded=tuple(entry for entry in open_entries if entry.id not in requested),
+        )
+    if min_severity is not None:
+        floor = SEVERITY_ORDER[min_severity]
+        missing = tuple(entry for entry in open_entries if entry.severity is None)
+        selected = tuple(
+            entry
+            for entry in open_entries
+            if entry.severity is not None and SEVERITY_ORDER[entry.severity] >= floor
+        )
+        selected_ids = {entry.id for entry in selected}
+        return SweepSelection(
+            selected=selected,
+            excluded=tuple(entry for entry in open_entries if entry.id not in selected_ids),
+            missing_severity=missing,
+        )
+    return SweepSelection(selected=open_entries, excluded=())
 
 
 def validate_triage(
@@ -582,6 +637,8 @@ class SweepEngine(Engine):
         max_bundles: int | None = None,
         repeat: bool | None = None,
         max_cycles: int | None = None,
+        only_ids: tuple[str, ...] | None = None,
+        min_severity: str | None = None,
         prompter: DecisionPrompter | None = None,
         **kwargs: Any,
     ):
@@ -594,6 +651,12 @@ class SweepEngine(Engine):
         self.max_bundles = max_bundles if max_bundles is not None else self.policy.sweep.max_bundles
         self.repeat = repeat if repeat is not None else self.policy.sweep.repeat
         self.max_cycles = max_cycles if max_cycles is not None else self.policy.sweep.max_cycles
+        self.only_ids = only_ids
+        self.min_severity = min_severity
+        self._selection_started = self.state.sweep_cycle > 1 or any(
+            key == TRIAGE_KEY or key.startswith(f"{TRIAGE_KEY}-") or BUNDLE_KEY_RE.match(key)
+            for key in self.state.tasks
+        )
         self.prompter = prompter or DecisionPrompter()
         # decisions already journaled as skipped this process; without it a
         # persistent decision item would notify once per repeat cycle
@@ -608,7 +671,12 @@ class SweepEngine(Engine):
         try:
             ledger = self.workspace.paths.deferred_work
             text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
-            return len(deferredwork.open_ids(text))
+            selection = select_entries(
+                deferredwork.parse_ledger(text),
+                only_ids=self.only_ids,
+                min_severity=self.min_severity,
+            )
+            return len(selection.selected)
         except Exception:  # a hint must never break the stop
             return None
 
@@ -648,16 +716,45 @@ class SweepEngine(Engine):
                     return
                 self._ensure_migration(text)
                 text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
-            open_now = deferredwork.open_ids(text)
+            entries = deferredwork.parse_ledger(text)
+            selection = select_entries(
+                entries,
+                only_ids=self.only_ids,
+                min_severity=self.min_severity,
+                validate_only=not self._selection_started,
+            )
+            self._selection_started = True
+            open_now = {entry.id for entry in entries if entry.open}
             if not open_now:
                 if cycle == 1:
                     self.journal.append("sweep-nothing-open", ledger=str(ledger))
                 else:
                     self.journal.append("sweep-repeat-done", cycles=cycle - 1, reason="no-open")
                 return
+            selected_ids = {entry.id for entry in selection.selected}
+            selector = "only" if self.only_ids is not None else f"min-severity:{self.min_severity}"
+            if selection.excluded:
+                self.journal.append(
+                    "sweep-selection-excluded",
+                    cycle=cycle,
+                    reason=selector,
+                    dw_ids=[entry.id for entry in selection.excluded],
+                )
+            if selection.missing_severity:
+                self.journal.append(
+                    "sweep-selection-missing-severity",
+                    cycle=cycle,
+                    dw_ids=[entry.id for entry in selection.missing_severity],
+                )
+            if not selected_ids:
+                if cycle == 1:
+                    self.journal.append("sweep-selection-empty", reason=selector)
+                else:
+                    self.journal.append("sweep-repeat-done", cycles=cycle - 1, reason="no-selected")
+                return
             if cycle > 1:
                 self.journal.append("sweep-cycle", cycle=cycle, open=len(open_now))
-            progressed = self._cycle(cycle, open_now)
+            progressed = self._cycle(cycle, selected_ids)
             if self.decisions_only or not self.repeat:
                 return
             if not progressed:
@@ -1210,7 +1307,7 @@ class SweepEngine(Engine):
             result = self._run_session(
                 task,
                 role="triage",
-                prompt=self._triage_prompt(feedback),
+                prompt=self._triage_prompt(feedback, open_now),
                 seq=task.attempt,
             )
             advance(task, Phase.TRIAGE_VERIFY)
@@ -1268,8 +1365,22 @@ class SweepEngine(Engine):
                 "The triage result.json failed deterministic validation:\n- " + "\n- ".join(errors),
             )
 
-    def _triage_prompt(self, feedback: Path | None) -> str:
+    def _triage_prompt(self, feedback: Path | None, open_now: set[str] | None = None) -> str:
         prompt = "/bmad-loop-sweep"
+        if open_now is not None and (self.only_ids is not None or self.min_severity is not None):
+            ordered = (
+                [dw_id for dw_id in self.only_ids if dw_id in open_now]
+                if self.only_ids is not None
+                else sorted(
+                    open_now,
+                    key=lambda value: (
+                        len(value.removeprefix("DW-").lstrip("0") or "0"),
+                        value.removeprefix("DW-").lstrip("0") or "0",
+                        value,
+                    ),
+                )
+            )
+            prompt += " --only " + ",".join(ordered)
         if feedback is not None:
             prompt += f" --feedback {feedback}"
         return prompt

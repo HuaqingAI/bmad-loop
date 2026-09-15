@@ -1201,6 +1201,32 @@ def test_field_severity_forms():
     assert field_severity("no field here") is None
 
 
+def test_canonical_severity_uses_the_whole_file_fence_index():
+    text = """\
+# Deferred Work
+
+### DW-1: live alias follows an example
+
+```markdown
+severity: critical
+```
+priority: minor
+status: open
+
+### DW-2: only an example
+
+~~~markdown
+priority: blocker
+~~~
+status: open
+"""
+
+    first, second = parse_ledger(text)
+
+    assert first.severity == "low"
+    assert second.severity is None
+
+
 # the generic bmad-dev-auto review appender flat shape (step-04 deferral)
 FLAT_APPENDER = """\
 # Deferred Work

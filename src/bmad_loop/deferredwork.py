@@ -176,6 +176,7 @@ class DWEntry:
     id: str
     title: str
     status: str  # the status field value, "" when the line is missing
+    severity: str | None  # normalized critical/high/medium/low, None unknown
     body: str  # full entry text including the heading
     span: tuple[int, int]  # char offsets of the entry in the ledger text
     # Body-relative offsets of the line `status` was read from; None when the
@@ -333,11 +334,15 @@ def parse_ledger(text: str) -> list[DWEntry]:
         # absolute offsets because `_example` reads fence state from the top of the
         # file — a body slice cannot see an opener that sits above the heading.
         status_m = _unfenced(STATUS_RE, text, m.start(), end, examples)
+        severity_m = _unfenced(SEVERITY_FIELD_RE, text, m.start(), end, examples)
         entries.append(
             DWEntry(
                 id=m.group(1),
                 title=m.group(2),
                 status=status_m.group(1).strip() if status_m else "",
+                severity=(
+                    _normalize_severity(severity_m.group(1)) if severity_m is not None else None
+                ),
                 body=body,
                 span=(m.start(), end),
                 status_span=(
@@ -2082,7 +2087,12 @@ SEVERITY_FIELD_RE = re.compile(
 
 def field_severity(body: str) -> str | None:
     m = SEVERITY_FIELD_RE.search(body)
-    return SEVERITY_ALIASES.get(m.group(1).lower()) if m else None
+    return _normalize_severity(m.group(1)) if m else None
+
+
+def _normalize_severity(value: str) -> str | None:
+    """Normalize one severity token for canonical and tolerant readers alike."""
+    return SEVERITY_ALIASES.get(value.lower())
 
 
 @dataclass(frozen=True)

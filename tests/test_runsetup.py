@@ -15,6 +15,7 @@ at the end of the file.
 """
 
 import dataclasses
+import json
 import os
 import shutil
 import threading
@@ -30,6 +31,7 @@ from bmad_loop import policy as policy_mod
 from bmad_loop import runs, runsetup
 from bmad_loop.adapters.profile import ProfileError
 from bmad_loop.journal import Journal, load_state, state_lock
+from bmad_loop.model import RunState
 
 # A profile overlay carrying the whole launch surface the digest covers. It lives
 # under .bmad-loop/profiles/, inside the tree every driven session can write.
@@ -356,6 +358,11 @@ class _AcceptingEngine:
         pass
 
 
+class _CapturingEngine:
+    def __init__(self, *args, **kwargs):
+        self.kwargs = kwargs
+
+
 def _split_root_paths(project):
     """`_fake_paths` with the one supported divergence: `repo_root` naming a code
     tree that is not the BMAD project dir (`isolation = "none"` plus a `repo_root:`
@@ -374,6 +381,146 @@ def _split_root_paths(project):
 
 def _accepting_adapters(*_a, **_k):
     return {role: None for role in runsetup.ROLES}
+
+
+@pytest.mark.parametrize(
+    ("only_ids", "min_severity"),
+    [(("DW-3", "DW-1"), None), (None, "high")],
+    ids=["only", "min-severity"],
+)
+def test_compose_sweep_persists_and_wires_selectors(tmp_path, only_ids, min_severity):
+    composed = runsetup.compose_sweep(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        repeat=None,
+        max_cycles=None,
+        trigger="cli",
+        make_adapters=_accepting_adapters,
+        sweep_engine_cls=_CapturingEngine,
+        trusted_config_digest="deadbeef",
+        only_ids=only_ids,
+        min_severity=min_severity,
+    )
+
+    options = json.loads((composed.run_dir / "sweep.json").read_text(encoding="utf-8"))
+    assert options["only"] == (list(only_ids) if only_ids is not None else None)
+    assert options["min_severity"] == min_severity
+    assert composed.engine.kwargs["only_ids"] == only_ids
+    assert composed.engine.kwargs["min_severity"] == min_severity
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "{}",
+        "[]",
+        "{",
+        '{"only": "DW-1", "min_severity": "high"}',
+        '{"only": ["DW-١"], "min_severity": null}',
+    ],
+    ids=["old", "non-object", "invalid-json", "bad-selector-shape", "non-ascii-id"],
+)
+def test_resume_defaults_old_or_corrupt_sweep_selectors_to_unrestricted(
+    tmp_path, monkeypatch, contents
+):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    (run_dir / "sweep.json").write_text(contents, encoding="utf-8")
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        run_type="sweep",
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+
+    composed = runsetup.compose_resume(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        run_dir=run_dir,
+        state=state,
+        policy=policy_mod.loads(""),
+        journal=Journal(run_dir),
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+    )
+
+    assert composed.engine.kwargs["only_ids"] is None
+    assert composed.engine.kwargs["min_severity"] is None
+
+
+def test_resume_reconstructs_persisted_sweep_selectors(tmp_path, monkeypatch):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    (run_dir / "sweep.json").write_text(
+        json.dumps({"only": ["DW-3", "DW-1", "DW-3"], "min_severity": None}),
+        encoding="utf-8",
+    )
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        run_type="sweep",
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+
+    composed = runsetup.compose_resume(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        run_dir=run_dir,
+        state=state,
+        policy=policy_mod.loads(""),
+        journal=Journal(run_dir),
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+    )
+
+    assert composed.engine.kwargs["only_ids"] == ("DW-3", "DW-1")
+    assert composed.engine.kwargs["min_severity"] is None
+
+
+def test_resume_reconstructs_persisted_min_severity(tmp_path, monkeypatch):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    (run_dir / "sweep.json").write_text(
+        json.dumps({"only": None, "min_severity": "high"}),
+        encoding="utf-8",
+    )
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        run_type="sweep",
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+
+    composed = runsetup.compose_resume(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        run_dir=run_dir,
+        state=state,
+        policy=policy_mod.loads(""),
+        journal=Journal(run_dir),
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+    )
+
+    assert composed.engine.kwargs["only_ids"] is None
+    assert composed.engine.kwargs["min_severity"] == "high"
 
 
 @pytest.mark.parametrize("run_type", ["run", "sweep"])

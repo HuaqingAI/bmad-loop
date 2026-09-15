@@ -34,6 +34,7 @@ from bmad_loop import verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths
+from bmad_loop.engine import RunPaused
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import PAUSE_STORY_GATE, Phase, RunState, StoryTask, TokenUsage
 from bmad_loop.policy import (
@@ -1048,6 +1049,187 @@ def test_sweep_nothing_open(project):
     assert summary.done == 0 and not summary.paused
     assert adapter.sessions == []
     assert "sweep-nothing-open" in journal_text(engine)
+
+
+def test_only_scopes_triage_and_audits_excluded_open_entries(project):
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
+    plan = triage_result(
+        ["DW-3", "DW-1"],
+        skip=[
+            {"id": "DW-1", "reason": "leave it"},
+            {"id": "DW-3", "reason": "leave it too"},
+        ],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(plan)],
+        only_ids=("DW-3", "DW-1"),
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and len(adapter.sessions) == 1
+    assert adapter.sessions[0].prompt == "/bmad-loop-sweep --only DW-3,DW-1"
+    excluded = [
+        entry for entry in engine.journal.entries() if entry["kind"] == "sweep-selection-excluded"
+    ]
+    assert excluded[0]["dw_ids"] == ["DW-2"]
+    assert all(entry.open for entry in ledger_entries(project).values())
+
+
+@pytest.mark.parametrize("only_id", ["DW-9", "DW-2"], ids=["unknown", "not-open"])
+def test_only_refuses_an_id_outside_the_initial_open_universe(project, only_id):
+    """Ablation: remove select_entries' validate_only refusal and this finishes silently."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"})
+    engine, adapter = make_sweep(project, [], only_ids=(only_id,))
+
+    summary = engine.run()
+
+    assert summary.crashed
+    assert adapter.sessions == []
+    assert "must exist and be open" in (engine.run_dir / "crash.txt").read_text()
+
+
+def test_only_refuses_when_the_initial_ledger_has_no_open_entries(project):
+    write_ledger(project, {"DW-1": "done 2026-06-01"})
+    engine, adapter = make_sweep(project, [], only_ids=("DW-1",))
+
+    summary = engine.run()
+
+    assert summary.crashed and adapter.sessions == []
+    assert "must exist and be open: DW-1" in (engine.run_dir / "crash.txt").read_text()
+
+
+def test_resumed_only_scope_contracts_after_its_entry_closed(project):
+    write_ledger(project, {"DW-1": "done 2026-06-01", "DW-2": "open"})
+    original, _ = make_sweep(project, [], only_ids=("DW-1",))
+    triage = StoryTask(story_key="sweep-triage", epic=0)
+    triage.phase = Phase.DONE
+    original.state.tasks[triage.story_key] = triage
+    save_state(original.run_dir, original.state)
+    resumed, adapter = resume_sweep(project, original, [], only_ids=("DW-1",))
+
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert adapter.sessions == []
+    assert "sweep-selection-empty" in journal_kinds(resumed)
+
+
+def test_min_severity_is_fence_safe_and_reports_every_exclusion(project):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: high\n\nseverity: high\nstatus: open\n\n"
+        "### DW-2: low\n\npriority: minor\nstatus: open\n\n"
+        "### DW-3: quoted only\n\n```markdown\nseverity: critical\n```\nstatus: open\n",
+        encoding="utf-8",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ledger")
+    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "leave it"}])
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(plan)],
+        min_severity="high",
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed
+    assert adapter.sessions[0].prompt == "/bmad-loop-sweep --only DW-1"
+    records = engine.journal.entries()
+    excluded = [e for e in records if e["kind"] == "sweep-selection-excluded"]
+    missing = [e for e in records if e["kind"] == "sweep-selection-missing-severity"]
+    assert excluded[0]["dw_ids"] == ["DW-2", "DW-3"]
+    assert missing[0]["dw_ids"] == ["DW-3"]
+
+
+def test_repeat_re_evaluates_severity_and_admits_a_new_matching_entry(project):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n### DW-1: first\n\nseverity: high\nstatus: open\n",
+        encoding="utf-8",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ledger")
+    first_plan = triage_result(
+        ["DW-1"], already_resolved=[{"id": "DW-1", "evidence": "fixed at src.txt:1"}]
+    )
+    second_plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "new but not actionable"}])
+
+    def first_triage(_spec):
+        assert (
+            deferredwork.append_entry(
+                project.deferred_work,
+                title="second",
+                origin="repeat test",
+                source_spec="spec-repeat.md",
+                reason="appeared during cycle one",
+                severity="critical",
+            )
+            == "DW-2"
+        )
+        return SessionResult(status="completed", result_json=first_plan)
+
+    engine, adapter = make_sweep(
+        project,
+        [first_triage, triage_effect(second_plan)],
+        min_severity="high",
+        repeat=True,
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed
+    assert [session.prompt for session in adapter.sessions] == [
+        "/bmad-loop-sweep --only DW-1",
+        "/bmad-loop-sweep --only DW-2",
+    ]
+
+
+def test_selection_precedes_max_bundle_truncation(project):
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
+    plan = triage_result(
+        ["DW-2", "DW-3"],
+        bundles=[
+            {"name": "two", "dw_ids": ["DW-2"], "intent": "fix two"},
+            {"name": "three", "dw_ids": ["DW-3"], "intent": "fix three"},
+        ],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(plan)],
+        only_ids=("DW-2", "DW-3"),
+        max_bundles=1,
+        decisions_only=True,
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and len(adapter.sessions) == 1
+    truncated = [e for e in engine.journal.entries() if e["kind"] == "sweep-bundles-truncated"]
+    assert truncated[0]["dropped"] == ["three"]
+    excluded = [e for e in engine.journal.entries() if e["kind"] == "sweep-selection-excluded"]
+    assert excluded[0]["dw_ids"] == ["DW-1"]
+
+
+def test_excluded_entry_still_gates_story_launch(project):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: selected\n\nstatus: open\n\n"
+        "### DW-2: excluded gate\n\nstatus: open\ngate: 1-1\n",
+        encoding="utf-8",
+    )
+    engine, _ = make_sweep(project, [], only_ids=("DW-1",))
+
+    with pytest.raises(RunPaused, match="DW-2"):
+        engine._refuse_gated_story("1-1-story")
+
+
+def test_selector_limits_graceful_stop_remaining_estimate(project):
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [], only_ids=("DW-2",))
+
+    assert engine._remaining_estimate() == 1
 
 
 def test_sweep_worktree_bundle_merges_to_target(project):

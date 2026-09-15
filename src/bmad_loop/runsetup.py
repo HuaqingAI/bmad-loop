@@ -1104,6 +1104,8 @@ def compose_sweep(
     make_adapters: MakeAdapters,
     sweep_engine_cls: type[SweepEngine],
     trusted_config_digest: str,
+    only_ids: tuple[str, ...] | None = None,
+    min_severity: str | None = None,
     profiles: dict[str, CLIProfile] | None = None,
     on_started: Callable[[], None] | None = None,
 ) -> ComposedRun:
@@ -1195,6 +1197,8 @@ def compose_sweep(
             "max_bundles": max_bundles,
             "repeat": repeat,
             "max_cycles": max_cycles,
+            "only": list(only_ids) if only_ids is not None else None,
+            "min_severity": min_severity,
             "trigger": trigger,
         }
         # Persist the sweep options atomically (tmp + os.replace), the way save_state
@@ -1220,6 +1224,8 @@ def compose_sweep(
             max_bundles=max_bundles,
             repeat=repeat,
             max_cycles=max_cycles,
+            only_ids=only_ids,
+            min_severity=min_severity,
         )
         if on_started is not None:
             on_started()
@@ -1276,6 +1282,41 @@ def compose_resume(
             # abort the recovery path — fall back to the same launch defaults as
             # the missing-file arm, mirroring tui.data's tolerant run-dir reads.
             opts = {}
+        if not isinstance(opts, dict):
+            opts = {}
+        raw_only = opts.get("only")
+        only_valid = (
+            isinstance(raw_only, list)
+            and bool(raw_only)
+            and all(
+                isinstance(value, str)
+                and value.startswith("DW-")
+                and value.removeprefix("DW-").isascii()
+                and value.removeprefix("DW-").isdigit()
+                for value in raw_only
+            )
+        )
+        if only_valid:
+            assert isinstance(raw_only, list)
+            only_ids = tuple(dict.fromkeys(str(value) for value in raw_only))
+        else:
+            only_ids = None
+        raw_min_severity = opts.get("min_severity")
+        min_severity = (
+            raw_min_severity if raw_min_severity in ("low", "medium", "high", "critical") else None
+        )
+        selectors_corrupt = (
+            (raw_only is not None and not only_valid)
+            or (
+                raw_min_severity is not None
+                and raw_min_severity not in ("low", "medium", "high", "critical")
+            )
+            or (only_ids is not None and min_severity is not None)
+        )
+        if selectors_corrupt:
+            # A hand-edited/corrupt option file must not invent a precedence.
+            only_ids = None
+            min_severity = None
         engine: Engine = sweep_engine_cls(
             paths=paths,
             policy=policy,
@@ -1290,6 +1331,8 @@ def compose_resume(
             max_bundles=opts.get("max_bundles"),
             repeat=opts.get("repeat"),
             max_cycles=opts.get("max_cycles"),
+            only_ids=only_ids,
+            min_severity=min_severity,
         )
     else:
         story_common = dict(

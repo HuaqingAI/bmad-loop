@@ -784,7 +784,7 @@ def deferred_entries(project: Path) -> list[DeferredItem] | None:
                             title=e.title,
                             status=e.status,
                             done=bool(e.status) and e.status.split()[0] == "done",
-                            severity=deferredwork.field_severity(e.body),
+                            severity=e.severity,
                             body=e.body,
                         ),
                     )

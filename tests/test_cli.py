@@ -39,7 +39,7 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import cli, envvars, platform_util
+from bmad_loop import cli, deferredwork, envvars, platform_util
 from bmad_loop import policy as policy_mod
 from bmad_loop import probe as probe_mod
 from bmad_loop import runs, runsetup, verify
@@ -1729,6 +1729,200 @@ def test_sweep_dry_run_renders_triage_adapter_from_policy(project, capsys):
 def test_sweep_dry_run_no_ledger(project, capsys):
     assert cli._sweep_dry_run(project, policy_mod.load(None)) == 0
     assert "no deferred-work ledger" in capsys.readouterr().out
+
+
+def test_sweep_only_parser_trims_and_stably_deduplicates():
+    assert cli._parse_sweep_only(" DW-3, DW-1,DW-3 ") == ("DW-3", "DW-1")
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("", "comma-separated"),
+        (" ", "comma-separated"),
+        ("DW-1,", "comma-separated"),
+        (",DW-1", "comma-separated"),
+        ("dw-1", "malformed"),
+        ("DW-x", "malformed"),
+    ],
+)
+def test_sweep_rejects_empty_or_malformed_only(project, capsys, value, message):
+    install_bmad_config(project)
+
+    rc = cli.main(["sweep", "--only", value, "--dry-run", "--project", str(project.project)])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--only" in err and message in err
+
+
+def test_sweep_selector_flags_are_mutually_exclusive(project, capsys):
+    install_bmad_config(project)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            [
+                "sweep",
+                "--only",
+                "DW-1",
+                "--min-severity",
+                "high",
+                "--project",
+                str(project.project),
+            ]
+        )
+
+    assert exc.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_sweep_dry_run_applies_severity_selector_and_reports_missing(project, capsys):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: critical\n\nseverity: critical\nstatus: open\n\n"
+        "### DW-2: low\n\nseverity: low\nstatus: open\n\n"
+        "### DW-3: missing\n\nstatus: open\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        cli._sweep_dry_run(
+            project,
+            policy_mod.load(None),
+            min_severity="high",
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "/bmad-loop-sweep --only DW-1" in out
+    assert "excluded by sweep selector" in out and "DW-2" in out
+    assert "missing or unrecognized severity" in out and "DW-3" in out
+
+
+def test_sweep_dry_run_refuses_unknown_or_non_open_only_id(project, capsys):
+    from conftest import write_ledger
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+
+    assert (
+        cli._sweep_dry_run(
+            project,
+            policy_mod.load(None),
+            only_ids=("DW-2", "DW-9"),
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "must exist and be open: DW-2, DW-9" in captured.err
+    assert "triage:" not in captured.out
+
+
+def test_sweep_dry_run_preserves_valid_only_order_and_reports_exclusions(project, capsys):
+    write_ledger(
+        project,
+        {"DW-1": "open", "DW-2": "open", "DW-3": "open"},
+        commit=False,
+    )
+
+    assert (
+        cli._sweep_dry_run(
+            project,
+            policy_mod.load(None),
+            only_ids=("DW-3", "DW-1"),
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "/bmad-loop-sweep --only DW-3,DW-1" in out
+    assert "excluded by sweep selector" in out and "DW-2" in out
+
+
+def test_sweep_dry_run_refuses_only_when_the_ledger_is_missing(project, capsys):
+    assert (
+        cli._sweep_dry_run(
+            project,
+            policy_mod.load(None),
+            only_ids=("DW-9",),
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "must exist and be open: DW-9" in captured.err
+    assert "no deferred-work ledger" not in captured.out
+
+
+@pytest.mark.parametrize(
+    ("only", "min_severity", "expected_only", "expected_min"),
+    [
+        (" DW-3, DW-1,DW-3 ", None, ("DW-3", "DW-1"), None),
+        (None, "high", None, "high"),
+    ],
+    ids=["only", "min-severity"],
+)
+def test_cmd_sweep_forwards_selector_to_start_sweep(
+    project,
+    monkeypatch,
+    only,
+    min_severity,
+    expected_only,
+    expected_min,
+):
+    install_bmad_config(project)
+    captured = {}
+    monkeypatch.setattr(cli, "_reject_under_floor_git", lambda _project: None)
+    monkeypatch.setattr(cli, "_reject_isolation_conflict", lambda _paths, _pol: None)
+    monkeypatch.setattr(cli.verify, "worktree_clean", lambda _root: True)
+    monkeypatch.setattr(cli, "_require_base_skills", lambda _project, _pol: True)
+    monkeypatch.setattr(cli, "_reconcile_stale", lambda *_args: None)
+    monkeypatch.setattr(
+        cli,
+        "_start_sweep",
+        lambda *_args, **kwargs: captured.update(kwargs) or 0,
+    )
+    args = argparse.Namespace(
+        project=str(project.project),
+        run_id=None,
+        before=None,
+        archive=False,
+        decisions_only=False,
+        repeat=None,
+        max_bundles=None,
+        max_cycles=None,
+        no_prompt=False,
+        dry_run=False,
+        only=only,
+        min_severity=min_severity,
+    )
+
+    assert cli.cmd_sweep(args) == 0
+    assert captured["only_ids"] == expected_only
+    assert captured["min_severity"] == expected_min
+
+
+def test_start_sweep_returns_failure_for_a_crashed_selection_run(project, monkeypatch):
+    summary = types.SimpleNamespace(crashed=True, render=lambda: "CRASHED")
+    engine = types.SimpleNamespace(run=lambda: summary)
+    monkeypatch.setattr(
+        runsetup,
+        "compose_sweep",
+        lambda **_kwargs: types.SimpleNamespace(
+            run_id="selector-crash",
+            engine=engine,
+        ),
+    )
+
+    rc = cli._start_sweep(
+        project.project,
+        project,
+        policy_mod.load(None),
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        trigger="cli",
+        only_ids=("DW-9",),
+    )
+
+    assert rc == 1
 
 
 def test_make_adapters_review_synthesizes_from_spec(project, monkeypatch):
@@ -10968,7 +11162,7 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
             captured.update(kw)
 
         def run(self):
-            return types.SimpleNamespace(render=lambda: "")
+            return types.SimpleNamespace(crashed=False, render=lambda: "")
 
     monkeypatch.setattr(cli, "SweepEngine", _Recorder)
 
@@ -10981,6 +11175,7 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
         profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
     ), "the swap must actually have landed on disk, or this test proves nothing"
     assert captured["adapter"].profile.binary == "mycli"
+    assert captured["only_ids"] is None and captured["min_severity"] is None
     assert signalled == ["started"]  # #501: the child composed, so the parent may latch
     run_id = captured["state"].run_id
     assert runs.read_trusted_config_digest(project.project, run_id) == pin
@@ -11607,6 +11802,49 @@ def test_sweep_archive_conflicting_flags_refused(project, capsys):
     err = capsys.readouterr().err
     assert "--archive cannot combine with" in err
     assert "--no-prompt" in err
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [("--only", "DW-1"), ("--min-severity", "high")],
+    ids=["only", "min-severity"],
+)
+def test_sweep_archive_refuses_selectors_before_archive_work(project, capsys, selector):
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "done 2026-06-01"}, commit=False)
+    before = project.deferred_work.read_text(encoding="utf-8")
+
+    rc = cli.main(["sweep", "--archive", *selector, "--project", str(project.project)])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--archive cannot combine" in err
+    assert "--only" in err and "--min-severity" in err
+    assert project.deferred_work.read_text(encoding="utf-8") == before
+    assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
+
+
+def test_sweep_before_without_archive_precedes_selector_validation(project, capsys):
+    install_bmad_config(project)
+
+    rc = cli.main(
+        [
+            "sweep",
+            "--before",
+            "2026-06-01",
+            "--only",
+            "bad",
+            "--project",
+            str(project.project),
+        ]
+    )
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--before requires --archive" in err
+    assert "malformed" not in err
 
 
 def test_sweep_archive_empty_before_without_archive_refused(project, capsys):
