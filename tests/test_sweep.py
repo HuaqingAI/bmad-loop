@@ -987,7 +987,10 @@ def test_validate_migration_rejects_leftover_legacy():
 def test_validate_migration_guards_pre_existing_canonical():
     manifest = legacy_manifest()
     # DW-1 regressed to done; DW-9 vanished
-    pre = {"DW-1": PreCanonical("open", ()), "DW-9": PreCanonical("open", ())}
+    pre = {
+        "DW-1": PreCanonical("open", (), None),
+        "DW-9": PreCanonical("open", (), None),
+    }
     rj = migrate_result(
         [{"key": manifest[0]["key"], "dw_id": "DW-1"}, {"key": manifest[1]["key"], "dw_id": "DW-2"}]
     )
@@ -997,6 +1000,22 @@ def test_validate_migration_guards_pre_existing_canonical():
     assert "DW-9 disappeared" in joined
     # and the new DW-2 does not continue numbering past DW-9
     assert "does not continue numbering past DW-9" in joined
+
+
+def test_validate_migration_refuses_changed_pre_existing_canonical_severity():
+    before = pre_gated_ledger().replace("status: open", "severity: high\nstatus: open", 1)
+    manifest = legacy_manifest(before)
+    assert len(manifest) == 1
+    rj = migrate_result([{"key": manifest[0]["key"], "dw_id": "DW-2"}])
+    pre = snapshot_canonical(before)
+    assert pre["DW-1"].severity == "high"
+    kept = rewritten_gated_ledger().replace("status: open", "severity: high\nstatus: open", 1)
+    changed = rewritten_gated_ledger().replace("status: open", "severity: low\nstatus: open", 1)
+
+    assert validate_migration(rj, manifest, pre, kept) == []
+    errors = validate_migration(rj, manifest, pre, changed)
+
+    assert errors == ["pre-existing DW-1 severity changed: 'high' -> 'low'"]
 
 
 def test_validate_migration_mapping_errors():

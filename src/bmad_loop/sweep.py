@@ -411,6 +411,7 @@ class PreCanonical:
 
     status: str
     gate_tokens: tuple[str, ...]
+    severity: str | None
 
 
 def snapshot_canonical(text: str) -> dict[str, PreCanonical]:
@@ -418,7 +419,7 @@ def snapshot_canonical(text: str) -> dict[str, PreCanonical]:
 
     A named function rather than a comprehension inlined at its one call site so
     that the tests grade the snapshot production actually builds: a hand-written
-    ``{"DW-1": PreCanonical("open", ("3-2",))}`` would pass whatever the parser
+    ``{"DW-1": PreCanonical("open", ("3-2",), "high")}`` would pass whatever the parser
     really produces for that entry, and the bug being fixed here lived in the
     snapshot, not in the comparison.
 
@@ -433,7 +434,7 @@ def snapshot_canonical(text: str) -> dict[str, PreCanonical]:
     snapshot: dict[str, PreCanonical] = {}
     for e in deferredwork.parse_ledger(text):
         g = deferredwork.gates(e)
-        snapshot[e.id] = PreCanonical(e.status, g.tokens + g.malformed)
+        snapshot[e.id] = PreCanonical(e.status, g.tokens + g.malformed, e.severity)
     return snapshot
 
 
@@ -490,6 +491,10 @@ def validate_migration(
             continue
         if first_word(e.status) != first_word(pre.status):
             errors.append(f"pre-existing {dw_id} status changed: {pre.status!r} -> {e.status!r}")
+        if e.severity != pre.severity:
+            errors.append(
+                f"pre-existing {dw_id} severity changed: {pre.severity!r} -> {e.severity!r}"
+            )
         # Drops and edits only; an ADDED token is deliberately accepted. The two
         # directions are not the same failure: a dropped token un-gates a story
         # silently, which is what #519 is about, while an added one over-blocks

@@ -9,7 +9,7 @@ breaking changes may land in a minor release.
 
 ### Added
 
-- **Targeted deferred-work sweeps.** `bmad-loop sweep --only DW-1,DW-3` selects an
+- **Target deferred-work sweeps.** `bmad-loop sweep --only DW-1,DW-3` selects an
   exact open-id set, while `--min-severity low|medium|high|critical` selects the
   named severity and higher. Selection happens before triage, bundle formation,
   and `--max-bundles`; dry-run and resume preserve the same contract, excluded
