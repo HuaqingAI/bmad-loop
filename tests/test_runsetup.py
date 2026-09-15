@@ -416,18 +416,10 @@ def test_compose_sweep_persists_and_wires_selectors(tmp_path, only_ids, min_seve
 
 @pytest.mark.parametrize(
     "contents",
-    [
-        "{}",
-        "[]",
-        "{",
-        '{"only": "DW-1", "min_severity": "high"}',
-        '{"only": ["DW-١"], "min_severity": null}',
-    ],
-    ids=["old", "non-object", "invalid-json", "bad-selector-shape", "non-ascii-id"],
+    ["{}", "[]", "{"],
+    ids=["old", "non-object", "invalid-json"],
 )
-def test_resume_defaults_old_or_corrupt_sweep_selectors_to_unrestricted(
-    tmp_path, monkeypatch, contents
-):
+def test_resume_defaults_old_sweep_options_to_unrestricted(tmp_path, monkeypatch, contents):
     run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
     run_dir.mkdir(parents=True)
     (run_dir / "sweep.json").write_text(contents, encoding="utf-8")
@@ -455,6 +447,47 @@ def test_resume_defaults_old_or_corrupt_sweep_selectors_to_unrestricted(
 
     assert composed.engine.kwargs["only_ids"] is None
     assert composed.engine.kwargs["min_severity"] is None
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        '{"only": "DW-1", "min_severity": null}',
+        '{"only": ["DW-١"], "min_severity": null}',
+        '{"only": null, "min_severity": "urgent"}',
+        '{"only": ["DW-1"], "min_severity": "high"}',
+    ],
+    ids=["only-shape", "non-ascii-id", "severity-value", "both"],
+)
+def test_resume_refuses_malformed_selector_bearing_options(tmp_path, monkeypatch, contents):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    (run_dir / "sweep.json").write_text(contents, encoding="utf-8")
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        run_type="sweep",
+    )
+    killed = []
+    monkeypatch.setattr(runs, "kill_session", lambda run_id: killed.append(run_id))
+
+    with pytest.raises(runsetup.SweepOptionsError):
+        runsetup.compose_resume(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            run_dir=run_dir,
+            state=state,
+            policy=policy_mod.loads(""),
+            journal=Journal(run_dir),
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_accepting_adapters,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            sweep_engine_cls=_CapturingEngine,
+        )
+
+    assert killed == []
 
 
 def test_resume_reconstructs_persisted_sweep_selectors(tmp_path, monkeypatch):

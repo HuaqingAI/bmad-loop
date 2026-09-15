@@ -93,7 +93,7 @@ from .runsetup import make_adapters as _make_adapters
 from .runsetup import mux_reason_label as _mux_reason_label
 from .runsetup import platform_preflight as _platform_preflight
 from .stories_engine import StoriesEngine
-from .sweep import DW_ID_RE, SweepEngine, select_entries
+from .sweep import DW_ID_RE, SEVERITY_ORDER, SweepEngine, select_entries
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -2617,15 +2617,47 @@ def _sweep_dry_run(
             print(f"  {entry.id:8s} {entry.title}")
     legacy = deferredwork.parse_legacy(text)
     legacy_open = [e for e in legacy if not e.done]
+    legacy_selected = legacy_open
+    legacy_excluded = []
+    legacy_missing_severity = []
+    if min_severity is not None:
+        floor = SEVERITY_ORDER[min_severity]
+        legacy_selected = [
+            entry
+            for entry in legacy_open
+            if entry.severity is not None and SEVERITY_ORDER[entry.severity] >= floor
+        ]
+        selected_keys = {entry.key for entry in legacy_selected}
+        legacy_excluded = [entry for entry in legacy_open if entry.key not in selected_keys]
+        legacy_missing_severity = [entry for entry in legacy_open if entry.severity is None]
     if legacy:
         print(
             f"plus {len(legacy)} legacy (pre-DW-format) entries, {len(legacy_open)} open"
             " — a sweep would first migrate them to DW format"
         )
-        for entry in legacy_open:
+        for entry in legacy_selected:
             print(f"  {entry.id or '-':8s} {entry.title}")
-    if selection.selected or (legacy_open and only_ids is None and min_severity is None):
+        if min_severity is not None and legacy_selected:
+            print(
+                f"{len(legacy_selected)} matching legacy entr"
+                f"{'y' if len(legacy_selected) == 1 else 'ies'} will be migrated then triaged"
+            )
+        if legacy_excluded:
+            print("legacy entries excluded by severity selector:")
+            for entry in legacy_excluded:
+                print(f"  {entry.id or '-':8s} {entry.title}")
+        if legacy_missing_severity:
+            print("legacy entries excluded for missing or unrecognized severity:")
+            for entry in legacy_missing_severity:
+                print(f"  {entry.id or '-':8s} {entry.title}")
+    if selection.selected or (legacy_selected and (only_ids is None or min_severity is not None)):
         print("a sweep would triage the open entries in one LLM session, then run bundles")
+        if min_severity is not None and legacy_selected:
+            print(
+                "  triage: after migration assigns canonical DW ids, the matching "
+                "legacy entries join the selected universe"
+            )
+            return 0
         prompt = "/bmad-loop-sweep"
         if only_ids is not None or min_severity is not None:
             selected_ids = {entry.id for entry in selection.selected}
@@ -2671,6 +2703,13 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     if state.finished:
         print(f"run {run_dir.name} already finished", file=sys.stderr)
         return 1
+    sweep_options = None
+    if state.run_type == "sweep":
+        try:
+            sweep_options = runsetup.load_sweep_resume_options(run_dir)
+        except runsetup.SweepOptionsError as exc:
+            print(f"cannot resume {run_dir.name}: {exc}", file=sys.stderr)
+            return 1
     pol = policy_mod.load(_policy_path(project))
     # Resume re-reads config.yaml and policy.toml from disk, so it is a second
     # entrypoint into the same engine and gets the same refusal — a run started
@@ -2904,7 +2943,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     # SweepEngine and _make_adapters are handed in from this module's namespace so
     # the test suite's `monkeypatch.setattr(cli, "SweepEngine"/"Engine"/..., ...)`
     # still applies.
-    return paths, state, pol, journal, new_digest, profiles
+    return paths, state, pol, journal, new_digest, profiles, sweep_options
 
 
 def _resume_paused_run(project: Path, run_dir: Path) -> int:
@@ -2929,7 +2968,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         prepared = _prepare_resume_locked(project, run_dir)
     if isinstance(prepared, int):
         return prepared
-    paths, state, pol, journal, new_digest, profiles = prepared
+    paths, state, pol, journal, new_digest, profiles, sweep_options = prepared
 
     # Adapter construction and the engine lifetime are deliberately outside the
     # state hold.  The pid/state publication above makes a rival control command
@@ -2947,6 +2986,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         stories_engine_cls=StoriesEngine,
         sweep_engine_cls=SweepEngine,
         profiles=profiles,
+        sweep_options=sweep_options,
     )
     summary = composed.engine.run()
     print(summary.render())

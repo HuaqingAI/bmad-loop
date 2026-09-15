@@ -38,7 +38,7 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from . import bmadconfig
 from . import policy as policy_mod
@@ -831,6 +831,68 @@ class ComposedRun:
     journal: Journal
 
 
+class SweepOptionsError(ValueError):
+    """Persisted selector-bearing sweep options are unsafe to resume."""
+
+
+@dataclass(frozen=True)
+class SweepResumeOptions:
+    values: dict[str, Any]
+    only_ids: tuple[str, ...] | None
+    min_severity: str | None
+
+
+def load_sweep_resume_options(run_dir: Path) -> SweepResumeOptions:
+    """Load sweep.json, tolerating old files but refusing malformed selectors."""
+    opts_path = run_dir / "sweep.json"
+    try:
+        loaded = json.loads(opts_path.read_text(encoding="utf-8")) if opts_path.is_file() else {}
+    except (OSError, json.JSONDecodeError):
+        loaded = {}
+    opts: dict[str, Any] = loaded if isinstance(loaded, dict) else {}
+
+    raw_only = opts.get("only")
+    only_present = "only" in opts
+    only_valid = (
+        isinstance(raw_only, list)
+        and bool(raw_only)
+        and all(
+            isinstance(value, str)
+            and value.startswith("DW-")
+            and value.removeprefix("DW-").isascii()
+            and value.removeprefix("DW-").isdigit()
+            for value in raw_only
+        )
+    )
+    if raw_only is None:
+        only_ids = None
+    elif only_valid:
+        assert isinstance(raw_only, list)
+        only_ids = tuple(dict.fromkeys(str(value) for value in raw_only))
+    else:
+        raise SweepOptionsError("sweep.json has a malformed 'only' selector")
+
+    raw_min = opts.get("min_severity")
+    min_present = "min_severity" in opts
+    if raw_min is None:
+        min_severity = None
+    elif raw_min in ("low", "medium", "high", "critical"):
+        assert isinstance(raw_min, str)
+        min_severity = raw_min
+    else:
+        raise SweepOptionsError("sweep.json has an invalid 'min_severity' selector")
+
+    if only_ids is not None and min_severity is not None:
+        raise SweepOptionsError("sweep.json cannot contain both 'only' and 'min_severity'")
+    # Missing keys are the pre-selector format and remain unrestricted. Explicit
+    # nulls are the current unrestricted format; both intentionally converge.
+    if not only_present:
+        only_ids = None
+    if not min_present:
+        min_severity = None
+    return SweepResumeOptions(opts, only_ids, min_severity)
+
+
 def _claim_run_dir(run_dir: Path) -> os.stat_result:
     """Take exclusive ownership of a fresh run directory, refusing an id that
     already names a run.
@@ -1249,6 +1311,7 @@ def compose_resume(
     stories_engine_cls: type[StoriesEngine],
     sweep_engine_cls: type[SweepEngine],
     profiles: dict[str, CLIProfile] | None = None,
+    sweep_options: SweepResumeOptions | None = None,
 ) -> ComposedRun:
     """Rebuild the engine for a paused/interrupted run and return it ready to
     :meth:`run` — the adapter build + engine selection ``cli._resume_paused_run``
@@ -1269,54 +1332,18 @@ def compose_resume(
     the new baseline describes the bytes these adapters are built from rather than
     a second read of an agent-writable file (#461 point 4). ``None`` resolves
     fresh."""
+    resolved_sweep_options = (
+        sweep_options
+        if sweep_options is not None
+        else load_sweep_resume_options(run_dir) if state.run_type == "sweep" else None
+    )
     # drop any stale agent session so the run spins up a fresh one (a stopped or
     # interrupted run can leave a lingering bmad-loop-<id> session behind).
     runs.kill_session(run_dir.name)
     adapters = make_adapters(project, run_dir, policy, profiles=profiles)
     if state.run_type == "sweep":
-        opts_path = run_dir / "sweep.json"
-        try:
-            opts = json.loads(opts_path.read_text(encoding="utf-8")) if opts_path.is_file() else {}
-        except (OSError, json.JSONDecodeError):
-            # A torn/corrupt sweep.json (crash mid-write on an older run) must not
-            # abort the recovery path — fall back to the same launch defaults as
-            # the missing-file arm, mirroring tui.data's tolerant run-dir reads.
-            opts = {}
-        if not isinstance(opts, dict):
-            opts = {}
-        raw_only = opts.get("only")
-        only_valid = (
-            isinstance(raw_only, list)
-            and bool(raw_only)
-            and all(
-                isinstance(value, str)
-                and value.startswith("DW-")
-                and value.removeprefix("DW-").isascii()
-                and value.removeprefix("DW-").isdigit()
-                for value in raw_only
-            )
-        )
-        if only_valid:
-            assert isinstance(raw_only, list)
-            only_ids = tuple(dict.fromkeys(str(value) for value in raw_only))
-        else:
-            only_ids = None
-        raw_min_severity = opts.get("min_severity")
-        min_severity = (
-            raw_min_severity if raw_min_severity in ("low", "medium", "high", "critical") else None
-        )
-        selectors_corrupt = (
-            (raw_only is not None and not only_valid)
-            or (
-                raw_min_severity is not None
-                and raw_min_severity not in ("low", "medium", "high", "critical")
-            )
-            or (only_ids is not None and min_severity is not None)
-        )
-        if selectors_corrupt:
-            # A hand-edited/corrupt option file must not invent a precedence.
-            only_ids = None
-            min_severity = None
+        assert resolved_sweep_options is not None
+        opts = resolved_sweep_options.values
         engine: Engine = sweep_engine_cls(
             paths=paths,
             policy=policy,
@@ -1331,8 +1358,8 @@ def compose_resume(
             max_bundles=opts.get("max_bundles"),
             repeat=opts.get("repeat"),
             max_cycles=opts.get("max_cycles"),
-            only_ids=only_ids,
-            min_severity=min_severity,
+            only_ids=resolved_sweep_options.only_ids,
+            min_severity=resolved_sweep_options.min_severity,
         )
     else:
         story_common = dict(

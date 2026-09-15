@@ -1709,6 +1709,59 @@ def test_sweep_dry_run_reports_legacy_entries(project, capsys):
     assert "triage:" in out  # a sweep still runs even with zero canonical opens
 
 
+def test_sweep_dry_run_applies_severity_floor_to_legacy_entries(project, capsys):
+    from conftest import write_legacy_ledger
+
+    write_legacy_ledger(
+        project,
+        "# Deferred Work\n\n"
+        "### D-1: Low legacy\n\nseverity: low\nreason: low item\n\n"
+        "### D-2: High legacy\n\nseverity: high\nreason: high item\n\n"
+        "### D-3: Missing legacy\n\nreason: missing severity\n",
+        commit=False,
+    )
+
+    assert cli._sweep_dry_run(project, policy_mod.load(None), min_severity="high") == 0
+    out = capsys.readouterr().out
+    assert "High legacy" in out
+    assert "1 matching legacy entry will be migrated then triaged" in out
+    assert "legacy entries excluded by severity selector" in out and "Low legacy" in out
+    assert "legacy entries excluded for missing or unrecognized severity" in out
+    assert "Missing legacy" in out
+    assert "triage: after migration assigns canonical DW ids" in out
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        '{"only": "DW-1", "min_severity": null}',
+        '{"only": null, "min_severity": "urgent"}',
+        '{"only": ["DW-1"], "min_severity": "high"}',
+    ],
+    ids=["only-shape", "severity-value", "both"],
+)
+def test_public_resume_refuses_malformed_selectors_before_mutation(
+    project, monkeypatch, capsys, contents
+):
+    run_dir = _paused_run_for_resume(project, monkeypatch, run_type="sweep")
+    (run_dir / "sweep.json").write_text(contents, encoding="utf-8")
+    state_before = (run_dir / "state.json").read_bytes()
+    journal_path = run_dir / "journal.jsonl"
+    journal_before = journal_path.read_bytes() if journal_path.is_file() else None
+    pid_before = (
+        (run_dir / runs.PID_FILE).read_bytes() if (run_dir / runs.PID_FILE).is_file() else None
+    )
+    monkeypatch.setattr(cli, "SweepEngine", lambda **_kwargs: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+
+    assert "cannot resume" in capsys.readouterr().err
+    assert (run_dir / "state.json").read_bytes() == state_before
+    assert (journal_path.read_bytes() if journal_path.is_file() else None) == journal_before
+    pid_path = run_dir / runs.PID_FILE
+    assert (pid_path.read_bytes() if pid_path.is_file() else None) == pid_before
+
+
 def test_sweep_dry_run_renders_triage_adapter_from_policy(project, capsys):
     from conftest import write_ledger
 
