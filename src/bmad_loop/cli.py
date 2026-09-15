@@ -2710,7 +2710,10 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     sweep_options = None
     if state.run_type == "sweep":
         try:
-            sweep_options = runsetup.load_sweep_resume_options(run_dir)
+            sweep_options = runsetup.load_sweep_resume_options(
+                run_dir,
+                required=state.sweep_options_version >= runsetup.SWEEP_OPTIONS_VERSION,
+            )
         except runsetup.SweepOptionsError as exc:
             print(f"cannot resume {run_dir.name}: {exc}", file=sys.stderr)
             return 1
@@ -2994,7 +2997,11 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     )
     summary = composed.engine.run()
     print(summary.render())
-    return 0
+    return (
+        ExitCode.FAILURE
+        if summary.crashed and sweep_options is not None and sweep_options.only_ids is not None
+        else ExitCode.OK
+    )
 
 
 def cmd_resume(args: argparse.Namespace) -> int:

@@ -759,6 +759,11 @@ class RunState:
     crashed: bool = False
     crash_error: str | None = None
     run_type: str = "story"  # "story" | "sweep" — resume/status dispatch on it
+    # Version of the separately persisted sweep.json options format. Zero means
+    # a pre-marker run, where a missing options file is the legacy unrestricted
+    # shape. Selector-capable sweeps stamp the current nonzero version at launch,
+    # so losing sweep.json cannot silently widen them on resume.
+    sweep_options_version: int = 0
     # story-queue source (policy.StoriesPolicy.source), pinned at run start so
     # resume/resolve rebuild the right engine (StoriesEngine vs the sprint Engine)
     # without re-reading policy — a policy edit mid-run must not switch a live run's
@@ -856,6 +861,7 @@ class RunState:
             "crashed": self.crashed,
             "crash_error": self.crash_error,
             "run_type": self.run_type,
+            "sweep_options_version": self.sweep_options_version,
             "source": self.source,
             "spec_folder": self.spec_folder,
             "sweep_cycle": self.sweep_cycle,
@@ -888,6 +894,7 @@ class RunState:
             crashed=bool(d.get("crashed", False)),
             crash_error=d.get("crash_error"),
             run_type=str(d.get("run_type", "story")),
+            sweep_options_version=int(d.get("sweep_options_version", 0)),
             source=str(d.get("source", "sprint-status")),
             spec_folder=str(d.get("spec_folder", "")),
             sweep_cycle=int(d.get("sweep_cycle", 1)),

@@ -411,6 +411,7 @@ def test_compose_sweep_persists_and_wires_selectors(tmp_path, only_ids, min_seve
     options = json.loads((composed.run_dir / "sweep.json").read_text(encoding="utf-8"))
     assert options["only"] == (list(only_ids) if only_ids is not None else None)
     assert options["min_severity"] == min_severity
+    assert load_state(composed.run_dir).sweep_options_version == runsetup.SWEEP_OPTIONS_VERSION
     assert composed.engine.kwargs["only_ids"] == only_ids
     assert composed.engine.kwargs["min_severity"] == min_severity
 
@@ -449,6 +450,15 @@ def test_resume_defaults_old_sweep_options_to_unrestricted(tmp_path, monkeypatch
 
     assert composed.engine.kwargs["only_ids"] is None
     assert composed.engine.kwargs["min_severity"] is None
+
+
+def test_missing_sweep_options_requires_current_state_marker(tmp_path):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+
+    assert runsetup.load_sweep_resume_options(run_dir).only_ids is None
+    with pytest.raises(runsetup.SweepOptionsError, match="missing"):
+        runsetup.load_sweep_resume_options(run_dir, required=True)
 
 
 @pytest.mark.parametrize(

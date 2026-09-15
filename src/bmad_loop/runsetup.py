@@ -82,6 +82,7 @@ if TYPE_CHECKING:
 # actually builds them) and re-exported as ``cli.ROLES``, which `cmd_validate`
 # and the test suite resolve.
 ROLES = ("dev", "review", "triage")
+SWEEP_OPTIONS_VERSION = 1
 
 
 def resolve_profiles(policy: Policy, project: Path) -> dict[str, CLIProfile]:
@@ -843,12 +844,14 @@ class SweepResumeOptions:
     min_severity: str | None
 
 
-def load_sweep_resume_options(run_dir: Path) -> SweepResumeOptions:
+def load_sweep_resume_options(run_dir: Path, *, required: bool = False) -> SweepResumeOptions:
     """Load sweep.json, tolerating old files but refusing malformed selectors."""
     opts_path = run_dir / "sweep.json"
     try:
         options_mode = opts_path.stat().st_mode
     except FileNotFoundError:
+        if required:
+            raise SweepOptionsError("sweep.json is missing for this selector-capable run")
         return SweepResumeOptions({}, None, None)
     except OSError as exc:
         raise SweepOptionsError(f"sweep.json cannot be inspected: {exc}") from exc
@@ -1258,6 +1261,7 @@ def compose_sweep(
             started_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
             policy_snapshot=policy.to_dict(),
             run_type="sweep",
+            sweep_options_version=SWEEP_OPTIONS_VERSION,
             trusted_config_digest=trusted_config_digest,
         )
         # Same indivisible state/pid publication as compose_run.
@@ -1348,7 +1352,13 @@ def compose_resume(
     resolved_sweep_options = (
         sweep_options
         if sweep_options is not None
-        else load_sweep_resume_options(run_dir) if state.run_type == "sweep" else None
+        else (
+            load_sweep_resume_options(
+                run_dir, required=state.sweep_options_version >= SWEEP_OPTIONS_VERSION
+            )
+            if state.run_type == "sweep"
+            else None
+        )
     )
     # drop any stale agent session so the run spins up a fresh one (a stopped or
     # interrupted run can leave a lingering bmad-loop-<id> session behind).

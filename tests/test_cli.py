@@ -2124,6 +2124,7 @@ class _StubEngine:
     def run(self):
         class Summary:
             paused = False
+            crashed = False
 
             def render(self):
                 return "stub summary"
@@ -6063,6 +6064,60 @@ def test_resume_tolerates_a_missing_legacy_sweep_json(project, monkeypatch):
     assert captured["prompting"] is False
     assert captured["decisions_only"] is False
     assert captured["max_bundles"] is None
+
+
+def test_public_resume_refuses_missing_current_sweep_options_before_mutation(
+    project, monkeypatch, capsys
+):
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+    )
+    (run_dir / "sweep.json").unlink(missing_ok=True)
+    state_before = (run_dir / "state.json").read_bytes()
+    journal_path = run_dir / "journal.jsonl"
+    journal_before = journal_path.read_bytes() if journal_path.is_file() else None
+    pid_path = run_dir / runs.PID_FILE
+    pid_before = pid_path.read_bytes() if pid_path.is_file() else None
+    monkeypatch.setattr(cli, "SweepEngine", lambda **_kwargs: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+
+    assert "missing" in capsys.readouterr().err
+    assert (run_dir / "state.json").read_bytes() == state_before
+    assert (journal_path.read_bytes() if journal_path.is_file() else None) == journal_before
+    assert (pid_path.read_bytes() if pid_path.is_file() else None) == pid_before
+
+
+@pytest.mark.parametrize(
+    ("only", "expected"),
+    [(["DW-9"], 1), (None, 0)],
+    ids=["named-only", "unrestricted"],
+)
+def test_resume_crash_exit_is_failure_only_for_persisted_named_scope(
+    project, monkeypatch, only, expected
+):
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+    )
+    (run_dir / "sweep.json").write_text(
+        json.dumps({"only": only, "min_severity": None}),
+        encoding="utf-8",
+    )
+    summary = types.SimpleNamespace(crashed=True, render=lambda: "CRASHED")
+    engine = types.SimpleNamespace(run=lambda: summary)
+    monkeypatch.setattr(
+        runsetup,
+        "compose_resume",
+        lambda **_kwargs: types.SimpleNamespace(engine=engine),
+    )
+
+    assert cli._resume_paused_run(project.project, run_dir) == expected
 
 
 def test_resume_stamps_a_legacy_run_with_no_snapshot(project, monkeypatch):
