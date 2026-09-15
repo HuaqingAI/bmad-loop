@@ -12,11 +12,15 @@ from enum import StrEnum
 from typing import Any
 
 from .adapters.base import SessionResult
-from .model import StoryTask, VerifyOutcome
+from .model import PAUSE_ESCALATION, RunState, StoryTask, VerifyOutcome
 from .policy import Policy
 
 SEVERITY_CRITICAL = "CRITICAL"
 SEVERITY_PREFERENCE = "PREFERENCE"
+CRITICAL_DISPLAY_MAX = 2000
+CRITICAL_FALLBACK_SOURCE = "journal.jsonl"
+CRITICAL_SOURCE_DISPLAY_MAX = 400
+_CRITICAL_TRUNCATION_MARKER = f" [… truncated; full detail in {CRITICAL_FALLBACK_SOURCE}]"
 
 
 class Action(StrEnum):
@@ -57,6 +61,66 @@ def critical_escalations(result_json: dict[str, Any] | None) -> list[dict[str, A
         for e in _escalation_list(result_json)
         if isinstance(e, dict) and str(e.get("severity", "")).upper() == SEVERITY_CRITICAL
     ]
+
+
+def critical_session_reason(role: str, result_json: dict[str, Any] | None) -> str | None:
+    """Compose the lossless reason for a session's CRITICAL escalations.
+
+    This is the one wording owner for every session role.  It deliberately does
+    no display truncation: callers journal and persist this value before a
+    human-facing boundary renders it through :func:`display_critical_reason`.
+    """
+    crits = critical_escalations(result_json)
+    if not crits:
+        return None
+    details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
+    return f"CRITICAL escalation from {role} session: {details}"
+
+
+def display_critical_reason(reason: str, source: str | None = None) -> str:
+    """Bound a CRITICAL reason and optional recovery trail for display.
+
+    The run journal is the durable source of every full reason.  A validated
+    story spec is useful for recovery, but is not claimed to contain arbitrary
+    verify/plugin/recovery detail.  Short reasons without a spec are returned
+    byte-for-byte; otherwise the reason and recovery hint share the existing
+    2,000-character display budget.
+
+    ``source`` is presentation metadata, not an authority grant.  Engine callers
+    pass only the already-validated ``StoryTask.spec_file``; claimed paths in a
+    raw session result therefore continue through the existing validation path.
+    """
+    recovery_hint = ""
+    if isinstance(source, str) and source:
+        shown_source = source
+        if len(shown_source) > CRITICAL_SOURCE_DISPLAY_MAX:
+            head = CRITICAL_SOURCE_DISPLAY_MAX // 3
+            tail = CRITICAL_SOURCE_DISPLAY_MAX - head - 1
+            shown_source = shown_source[:head] + "…" + shown_source[-tail:]
+        recovery_hint = f" [recovery trail: {shown_source}]"
+
+    if len(reason) + len(recovery_hint) <= CRITICAL_DISPLAY_MAX:
+        return reason + recovery_hint
+    suffix = _CRITICAL_TRUNCATION_MARKER + recovery_hint
+    prefix = reason[: CRITICAL_DISPLAY_MAX - len(suffix)].rstrip()
+    return prefix + suffix
+
+
+def display_pause_reason(state: RunState) -> str:
+    """Render a state's pause reason without mutating its lossless record.
+
+    Missing task/source metadata is total and falls back to ``journal.jsonl``.
+    """
+    raw_reason = state.paused_reason
+    reason = (
+        raw_reason if isinstance(raw_reason, str) else "" if raw_reason is None else str(raw_reason)
+    )
+    if state.paused_stage != PAUSE_ESCALATION:
+        return reason
+    story_key = state.paused_story_key
+    task = state.tasks.get(story_key) if isinstance(story_key, str) else None
+    source = task.spec_file if task is not None else None
+    return display_critical_reason(reason, source)
 
 
 def preference_escalations(result_json: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -126,10 +190,9 @@ def decide_dev(
     policy: Policy,
 ) -> Decision:
     """After a dev session (and its verification, when the session completed)."""
-    crits = critical_escalations(result.result_json)
-    if crits:
-        details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
-        return Decision(Action.PAUSE, f"CRITICAL escalation from dev session: {details}")
+    critical_reason = critical_session_reason("dev", result.result_json)
+    if critical_reason is not None:
+        return Decision(Action.PAUSE, critical_reason)
 
     budget_left = task.attempt < policy.limits.max_dev_attempts
     exhausted = _exhausted_action(task)
@@ -162,10 +225,9 @@ def decide_dev(
 
 def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy) -> Decision:
     """After a review session returns, before interpreting its done/followup status."""
-    crits = critical_escalations(result.result_json)
-    if crits:
-        details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
-        return Decision(Action.PAUSE, f"CRITICAL escalation from review session: {details}")
+    critical_reason = critical_session_reason("review", result.result_json)
+    if critical_reason is not None:
+        return Decision(Action.PAUSE, critical_reason)
 
     if result.status != "completed":
         if result.env_fault:

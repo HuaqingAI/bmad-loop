@@ -291,6 +291,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Preserve complete CRITICAL escalation detail in run records while visibly bounding human displays and naming the spec or journal that holds the recovery trail.
+
 - **The TUI's re-arm declines a contended run instead of waiting for it.** The
   gesture runs on Textual's message loop, so taking the run's state lock blocking
   froze the whole dashboard for as long as a rival held it — unbounded on POSIX,

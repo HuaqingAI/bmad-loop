@@ -19,7 +19,7 @@ from typing import Any, Callable, Iterable
 
 from . import deferredwork, gates, verify
 from .engine import Engine, RunPaused, _ArmedClose, _LedgerAnchor
-from .escalation import critical_escalations, env_fault_pause_reason, session_failure_reason
+from .escalation import critical_session_reason, env_fault_pause_reason, session_failure_reason
 from .model import PAUSE_STORY_GATE, Phase, StoryTask
 from .platform_util import (
     atomic_write_text,
@@ -1024,10 +1024,9 @@ class SweepEngine(Engine):
             )
             advance(task, Phase.TRIAGE_VERIFY)
             self._save()
-            crits = critical_escalations(result.result_json)
-            if crits:
-                details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
-                self._escalate(task, f"CRITICAL escalation from migration session: {details}")
+            critical_reason = critical_session_reason("migration", result.result_json)
+            if critical_reason is not None:
+                self._escalate(task, critical_reason)
             # Split so ABSENCE survives: `new_text` stays `str` for
             # `validate_migration`, while `rewrite` keeps the difference between
             # "the session emptied the ledger" and "the session deleted it". On
@@ -1215,10 +1214,9 @@ class SweepEngine(Engine):
             )
             advance(task, Phase.TRIAGE_VERIFY)
             self._save()
-            crits = critical_escalations(result.result_json)
-            if crits:
-                details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
-                self._escalate(task, f"CRITICAL escalation from triage session: {details}")
+            critical_reason = critical_session_reason("triage", result.result_json)
+            if critical_reason is not None:
+                self._escalate(task, critical_reason)
             if result.status != "completed":
                 plan, errors = None, [session_failure_reason("triage", result)]
             else:

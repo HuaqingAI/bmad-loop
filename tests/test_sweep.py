@@ -2497,6 +2497,33 @@ def test_triage_session_env_fault_escalates_then_resume_restores_budget(project)
     assert radapter.sessions[0].task_id not in abandoned
 
 
+@pytest.mark.parametrize("role", ["triage", "migration"])
+def test_spec_less_critical_session_keeps_full_reason_and_points_displays_to_journal(project, role):
+    if role == "migration":
+        write_legacy_ledger(project, LEGACY_LEDGER)
+    else:
+        write_ledger(project, {"DW-1": "open"})
+    tail = "RECOVERY-TAIL"
+    detail = "x" * 2500 + tail
+    result = SessionResult(
+        status="completed",
+        result_json={
+            "escalations": [{"severity": "CRITICAL", "detail": detail}],
+        },
+    )
+    engine, _ = make_sweep(project, [result])
+
+    summary = engine.run()
+
+    assert engine.state.paused_reason.endswith(tail)
+    assert summary.paused_reason.endswith("[… truncated; full detail in journal.jsonl]")
+    assert tail not in summary.paused_reason
+    (escalated,) = [
+        entry for entry in engine.journal.entries() if entry["kind"] == "story-escalated"
+    ]
+    assert escalated["reason"] == f"CRITICAL escalation from {role} session: {detail}"
+
+
 def test_repeated_triage_escalation_restarts_keep_advancing_generation(project):
     """Every ESCALATED restart opens a new namespace, not only the first one.
 

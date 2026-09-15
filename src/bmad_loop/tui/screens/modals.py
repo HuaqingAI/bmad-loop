@@ -20,6 +20,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, Select, Static
 
 from ... import stories
+from ...escalation import display_pause_reason
 from ...model import RunState
 from .. import data, widgets
 
@@ -388,7 +389,7 @@ class ConfirmResumeModal(ConfirmModal):
         if state.paused:
             body.append(f"paused at {state.paused_stage or '?'}", style="yellow")
             if state.paused_reason:
-                body.append(f" — {state.paused_reason}", style="yellow")
+                body.append(f" — {display_pause_reason(state)}", style="yellow")
         else:
             body.append("run is not paused — it looks interrupted", style="dim")
         warning = (
