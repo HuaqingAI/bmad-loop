@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import sys
 import time
 from contextlib import suppress
@@ -845,8 +846,14 @@ class SweepResumeOptions:
 def load_sweep_resume_options(run_dir: Path) -> SweepResumeOptions:
     """Load sweep.json, tolerating old files but refusing malformed selectors."""
     opts_path = run_dir / "sweep.json"
-    if not opts_path.is_file():
+    try:
+        options_mode = opts_path.stat().st_mode
+    except FileNotFoundError:
         return SweepResumeOptions({}, None, None)
+    except OSError as exc:
+        raise SweepOptionsError(f"sweep.json cannot be inspected: {exc}") from exc
+    if not stat.S_ISREG(options_mode):
+        raise SweepOptionsError("sweep.json must be a regular file")
     try:
         loaded = json.loads(opts_path.read_text(encoding="utf-8"))
     except OSError as exc:

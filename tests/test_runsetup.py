@@ -505,6 +505,14 @@ def test_resume_refuses_an_unreadable_existing_sweep_options_file(tmp_path, monk
         runsetup.load_sweep_resume_options(run_dir)
 
 
+def test_resume_refuses_a_nonregular_existing_sweep_options_path(tmp_path):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    (run_dir / "sweep.json").mkdir(parents=True)
+
+    with pytest.raises(runsetup.SweepOptionsError, match="regular file"):
+        runsetup.load_sweep_resume_options(run_dir)
+
+
 def test_resume_reconstructs_persisted_sweep_selectors(tmp_path, monkeypatch):
     run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
     run_dir.mkdir(parents=True)
