@@ -110,6 +110,8 @@ def display_pause_reason(state: RunState) -> str:
     """Render a state's pause reason without mutating its lossless record.
 
     Missing task/source metadata is total and falls back to ``journal.jsonl``.
+    A persisted worktree-local spec is relative by design, so anchor it through
+    ``runs.task_spec_path`` before presenting it to an operator (#734).
     """
     raw_reason = state.paused_reason
     reason = (
@@ -119,7 +121,13 @@ def display_pause_reason(state: RunState) -> str:
         return reason
     story_key = state.paused_story_key
     task = state.tasks.get(story_key) if isinstance(story_key, str) else None
-    source = task.spec_file if task is not None else None
+    source = None
+    if task is not None and task.spec_file:
+        # Local import avoids an escalation -> runs -> devcontract -> verify
+        # module-initialization cycle. Display calls happen only after startup.
+        from .runs import task_spec_path
+
+        source = str(task_spec_path(task, state))
     return display_critical_reason(reason, source)
 
 

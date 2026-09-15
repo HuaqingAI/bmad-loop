@@ -1242,8 +1242,15 @@ def test_status_text_bounds_critical_reason_while_json_stays_lossless(project, c
     run_id = "20260101-000000-aaaa"
     run_dir = project.project / ".bmad-loop" / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    spec = project.implementation_artifacts / "spec-1-1-login.md"
-    task = StoryTask(story_key="1-1-login", epic=1, phase=Phase.ESCALATED, spec_file=str(spec))
+    worktree = project.project / ".bmad-loop" / "runs" / run_id / "worktrees" / "1-1-login"
+    spec = worktree / "_bmad-output" / "implementation-artifacts" / "spec-1-1-login.md"
+    task = StoryTask(
+        story_key="1-1-login",
+        epic=1,
+        phase=Phase.ESCALATED,
+        spec_file=str(spec),
+        worktree_path=str(worktree),
+    )
     tail = "RECOVERY-TAIL"
     reason = "CRITICAL escalation from dev session: " + "x" * 2500 + tail
     save_state(
