@@ -1039,6 +1039,27 @@ def test_validate_migration_wrong_workflow():
     assert errors and "workflow" in errors[0]
 
 
+def test_validate_migration_rejects_changed_manifest_severity():
+    manifest = [
+        {
+            "key": "legacy-1",
+            "id": "D-1",
+            "title": "legacy",
+            "section": "",
+            "done": False,
+            "severity": "high",
+        }
+    ]
+    migrated = (
+        "# Deferred Work\n\n### DW-1: legacy\n\norigin: migrated\n" "severity: low\nstatus: open\n"
+    )
+    rj = migrate_result([{"key": "legacy-1", "dw_id": "DW-1"}])
+
+    errors = validate_migration(rj, manifest, {}, migrated)
+
+    assert errors == ["mapping legacy-1 -> DW-1: manifest severity 'high', ledger has 'low'"]
+
+
 # ------------------------------------------------------------ engine flow
 
 
@@ -1230,6 +1251,31 @@ def test_selector_limits_graceful_stop_remaining_estimate(project):
     engine, _ = make_sweep(project, [], only_ids=("DW-2",))
 
     assert engine._remaining_estimate() == 1
+
+
+def test_selector_scope_change_declines_cached_triage(project):
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    fresh = triage_result(
+        ["DW-2"],
+        skip=[{"id": "DW-2", "reason": "fresh selector universe"}],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(fresh)],
+        min_severity="high",
+    )
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    cached = triage_result(
+        ["DW-1"],
+        skip=[{"id": "DW-1", "reason": "stale selector universe"}],
+    )
+    (engine.run_dir / "triage.json").write_text(json.dumps(cached), encoding="utf-8")
+
+    plan = engine._ensure_triage({"DW-2"})
+
+    assert plan.open_ids == frozenset({"DW-2"})
+    assert len(adapter.sessions) == 1
+    assert "cached selected open_ids no longer match" in journal_text(engine)
 
 
 def test_sweep_worktree_bundle_merges_to_target(project):
@@ -4217,6 +4263,44 @@ def test_sweep_migrates_legacy_then_triages_and_runs_bundle(project):
     assert [m["key"] for m in written] == [m["key"] for m in manifest]
     # triage ran against the post-migration open set, strict check intact
     assert "--migrate" not in adapter.sessions[1].prompt
+
+
+def test_severity_selector_applies_to_the_post_migration_ledger(project):
+    legacy = (
+        "# Deferred Work\n\n"
+        "### D-1: Low legacy\n\nseverity: low\nreason: low item\n\n"
+        "### D-2: High legacy\n\nseverity: high\nreason: high item\n"
+    )
+    write_legacy_ledger(project, legacy)
+    manifest = legacy_manifest(legacy)
+    assert [item["severity"] for item in manifest] == ["low", "high"]
+    mapping = [
+        {"key": manifest[0]["key"], "dw_id": "DW-1"},
+        {"key": manifest[1]["key"], "dw_id": "DW-2"},
+    ]
+    migrated = (
+        "# Deferred Work\n\n"
+        "### DW-1: Low legacy\n\norigin: migrated\nseverity: low\nstatus: open\n\n"
+        "### DW-2: High legacy\n\norigin: migrated\nseverity: high\nstatus: open\n"
+    )
+    plan = triage_result(
+        ["DW-2"],
+        skip=[{"id": "DW-2", "reason": "selected high entry"}],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [migrate_effect(project, migrated, mapping), triage_effect(plan)],
+        min_severity="high",
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert adapter.sessions[1].prompt == "/bmad-loop-sweep --only DW-2"
+    excluded = [
+        entry for entry in engine.journal.entries() if entry["kind"] == "sweep-selection-excluded"
+    ]
+    assert excluded[0]["dw_ids"] == ["DW-1"]
 
 
 def test_migration_validation_failure_restores_ledger_then_escalates(project):

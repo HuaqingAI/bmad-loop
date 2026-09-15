@@ -1899,7 +1899,12 @@ def test_cmd_sweep_forwards_selector_to_start_sweep(
     assert captured["min_severity"] == expected_min
 
 
-def test_start_sweep_returns_failure_for_a_crashed_selection_run(project, monkeypatch):
+@pytest.mark.parametrize(
+    ("only_ids", "expected"),
+    [(("DW-9",), 1), (None, 0)],
+    ids=["named-selector", "historical-unrestricted"],
+)
+def test_start_sweep_crash_exit_preserves_existing_modes(project, monkeypatch, only_ids, expected):
     summary = types.SimpleNamespace(crashed=True, render=lambda: "CRASHED")
     engine = types.SimpleNamespace(run=lambda: summary)
     monkeypatch.setattr(
@@ -1919,10 +1924,10 @@ def test_start_sweep_returns_failure_for_a_crashed_selection_run(project, monkey
         decisions_only=False,
         max_bundles=None,
         trigger="cli",
-        only_ids=("DW-9",),
+        only_ids=only_ids,
     )
 
-    assert rc == 1
+    assert rc == expected
 
 
 def test_make_adapters_review_synthesizes_from_spec(project, monkeypatch):

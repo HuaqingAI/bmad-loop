@@ -529,9 +529,15 @@ def validate_migration(
         target = entries.get(dw_id)
         if target is None:
             errors.append(f"mapping {key} -> {dw_id}: no such entry in the ledger")
-        elif (first_word(target.status) == "done") != bool(source["done"]):
-            want = "done" if source["done"] else "open"
-            errors.append(f"mapping {key} -> {dw_id}: manifest says {want}, ledger disagrees")
+        else:
+            if (first_word(target.status) == "done") != bool(source["done"]):
+                want = "done" if source["done"] else "open"
+                errors.append(f"mapping {key} -> {dw_id}: manifest says {want}, ledger disagrees")
+            if target.severity != source.get("severity"):
+                errors.append(
+                    f"mapping {key} -> {dw_id}: manifest severity "
+                    f"{source.get('severity')!r}, ledger has {target.severity!r}"
+                )
     missing = sorted(set(manifest_by_key) - seen_keys)
     if missing:
         errors.append("manifest keys not mapped: " + ", ".join(missing))
@@ -1283,6 +1289,14 @@ class SweepEngine(Engine):
                     plan, errors = validate_triage(cached, None)
                 else:
                     plan, errors = None, [f"not a JSON object: {type(cached).__name__}"]
+                if (
+                    plan is not None
+                    and (self.only_ids is not None or self.min_severity is not None)
+                    and plan.open_ids != frozenset(open_now)
+                ):
+                    plan, errors = None, [
+                        "cached selected open_ids no longer match the current selector universe"
+                    ]
                 if plan is not None:
                     return plan
                 self.journal.append("sweep-triage-reload-failed", errors=errors)

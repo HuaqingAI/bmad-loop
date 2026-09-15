@@ -2298,7 +2298,7 @@ def _start_sweep(
     print(f"sweep {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
     print(summary.render())
-    return ExitCode.FAILURE if summary.crashed else ExitCode.OK
+    return ExitCode.FAILURE if summary.crashed and only_ids is not None else ExitCode.OK
 
 
 def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest: str):
