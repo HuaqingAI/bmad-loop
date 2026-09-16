@@ -9,6 +9,14 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **The `_usage` stash is now pinned to survive teardown** (DW-129) — the invariant
+  DW-117's cap placement rests on, since `read_usage(result)` runs after `run()`/`kill()`
+  return. `tests/test_opencode_http.py` gains a row that stashes a session's usage,
+  drives a real `kill()` -> `_teardown()` (nothing stubbed) over a live child process and
+  a real log handle, and asserts `read_usage` still resolves that session id. Until now
+  the invariant was only observed incidentally, by three fake-binary E2E rows that happen
+  to read usage after teardown; this one pins it directly at the kill seam.
+
 - **Verify-command seam coverage for the legs the earlier passes left unpinned**
   (DW-55). `tests/test_verify.py` gains a row driving all three exits of
   `run_verify_commands`' loop body — completed, timed out, never spawned — in a single
@@ -29,6 +37,17 @@ breaking changes may land in a minor release.
   fails, recorded as `compared: false` — is journalled with the main-checkout spec path
   and the target branch to commit it on. Advisory only: the record refuses nothing,
   pauses nothing and overwrites nothing.
+
+- **A mount that cannot be shown to carry the accepted spec at all now journals
+  `accepted-spec-delivery-unreachable`** (DW-104, DW-115). Fires only for a spec the
+  task already spells project-relative — the spelling a resume persists, and the one
+  leg with no escalating guard above it — when the mounted parent escapes the
+  worktree, or the spec could not be resolved at all (a swallowed filesystem fault,
+  or a spelling that no longer resolves). Carries the main-checkout spec path, the
+  target branch, and `located`, a bare boolean saying which of the two silences it
+  ended: `true` the spec was resolved and the mount could not be shown to carry it,
+  `false` the spec itself could not be resolved. Advisory only: nothing reads it as a
+  gate, and the relocated leg still escalates instead of recording.
 - **Target deferred-work sweeps.** `bmad-loop sweep --only DW-1,DW-3` selects an
   exact open-id set, while `--min-severity low|medium|high|critical` selects the
   named severity and higher. Selection happens before triage, bundle formation,
@@ -321,11 +340,94 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Make stories E2E reap identity reuse-proof and clean up a live child when either
+  protected reap assertion fires** (DW-126, DW-127).
+
+- **`runs.restamp_code_root` now warns only when THAT call moved the code root**
+  (DW-114). A set `code_root_restamp_pending` with the mirror already equal to the
+  incoming root made the function fall past the "already agrees" exit, discharge the
+  owed record with a hardcoded `code_root_changed=True`, and return the "the code root
+  in `_bmad/bmm/config.yaml` has changed" warning that `bmad-loop resolve` and the TUI's
+  re-arm print — on a call that re-pointed nothing, and on the same seam where
+  `cli._prepare_resume_locked` stays quiet. The marker is a record DEBT, not a move: the
+  trailing record now reports whether THIS invocation re-pointed the root, and the call
+  returns `None` when it did not, so the re-arm surfaces and plain `resume` now agree
+  about whether an operator is warned in that state. They still differ on the journal:
+  this record reads `code_root_changed=false` where resume's own discharge row keeps
+  `true`, because resume's names the pre-overwrite root and this one names the call that
+  moved nothing. The at-least-once discharge is unchanged — the record
+  still lands exactly once under the root now recorded, the marker still clears only
+  after the append returns, and the pre-overwrite discharge still names the previous
+  root with `code_root_changed=True`. A genuine move still warns.
+
+- **Stop stale `keep-open` answers from suppressing later deferred-work bundles**
+  when triage options are renumbered or removed (DW-123).
+
+- **A stored deferred-work decision answer is now validated against the triage
+  option its key resolves to before the two are blended** (DW-118). `Decision.option`
+  matches on key alone and a key is a position in a list every triage re-authors, so a
+  renumbering re-triage attributed one question's answer to another question's option:
+  on DW-55 a stored `build` answer keyed "1" met a fresh option "1" spelled "Close as
+  decayed", and the bundle shipped the stale review intent under the close label while
+  quoting a question the human never answered. The answer's own `label` and `effect` —
+  the two fields both provenances carry — are now compared first, and a disagreeing
+  option is discarded outright: it contributes no intent, label or bundle name, the
+  mismatch is journaled (`sweep-decision-option-mismatch`), and the decision note cites
+  the earlier triage rather than the current question. Precedence is flipped with it, so
+  even an agreeing option fills only the fields the stored answer omits and re-authored
+  triage prose can no longer reach a bundle the human chose against different prose.
+  Covers the in-run lane too — `--repeat` re-triages each cycle while answers persist for
+  the whole run — where a discarded option can leave nothing to build from: that answer
+  is journaled (`sweep-decision-answer-dropped`) and notified instead of vanishing, and
+  its ledger entry stays open for the next sweep to re-ask. A dropped decision is
+  quarantined for the rest of the sweep process, so a later cycle whose re-triage agrees
+  with it again neither revives it nor re-notifies it; the quarantine is instance state
+  and is never persisted, so a resumed run re-evaluates the decision. The
+  `decision-<id>` fallback name is also made unique now: it is a fallback, not a
+  reserved namespace, so a plan bundle may legally carry it and the two would have
+  hashed to one task key and one intent directory, silently losing the human's bundle. A
+  taken name gains a bounded numeric suffix (`-2` … `-9`, first free wins, journaled
+  `sweep-bundle-name-deduped`); exhausting the bound is the one point in name assignment
+  at which a buildable answer yields no bundle, journaled with
+  `drop_cause: name-collision` and notified.
+
+- Inventory keyword and splat journal kinds only over an empty positional slot,
+  preserving literalness and field findings (DW-109); give unresolved-kind failures
+  call-site advice and prohibit sentinel declarations (DW-113); remove stale guard
+  counts (DW-110, DW-112) and pin every kind covered by the by-name `patch` drop
+  (DW-78).
+
+- Name the property instead of counting siblings in the portability guard's last three
+  journal-kind comments (DW-120): a kind-only write is one passing no keyword arguments
+  at all, not even a `**` splat, and the other class is a literal reaching a declared
+  dynamic-kind position from outside its body — a caller's `kind=` keyword or the
+  position's own parameter default. A fifth of either no longer falsifies the prose.
+
+- Retire two unpinned prose claims in the portability guard (DW-130, DW-131): the
+  dynamic-kind literalness docstring no longer counts the writes it governs, keeping only
+  the ablation-pinned position count, and the kind-literal probe's ablation now maps each
+  feeding emit to the rows it reddens instead of crediting one emit with all of them.
+
 - Probe both existence arms of the accepted-spec worktree seed through the total
   `_is_file` (DW-103), matching its structural siblings and the DW-101 supersession
   warning. On Python <=3.13 a raw `Path.is_file` raises on an unreadable path, and
   this call site sits outside every `except` in `run_isolated`, so the fault ended
   the run instead of allowing dispatch to continue. No change on non-faulting paths.
+
+- Name the two silent refusals on the accepted-spec delivery path (DW-104, DW-115).
+  The worktree seed's containment refusal now nominates its rel anyway, so
+  `worktree-seed-dropped` reports it — the copier re-checks destination containment
+  itself, so still nothing is written outside the mount — and both that refusal and a
+  source the locator could not resolve at all (a swallowed filesystem fault, or a
+  spelling that no longer resolves) are journalled as
+  `accepted-spec-delivery-unreachable` on the non-relocated leg. Previously the rel reached no journal and, for a
+  project-relative spec, no gate either: the unit dispatched against a mount lacking
+  the operator's spec and fell back to the bare story key. Nothing new escalates.
+
+- Probe the accepted spec for file-ness inside `relativize_project_local_accepted_spec`'s
+  own `except` (DW-116). `run_isolated` calls the method before its first `try`, so a
+  TOCTOU or non-EACCES `OSError` at that probe ended the run; it now leaves the
+  spelling unchanged, as a false probe already did.
 
 - Discharge an owed code-root re-stamp record under its original root before
   resuming (DW-100), preserving the record and integrity pin for retry on failure.
@@ -340,10 +442,23 @@ breaking changes may land in a minor release.
   which the marks are silently inert. Separately, the four completion- and crash-path
   waits in `tests/test_generic_tmux.py` now share one named 90s hang ceiling — a hang
   detector, not a performance budget — replacing per-site 30s and 20s walls; the
-  `tests/test_stories_e2e.py` tests keep their own subprocess budgets and rely on the
-  grouping alone. Guards in `tests/test_conftest.py` check repository scheduling
+  `tests/test_stories_e2e.py` subprocess `timeout=` budgets stay their own and rely on
+  the grouping alone. Guards in `tests/test_conftest.py` check repository scheduling
   declarations and the synthetic scheduling mechanism, and prevent short completion
   walls from returning while preserving the deliberate 6s triggers. Tests only; no
+  production change.
+
+- **Put the last two load-sensitive real-tmux walls on the shared hang ceiling**
+  (DW-108). The descendant-reap polls in `tests/test_stories_e2e.py` deadlined on a
+  fixed `time.monotonic() + 10`, which a starved scheduler can blow through — the class
+  DW-95 removed from the generic-tmux waits but left in the one module its guard
+  excludes. Both now spell the imported `REAL_MUX_HANG_CEILING_S`; the trade-off is
+  deliberate, a merely slow reaper is caught at 90s rather than at 10s while a broken
+  one still fails. A second scanner in `tests/test_conftest.py` keeps them there,
+  rejecting any `time.monotonic() + <budget>` in a tmux-gated test in that file that is
+  not the imported constant, with a named expected-site inventory so it cannot pass by
+  scanning nothing and must-flag / must-stay-silent probe rows through the same function.
+  The subprocess `timeout=` budgets in that file stay out of scope. Tests only; no
   production change.
 
 - **Bound launch-marker snapshot retention in the dev adapters** (DW-96). Each dev
@@ -363,8 +478,20 @@ breaking changes may land in a minor release.
   `_post_kill_reconcile`, and still reached when `wait_for_completion` raises. Scoped to
   the returning task id, so a concurrent session keeps its entries; within-session
   semantics (the exactly-once contract nudge included) are unchanged.
-  `OpencodeHttpAdapter._usage` is a separate, still-unbounded case: it is keyed by
-  session id and read after `run()` returns, so it cannot use this seam.
+  `OpencodeHttpAdapter._usage` is a separate case: it is keyed by session id and read
+  after `run()` returns, so it cannot use this seam — it is capacity-bounded instead
+  (DW-117).
+
+- **Bound the OpenCode HTTP adapter's session usage stash** (DW-117).
+  `OpencodeHttpAdapter._usage` was written once per session in `_capture_usage` and
+  never popped, so it grew O(sessions) for the adapter's lifetime. It cannot join the
+  `_evict_task_state` seam — it is keyed by session id, not task id, and the engine
+  calls `read_usage(result)` after `run()` returns, so evicting there would zero token
+  accounting. The write site now enforces a fixed `USAGE_STASH_CAP` (256), dropping the
+  oldest entries first and only when the key is new, so a re-stash of a live session
+  never evicts a peer. The cap sits orders of magnitude above any plausible in-flight
+  session count, and `read_usage`'s contract — signature, idempotence, `None` for a
+  missing or absent session id — is unchanged.
 
 - Prevent harvest races from filing cross-spec duplicates for one fingerprint (DW-98).
 
