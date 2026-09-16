@@ -728,9 +728,14 @@ def test_resume_refuses_a_link_like_sweep_options_path(tmp_path, monkeypatch):
         runsetup.load_sweep_resume_options(run_dir)
 
 
-def test_resume_refuses_a_nonregular_existing_sweep_options_path(tmp_path):
+def test_resume_refuses_a_nonregular_existing_sweep_options_path(tmp_path, monkeypatch):
     run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
     (run_dir / "sweep.json").mkdir(parents=True)
+
+    def windows_directory_open_refusal(*_args, **_kwargs):
+        raise PermissionError("Windows refuses opening a directory")
+
+    monkeypatch.setattr(runsetup.os, "open", windows_directory_open_refusal)
 
     with pytest.raises(runsetup.SweepOptionsError, match="regular file|cannot be opened"):
         runsetup.load_sweep_resume_options(run_dir)

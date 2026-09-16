@@ -868,6 +868,11 @@ def load_sweep_resume_options(
     opts_path = run_dir / "sweep.json"
     if is_link_like(opts_path):
         raise SweepOptionsError("sweep.json must not be a link-like path")
+    # Windows refuses opening a directory before fstat can classify it.  Keep
+    # nonregular paths on the fail-closed boundary rather than misclassifying
+    # that open error as a tolerant legacy-file read failure.
+    if opts_path.exists() and not opts_path.is_file():
+        raise SweepOptionsError("sweep.json must be a regular file")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     flags |= getattr(os, "O_BINARY", 0)
     try:
@@ -1330,8 +1335,9 @@ def compose_sweep(
         "trigger": trigger,
     }
     options_text = json.dumps(options, indent=2)
-    options_digest = hashlib.sha256(options_text.encode("utf-8")).hexdigest()
-    if len(options_text.encode("utf-8")) > _MAX_SWEEP_OPTIONS_BYTES:
+    options_bytes = options_text.encode("utf-8")
+    options_digest = hashlib.sha256(options_bytes).hexdigest()
+    if len(options_bytes) > _MAX_SWEEP_OPTIONS_BYTES:
         raise SweepOptionsError(f"sweep options exceed {_MAX_SWEEP_OPTIONS_BYTES} bytes")
 
     run_id = run_id or runs.new_run_id()
@@ -1360,7 +1366,7 @@ def compose_sweep(
         # crash mid-write must not leave a torn file the recovery path then chokes on.
         sweep_path = run_dir / "sweep.json"
         sweep_tmp = sweep_path.with_suffix(".json.tmp")
-        sweep_tmp.write_text(options_text, encoding="utf-8")
+        sweep_tmp.write_bytes(options_bytes)
         atomic_replace(sweep_tmp, sweep_path)
         # Publish selector-capable state only after its required options file is
         # complete. The state lock keeps state.json + pid indivisible to resume;
