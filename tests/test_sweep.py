@@ -28,6 +28,7 @@ from conftest import (
     nested_repo_root_paths,
     passes_once,
     refuse_to_resolve,
+    remove_tree,
     seed_outer_decoy_ledger,
     triage_effect,
     write_ledger,
@@ -8311,6 +8312,23 @@ def test_a_prune_with_an_undecodable_ledger_refuses_and_keeps_every_answer(proje
 # the third topology no repository does, and `git commit` refuses an empty commit.
 
 
+def _link_target(link: Path) -> Path:
+    """The path `link` was created with, as `Path.readlink()` reports it.
+
+    Windows stores an absolute symlink's substitute name in NT form and CPython's
+    `os.readlink` hands it back with the extended-length `\\\\?\\` prefix (3.8+), so
+    `readlink() == target` compares `\\\\?\\D:\\...` against the `D:\\...` the test spelled
+    and fails on every Windows row. The prefix is dropped there and only there: on
+    POSIX `readlink` returns the bytes `symlink_to` wrote, and a leading `\\\\?\\` in
+    them would be a real (if bizarre) filename component the assertion must see.
+    Drive paths only, which is every sandbox path; a `\\\\?\\UNC\\` spelling is not
+    folded."""
+    raw = str(link.readlink())
+    if sys.platform == "win32" and raw.startswith("\\\\?\\"):
+        raw = raw[len("\\\\?\\") :]
+    return Path(raw)
+
+
 def _settle(*repos):
     """Commit whatever each repo is carrying, so every tree starts clean."""
     for repo in repos:
@@ -8786,7 +8804,7 @@ def test_a_symlinked_ledger_commits_in_the_repository_that_holds_its_target(
     _settle(project.project, ledger_repo)
 
     # premise before outcome
-    assert link.is_symlink() and link.readlink() == target  # the indirection is real
+    assert link.is_symlink() and _link_target(link) == target  # the indirection is real
     assert target.is_file() and not target.is_symlink()  # ...and the write went through it
     project_resolved, ledger_resolved = project.project.resolve(), ledger_repo.resolve()
     assert project_resolved != ledger_resolved
@@ -8818,7 +8836,7 @@ def test_a_symlinked_ledger_commits_in_the_repository_that_holds_its_target(
     assert commit["commit"] == git(ledger_repo, "rev-parse", "HEAD")
     assert git(ledger_repo, "status", "--porcelain") == ""
     # the link survives AS a link, still aimed at the same file
-    assert link.is_symlink() and link.readlink() == target
+    assert link.is_symlink() and _link_target(link) == target
     # ...and the project repo, which holds only the link, receives nothing
     assert git(project.project, "rev-parse", "HEAD") == project_head
 
@@ -9543,7 +9561,7 @@ def test_a_ledger_commit_in_a_non_git_project_keeps_the_write_and_journals(proje
         already_resolved=(ResolvedEntry("DW-1", "fixed by a1b2c3d"),),
     )
     # the project stops being a repo; the run dir and the ledger stay as they are
-    shutil.rmtree(project.project / ".git")
+    remove_tree(project.project / ".git")
     assert not (project.project / ".git").exists()
 
     assert engine._close_resolved(plan) == 1  # must not raise
@@ -9670,7 +9688,7 @@ def test_publication_journal_write_errors_propagate_without_retry(project, monke
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
     if outcome == "unavailable":
-        shutil.rmtree(project.project / ".git")
+        remove_tree(project.project / ".git")
     if outcome == "refused":
         project.deferred_work.unlink()
     attempted = []
@@ -9722,7 +9740,7 @@ def test_the_ledger_commit_rows_name_the_file_they_are_about(project):
     project.deferred_work.write_text(
         project.deferred_work.read_text(encoding="utf-8") + "\n<!-- more -->\n", encoding="utf-8"
     )
-    shutil.rmtree(project.project / ".git")
+    remove_tree(project.project / ".git")
     engine._commit_ledger("chore(sweep): degraded", path=project.deferred_work, family="ledger")
 
     [failed] = _records(engine, "sweep-ledger-commit-unavailable")
@@ -9880,7 +9898,7 @@ def test_the_journalled_file_is_the_lexical_tail_not_the_symlink_target(project,
     write_ledger(project, {"DW-1": "open", "DW-2": "open"}, commit=False)  # writes THROUGH
     _settle(project.project, ledger_repo)
     # premise: the indirection is real and the names really differ
-    assert link.is_symlink() and link.readlink() == target
+    assert link.is_symlink() and _link_target(link) == target
     assert target.name != link.name
 
     engine, _ = make_sweep(project, [])
@@ -9908,7 +9926,7 @@ def test_the_journalled_file_is_the_lexical_tail_not_the_symlink_target(project,
     assert clean["file"] == "deferred-work.md"
     assert _records(engine, "sweep-ledger-commit-unavailable") == []  # premise: it really ran
 
-    shutil.rmtree(ledger_repo / ".git")
+    remove_tree(ledger_repo / ".git")
     assert link.resolve() == target  # resolution succeeds; Git publication fails
     engine._commit_ledger("chore(sweep): unavailable", path=link, family="ledger")
     [failed] = _records(engine, "sweep-ledger-commit-unavailable")

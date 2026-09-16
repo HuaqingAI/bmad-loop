@@ -15,6 +15,7 @@ therefore pinned here, one fact per row.
 from __future__ import annotations
 
 import ast
+import errno
 import functools
 import json
 import os
@@ -390,9 +391,16 @@ def test_refuse_to_resolve_defaults_to_the_unc_refusal_and_stays_scoped(project,
         target.resolve()
 
     assert conftest.UNRESOLVABLE in str(caught.value)
-    assert caught.value.errno == 0
-    if sys.platform == "win32":  # the 4th constructor arg is surfaced only there
+    if sys.platform == "win32":
+        # The 4th constructor arg is surfaced only there — and it is authoritative:
+        # CPython DERIVES `errno` from a supplied `winerror` (`winerror_to_errno`, whose
+        # fallback for a code it has no mapping for — ERROR_NETNAME_DELETED among them —
+        # is EINVAL), so the `0` placeholder the helper passes never reaches the
+        # exception on Windows.
         assert caught.value.winerror == 64
+        assert caught.value.errno == errno.EINVAL
+    else:
+        assert caught.value.errno == 0
     assert sibling.resolve() == Path(os.path.realpath(sibling))  # unnamed paths still resolve
 
 

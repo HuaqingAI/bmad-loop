@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import warnings
@@ -570,6 +571,28 @@ def git(repo: Path, *args: str) -> str:
         ["git", "-C", str(repo), *args], capture_output=True, text=True, check=True
     )
     return proc.stdout.strip()
+
+
+def remove_tree(path: Path) -> None:
+    """``shutil.rmtree`` that also removes a tree holding READ-ONLY files.
+
+    Git writes every loose object ``0444``, and on Windows ``DeleteFile`` refuses a
+    file carrying the READONLY attribute (``WinError 5``), so a bare
+    ``shutil.rmtree(repo / ".git")`` — the way a test turns a sandbox into "not a git
+    repository" — dies on the first object it reaches there. POSIX never takes that
+    arm: unlink consults the parent directory's mode, never the entry's own. The bit
+    is cleared file by file up front rather than through ``rmtree``'s ``onerror``,
+    which 3.12 deprecates in favour of an ``onexc`` that 3.11 does not have.
+
+    Symlinks are not followed: ``os.walk`` lists a linked directory under ``dirs``
+    without descending (``followlinks=False``), and a linked file is skipped, so a
+    link out of the tree never passes the write bit through to its target."""
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            entry = os.path.join(root, name)
+            if not os.path.islink(entry):
+                os.chmod(entry, stat.S_IREAD | stat.S_IWRITE)
+    shutil.rmtree(path)
 
 
 NOISY_GIT_KEY = "core.fsyncMethod"
