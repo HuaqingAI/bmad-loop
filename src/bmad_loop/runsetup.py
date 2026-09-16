@@ -82,7 +82,7 @@ if TYPE_CHECKING:
 # actually builds them) and re-exported as ``cli.ROLES``, which `cmd_validate`
 # and the test suite resolve.
 ROLES = ("dev", "review", "triage")
-SWEEP_OPTIONS_VERSION = 1
+SWEEP_OPTIONS_VERSION = 2
 _MAX_SWEEP_OPTIONS_BYTES = 64 * 1024
 
 
@@ -843,9 +843,15 @@ class SweepResumeOptions:
     values: dict[str, Any]
     only_ids: tuple[str, ...] | None
     min_severity: str | None
+    digest: str | None = None
 
 
-def load_sweep_resume_options(run_dir: Path, *, required: bool = False) -> SweepResumeOptions:
+def load_sweep_resume_options(
+    run_dir: Path,
+    *,
+    required: bool = False,
+    expected_digest: str | None = None,
+) -> SweepResumeOptions:
     """Load bounded, non-redirected sweep.json bytes and validate selectors."""
 
     def corrupt(message: str, *, cause: BaseException | None = None) -> SweepResumeOptions:
@@ -893,6 +899,9 @@ def load_sweep_resume_options(run_dir: Path, *, required: bool = False) -> Sweep
     data = b"".join(chunks)
     if len(data) > _MAX_SWEEP_OPTIONS_BYTES:
         raise SweepOptionsError(f"sweep.json exceeds {_MAX_SWEEP_OPTIONS_BYTES} bytes")
+    digest = hashlib.sha256(data).hexdigest()
+    if expected_digest is not None and digest != expected_digest:
+        raise SweepOptionsError("sweep.json no longer matches the options bound at launch")
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -943,22 +952,31 @@ def load_sweep_resume_options(run_dir: Path, *, required: bool = False) -> Sweep
 
     if only_ids is not None and min_severity is not None:
         return corrupt("sweep.json cannot contain both 'only' and 'min_severity'")
-    # Missing keys are the pre-selector format and remain unrestricted. Explicit
-    # nulls are the current unrestricted format; both intentionally converge.
-    if not only_present:
+    # Version-zero callers predate selectors and must never inherit selector-
+    # shaped keys from a stray or replaced options file.  Current callers pass
+    # ``required=True`` and bind these exact bytes through RunState.
+    if not required or not only_present:
         only_ids = None
-    if not min_present:
+    if not required or not min_present:
         min_severity = None
-    return SweepResumeOptions(opts, only_ids, min_severity)
+    return SweepResumeOptions(opts, only_ids, min_severity, digest)
 
 
 def validate_sweep_options_version(version: int) -> None:
     """Refuse state whose sweep options semantics this binary cannot interpret."""
-    if version < 0 or version > SWEEP_OPTIONS_VERSION:
+    if version not in (0, SWEEP_OPTIONS_VERSION):
         raise SweepOptionsError(
-            f"unsupported sweep options version {version}; this binary supports "
-            f"0 through {SWEEP_OPTIONS_VERSION}"
+            f"unsupported sweep options version {version}; this binary supports legacy 0 "
+            f"or current {SWEEP_OPTIONS_VERSION}"
         )
+
+
+def validate_sweep_options_binding(
+    version: int, expected_digest: str, options: SweepResumeOptions
+) -> None:
+    """Bind current sweep options to the exact bytes published at launch."""
+    if version == SWEEP_OPTIONS_VERSION and options.digest != expected_digest:
+        raise SweepOptionsError("sweep.json no longer matches the options bound at launch")
 
 
 def _claim_run_dir(run_dir: Path) -> os.stat_result:
@@ -1313,6 +1331,7 @@ def compose_sweep(
         "trigger": trigger,
     }
     options_text = json.dumps(options, indent=2)
+    options_digest = hashlib.sha256(options_text.encode("utf-8")).hexdigest()
     if len(options_text.encode("utf-8")) > _MAX_SWEEP_OPTIONS_BYTES:
         raise SweepOptionsError(f"sweep options exceed {_MAX_SWEEP_OPTIONS_BYTES} bytes")
 
@@ -1334,6 +1353,7 @@ def compose_sweep(
             policy_snapshot=policy.to_dict(),
             run_type="sweep",
             sweep_options_version=SWEEP_OPTIONS_VERSION,
+            sweep_options_digest=options_digest,
             trusted_config_digest=trusted_config_digest,
         )
         # Persist the sweep options atomically (tmp + os.replace), the way save_state
@@ -1421,12 +1441,25 @@ def compose_resume(
         if sweep_options is not None
         else (
             load_sweep_resume_options(
-                run_dir, required=state.sweep_options_version >= SWEEP_OPTIONS_VERSION
+                run_dir,
+                required=state.sweep_options_version >= SWEEP_OPTIONS_VERSION,
+                expected_digest=(
+                    state.sweep_options_digest
+                    if state.sweep_options_version == SWEEP_OPTIONS_VERSION
+                    else None
+                ),
             )
             if state.run_type == "sweep"
             else None
         )
     )
+    if state.run_type == "sweep":
+        assert resolved_sweep_options is not None
+        validate_sweep_options_binding(
+            state.sweep_options_version,
+            state.sweep_options_digest,
+            resolved_sweep_options,
+        )
     # drop any stale agent session so the run spins up a fresh one (a stopped or
     # interrupted run can leave a lingering bmad-loop-<id> session behind).
     runs.kill_session(run_dir.name)

@@ -2750,6 +2750,11 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
             sweep_options = runsetup.load_sweep_resume_options(
                 run_dir,
                 required=state.sweep_options_version >= runsetup.SWEEP_OPTIONS_VERSION,
+                expected_digest=(
+                    state.sweep_options_digest
+                    if state.sweep_options_version == runsetup.SWEEP_OPTIONS_VERSION
+                    else None
+                ),
             )
         except runsetup.SweepOptionsError as exc:
             print(f"cannot resume {run_dir.name}: {exc}", file=sys.stderr)

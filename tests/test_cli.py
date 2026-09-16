@@ -1,6 +1,7 @@
 """CLI command tests — init policy-derived profiles and per-stage dry-run."""
 
 import argparse
+import hashlib
 import io
 import json
 import ntpath
@@ -1833,6 +1834,7 @@ def test_public_resume_refuses_malformed_selectors_before_mutation(
         monkeypatch,
         run_type="sweep",
         sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(contents.encode("utf-8")).hexdigest(),
     )
     (run_dir / "sweep.json").write_text(contents, encoding="utf-8")
     state_before = (run_dir / "state.json").read_bytes()
@@ -6161,6 +6163,7 @@ def test_public_resume_refuses_missing_current_sweep_options_before_mutation(
         monkeypatch,
         run_type="sweep",
         sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(b"{}").hexdigest(),
     )
     (run_dir / "sweep.json").unlink(missing_ok=True)
     state_before = (run_dir / "state.json").read_bytes()
@@ -6207,6 +6210,7 @@ def test_public_resume_refuses_incomplete_current_sweep_options_before_mutation(
         monkeypatch,
         run_type="sweep",
         sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(b"{}").hexdigest(),
     )
     (run_dir / "sweep.json").write_text("{}", encoding="utf-8")
     state_before = (run_dir / "state.json").read_bytes()
@@ -6218,6 +6222,29 @@ def test_public_resume_refuses_incomplete_current_sweep_options_before_mutation(
     assert (run_dir / "state.json").read_bytes() == state_before
 
 
+def test_public_resume_refuses_replacing_targeted_options_with_unrestricted_json(
+    project, monkeypatch, capsys
+):
+    targeted = json.dumps({"only": ["DW-1"], "min_severity": None})
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(targeted.encode("utf-8")).hexdigest(),
+    )
+    (run_dir / "sweep.json").write_text(
+        json.dumps({"only": None, "min_severity": None}), encoding="utf-8"
+    )
+    state_before = (run_dir / "state.json").read_bytes()
+    monkeypatch.setattr(cli, "SweepEngine", lambda **_kwargs: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+
+    assert "bound at launch" in capsys.readouterr().err
+    assert (run_dir / "state.json").read_bytes() == state_before
+
+
 @pytest.mark.parametrize(
     ("only", "expected"),
     [(["DW-9"], 1), (None, 0)],
@@ -6226,16 +6253,15 @@ def test_public_resume_refuses_incomplete_current_sweep_options_before_mutation(
 def test_resume_crash_exit_is_failure_only_for_persisted_named_scope(
     project, monkeypatch, only, expected
 ):
+    options_text = json.dumps({"only": only, "min_severity": None})
     run_dir = _paused_run_for_resume(
         project,
         monkeypatch,
         run_type="sweep",
         sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(options_text.encode("utf-8")).hexdigest(),
     )
-    (run_dir / "sweep.json").write_text(
-        json.dumps({"only": only, "min_severity": None}),
-        encoding="utf-8",
-    )
+    (run_dir / "sweep.json").write_text(options_text, encoding="utf-8")
     summary = types.SimpleNamespace(crashed=True, render=lambda: "CRASHED")
     engine = types.SimpleNamespace(run=lambda: summary)
     monkeypatch.setattr(

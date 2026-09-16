@@ -15,6 +15,7 @@ at the end of the file.
 """
 
 import dataclasses
+import hashlib
 import json
 import os
 import shutil
@@ -410,7 +411,12 @@ def test_compose_sweep_persists_and_wires_selectors(tmp_path, only_ids, min_seve
     options = json.loads((composed.run_dir / "sweep.json").read_text(encoding="utf-8"))
     assert options["only"] == (list(only_ids) if only_ids is not None else None)
     assert options["min_severity"] == min_severity
-    assert load_state(composed.run_dir).sweep_options_version == runsetup.SWEEP_OPTIONS_VERSION
+    persisted = load_state(composed.run_dir)
+    assert persisted.sweep_options_version == runsetup.SWEEP_OPTIONS_VERSION
+    assert (
+        persisted.sweep_options_digest
+        == hashlib.sha256((composed.run_dir / "sweep.json").read_bytes()).hexdigest()
+    )
     assert composed.engine.kwargs["only_ids"] == only_ids
     assert composed.engine.kwargs["min_severity"] == min_severity
 
@@ -622,6 +628,7 @@ def test_resume_refuses_malformed_selector_bearing_options(tmp_path, monkeypatch
         started_at="now",
         run_type="sweep",
         sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(contents.encode("utf-8")).hexdigest(),
     )
     killed = []
     monkeypatch.setattr(runs, "kill_session", lambda run_id: killed.append(run_id))
@@ -759,7 +766,7 @@ def test_resume_refuses_non_utf8_sweep_options(tmp_path):
     assert runsetup.load_sweep_resume_options(run_dir).only_ids is None
 
 
-@pytest.mark.parametrize("version", [-1, runsetup.SWEEP_OPTIONS_VERSION + 1])
+@pytest.mark.parametrize("version", [-1, 1, runsetup.SWEEP_OPTIONS_VERSION + 1])
 def test_resume_refuses_unsupported_sweep_options_version_before_mutation(
     tmp_path, monkeypatch, version
 ):
@@ -799,15 +806,15 @@ def test_resume_refuses_unsupported_sweep_options_version_before_mutation(
 def test_resume_reconstructs_persisted_sweep_selectors(tmp_path, monkeypatch):
     run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
     run_dir.mkdir(parents=True)
-    (run_dir / "sweep.json").write_text(
-        json.dumps({"only": ["DW-3", "DW-1", "DW-3"], "min_severity": None}),
-        encoding="utf-8",
-    )
+    options_text = json.dumps({"only": ["DW-3", "DW-1", "DW-3"], "min_severity": None})
+    (run_dir / "sweep.json").write_text(options_text, encoding="utf-8")
     state = RunState(
         run_id=RUN_ID,
         project=str(tmp_path),
         started_at="now",
         run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(options_text.encode("utf-8")).hexdigest(),
     )
     monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
 
@@ -832,9 +839,79 @@ def test_resume_reconstructs_persisted_sweep_selectors(tmp_path, monkeypatch):
 def test_resume_reconstructs_persisted_min_severity(tmp_path, monkeypatch):
     run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
     run_dir.mkdir(parents=True)
+    options_text = json.dumps({"only": None, "min_severity": "high"})
+    (run_dir / "sweep.json").write_text(options_text, encoding="utf-8")
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(options_text.encode("utf-8")).hexdigest(),
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+
+    composed = runsetup.compose_resume(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        run_dir=run_dir,
+        state=state,
+        policy=policy_mod.loads(""),
+        journal=Journal(run_dir),
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+    )
+
+    assert composed.engine.kwargs["only_ids"] is None
+    assert composed.engine.kwargs["min_severity"] == "high"
+
+
+def test_resume_refuses_replacing_targeted_options_with_valid_unrestricted_json(
+    tmp_path, monkeypatch
+):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    targeted = json.dumps({"only": ["DW-1"], "min_severity": None})
     (run_dir / "sweep.json").write_text(
-        json.dumps({"only": None, "min_severity": "high"}),
-        encoding="utf-8",
+        json.dumps({"only": None, "min_severity": None}), encoding="utf-8"
+    )
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(targeted.encode("utf-8")).hexdigest(),
+    )
+    killed = []
+    monkeypatch.setattr(runs, "kill_session", lambda run_id: killed.append(run_id))
+
+    with pytest.raises(runsetup.SweepOptionsError, match="bound at launch"):
+        runsetup.compose_resume(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            run_dir=run_dir,
+            state=state,
+            policy=policy_mod.loads(""),
+            journal=Journal(run_dir),
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_accepting_adapters,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            sweep_engine_cls=_CapturingEngine,
+        )
+
+    assert killed == []
+
+
+def test_legacy_run_does_not_inherit_selector_shaped_options(tmp_path, monkeypatch):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    (run_dir / "sweep.json").write_text(
+        json.dumps({"only": ["DW-9"], "min_severity": None}), encoding="utf-8"
     )
     state = RunState(
         run_id=RUN_ID,
@@ -859,7 +936,7 @@ def test_resume_reconstructs_persisted_min_severity(tmp_path, monkeypatch):
     )
 
     assert composed.engine.kwargs["only_ids"] is None
-    assert composed.engine.kwargs["min_severity"] == "high"
+    assert composed.engine.kwargs["min_severity"] is None
 
 
 @pytest.mark.parametrize("run_type", ["run", "sweep"])
