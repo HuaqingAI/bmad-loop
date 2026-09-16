@@ -24,7 +24,6 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
-from conftest import fault_read_text
 
 from bmad_loop import bmadconfig
 from bmad_loop import journal as journal_mod
@@ -596,9 +595,27 @@ def test_resume_refuses_an_unreadable_existing_sweep_options_file(tmp_path, monk
     run_dir.mkdir(parents=True)
     options_path = run_dir / "sweep.json"
     options_path.write_text("{}", encoding="utf-8")
-    fault_read_text(monkeypatch, options_path)
+    real_open = os.open
 
-    with pytest.raises(runsetup.SweepOptionsError, match="cannot be read"):
+    def denied_open(path, flags, *args, **kwargs):
+        if Path(path) == options_path:
+            raise PermissionError("denied in test")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(runsetup.os, "open", denied_open)
+
+    with pytest.raises(runsetup.SweepOptionsError, match="cannot be opened"):
+        runsetup.load_sweep_resume_options(run_dir)
+
+
+def test_resume_refuses_a_link_like_sweep_options_path(tmp_path, monkeypatch):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    options_path = run_dir / "sweep.json"
+    options_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(runsetup, "is_link_like", lambda path: path == options_path)
+
+    with pytest.raises(runsetup.SweepOptionsError, match="link-like"):
         runsetup.load_sweep_resume_options(run_dir)
 
 
@@ -607,6 +624,34 @@ def test_resume_refuses_a_nonregular_existing_sweep_options_path(tmp_path):
     (run_dir / "sweep.json").mkdir(parents=True)
 
     with pytest.raises(runsetup.SweepOptionsError, match="regular file"):
+        runsetup.load_sweep_resume_options(run_dir)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="host has no FIFO support")
+def test_resume_refuses_a_fifo_sweep_options_path_without_blocking(tmp_path):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    os.mkfifo(run_dir / "sweep.json")
+
+    with pytest.raises(runsetup.SweepOptionsError, match="regular file"):
+        runsetup.load_sweep_resume_options(run_dir)
+
+
+def test_resume_refuses_oversize_sweep_options(tmp_path):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    (run_dir / "sweep.json").write_bytes(b" " * (runsetup._MAX_SWEEP_OPTIONS_BYTES + 1))
+
+    with pytest.raises(runsetup.SweepOptionsError, match="exceeds"):
+        runsetup.load_sweep_resume_options(run_dir)
+
+
+def test_resume_refuses_non_utf8_sweep_options(tmp_path):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    (run_dir / "sweep.json").write_bytes(b"{\xff}")
+
+    with pytest.raises(runsetup.SweepOptionsError, match="UTF-8"):
         runsetup.load_sweep_resume_options(run_dir)
 
 

@@ -1763,6 +1763,26 @@ def test_sweep_dry_run_only_reports_excluded_projected_legacy_ids(project, capsy
     assert "DW-3" in out and "Second legacy item" in out
 
 
+def test_sweep_dry_run_projection_ignores_fenced_and_body_dw_references(project, capsys):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: Canonical open\n\n"
+        "origin: test\nreason: related prose mentions DW-99\nstatus: open\n\n"
+        "```markdown\n### DW-99: quoted example\nstatus: open\n```\n\n"
+        "## Deferred from: review\n\n- Open legacy item\n",
+        encoding="utf-8",
+    )
+
+    assert cli._sweep_dry_run(project, policy_mod.load(None), only_ids=("DW-2",)) == 0
+    out = capsys.readouterr().out
+    assert "DW-2" in out and "Open legacy item" in out
+
+    assert cli._sweep_dry_run(project, policy_mod.load(None), only_ids=("DW-100",)) == 1
+    captured = capsys.readouterr()
+    assert "must exist and be open: DW-100" in captured.err
+    assert "triage:" not in captured.out
+
+
 @pytest.mark.parametrize("only_id", ["DW-2", "DW-9"], ids=["projected-done", "unknown"])
 def test_sweep_dry_run_only_refuses_non_open_or_unknown_projected_id(project, capsys, only_id):
     project.deferred_work.write_text(

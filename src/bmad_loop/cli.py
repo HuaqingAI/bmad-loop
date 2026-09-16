@@ -2593,7 +2593,9 @@ def _sweep_dry_run(
     entries = deferredwork.parse_ledger(text)
     open_entries = [e for e in entries if e.open]
     legacy = deferredwork.parse_legacy(text)
-    first_projected_id = deferredwork.next_seq(text)
+    first_projected_id = (
+        max((int(entry.id.removeprefix("DW-")) for entry in entries), default=0) + 1
+    )
     projected_legacy = [
         (f"DW-{first_projected_id + index}", entry) for index, entry in enumerate(legacy)
     ]

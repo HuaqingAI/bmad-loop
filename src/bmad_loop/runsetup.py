@@ -47,7 +47,7 @@ from . import runs
 from .checks import Finding
 from .journal import Journal, save_state, state_lock
 from .model import RunState
-from .platform_util import atomic_replace, is_wsl_unc_path
+from .platform_util import atomic_replace, is_link_like, is_wsl_unc_path
 from .runs import RUNS_DIR
 
 if TYPE_CHECKING:
@@ -83,6 +83,7 @@ if TYPE_CHECKING:
 # and the test suite resolve.
 ROLES = ("dev", "review", "triage")
 SWEEP_OPTIONS_VERSION = 1
+_MAX_SWEEP_OPTIONS_BYTES = 64 * 1024
 
 
 def resolve_profiles(policy: Policy, project: Path) -> dict[str, CLIProfile]:
@@ -845,22 +846,47 @@ class SweepResumeOptions:
 
 
 def load_sweep_resume_options(run_dir: Path, *, required: bool = False) -> SweepResumeOptions:
-    """Load sweep.json, tolerating old files but refusing malformed selectors."""
+    """Load bounded, non-redirected sweep.json bytes and validate selectors."""
     opts_path = run_dir / "sweep.json"
+    if is_link_like(opts_path):
+        raise SweepOptionsError("sweep.json must not be a link-like path")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)
     try:
-        options_mode = opts_path.stat().st_mode
+        fd = os.open(opts_path, flags)
     except FileNotFoundError:
         if required:
             raise SweepOptionsError("sweep.json is missing for this selector-capable run")
         return SweepResumeOptions({}, None, None)
     except OSError as exc:
-        raise SweepOptionsError(f"sweep.json cannot be inspected: {exc}") from exc
-    if not stat.S_ISREG(options_mode):
-        raise SweepOptionsError("sweep.json must be a regular file")
+        raise SweepOptionsError(f"sweep.json cannot be opened: {exc}") from exc
     try:
-        loaded = json.loads(opts_path.read_text(encoding="utf-8"))
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise SweepOptionsError("sweep.json must be a regular file")
+        if opened.st_size > _MAX_SWEEP_OPTIONS_BYTES:
+            raise SweepOptionsError(f"sweep.json exceeds {_MAX_SWEEP_OPTIONS_BYTES} bytes")
+        chunks: list[bytes] = []
+        remaining = _MAX_SWEEP_OPTIONS_BYTES + 1
+        while remaining:
+            chunk = os.read(fd, min(8192, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
     except OSError as exc:
         raise SweepOptionsError(f"sweep.json cannot be read: {exc}") from exc
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    if len(data) > _MAX_SWEEP_OPTIONS_BYTES:
+        raise SweepOptionsError(f"sweep.json exceeds {_MAX_SWEEP_OPTIONS_BYTES} bytes")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SweepOptionsError("sweep.json is not valid UTF-8") from exc
+    try:
+        loaded = json.loads(text)
     except json.JSONDecodeError as exc:
         raise SweepOptionsError("sweep.json is not valid JSON") from exc
     if not isinstance(loaded, dict):
