@@ -50,7 +50,7 @@ _BUNDLE_NAME_SAFE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
 BUNDLE_KEY_RE = re.compile(r"^dw(\d*)-(.+)\Z")
 DECISION_EFFECTS = ("build", "close", "keep-open")
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
-DW_ID_RE = re.compile(r"DW-[0-9]+\Z")
+DW_ID_RE = re.compile(r"DW-\d+\Z")
 
 
 def decimal_digits_key(value: str) -> tuple[int, str]:

@@ -1223,6 +1223,20 @@ def test_only_scopes_triage_and_audits_excluded_open_entries(project):
     assert all(entry.open for entry in ledger_entries(project).values())
 
 
+def test_only_selects_parser_supported_unicode_decimal_id(project):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n### DW-９: unicode id\n\norigin: test\nstatus: open\n",
+        encoding="utf-8",
+    )
+    plan = triage_result(["DW-９"], skip=[{"id": "DW-９", "reason": "leave it"}])
+    engine, adapter = make_sweep(project, [triage_effect(plan)], only_ids=("DW-９",))
+
+    summary = engine.run()
+
+    assert not summary.crashed
+    assert adapter.sessions[0].prompt == "/bmad-loop-sweep --only DW-９"
+
+
 @pytest.mark.parametrize("only_id", ["DW-9", "DW-2"], ids=["unknown", "not-open"])
 def test_only_refuses_an_id_outside_the_initial_open_universe(project, only_id):
     """Ablation: remove select_entries' validate_only refusal and this finishes silently."""

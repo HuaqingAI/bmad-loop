@@ -927,8 +927,7 @@ def load_sweep_resume_options(
         and all(
             isinstance(value, str)
             and value.startswith("DW-")
-            and value.removeprefix("DW-").isascii()
-            and value.removeprefix("DW-").isdigit()
+            and value.removeprefix("DW-").isdecimal()
             for value in raw_only
         )
     )

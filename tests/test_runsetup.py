@@ -612,11 +612,11 @@ def test_current_sweep_options_require_both_selector_fields(tmp_path, contents):
         "[]",
         "{",
         '{"only": "DW-1", "min_severity": null}',
-        '{"only": ["DW-١"], "min_severity": null}',
+        '{"only": ["DW-²"], "min_severity": null}',
         '{"only": null, "min_severity": "urgent"}',
         '{"only": ["DW-1"], "min_severity": "high"}',
     ],
-    ids=["non-object", "invalid-json", "only-shape", "non-ascii-id", "severity-value", "both"],
+    ids=["non-object", "invalid-json", "only-shape", "non-decimal-id", "severity-value", "both"],
 )
 def test_resume_refuses_malformed_selector_bearing_options(tmp_path, monkeypatch, contents):
     run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
@@ -834,6 +834,38 @@ def test_resume_reconstructs_persisted_sweep_selectors(tmp_path, monkeypatch):
 
     assert composed.engine.kwargs["only_ids"] == ("DW-3", "DW-1")
     assert composed.engine.kwargs["min_severity"] is None
+
+
+def test_resume_reconstructs_unicode_decimal_selector(tmp_path, monkeypatch):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    options_text = json.dumps({"only": ["DW-９"], "min_severity": None}, ensure_ascii=False)
+    (run_dir / "sweep.json").write_text(options_text, encoding="utf-8")
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(options_text.encode("utf-8")).hexdigest(),
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+
+    composed = runsetup.compose_resume(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        run_dir=run_dir,
+        state=state,
+        policy=policy_mod.loads(""),
+        journal=Journal(run_dir),
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        sweep_engine_cls=_CapturingEngine,
+    )
+
+    assert composed.engine.kwargs["only_ids"] == ("DW-９",)
 
 
 def test_resume_reconstructs_persisted_min_severity(tmp_path, monkeypatch):

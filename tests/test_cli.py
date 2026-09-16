@@ -1892,6 +1892,7 @@ def test_sweep_dry_run_no_ledger(project, capsys):
 
 def test_sweep_only_parser_trims_and_stably_deduplicates():
     assert cli._parse_sweep_only(" DW-3, DW-1,DW-3 ") == ("DW-3", "DW-1")
+    assert cli._parse_sweep_only("DW-９") == ("DW-９",)
 
 
 @pytest.mark.parametrize(
