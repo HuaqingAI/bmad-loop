@@ -456,6 +456,22 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Restore the accepted commit chain and index when the post-squash HEAD identity
+  probe fails, retaining the probe fault if rollback also fails (DW-305).
+
+- Preserve accepted tracked artifact identities through target merge, squash,
+  fast-forward, hooks, and crash replay; snapshot the complete target transaction
+  into aggregate-limited streamed sidecars, preserve exact index/worktree and
+  cleanup-phase state, and refuse drift with verified, retained-source recovery
+  when ref, index, worktree, ignored-path, topology, or submodule evidence is unsafe
+  (DW-302/DW-303).
+
+- Recover sweep migration publication faults without persisting unearned `DONE`
+  state (DW-296/DW-297). Persist accepted baseline/rewrite records, clear a
+  pre-dispatch baseline after publication refusal, restore result-faulted ledgers
+  by compare-and-set, and resume a durable `COMMITTING` task through the commit-only
+  tail.
+
 - Bind tracked and pending-tracked isolated bundle deliverables to their accepted
   Git-normalized bytes and validate their exact staged entries before commit (DW-300).
   Drift now pauses with path-only recovery evidence and retains the source mount;
@@ -467,6 +483,10 @@ breaking changes may land in a minor release.
 - Stream artifact destination hashing and equality checks in fixed-size chunks, bounding
   baseline-capture and publication memory even when operator-owned files are large or grow
   during validation (DW-298/DW-299).
+
+- Restore attempt-owned specs through descriptor-capable parent-anchored publication and
+  verification on POSIX, preventing late parent substitution from redirecting bytes; retain
+  checked path-based restoration on no-descriptor platforms (DW-295).
 
 - Bind explicitly published ignored bundle deliverables to the exact bytes accepted by final
   dev, repair, or review verification (DW-290). Preparation now refuses post-verification byte
