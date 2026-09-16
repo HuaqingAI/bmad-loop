@@ -7795,7 +7795,9 @@ def test_resume_sweep_os_refused_ledger_propagates_to_mains_tail(project, monkey
     assert rc == cli.ExitCode.FAILURE
     err = capsys.readouterr().err
     assert "error: [Errno 13]" in err  # `main`'s tail, routeless by decision
-    assert str(project.deferred_work) in err  # the errno's own filename, not a refusal
+    # `OSError.__str__` quotes `filename` through `repr`, so on Windows the
+    # backslashes in the tail are doubled; compare the same rendering.
+    assert repr(str(project.deferred_work)) in err  # the errno's own filename, not a refusal
     # None of the struck arm's wording: no route, no repair, no resumability note.
     assert "`bmad-loop sweep`" not in err
     assert "permissions or storage" not in err

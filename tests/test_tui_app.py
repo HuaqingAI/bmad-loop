@@ -7757,6 +7757,12 @@ async def test_decision_modal_toasts_an_answer_git_could_not_commit(project, mon
             lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
         )
         await pilot.click(await ready(pilot, "#opt-1"))
+        # DW-2's toast, not merely the dashboard: see the sibling row above for
+        # the `dismiss`/`call_next` window the Windows runners hit.
+        await until(
+            pilot,
+            lambda: any("DW-2: not committed to git" in m for m in notifications(app)),
+        )
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
 
         toasts = [n for n in app._notifications if "not committed to git" in n.message]
