@@ -5238,8 +5238,9 @@ def test_read_for_write_follows_noncyclic_symlinks(tmp_path, present):
 # ERROR_CANT_RESOLVE_FILENAME (winerror 1921), which `PC/errmap.h` folds onto a
 # generic errno, so only `.winerror` and the `[WinError 1921]` prefix name the
 # condition there. Both symlink-loop pins assert the CLASSIFICATION (a refusal
-# at the write arm, an attributed `OSError:` fault at the observation arm) and
-# then this platform's spelling, never the POSIX message alone.
+# at the write arm — absence on win32, where DW-256 absorbs 1921 — and an
+# attributed `OSError:` fault at the observation arm) and then this platform's
+# spelling, never the POSIX message alone.
 _WINERROR_CANT_RESOLVE_FILENAME = 1921
 _SYMLINK_LOOP_MESSAGE = (
     f"[WinError {_WINERROR_CANT_RESOLVE_FILENAME}]"
@@ -5256,11 +5257,17 @@ def _assert_is_a_symlink_loop_refusal(exc: OSError) -> None:
 
 
 def test_read_for_write_raises_on_a_symlink_loop(tmp_path):
-    """A real symlink cycle is refused rather than absent (DW-221/279).
+    """A real symlink cycle is refused rather than absent (DW-221/279) — on POSIX.
 
     is_file() historically suppressed ELOOP on every supported interpreter;
     stat() exposes it. Restoring that probe returns None, while removing the
     metadata wrap loses LedgerReadFault. Its cause must preserve errno ELOOP.
+
+    Windows is the documented exception, not a gap: a reparse-point cycle fails
+    with winerror 1921, one of `ABSENCE_WINERRORS` — pathlib's own ignored set —
+    which DW-256 absorbs as ABSENCE at the write arm, so there `read_for_write`
+    answers `None` exactly as `is_file()` always did. Ablation on win32: drop 1921
+    from `ABSENCE_WINERRORS` and this row reds with `LedgerReadFault`.
     """
     path, other = tmp_path / "deferred-work.md", tmp_path / "ledger-loop"
     try:
@@ -5268,6 +5275,11 @@ def test_read_for_write_raises_on_a_symlink_loop(tmp_path):
         other.symlink_to(path)
     except OSError as e:
         pytest.skip(f"symlinks unavailable: {e}")
+
+    if sys.platform == "win32":
+        assert _WINERROR_CANT_RESOLVE_FILENAME in deferredwork.ABSENCE_WINERRORS
+        assert deferredwork.read_for_write(path) is None
+        return
 
     with pytest.raises(deferredwork.LedgerReadFault) as excinfo:
         deferredwork.read_for_write(path)
