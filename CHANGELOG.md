@@ -14,7 +14,9 @@ breaking changes may land in a minor release.
   named severity and higher. Selection happens before triage, bundle formation,
   and `--max-bundles`; dry-run and resume preserve the same contract, excluded
   and missing-severity ids are journaled, and selectors are incompatible with
-  each other and with archive mode.
+  each other and with archive mode. Named dry-runs over mixed legacy ledgers
+  project and label provisional post-migration ids, while real runs revalidate
+  after semantic duplicate merging assigns the actual universe.
 
 - **Journal-kind and refusal-site coverage gates.** `tests/test_portability_guard.py` gains
   three enumerate-vs-declare inventories: the 204 literal journal kinds (`JOURNAL_KINDS`,

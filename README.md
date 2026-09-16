@@ -285,6 +285,14 @@ severity sweep re-evaluates the current ledger, while a repeated named sweep can
 only contract as its original ids close. Selectors are mutually exclusive and
 cannot be combined with `--archive`.
 
+For a mixed legacy ledger, `--dry-run --only` projects provisional canonical ids
+by continuing from the highest existing `DW-<n>` in legacy manifest/file order.
+Projected rows are labeled as pre-migration, participate in selection and
+exclusion reporting, and let a named preview reject projected done or unknown
+ids without spawning migration. Semantic duplicate merging may compact those
+ids, so the real run revalidates the requested set against the actual
+post-migration universe before triage.
+
 **Closing entries from a story.** Sweeps are not the only way an entry gets closed. A story spec can declare the entries its work closes, in frontmatter:
 
 ```yaml

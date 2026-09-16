@@ -1725,11 +1725,59 @@ def test_sweep_dry_run_applies_severity_floor_to_legacy_entries(project, capsys)
     out = capsys.readouterr().out
     assert "High legacy" in out
     assert "1 matching legacy entry will be migrated then triaged" in out
-    assert "legacy entries excluded by severity selector" in out and "Low legacy" in out
-    assert "legacy entries excluded for missing or unrecognized severity" in out
+    assert "projected legacy entries excluded by sweep selector" in out and "Low legacy" in out
+    assert "projected legacy entries excluded for missing or unrecognized severity" in out
     assert "Missing legacy" in out
     assert out.count("Missing legacy") == 1
-    assert "triage: after migration assigns canonical DW ids" in out
+    assert "triage: projected legacy ids are provisional" in out
+
+
+def test_sweep_dry_run_only_accepts_a_projected_open_legacy_id(project, capsys):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: Canonical open\n\norigin: test\nstatus: open\n\n"
+        "## Deferred from: review\n\n- Open legacy item\n",
+        encoding="utf-8",
+    )
+
+    assert cli._sweep_dry_run(project, policy_mod.load(None), only_ids=("DW-2",)) == 0
+    out = capsys.readouterr().out
+    assert "DW-2" in out and "Open legacy item" in out
+    assert "pre-migration; provisional ids" in out
+    assert "Canonical open" in out and "excluded by sweep selector" in out
+    assert "real run revalidates --only" in out
+
+
+def test_sweep_dry_run_only_reports_excluded_projected_legacy_ids(project, capsys):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: Canonical open\n\norigin: test\nstatus: open\n\n"
+        "## Deferred from: review\n\n- First legacy item\n- Second legacy item\n",
+        encoding="utf-8",
+    )
+
+    assert cli._sweep_dry_run(project, policy_mod.load(None), only_ids=("DW-2",)) == 0
+    out = capsys.readouterr().out
+    assert "DW-2" in out and "First legacy item" in out
+    assert "projected legacy entries excluded by sweep selector" in out
+    assert "DW-3" in out and "Second legacy item" in out
+
+
+@pytest.mark.parametrize("only_id", ["DW-2", "DW-9"], ids=["projected-done", "unknown"])
+def test_sweep_dry_run_only_refuses_non_open_or_unknown_projected_id(project, capsys, only_id):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: Canonical open\n\norigin: test\nstatus: open\n\n"
+        "## Deferred from: review\n\n"
+        "- ~~Done legacy item~~ -> fixed\n"
+        "- Open legacy item\n",
+        encoding="utf-8",
+    )
+
+    assert cli._sweep_dry_run(project, policy_mod.load(None), only_ids=(only_id,)) == 1
+    captured = capsys.readouterr()
+    assert f"must exist and be open: {only_id}" in captured.err
+    assert "triage:" not in captured.out
 
 
 @pytest.mark.parametrize(

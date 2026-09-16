@@ -2592,6 +2592,12 @@ def _sweep_dry_run(
     text = ledger.read_text(encoding="utf-8")
     entries = deferredwork.parse_ledger(text)
     open_entries = [e for e in entries if e.open]
+    legacy = deferredwork.parse_legacy(text)
+    first_projected_id = deferredwork.next_seq(text)
+    projected_legacy = [
+        (f"DW-{first_projected_id + index}", entry) for index, entry in enumerate(legacy)
+    ]
+    projected_open = [(dw_id, entry) for dw_id, entry in projected_legacy if not entry.done]
     closed = len(entries) - len(open_entries)
     print(f"{ledger}: {len(open_entries)} open, {closed} closed/non-open")
     try:
@@ -2599,11 +2605,20 @@ def _sweep_dry_run(
             entries,
             only_ids=only_ids,
             min_severity=min_severity,
-            validate_only=True,
+            validate_only=only_ids is None,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return ExitCode.FAILURE
+    if only_ids is not None:
+        available = {entry.id for entry in open_entries} | {dw_id for dw_id, _ in projected_open}
+        unavailable = [dw_id for dw_id in only_ids if dw_id not in available]
+        if unavailable:
+            print(
+                "error: --only ids must exist and be open: " + ", ".join(unavailable),
+                file=sys.stderr,
+            )
+            return ExitCode.FAILURE
     shown = selection.selected if only_ids is not None or min_severity is not None else open_entries
     for entry in shown:
         print(f"  {entry.id:8s} {entry.title}")
@@ -2615,51 +2630,59 @@ def _sweep_dry_run(
         print("excluded for missing or unrecognized severity:")
         for entry in selection.missing_severity:
             print(f"  {entry.id:8s} {entry.title}")
-    legacy = deferredwork.parse_legacy(text)
     legacy_open = [e for e in legacy if not e.done]
-    legacy_selected = legacy_open
-    legacy_excluded = []
-    legacy_missing_severity = []
-    if min_severity is not None:
+    projected_selected = projected_open
+    projected_excluded: list[tuple[str, deferredwork.LegacyEntry]] = []
+    projected_missing_severity: list[tuple[str, deferredwork.LegacyEntry]] = []
+    if only_ids is not None:
+        requested = set(only_ids)
+        projected_selected = [item for item in projected_open if item[0] in requested]
+        projected_excluded = [item for item in projected_open if item[0] not in requested]
+    elif min_severity is not None:
         floor = SEVERITY_ORDER[min_severity]
-        legacy_selected = [
-            entry
-            for entry in legacy_open
+        projected_selected = [
+            (dw_id, entry)
+            for dw_id, entry in projected_open
             if entry.severity is not None and SEVERITY_ORDER[entry.severity] >= floor
         ]
-        selected_keys = {entry.key for entry in legacy_selected}
-        legacy_excluded = [
-            entry
-            for entry in legacy_open
+        selected_keys = {entry.key for _, entry in projected_selected}
+        projected_excluded = [
+            (dw_id, entry)
+            for dw_id, entry in projected_open
             if entry.severity is not None and entry.key not in selected_keys
         ]
-        legacy_missing_severity = [entry for entry in legacy_open if entry.severity is None]
+        projected_missing_severity = [
+            (dw_id, entry) for dw_id, entry in projected_open if entry.severity is None
+        ]
     if legacy:
         print(
             f"plus {len(legacy)} legacy (pre-DW-format) entries, {len(legacy_open)} open"
             " — a sweep would first migrate them to DW format"
         )
-        for entry in legacy_selected:
-            print(f"  {entry.id or '-':8s} {entry.title}")
-        if min_severity is not None and legacy_selected:
+        if projected_selected:
+            print("projected legacy selection (pre-migration; provisional ids):")
+        for dw_id, entry in projected_selected:
+            print(f"  {dw_id:8s} {entry.title}  [pre-migration projection]")
+        if min_severity is not None and projected_selected:
             print(
-                f"{len(legacy_selected)} matching legacy entr"
-                f"{'y' if len(legacy_selected) == 1 else 'ies'} will be migrated then triaged"
+                f"{len(projected_selected)} matching legacy entr"
+                f"{'y' if len(projected_selected) == 1 else 'ies'} will be migrated then triaged"
             )
-        if legacy_excluded:
-            print("legacy entries excluded by severity selector:")
-            for entry in legacy_excluded:
-                print(f"  {entry.id or '-':8s} {entry.title}")
-        if legacy_missing_severity:
-            print("legacy entries excluded for missing or unrecognized severity:")
-            for entry in legacy_missing_severity:
-                print(f"  {entry.id or '-':8s} {entry.title}")
-    if selection.selected or (legacy_selected and (only_ids is None or min_severity is not None)):
+        if projected_excluded:
+            print("projected legacy entries excluded by sweep selector:")
+            for dw_id, entry in projected_excluded:
+                print(f"  {dw_id:8s} {entry.title}  [pre-migration projection]")
+        if projected_missing_severity:
+            print("projected legacy entries excluded for missing or unrecognized severity:")
+            for dw_id, entry in projected_missing_severity:
+                print(f"  {dw_id:8s} {entry.title}  [pre-migration projection]")
+    if selection.selected or projected_selected:
         print("a sweep would triage the open entries in one LLM session, then run bundles")
-        if min_severity is not None and legacy_selected:
+        if projected_selected and (only_ids is not None or min_severity is not None):
             print(
-                "  triage: after migration assigns canonical DW ids, the matching "
-                "legacy entries join the selected universe"
+                "  triage: projected legacy ids are provisional; semantic duplicate merging may "
+                "compact them, and the real run revalidates --only against the actual "
+                "post-migration universe"
             )
             return 0
         prompt = "/bmad-loop-sweep"
