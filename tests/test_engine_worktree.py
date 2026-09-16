@@ -546,7 +546,10 @@ def test_mount_superseding_an_uncommitted_accepted_spec_warns_and_still_dispatch
     rel = "_bmad-output/implementation-artifacts/accepted-tracked.md"
     accepted = project.project / rel
     accepted.parent.mkdir(parents=True, exist_ok=True)
-    accepted.write_bytes(b"pre-approval bytes\n")
+    # No trailing newline: the mount is a git CHECKOUT, and under Git-for-Windows'
+    # system `core.autocrlf=true` (which conftest deliberately leaves reachable) a
+    # committed LF would come back CRLF. The newline is not load-bearing here.
+    accepted.write_bytes(b"pre-approval bytes")
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     # what the operator corrected at the gate, still uncommitted
     accepted.write_bytes(b"operator corrections\n")
@@ -571,7 +574,7 @@ def test_mount_superseding_an_uncommitted_accepted_spec_warns_and_still_dispatch
     # what it reported. That is deliberate: a dirty TRACKED file inside the mount is
     # not covered by the worktree-scoped exclude fold, so `finalize_commit`'s
     # `git add -A` would fold the operator's in-progress edits into the story commit.
-    assert seen == [b"pre-approval bytes\n"]
+    assert seen == [b"pre-approval bytes"]
     # and the main checkout still holds the operator's corrections, untouched
     assert accepted.read_bytes() == b"operator corrections\n"
 
@@ -581,7 +584,10 @@ def test_byte_identical_accepted_spec_delivery_journals_no_warning(project):
     rel = "_bmad-output/implementation-artifacts/accepted-committed.md"
     accepted = project.project / rel
     accepted.parent.mkdir(parents=True, exist_ok=True)
-    accepted.write_bytes(b"accepted and committed\n")
+    # No trailing newline: the mount is a git CHECKOUT, and under Git-for-Windows'
+    # system `core.autocrlf=true` (which conftest deliberately leaves reachable) a
+    # committed LF would come back CRLF. The newline is not load-bearing here.
+    accepted.write_bytes(b"accepted and committed")
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
 
     engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
@@ -592,7 +598,7 @@ def test_byte_identical_accepted_spec_delivery_journals_no_warning(project):
 
     engine._run_isolated(task, _defer_reading_mount(engine, rel, seen))
 
-    assert seen == [b"accepted and committed\n"]
+    assert seen == [b"accepted and committed"]
     assert _superseded_records(engine) == []
 
 
@@ -744,7 +750,10 @@ def test_project_relative_accepted_spec_superseded_by_the_mount_warns(project):
     rel = "_bmad-output/implementation-artifacts/accepted-relative.md"
     accepted = project.project / rel
     accepted.parent.mkdir(parents=True, exist_ok=True)
-    accepted.write_bytes(b"pre-approval bytes\n")
+    # No trailing newline: the mount is a git CHECKOUT, and under Git-for-Windows'
+    # system `core.autocrlf=true` (which conftest deliberately leaves reachable) a
+    # committed LF would come back CRLF. The newline is not load-bearing here.
+    accepted.write_bytes(b"pre-approval bytes")
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     accepted.write_bytes(b"operator corrections\n")
 
@@ -762,7 +771,7 @@ def test_project_relative_accepted_spec_superseded_by_the_mount_warns(project):
     assert record["spec_file"] == str(accepted.resolve())
     assert record["target_branch"] == "main"
     assert record["compared"] is True
-    assert seen == [b"pre-approval bytes\n"]
+    assert seen == [b"pre-approval bytes"]
 
 
 def test_unprobeable_main_accepted_spec_seeds_nothing_instead_of_raising(project, monkeypatch):
