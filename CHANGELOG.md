@@ -9,7 +9,35 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Give each declared journal `**splat` hole a COUNT of the unresolved `**` keyword
+  arguments it holds — not write calls, so `append(kind, **a, **b)` counts 2 — and a
+  second unresolvable splat inside an already-declared position now reddens instead of
+  being waived on arrival, whether it arrives as a new call or as a second `**` on an
+  existing one; the field inventory moves to a sibling `JOURNAL_SPLAT_FIELDS` table
+  (DW-150).
+
+- Enforce the bare-function-name key the five journal position tables rest on: the
+  scan emits each journal write's enclosing def identity and a guard reddens if one
+  module ever holds two same-named journal-writing functions. The property is exactly a
+  pair of WRITERS, which is what the four position tables need — not full name safety
+  for the fifth, `JOURNAL_FORWARDERS`, whose row makes any call to that name in that
+  file read as a journal write, so a same-named twin that never journals still routes
+  its callers' keywords into the field inventory and, emitting nothing, stays invisible
+  to the guard. Qualifying those keys to `class.method` stays deliberately deferred;
+  the guard is what makes the writer-pair half of that deferral safe (DW-152).
+
+- Grade the real harvest exclusion producer through the stories plan-halt observation (DW-153).
+
+- Name the three harvest exclusion grading rows in the producer docstring (DW-154).
+
+- Grade the real harvest exclusion producer through the sweep bundle proof-of-work gate (DW-168).
+
+- Correct the harvest exclusion docstring to name both `repo_root` override shapes (DW-169).
+
 - Prove real-tmux teardown reaps the exact detached child after identity publication fails (DW-149).
+
+- Pin dynamically generated journal kind spellings in `recovery_flow` and detect
+  renames independently of write counts (DW-151).
 
 - **The accepted-park arm's `_harvest_gate_exclude` join is now graded engine-side**
   (DW-139). `tests/test_verify.py::test_verify_dev_park_zero_diff_excludes_the_orchestrators_own_writes`
@@ -166,6 +194,33 @@ breaking changes may land in a minor release.
   failing on a lock it never needed.
 
 ### Changed
+
+- **The deferred-work ledger-read contract is settled repo-wide** (DW-146).
+  `deferredwork` now owns both arms as named readers — `read_for_write` (repair/write:
+  absence is `None`, `OSError` propagates, undecodable bytes raise the new
+  `LedgerReadError` with the codec error chained) and `read_for_observation`
+  (observation: never raises, degrading to an empty text plus an attributed fault) —
+  documented once in the module docstring alongside the advisory pre-lock probes that
+  are neither arm. Every deferred-work ledger read in `src/bmad_loop` now names its
+  arm or carries a comment classifying it. Three sites change behavior:
+  `decisions.pending_missed_decisions` no longer aborts `bmad-loop decisions` and
+  `bmad-loop status` on a ledger that is not valid UTF-8, `sweep --dry-run` refuses
+  such a ledger with an attributed `error:` naming the file instead of an anonymous
+  traceback (never a fabricated empty listing), and `verify.verify_review_bundle`
+  plus the TUI's deferred pane reach their existing degrade arms for it. `OSError`
+  is unchanged at every repair/write site, where it still propagates untouched;
+  observation sites now degrade on it as well as on undecodable bytes, so an
+  `OSError` that used to escape `decisions.pending_missed_decisions` or abort
+  `sweep --dry-run` with a bare traceback now yields an empty result or an
+  attributed `error:` instead. The observation arm covers its own `is_file()`
+  probe, so metadata exceptions it raises (including `EACCES` on Python 3.11–3.13)
+  become attributed faults. Errors the probe suppresses still mean absence;
+  Python 3.14 suppresses all OS errors there. A ledger that goes undecodable while a
+  decision prompt is open still names the decision that did not land — in
+  `bmad-loop decisions` and in the TUI's decision modal, which keeps degrading to a
+  per-decision toast instead of taking the dashboard down. And a sweep whose ledger
+  cannot be read at a graceful stop journals `sweep-remaining-estimate-unreadable`
+  next to the `run-stop` row, so a withheld estimate says why it was withheld.
 
 - **`bmad-loop diagnose --json` reports `schema_version: 4`.** Journal `path` values
   become `path_present`; stale-restore and merge filename lists become counts.
@@ -353,6 +408,121 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Stop a re-dispatched sweep bundle from carrying the SUPERSEDED bundle's state
+  (DW-162, DW-163, DW-165). `Sweep._run_bundle` already adopted a different bundle's
+  `dw_ids` onto a task `_recover_inflight_bundle` had reset to PENDING, but every other
+  per-bundle field stayed: `bundle_closes_intended` (which the DONE-leg ledger carry and
+  the engine's replay predicate both read, so it closed ids this task never ran),
+  `spec_file` + `restore_patch` (which made the dispatch prompt select the superseded
+  amended contract, and `_record_dev_spec` — a no-op once set — refuse the replacement's
+  own spec). Reset `attempt`, `review_cycle` and `followup_reviews_spent`, clear
+  `defer_reason`, and advance `generation` to give replacement work fresh session ids
+  and review budgets, as a human-resolved re-arm does. Apply these changes through
+  `_reset_superseded_bundle_state` on the DIVERGENCE branch alone;
+  an agreeing or merely reordered re-dispatch is the same bundle and keeps everything,
+  and `resolved_redrive` stays latched because it records a HUMAN resolution, not spec
+  ownership. Defensive: no reachable sequence was demonstrated for the `spec_file` /
+  `restore_patch` half.
+
+- Grade a persisted sweep bundle intent document against the task that owns it (DW-164).
+  `_run_bundle` writes `task.bundle_file` and only then `_save()`s the adopted ids, so a
+  crash between them left `_ensure_bundle_intent` reusing a still-existing document whose
+  `dw_ids:` line named ids the task no longer carried. Re-ordering the two writes only
+  inverts that pairing, so the check is total instead: a new `_bundle_intent_reason`
+  compares the document's ids against `task.dw_ids` as a SET and regenerates on
+  disagreement, on an unreadable file, on a document with no `dw_ids:` line at all, or
+  when the file is gone — `sweep-intent-regenerated` now carries a `regen_cause` field
+  saying which. That is a closed slug rather than a free-text `reason`, which
+  `diagnostics._JOURNAL_DROP_FIELDS` would have rendered as a presence boolean, defeating
+  the field's whole purpose. An EMPTY `task.dw_ids` (the pre-`dw_ids` `state.json` shape)
+  is not an authority and keeps its real document.
+
+- Serialize the project pre-answer store's three writers (DW-161). `record_pre_answer`,
+  `prune_pre_answers` and `drop_pre_answer` each did an unlocked `load_pre_answers` ->
+  `_write_store`, so a `bmad-loop decisions` answer, a TUI decision modal or a second sweep
+  landing in that window was overwritten wholesale — the store read-modify-writes the WHOLE
+  file, so a lost update is a human's answer gone, not a stale field. Each now runs its read
+  and its write inside ONE `deferredwork.ledger_lock` hold keyed on the store path. The
+  ledger's helper is reused rather than twinned, and the two files share only its
+  path-agnostic NESTING guard — never an OS lock, since each sidecar is keyed on its own
+  resolved path — whose consequence is that no caller may hold both at once, in either
+  order. The two conditional writers keep a #736 advisory pre-lock probe, so a call a read
+  proves will write nothing still acquires nothing and still leaves the store's bytes and
+  mtime untouched. Readers stay lock-free; a real write can now surface a lock-acquisition
+  failure where none was possible before.
+
+- Commit the sweep's pre-answer prunes in the store's own tree (DW-160). Both prune sites
+  resolve the store under `_project_of_run_dir(self.run_dir)` but committed through
+  `_commit_ledger`, which checked and committed `self.workspace.root`: where `repo_root`
+  names a tree DISJOINT from the project those diverge, the clean check passed against the
+  untouched code repo, nothing was committed, and the project worktree was left dirty ahead
+  of this cycle's bundles. (The nested/monorepo shape was unaffected — `repo_root` is an
+  ancestor there, so the store edit was already visible.) `_commit_ledger` takes a
+  keyword-only `root` and both prune sites pass the store's own; a `verify.GitError` from an
+  explicitly-rooted call now degrades to a `sweep-ledger-commit-unavailable` journal row
+  naming the tree and the error, so a project that is not a git repository keeps its store
+  write instead of aborting the sweep. The five default-root callers are unchanged: they
+  still fail loud, and they remain wrong in the disjoint shape for the same reason — out of
+  scope here, not fixed.
+
+- Gate the stories E2E's detached-writer fakes on a completed `setsid` transition. `$!`
+  names the straggler the instant `fork` returns, but `setsid(2)` runs in that child
+  afterwards, so publishing the identity straight off `$!` only assumed the escape the
+  rows exist to prove — under a scheduler delay the reaper could be graded against a
+  child still inside the pane's session, covering the weaker same-pgid case. Both
+  detached fakes now bounded-poll the child's observed `/proc` session id, off the
+  shared real-tmux hang ceiling, and fail loudly rather than publish an ungraded
+  identity (DW-159). Three local-process rows drive that fragment directly — the
+  detached, the late-detaching and the never-detaching child — and the stories module's
+  xdist-group floor is re-pinned from 30 to its actual gated-def count, so it no longer
+  carries fourteen deletions' worth of silent slack. Synchronize retry coverage, grade
+  session identity independently of process groups, and kill unpublished children when
+  readiness times out.
+
+- Type-check the decision `question` and option `key` a triage plan carries instead of
+  `str(...)`-ing them: both are printed by `bmad-loop decisions`, announced by the
+  attention notifier and written to the `decision-pending`/`decision-answered` journal
+  records, so a list `question` used to validate cleanly and reach an operator as the
+  repr `['a', 'b']`. A non-string one is now refused through the existing `errors`
+  channel, one error per fault, with no repair path. This refuses triage plans the
+  previous release accepted: such a plan is re-driven, and a cached `triage*.json`
+  written before this release that carries such a value stops contributing its
+  decisions to `decisions --list`, `status` and the TUI until the next sweep re-triages
+  the still-open ids (DW-156).
+
+- Name a triage decision by its position when its `id` is not a string, in every
+  diagnostic the decisions loop emits, so an object-valued `id` can no longer print its
+  own contents into messages that promise type names only. Acceptance is unchanged: the
+  same plans validate and are refused, and a string id — the empty string included —
+  keeps today's wording byte for byte (DW-157).
+
+- **Refuse a migration result whose top level is the wrong shape** (DW-170), the DW-155
+  guard `validate_triage` got and its twin one function over did not. `rj = rj or {}`
+  substituted only on a falsy document, so a truthy non-object result — a list, a
+  string, a number — reached `.get` and raised `AttributeError` out of
+  `validate_migration`. It is now refused through the existing `errors` channel, which
+  for a list top level emits `migration result not a JSON object: list`, and an empty
+  list is refused by shape rather than reported as a `workflow` error. This makes the
+  function total over parseable JSON for its own callers rather than fixing a live
+  crash: `_ensure_migration`, its only production caller, screens the same result
+  through `critical_escalations` first, which raises on a truthy non-dict before this
+  guard is reached.
+
+- Extend DW-157's positional naming to the triage diagnostics it missed (DW-171): the
+  `already_resolved`, `blocked` and `skip` loops, the open-set mismatch's `not open in
+the ledger` list and the `workflow must be ...` refusal in BOTH validators used to
+  interpolate LLM-authored objects verbatim into strings that reach the journal. A
+  non-string identifier is now named by its position and type name (`already_resolved[0]
+(id not a string: dict)`, `open_ids[0] (not a string: dict)`) and a non-scalar
+  `workflow` prints as `a dict`. Acceptance is unchanged — the identifier fields are
+  still deliberately not type-checked, so the same plans validate and the same plans are
+  refused — and a string identifier, the empty string included, plus a scalar `workflow`
+  (`got None`, `got 'wrong'`) keep today's wording byte for byte.
+
+- Re-offer a decision hand-seeded as `effect: "close"` in `.bmad-loop/decisions.json`
+  (DW-147), instead of counting it answered while no sweep ever built, closed or re-asked
+  it. Re-answer it with `bmad-loop decisions`; the file is journaled, never edited.
+
 - Adopt the current bundle's deferred-work ids before writing a reset sweep task's
   intent (DW-144). Keep dispatch and ledger-close ids aligned, and journal both
   old and new ids as `sweep-bundle-dwids-adopted` when they differ.
@@ -382,6 +552,20 @@ breaking changes may land in a minor release.
   that the stricter check now refuses is skipped by `pending_missed_decisions`, so its
   decision drops out of `decisions --list`, `status` and the TUI until the next sweep
   re-triages the still-open entry.
+
+- **Refuse a triage plan whose CONTAINERS are the wrong shape** (DW-155, DW-158), instead
+  of raising out of `validate_triage` and every caller of it. `rj = rj or {}` substituted
+  only on a falsy document, so a non-object top level raised `AttributeError`; a `null`
+  `open_ids`/`bundles`/`already_resolved`/`blocked`/`skip`/`decisions`/`options`/`dw_ids`
+  raised `TypeError`; and a `null` member of any list section raised `AttributeError` —
+  crashing the sweep run loop on a live triage session and taking `decisions --json`,
+  `status` and the TUI down on one bad cached `triage*.json`. The validator is now total
+  over parseable JSON: wrong shapes in these containers and object members are refused
+  as `(None, errors)`, with a shape diagnostic naming the location and type. Independent
+  partition errors can still be reported. Positions stay the document's, so a
+  dropped member does not renumber its siblings, and a shape-failed section no longer
+  double-reports its own `has no dw_ids` / `needs at least 2 options` value error.
+  `pending_missed_decisions` degrades per file, as it does for an unreadable cache.
 
 - **Close the last reuse-exposed test child identities** (DW-136, DW-137). Share the
   pidfd-authentication helpers, publish identities atomically, and sweep authenticated
