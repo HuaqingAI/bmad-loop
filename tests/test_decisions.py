@@ -2227,7 +2227,7 @@ def test_pre_answer_locked_read_fault_preserves_ledger_store_and_head(
     head = _git(project, "rev-parse", "HEAD")
     store = decisions.store_path(project.project)
     store.parent.mkdir(parents=True, exist_ok=True)
-    store.write_text("{}\n", encoding="utf-8")
+    store.write_bytes(b"{}\n")  # bytes: write_text would CRLF on win32
 
     with pytest.raises(deferredwork.LedgerReadFault) as raised:
         decisions.apply_pre_answer(project.project, decision, opt, date="2026-09-12")

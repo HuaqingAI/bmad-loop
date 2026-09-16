@@ -17026,7 +17026,7 @@ def test_harvest_over_os_refused_ledger_pauses_and_resume_replays_the_session(pr
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     ledger = project.deferred_work
     ledger.parent.mkdir(parents=True, exist_ok=True)
-    ledger.write_text("# Deferred Work\n", encoding="utf-8")
+    ledger.write_bytes(b"# Deferred Work\n")  # bytes: write_text would CRLF on win32
     engine, adapter = make_engine(
         project,
         [
@@ -17092,7 +17092,7 @@ def test_story_over_os_refused_ledger_completes_when_the_spec_records_no_finding
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     ledger = project.deferred_work
     ledger.parent.mkdir(parents=True, exist_ok=True)
-    ledger.write_text("# Deferred Work\n", encoding="utf-8")
+    ledger.write_bytes(b"# Deferred Work\n")  # bytes: write_text would CRLF on win32
     engine, adapter = make_engine(
         project,
         [
@@ -17131,7 +17131,7 @@ def test_in_place_defer_over_os_refused_ledger_degrades_the_snapshot(project, mo
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     ledger = project.deferred_work
     ledger.parent.mkdir(parents=True, exist_ok=True)
-    ledger.write_text("# Deferred Work\n", encoding="utf-8")
+    ledger.write_bytes(b"# Deferred Work\n")  # bytes: write_text would CRLF on win32
     engine, _ = make_engine(
         project,
         [_refusing_ledger(dev_effect(project, "1-1-a"), monkeypatch, ledger)]
@@ -17175,7 +17175,7 @@ def test_restore_ledger_skips_a_ledger_the_os_refuses(project, monkeypatch):
     snapshot = "# Deferred Work\n\n## DW-1 pre-existing\n"
     harvested = snapshot + "\n## DW-2 our harvest row\n"
     task.post_engine_ledger_digest = _digest_of(harvested)
-    ledger.write_text(harvested, encoding="utf-8")
+    ledger.write_bytes(harvested.encode("utf-8"))  # bytes: write_text would CRLF on win32
     fault_read_text(monkeypatch, ledger)
 
     engine._restore_ledger(task, snapshot)
