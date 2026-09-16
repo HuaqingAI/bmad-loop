@@ -11362,7 +11362,10 @@ def test_a_refused_cache_unlink_degrades_and_still_re_triages(project, monkeypat
     assert not summary.crashed and not summary.paused
     assert len(adapter.sessions) == 1  # fresh triage still ran
     [failed] = _records(engine, "sweep-triage-cache-unlink-failed")
-    assert failed["errors"][0].startswith("unremovable: ") and str(cache) in failed["errors"][0]
+    # `OSError.__str__` spells its filename as a repr, so the quoted form is what
+    # the row carries on both platforms (on Windows the backslashes are doubled)
+    assert failed["errors"][0].startswith("unremovable: ")
+    assert repr(str(cache)) in failed["errors"][0]
     assert _records(engine, "sweep-triage-cache-invalidated") == []
     kinds = journal_kinds(engine)
     assert (

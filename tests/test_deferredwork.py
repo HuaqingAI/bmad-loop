@@ -5067,6 +5067,29 @@ def test_read_for_write_follows_noncyclic_symlinks(tmp_path, present):
     assert deferredwork.read_for_write(link) == ("ledger text" if present else None)
 
 
+# How each OS spells "a symlink cycle at this name". POSIX raises ELOOP, whose
+# strerror is the message the observation arm attributes. Windows has no ELOOP
+# at the filesystem: a reparse-point cycle fails `CreateFileW` with
+# ERROR_CANT_RESOLVE_FILENAME (winerror 1921), which `PC/errmap.h` folds onto a
+# generic errno, so only `.winerror` and the `[WinError 1921]` prefix name the
+# condition there. Both symlink-loop pins assert the CLASSIFICATION (a refusal
+# at the write arm, an attributed `OSError:` fault at the observation arm) and
+# then this platform's spelling, never the POSIX message alone.
+_WINERROR_CANT_RESOLVE_FILENAME = 1921
+_SYMLINK_LOOP_MESSAGE = (
+    f"[WinError {_WINERROR_CANT_RESOLVE_FILENAME}]"
+    if sys.platform == "win32"
+    else "Too many levels of symbolic links"
+)
+
+
+def _assert_is_a_symlink_loop_refusal(exc: OSError) -> None:
+    if sys.platform == "win32":
+        assert exc.winerror == _WINERROR_CANT_RESOLVE_FILENAME
+    else:
+        assert exc.errno == errno.ELOOP
+
+
 def test_read_for_write_raises_on_a_symlink_loop(tmp_path):
     """ELOOP is the reading DW-221 changes on EVERY interpreter, not just 3.14, and
     this is its lowest-layer pin — the twin of
@@ -5094,7 +5117,7 @@ def test_read_for_write_raises_on_a_symlink_loop(tmp_path):
     with pytest.raises(OSError) as excinfo:
         deferredwork.read_for_write(path)
 
-    assert excinfo.value.errno == errno.ELOOP
+    _assert_is_a_symlink_loop_refusal(excinfo.value)
 
 
 def test_read_for_write_returns_none_for_a_path_under_a_non_directory(tmp_path):
@@ -5242,7 +5265,7 @@ def test_read_for_observation_classifies_the_ignored_errnos(tmp_path, shape):
 
     assert text == ""
     assert fault is not None and fault.startswith("OSError: ")
-    assert "Too many levels of symbolic links" in fault
+    assert _SYMLINK_LOOP_MESSAGE in fault
 
 
 def test_mark_done_many_raises_on_an_undecodable_ledger_and_writes_nothing(tmp_path):
