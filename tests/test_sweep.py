@@ -11261,8 +11261,10 @@ def test_a_triage_cache_that_is_not_a_regular_file_re_triages_silently(project, 
         [failed] = write_failed  # the planted directory refuses the fresh plan's write-back
         assert failed["errors"][0].startswith("unwritable: ")
         # the path, not the message: POSIX raises `IsADirectoryError`, Windows a
-        # `PermissionError` from the same `open`, and both carry the filename
-        assert str(cache) in failed["errors"][0]
+        # `PermissionError` from the same `open`, and both carry the filename —
+        # rendered through `repr` by `OSError.__str__`, so compare that spelling
+        # (Windows doubles the backslashes there)
+        assert repr(str(cache)) in failed["errors"][0]
     else:
         assert write_failed == []  # only `stat` was refused; the write landed
         # read, not `is_file()`: the refused `stat` is still installed on this path
