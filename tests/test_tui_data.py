@@ -1155,3 +1155,32 @@ def test_sprint_overview_namespaces_are_policy_aware_and_cache_isolated(project)
     policy_dir.mkdir(exist_ok=True)
     (policy_dir / "policy.toml").write_text('[stories]\nnamespace = "L0"\n')
     assert data.sprint_overview(project.project).stories is l0.stories
+
+
+def test_story_key_from_task_id_grammar_including_the_generation_suffix():
+    """The id grammar this fallback parses, pinned in both directions.
+
+    `_session_task_id` composes `safe_segment(f"{story_key}-{part}-{seq}{gen}")`, and
+    #705 added `gen` — a `-g<N>` suffix emitted only above generation zero. That
+    changed the grammar this parser documents. Only a final numeric generation
+    component is peeled; generation-like malformed or nonterminal components retain
+    the existing best-effort fallback behavior.
+    """
+    # the ordinary unsuffixed shape: the recorded role is peeled with its seq
+    assert data._story_key_from_task_id("1-1-a-dev-1", "dev") == "1-1-a"
+    assert data._story_key_from_task_id("1-1-a-review-12", "review") == "1-1-a"
+    # a labeled plugin session: role does not match, so one more `-` group goes
+    assert data._story_key_from_task_id("1-1-a-somelabel-1", "dev") == "1-1-a"
+    # not the expected shape at all — returned verbatim
+    assert data._story_key_from_task_id("nonsense", "dev") == "nonsense"
+
+    # generation-suffixed (#705): one terminal numeric generation is peeled
+    assert data._story_key_from_task_id("1-1-a-dev-1-g1", "dev") == "1-1-a"
+    assert data._story_key_from_task_id("1-1-a-dev-1-g12", "dev") == "1-1-a"
+    # malformed and nonterminal generation-like components are not suffixes
+    assert data._story_key_from_task_id("1-1-a-dev-1-g", "dev") == "1-1-a-dev-1-g"
+    assert data._story_key_from_task_id("1-1-a-dev-1-gx", "dev") == "1-1-a-dev-1-gx"
+    assert data._story_key_from_task_id("1-1-a-dev-1-g0", "dev") == "1-1-a-dev-1-g0"
+    assert data._story_key_from_task_id("1-1-a-dev-1-g01", "dev") == "1-1-a-dev-1-g01"
+    assert data._story_key_from_task_id("1-1-a-dev-1-g١", "dev") == "1-1-a-dev-1-g١"
+    assert data._story_key_from_task_id("1-1-a-dev-1-g1-extra", "dev") == "1-1-a-dev-1-g1-extra"

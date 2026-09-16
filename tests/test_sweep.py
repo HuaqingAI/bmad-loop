@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    _OK,
     _file_exists_cmd,
+    _spec_baseline,
     attach_profile,
     bundle_dev_effect,
     bundle_dev_escalates,
@@ -1204,6 +1206,30 @@ def wt_bundle_dev(project, name="fix", dw_ids=("DW-1",), deferred=None):
     return effect
 
 
+def wt_bundle_review(project, name="fix"):
+    """Follow-up review effect that resolves the accepted spec from ``spec.cwd``."""
+
+    def effect(spec):
+        wt = project.rebased(spec.cwd)
+        sp = wt.implementation_artifacts / f"spec-dw-{name}.md"
+        baseline = _spec_baseline(sp)
+        write_spec(sp, "done", baseline)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": f"dw-{name}",
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "status": "done",
+                "followup_review_recommended": False,
+                "escalations": [],
+            },
+        )
+
+    return effect
+
+
 def bundle_plan(dw_ids=("DW-1",), name="fix"):
     return triage_result(
         list(dw_ids),
@@ -1767,6 +1793,64 @@ def test_resume_dev_verify_bundle_replays_accepted_sync_before_review(project, m
     assert saved.pre_harvest_ledger_captured is False
 
 
+def test_isolation_flip_resumes_accepted_bundle_in_mount_and_integrates(project, monkeypatch):
+    """A sweep receipt owns its recorded tree until sync, review, commit, and merge.
+
+    Ablation: gate accepted DEV_VERIFY reopening on live isolation and review sees
+    main's still-open ledger instead of the accepted close in the mounted workspace.
+    """
+    write_ledger(project, {"DW-1": "open"})
+    plan = bundle_plan()
+    isolated = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(isolation="worktree", rollback_on_failure=True),
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan), wt_bundle_dev(project)],
+        policy=isolated,
+    )
+
+    def crash_before_accepted_sync(task, result_json):
+        raise RuntimeError("host died before accepted sync")
+
+    monkeypatch.setattr(engine, "_post_dev_accepted_sync", crash_before_accepted_sync)
+    assert engine.run().crashed
+    crashed = load_state(engine.run_dir).tasks["dw-fix"]
+    mount = Path(crashed.worktree_path)
+    assert crashed.phase == Phase.DEV_VERIFY and mount.is_dir()
+
+    engine.policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(isolation="none", rollback_on_failure=True),
+    )
+    seen: list[tuple[Path, str]] = []
+    review = wt_bundle_review(project)
+
+    def review_mounted_close(spec):
+        wt = project.rebased(spec.cwd)
+        seen.append((spec.cwd, ledger_entries(wt)["DW-1"].status))
+        return review(spec)
+
+    resumed, adapter = resume_sweep(project, engine, [review_mounted_close])
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert [session.role for session in adapter.sessions] == ["review"]
+    assert seen and seen[0][0] == mount and seen[0][1].startswith("done")
+    assert "change for dw-fix" in (project.project / "src.txt").read_text(encoding="utf-8")
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+    assert "unit-merged" in journal_kinds(resumed)
+    assert "isolation-flip-orphaned-worktree" not in journal_kinds(resumed)
+    assert not mount.exists()
+
+
 def test_resume_dev_verify_bundle_after_repair_preserves_acceptance(project, monkeypatch):
     """A verify-green repair remains accepted across a DEV_VERIFY crash."""
     write_ledger(project, {"DW-1": "open"})
@@ -2121,6 +2205,38 @@ def test_bundle_pre_gate_state_sync_is_a_noop(project):
     assert task.board_advance_intended is None
 
 
+def test_bundle_review_gate_journals_its_verify_commands(project):
+    """`SweepEngine._verify_review` threads the base engine's review sink, so a
+    bundle's review-leg verifier pass lands the same `verify-command-result`
+    records a story's does.
+
+    Its own row rather than a claim carried by `test_engine.py`: the sink is
+    passed at each override, so dropping it here would leave every sweep run
+    silently unrecorded while the base engine's tests stayed green — which is the
+    shape the #695 root bug already took across these same three gates.
+
+    Ablation: remove `on_results=` from `SweepEngine._verify_review` and the
+    record assertion fails at zero entries."""
+    write_ledger(project, {"DW-1": "done 2026-06-11"})
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_OK,)),
+    )
+    engine, _ = make_sweep(project, [], policy=pol)
+    spec = project.implementation_artifacts / "spec-dw-fix.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(spec, "done", git(project.project, "rev-parse", "HEAD"))
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"])
+    task.spec_file = str(spec)
+
+    assert engine._verify_review(task).ok
+
+    (entry,) = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    assert entry["verification_stage"] == "review"
+    assert entry["command"] == _OK and entry["story_key"] == "dw-fix"
+
+
 def test_bundle_ledger_close_skips_on_unreadable_spec(project, monkeypatch):
     """The bundle counterpart of the sprint-board sync: an unreadable bundle spec
     must not close any dw id (the ledger write is a repair — it must never fire off
@@ -2359,6 +2475,9 @@ def test_triage_session_env_fault_escalates_then_resume_restores_budget(project)
     dec = [e for e in engine.journal.entries() if e["kind"] == "triage-decision"][-1]
     assert dec["env_fault"] is True
 
+    abandoned = [s.task_id for s in adapter.sessions]
+    assert abandoned == ["sweep-triage-triage-1"]  # generation 0 emits no suffix
+
     # resume once the outage clears: the ESCALATED-resume resets attempt to 0
     # (fresh budget) and re-drives triage to completion
     good = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "moot"}])
@@ -2366,6 +2485,49 @@ def test_triage_session_env_fault_escalates_then_resume_restores_budget(project)
     assert not resumed.run().paused
     assert resumed.state.tasks["sweep-triage"].phase == Phase.DONE
     assert len(radapter.sessions) == 1
+    # ...and it does so in a NEW generation. The attempt reset above is exactly what
+    # would otherwise re-mint `attempt == 1` — an id byte-equal to the abandoned
+    # attempt's, pointing the fresh record at the abandoned cycle's
+    # tasks/<id>/escalation.json. Both adapters now clear cycle outputs at launch, and
+    # `resolve._gather_escalations` opens each distinct task_id once, but neither makes
+    # two historical records stop aliasing one mutable directory. The fresh id preserves
+    # a separate artifact namespace for each cycle, independent of cleanup.
+    assert resumed.state.tasks["sweep-triage"].generation == 1
+    assert [s.task_id for s in radapter.sessions] == ["sweep-triage-triage-1-g1"]
+    assert radapter.sessions[0].task_id not in abandoned
+
+
+def test_repeated_triage_escalation_restarts_keep_advancing_generation(project):
+    """Every ESCALATED restart opens a new namespace, not only the first one.
+
+    Starting from generation zero alone would let ``generation += 1`` regress to
+    ``generation = 1`` while every first-restart assertion stayed green. A second
+    escalation proves the next reset advances to generation two and cannot re-mint
+    either earlier session id.
+    """
+    write_ledger(project, {"DW-1": "open"})
+    outage = SessionResult(
+        status="timeout",
+        env_fault=True,
+        env_fault_evidence="API Error: Unable to connect (ECONNREFUSED)",
+    )
+    engine, first = make_sweep(project, [outage])
+    assert engine.run().paused
+    first_id = first.sessions[0].task_id
+
+    resumed_once, second = resume_sweep(project, engine, [outage])
+    assert resumed_once.run().paused
+    assert resumed_once.state.tasks["sweep-triage"].generation == 1
+    second_id = second.sessions[0].task_id
+    assert second_id == "sweep-triage-triage-1-g1"
+
+    good = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "moot"}])
+    resumed_twice, third = resume_sweep(project, resumed_once, [triage_effect(good)])
+    assert not resumed_twice.run().paused
+    assert resumed_twice.state.tasks["sweep-triage"].generation == 2
+    third_id = third.sessions[0].task_id
+    assert third_id == "sweep-triage-triage-1-g2"
+    assert len({first_id, second_id, third_id}) == 3
 
 
 def test_triage_plain_timeout_still_retries_to_cap(project):
@@ -2462,6 +2624,59 @@ def test_triage_escalation_resume_retries_triage(project):
     assert not summary.paused
     assert resumed.state.tasks["sweep-triage"].phase == Phase.DONE
     assert len(adapter.sessions) == 1
+
+
+def test_non_escalated_triage_restart_keeps_its_generation(project):
+    """Control for the ESCALATED-arm bump: a task restarted from a NON-escalated
+    phase (the host died mid-triage) keeps its attempt counter, so `attempt += 1`
+    already yields a fresh number and the namespace must not move. Bumping outside
+    that arm would break the property `_session_task_id`'s suffix rule exists to
+    hold — every id an existing run already wrote to disk stays byte-identical."""
+    write_ledger(project, {"DW-1": "open"})
+    good = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "moot"}])
+    engine, adapter = make_sweep(project, [triage_effect(good)])
+    # a session that never reported: TRIAGE_RUNNING with one attempt already spent
+    task = StoryTask(story_key="sweep-triage", epic=0)
+    task.phase = Phase.TRIAGE_RUNNING
+    task.attempt = 1
+    engine.state.tasks["sweep-triage"] = task
+
+    assert not engine.run().paused
+
+    assert engine.state.tasks["sweep-triage"].generation == 0  # NOT bumped
+    assert engine.state.tasks["sweep-triage"].attempt == 2  # the counter continued
+    # attempt 2 is already a fresh id; no -g suffix rewrites the namespace
+    assert [s.task_id for s in adapter.sessions] == ["sweep-triage-triage-2"]
+
+
+def test_non_escalated_migrate_restart_keeps_its_generation(project):
+    """The migrate twin of the row above. Both restart arms scope the bump to
+    `Phase.ESCALATED` independently, so pinning only the triage one leaves
+    `_ensure_migration`'s scoping free: dedenting its `_rearm_generation(task)` call
+    a level passes the whole triage-side suite."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    manifest = legacy_manifest()
+    mapping = [
+        {"key": manifest[0]["key"], "dw_id": "DW-1"},
+        {"key": manifest[1]["key"], "dw_id": "DW-2"},
+    ]
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "moot"}])
+    engine, adapter = make_sweep(
+        project,
+        [migrate_effect(project, migrated_ledger(), mapping), triage_effect(plan)],
+    )
+    # a migration session that never reported: TRIAGE_RUNNING, one attempt spent
+    task = StoryTask(story_key="sweep-migrate", epic=0)
+    task.phase = Phase.TRIAGE_RUNNING
+    task.attempt = 1
+    engine.state.tasks["sweep-migrate"] = task
+
+    assert not engine.run().paused
+
+    assert engine.state.tasks["sweep-migrate"].generation == 0  # NOT bumped
+    assert engine.state.tasks["sweep-migrate"].attempt == 2  # the counter continued
+    # attempt 2 is already a fresh id; no -g suffix rewrites the namespace
+    assert adapter.sessions[0].task_id == "sweep-migrate-triage-2"
 
 
 def test_interactive_decisions_build_and_close(project):
@@ -3334,7 +3549,13 @@ def test_sweep_bundle_restore_redrive_reaches_done_and_clears_latch(project, mon
     patch.parent.mkdir(parents=True, exist_ok=True)
     patch.write_text("dummy\n")
 
-    runs.rearm_escalation(engine.run_dir, "dw-fix", restore_patch=str(patch))
+    runs.rearm_escalation(
+        engine.run_dir,
+        "dw-fix",
+        restore_patch=str(patch),
+        isolated_redrive=False,
+        resolution_recorded=True,
+    )
 
     resumed, adapter = resume_sweep(
         project,
@@ -3373,7 +3594,13 @@ def test_sweep_restore_redrive_exhaustion_pauses_not_defers(project, monkeypatch
     patch = project.implementation_artifacts / "attempt-dw-fix.patch"
     patch.parent.mkdir(parents=True, exist_ok=True)
     patch.write_text("dummy\n")
-    runs.rearm_escalation(engine.run_dir, "dw-fix", restore_patch=str(patch))
+    runs.rearm_escalation(
+        engine.run_dir,
+        "dw-fix",
+        restore_patch=str(patch),
+        isolated_redrive=False,
+        resolution_recorded=True,
+    )
 
     resumed, _ = resume_sweep(project, engine, [lambda spec: SessionResult(status="died")])
     summary = resumed.run()
@@ -3393,7 +3620,9 @@ def test_sweep_from_scratch_redrive_exhaustion_pauses_not_defers(project):
         limits=LimitsPolicy(max_dev_attempts=1),
     )
     engine = _run_to_dev_escalation(project, policy=policy)
-    runs.rearm_escalation(engine.run_dir, "dw-fix")  # from-scratch, no restore
+    runs.rearm_escalation(
+        engine.run_dir, "dw-fix", isolated_redrive=False, resolution_recorded=True
+    )  # from-scratch, no restore
 
     resumed, _ = resume_sweep(project, engine, [lambda spec: SessionResult(status="died")])
     summary = resumed.run()
@@ -4113,8 +4342,10 @@ def test_migration_escalation_resume_retries(project):
     write_legacy_ledger(project, LEGACY_LEDGER)
     manifest = legacy_manifest()
     bad = migrate_effect(project, LEGACY_LEDGER, [])  # no conversion at all
-    engine, _ = make_sweep(project, [bad, bad])
+    engine, first = make_sweep(project, [bad, bad])
     assert engine.run().paused
+    abandoned = [s.task_id for s in first.sessions]
+    assert abandoned == ["sweep-migrate-triage-1", "sweep-migrate-triage-2"]
 
     mapping = [
         {"key": manifest[0]["key"], "dw_id": "DW-1"},
@@ -4131,6 +4362,12 @@ def test_migration_escalation_resume_retries(project):
     assert resumed.state.tasks["sweep-migrate"].phase == Phase.DONE
     assert resumed.state.tasks["sweep-triage"].phase == Phase.DONE
     assert len(adapter.sessions) == 2
+    # the ESCALATED-resume opened a new generation of the migrate task, so its
+    # restarted attempt 1 does not re-mint the abandoned attempt 1's id
+    assert resumed.state.tasks["sweep-migrate"].generation == 1
+    migrate_id = adapter.sessions[0].task_id
+    assert migrate_id == "sweep-migrate-triage-1-g1"
+    assert migrate_id not in abandoned
 
 
 def test_no_legacy_skips_migration(project):
@@ -4335,11 +4572,11 @@ def test_migration_duplicate_refusal_clears_a_baseline_it_arrived_holding(projec
 # ------------------------------------------ review-budget commit-instead-of-rollback
 
 
-def test_sweep_bundle_budget_exhausted_commits_and_refiles(project):
+def test_sweep_bundle_budget_exhausted_commits_and_journals(project):
     """A bundle whose review keeps recommending a follow-up but is finalized
     (spec done, owned dw ids closed, verify green) is COMMITTED when the review
-    budget is exhausted — not rolled back. The lingering follow-up is re-filed as
-    a fresh open deferred-work entry."""
+    budget is exhausted — not rolled back. The spent budget is journaled; no
+    deferred-work entry is filed."""
     write_ledger(project, {"DW-1": "open"})
     plan = triage_result(
         ["DW-1"],
@@ -4365,15 +4602,16 @@ def test_sweep_bundle_budget_exhausted_commits_and_refiles(project):
     entries = ledger_entries(project)
     assert entries["DW-1"].status.startswith("done")  # the worked item closed
     refiled = [e for e in entries.values() if e.open and "origin: review-budget-followup" in e.body]
-    assert len(refiled) == 1
+    assert refiled == []  # journal-only: no follow-up entry filed
     kinds = {e["kind"] for e in engine.journal.entries()}
     assert "review-budget-committed" in kinds and "story-deferred" not in kinds
 
 
 def test_sweep_bundle_budget_followup_not_refiled_twice(project):
     """Re-review cap: when a bundle itself closes a `review-budget-followup` entry
-    and still won't converge, the work is committed but NOT re-filed again — a
-    second non-convergence should reach a human, not loop across sweeps."""
+    (legacy and hand-filed rows still exist) and still won't converge, the work is
+    committed and the journal flags the repeat — a second non-convergence should
+    reach a human, not loop across sweeps."""
     ledger = (
         "# Deferred Work\n\n"
         "### DW-1: follow-up still recommended for dw-prior\n"
@@ -4414,11 +4652,11 @@ def test_sweep_bundle_budget_followup_not_refiled_twice(project):
     assert len(capped) == 1 and capped[0]["re_review_capped"] is True
 
 
-def test_sweep_bundle_followup_damped_commits_and_refiles(project):
+def test_sweep_bundle_followup_damped_commits_and_journals(project):
     """Default damping cap (1): a bundle whose review keeps recommending a follow-up
     converges after ONE honored round instead of burning the whole review budget.
-    The lingering follow-up is re-filed once, the work is committed, and — the
-    steady state — the damped converge stays quiet (no review-budget ATTENTION)."""
+    The spent budget is journaled (no ledger entry), the work is committed, and —
+    the steady state — the damped converge stays quiet (no review-budget ATTENTION)."""
     write_ledger(project, {"DW-1": "open"})
     plan = triage_result(
         ["DW-1"],
@@ -4439,7 +4677,7 @@ def test_sweep_bundle_followup_damped_commits_and_refiles(project):
     entries = ledger_entries(project)
     assert entries["DW-1"].status.startswith("done")  # the worked item closed
     refiled = [e for e in entries.values() if e.open and "origin: review-budget-followup" in e.body]
-    assert len(refiled) == 1
+    assert refiled == []  # journal-only: no follow-up entry filed
     kinds = {e["kind"] for e in engine.journal.entries()}
     assert "review-followup-damped" in kinds
     assert "review-budget-committed" not in kinds and "story-deferred" not in kinds
@@ -4449,9 +4687,10 @@ def test_sweep_bundle_followup_damped_commits_and_refiles(project):
 
 def test_sweep_bundle_damped_re_review_capped_notifies_not_refiles(project):
     """Re-review cap survives damping: when a bundle itself closes a
-    `review-budget-followup` entry and still won't converge, the damped force-
-    converge commits but does NOT re-file again — and, unlike an ordinary quiet
-    damped converge, it raises an ATTENTION notice so a human sees the repeat."""
+    `review-budget-followup` entry (legacy and hand-filed rows still exist) and
+    still won't converge, the damped force-converge commits — and, unlike an
+    ordinary quiet damped converge, it raises an ATTENTION notice so a human sees
+    the repeat."""
     ledger = (
         "# Deferred Work\n\n"
         "### DW-1: follow-up still recommended for dw-prior\n"
@@ -4532,7 +4771,9 @@ def test_rearmed_bundle_redrives_when_triage_json_lost(project):
     # cached triage plan reloaded and re-emitted its name. Recovery now keys on
     # the persisted task, so losing the cache changes nothing.
     engine = _run_to_dev_escalation(project)
-    runs.rearm_escalation(engine.run_dir, "dw-fix")
+    runs.rearm_escalation(
+        engine.run_dir, "dw-fix", isolated_redrive=False, resolution_recorded=True
+    )
     _lose_triage(engine.run_dir)
 
     resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
@@ -4554,7 +4795,9 @@ def test_fresh_triage_different_bundle_name_no_double_drive(project, corruption)
     # would orphan the re-armed one. It must re-drive by identity, and its ids
     # must have left the open set before the fresh triage sees them.
     engine = _run_two_bundle_dev_escalation(project)
-    runs.rearm_escalation(engine.run_dir, "dw-fix")
+    runs.rearm_escalation(
+        engine.run_dir, "dw-fix", isolated_redrive=False, resolution_recorded=True
+    )
     _lose_triage(engine.run_dir, corruption)
 
     fresh = triage_result(
@@ -4591,7 +4834,13 @@ def test_restore_patch_latch_honored_when_triage_json_lost(project, monkeypatch)
     patch = project.implementation_artifacts / "attempt-dw-fix.patch"
     patch.parent.mkdir(parents=True, exist_ok=True)
     patch.write_text("dummy\n")
-    runs.rearm_escalation(engine.run_dir, "dw-fix", restore_patch=str(patch))
+    runs.rearm_escalation(
+        engine.run_dir,
+        "dw-fix",
+        restore_patch=str(patch),
+        isolated_redrive=False,
+        resolution_recorded=True,
+    )
     _lose_triage(engine.run_dir)
 
     resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
@@ -4677,13 +4926,21 @@ def test_resume_committing_bundle_finishes_commit(project):
     plan = triage_result(
         ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
     )
+    isolated = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(isolation="worktree", rollback_on_failure=True),
+    )
     engine, _ = make_sweep(
         project,
         [
             triage_effect(plan),
-            bundle_dev_effect(project, "fix", ["DW-1"]),
-            bundle_review_effect(project, "fix"),
+            wt_bundle_dev(project),
+            wt_bundle_review(project),
         ],
+        policy=isolated,
     )
 
     def crashing_emit(stage, *args, **kwargs):
@@ -4697,7 +4954,16 @@ def test_resume_committing_bundle_finishes_commit(project):
     crashed = load_state(engine.run_dir).tasks["dw-fix"]
     assert crashed.phase == Phase.COMMITTING
     assert not crashed.commit_sha  # stamped only by the DONE save that never ran
+    mount = Path(crashed.worktree_path)
+    assert mount.is_dir()
 
+    engine.policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(isolation="none", rollback_on_failure=True),
+    )
     resumed, adapter = resume_sweep(project, engine, [])
     summary = resumed.run()
 
@@ -4709,13 +4975,97 @@ def test_resume_committing_bundle_finishes_commit(project):
     assert "resume-commit" in journal
     assert "resume-restart" not in journal
     assert ledger_entries(project)["DW-1"].status.startswith("done")
+    assert "change for dw-fix" in (project.project / "src.txt").read_text(encoding="utf-8")
+    assert "unit-merged" in journal_kinds(resumed)
+    assert not mount.exists()
+
+
+def test_sweep_isolation_flip_restart_releases_mount_state_without_main_rollback(
+    project, monkeypatch
+):
+    """Rejected/incomplete work restarts in main without carrying mount operands.
+
+    Ablation: omit the mounted restart release and the rollback spy receives the
+    unit baseline while the mount claim remains attached.
+    """
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none", rollback_on_failure=True),
+    )
+    engine, _ = make_sweep(project, [], policy=in_place)
+    mount = engine.run_dir / "worktrees" / "dw-fix"
+    mount.mkdir(parents=True)
+    task = StoryTask(
+        "dw-fix",
+        0,
+        phase=Phase.DEV_RUNNING,
+        worktree_path=str(mount),
+        branch="bmad-loop/sweep-run/dw-fix",
+        baseline_commit=verify.rev_parse_head(project.project),
+        baseline_untracked=[],
+        spec_file="_bmad-output/implementation-artifacts/spec-dw-fix.md",
+        dispatched_spec_file="_bmad-output/implementation-artifacts/spec-dw-fix.md",
+        dispatched_spec_snapshot=b"bound",
+    )
+    engine.state.tasks[task.story_key] = task
+    rolled: list[str] = []
+    monkeypatch.setattr(engine, "_rollback_or_pause", lambda _task, cause: rolled.append(cause))
+
+    assert engine._recover_inflight_bundle(task) is False
+
+    assert rolled == []
+    assert task.phase == Phase.PENDING
+    assert task.worktree_path == "" and task.branch == ""
+    assert task.baseline_commit is None and task.baseline_untracked is None
+    assert task.dispatched_spec_file is None and task.dispatched_spec_snapshot is None
+    assert task.spec_file == "_bmad-output/implementation-artifacts/spec-dw-fix.md"
+    assert mount.is_dir()  # released and journaled, not destroyed
+    assert "isolation-flip-orphaned-worktree" in journal_kinds(engine)
+
+
+def test_sweep_missing_recorded_mount_escalates_without_finalizing_in_main(project, monkeypatch):
+    """A mounted COMMITTING receipt has no in-place fallback when its tree is gone.
+
+    Ablation: gate the reopen on live isolation and the finalizer spy runs against
+    main rather than the bundle escalating.
+    """
+    from bmad_loop.engine import RunPaused
+
+    in_place = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(isolation="none"),
+    )
+    engine, _ = make_sweep(project, [], policy=in_place)
+    task = StoryTask(
+        "dw-fix",
+        0,
+        phase=Phase.COMMITTING,
+        worktree_path=str(engine.run_dir / "worktrees" / "gone"),
+        branch="bmad-loop/sweep-run/dw-fix",
+    )
+    engine.state.tasks[task.story_key] = task
+    finalized: list[Path] = []
+    monkeypatch.setattr(
+        engine, "_finalize_commit_phase", lambda _task: finalized.append(engine.workspace.root)
+    )
+
+    with pytest.raises(RunPaused, match="is gone"):
+        engine._recover_inflight_bundle(task)
+
+    assert finalized == []
+    assert task.phase == Phase.ESCALATED
+    assert engine.workspace.root == project.project
 
 
 def test_regenerated_intent_when_bundle_file_missing(project):
     # The triage session's authored prose is the one unrecoverable piece; the
     # verbatim ledger entries are re-attached and become the contract.
     engine = _run_to_dev_escalation(project)
-    runs.rearm_escalation(engine.run_dir, "dw-fix")
+    runs.rearm_escalation(
+        engine.run_dir, "dw-fix", isolated_redrive=False, resolution_recorded=True
+    )
     _lose_triage(engine.run_dir)
     intent = Path(engine.state.tasks["dw-fix"].bundle_file)
     intent.unlink()
@@ -5519,3 +5869,61 @@ def test_migration_restore_accepts_an_already_restored_symlink_ledger(project, t
     assert "changed underneath the failed migration attempt" not in engine.state.paused_reason
     assert target.read_text(encoding="utf-8") == LEGACY_LEDGER
     assert len(adapter.sessions) == 2
+
+
+def test_bundle_restart_arm_anchors_spec_ownership_before_it_discards_the_mount(
+    project, monkeypatch
+):
+    """Sweep's restart arm is the engine's, and it needed the same re-anchor.
+
+    `SweepEngine` replaces `_loop` wholesale and `Engine._loop` is the ONLY caller of
+    `_finish_inflight`, so the re-anchor that method makes never runs here — while
+    `_recover_inflight_bundle` reaches the very same shared
+    `Engine._discard_unit_for_restart`. The baseline half of that helper was therefore
+    inherited by sweep and the spec-ownership half was not.
+
+    Both spec paths are persisted RELATIVE to the mount
+    (`model._serialized_worktree_path`), and the restart arm discards the worktree and
+    clears `task.worktree_path` before the caller saves — so without the re-anchor the
+    save strands a worktree-relative spelling beside an EMPTY `worktree_path`, and the
+    next resume resolves it against the main checkout, which carries the same layout.
+    `recovery_flow._attempt_owned_spec` then finds exactly one candidate,
+    `spec_within_roots` accepts it, and the snapshot restore rewrites the operator's own
+    copy.
+
+    Graded at the discard, like its engine sibling: the ordering is the property, and a
+    later rebind would let a post-hoc assertion pass with the re-anchor deleted.
+
+    Ablation: drop `task.rebase_spec_paths_on(...)` from `_recover_inflight_bundle` and
+    both assertions fail with the bare relative spellings.
+    """
+    from bmad_loop.workspace import open_unit_workspace
+
+    engine, _ = make_sweep(project, [], policy=isolated_policy())
+    unit = open_unit_workspace(
+        project.project, project, "sweep-run", "dw-fix", "main", "bundle", engine.run_dir
+    )
+    task = StoryTask("dw-fix", 1, phase=Phase.DEV_RUNNING)
+    task.worktree_path = str(unit.path)
+    task.branch = unit.branch
+    task.spec_file = "_bmad-output/accepted.md"
+    task.dispatched_spec_file = "_bmad-output/dispatched.md"
+    engine.state.tasks["dw-fix"] = task
+
+    seen: dict[str, str | None] = {}
+
+    class _StopAtDiscard(Exception):
+        pass
+
+    def _spy(*_args, **_kwargs):
+        seen["spec_file"] = task.spec_file
+        seen["dispatched_spec_file"] = task.dispatched_spec_file
+        raise _StopAtDiscard
+
+    monkeypatch.setattr("bmad_loop.engine.discard_worktree", _spy)
+
+    with pytest.raises(_StopAtDiscard):
+        engine._recover_inflight_bundle(task)
+
+    assert seen["spec_file"] == str(unit.path / "_bmad-output/accepted.md")
+    assert seen["dispatched_spec_file"] == str(unit.path / "_bmad-output/dispatched.md")

@@ -146,16 +146,25 @@ from typing import TYPE_CHECKING, Any
 
 from .. import gates
 from ..bmadconfig import ProjectPaths
-from ..journal import LOGS_DIR
+from ..journal import LOGS_DIR, TASK_CYCLE_ARTIFACTS
 from ..model import TokenUsage
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
-from .base import CodingCLIAdapter, SessionHandle, SessionResult, SessionSpec
+from .base import (
+    CodingCLIAdapter,
+    SessionHandle,
+    SessionResult,
+    SessionSpec,
+    reset_task_prompt,
+    validate_adapter_artifact_paths,
+    validated_task_directory,
+)
 from .env_fault import EnvFaultMixin
 from .generic import (
     BUDGET_NUDGE_TEXT,
     HEARTBEAT_INTERVAL_S,
     NUDGE_TEXT,
+    RESULT_FILE_ARTIFACTS,
     STALL_NUDGE_TEXT,
     _DevSynthesisMixin,
     _ResultFileMixin,
@@ -619,12 +628,30 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     # -------------------------------------------------------------- adapter
 
     def start_session(self, spec: SessionSpec) -> SessionHandle:
-        task_dir = self.tasks_dir / spec.task_id
+        task_dir = validated_task_directory(self.tasks_dir, spec.task_id)
+        # `messages.json` is this transport's own; the rest are the inherited
+        # `_ResultFileMixin`'s writes, validated here for the same reason
+        # GenericAdapter validates them — see `RESULT_FILE_ARTIFACTS`.
+        validate_adapter_artifact_paths(
+            task_dir,
+            (task_dir / "messages.json", *(task_dir / name for name in RESULT_FILE_ARTIFACTS)),
+        )
+        log_paths = [
+            self.logs_dir / f"{spec.task_id}.log",
+            self.logs_dir / f"{spec.task_id}.server.out",
+        ]
+        if self.sse_trace:
+            log_paths.append(self.logs_dir / f"{spec.task_id}.sse.jsonl")
+        validate_adapter_artifact_paths(self.logs_dir, tuple(log_paths))
         task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / "prompt.txt").write_text(spec.prompt + "\n", encoding="utf-8")
-        # A re-armed/resumed run reuses task_ids; drop any prior cycle's result
-        # so a session that writes nothing can't be read as a stale completion.
-        (task_dir / "result.json").unlink(missing_ok=True)
+        reset_task_prompt(task_dir, spec.prompt)
+        # Task ids are supplied by the caller, so defensively reset cycle-scoped
+        # outputs if one is reused. A silent session must not inherit a stale result.
+        # Iterating `journal.TASK_CYCLE_ARTIFACTS` is what makes the parity with
+        # GenericAdapter.start_session structural instead of a claim in a test
+        # docstring: both adapters and `resolve._gather_escalations` share one list.
+        for artifact in TASK_CYCLE_ARTIFACTS:
+            (task_dir / artifact).unlink(missing_ok=True)
         # Same hazard, same reason, for the file the #194 tail scan reads (mirrors
         # GenericAdapter.start_session, which unlinks its pane tee here). This one
         # bites hardest on the path the classifier exists to serve: an env fault

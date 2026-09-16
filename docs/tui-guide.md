@@ -72,7 +72,9 @@ screen). An explicit `TEXTUAL_FPS` in the environment still wins.
 The TUI never runs an engine in-process. The two halves:
 
 - **Launcher** — `r`, `s`, and `e` spawn detached `bmad-loop` processes as
-  windows of a dedicated tmux session, `bmad-loop-ctl`. Windows are named
+  windows of a dedicated tmux session, `bmad-loop-ctl` (on psmux the name
+  carries a per-project registry suffix — the launch toast names the exact
+  session; see [multiplexer backends](multiplexer-backends.md)). Windows are named
   `run-<run-id>`, `sweep-<run-id>`, or `resume-<run-id>`, run the same Python
   interpreter as the TUI (`python -m bmad_loop.cli`, immune to PATH/venv drift
   inside tmux), and stay open after exit showing
@@ -470,7 +472,11 @@ artifacts the engine already wrote.
 
 - **Plan checkpoint** (`spec_checkpoint`, stories mode) — a read-only viewer of
   the planned `ready-for-dev` spec at its id-keyed path (shown prominently, with a
-  copy-path action). **Approve & resume** resumes straight to implementation;
+  copy-path action). Under worktree isolation the path is anchored on the tree the
+  run owns, not on the directory the dashboard was launched from, so the viewer and
+  the replan write both act on the run's own copy rather than the main checkout's
+  twin. A spec that cannot be read at that path says so explicitly and its actions
+  are disabled — an unreviewable gate is not approvable. **Approve & resume** resumes straight to implementation;
   **Request replan** resets the spec to `draft` and strips its Auto Run Result
   (via the same `devcontract` primitives the engine's repair path uses), then
   resumes so the next dispatch re-plans. Edit the markdown in your own editor — the
@@ -482,13 +488,24 @@ artifacts the engine already wrote.
 - **Escalation** — the escalation view enriched with story context: the story
   entry's title/description (from `stories.yaml`), the blocking condition parsed
   from the spec's `## Auto Run Result`, and a sentinel indicator when the matched
-  spec is a fixed-slug pre-planning-halt sentinel. **Resolve** launches the same
-  interactive agent as `R`; **Re-arm & resume** (offered once the resolve agent has
-  recorded a resolution) re-arms and resumes — deleting a sentinel with a preserved
-  copy for a clean re-dispatch. Both refuse a still-live engine.
+  spec is a fixed-slug pre-planning-halt sentinel. Both of those answer from the
+  tree the run owns: under isolation the spec text and the sentinel live in the
+  unit's mount, and reading either from the launch directory let one modal
+  contradict itself. A spec that cannot be read reports its blocking condition as
+  unknown rather than absent — the two are otherwise indistinguishable — and
+  refuses **Re-arm & resume**, which would flip the spec's frontmatter, strip its
+  result and re-stamp the baseline on evidence nobody could read. **Resolve** stays
+  offered: it neither re-arms nor rewrites the spec — it writes the resolver's
+  `context.json` and starts the repair session, which is what repairs a bad anchor — and
+  gating it would have left `close` as the modal's only action while the `R` binding
+  reached the same agent anyway. **Resolve** launches the same interactive agent as `R`;
+  **Re-arm & resume** (offered once the resolve agent has recorded a resolution)
+  re-arms and resumes — deleting a sentinel with a preserved copy for a clean
+  re-dispatch. Both refuse a still-live engine.
 - **Spec-approval / epic / story gate** — a spec-approval gate reuses the spec viewer
   (view the finalized spec, then **Approve & resume**), so the pre-existing sprint-mode
-  gate inherits the same richer surface. Story-gate and epic-boundary pauses have no
+  gate inherits the same richer surface — including the anchored read and the refusal
+  of **Approve & resume** on a spec that cannot be read. Story-gate and epic-boundary pauses have no
   spec to show — a story gate fires before the story is recorded, an epic boundary has
   no story at all — so they open a compact pause-reason viewer instead: the reason names
   the blocking entries and the remedy, and **Resume** re-picks the story and re-asks the
@@ -693,7 +710,7 @@ if the operator has marked `policy.toml` read-only (#593, #597).
 | `multiplexer backend unavailable — launch/attach disabled`                          | install the selected backend's binary (tmux by default — see `bmad-loop mux`); the dashboard still works read-only                   |
 | `git worktree is not clean — commit or stash first`                                 | the launch guard; commit/stash and retry. `.bmad-loop/policy.toml` is exempt, so saving in the settings editor never blocks a launch |
 | `another run is live: <ids>`                                                        | a second engine on the same project may conflict — confirm only if you know they won't touch the same stories                        |
-| `launch may have failed — attach to control session bmad-loop-ctl`                  | no `state.json` within 10 s of launch; attach to the ctl window to read the error (the window stays open with the exit code)         |
+| `launch may have failed — attach to control session <name>`                         | no `state.json` within 10 s of launch; attach to the named ctl session to read the error (the window stays open with the exit code)  |
 | `no run selected`                                                                   | `e` / `a` need a selected run — the project has no runs yet                                                                          |
 | `state for run <id> is unreadable`                                                  | corrupt/missing `state.json`; inspect the run dir                                                                                    |
 | `run <id> already finished`                                                         | finished runs can't be resumed                                                                                                       |

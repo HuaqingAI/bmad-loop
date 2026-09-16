@@ -31,7 +31,11 @@ These environment variables are set:
 {
   "story_key": "6-4-cli-list-command",
   "run_id": "20260613-111429-6a14",
+  "project_root": "/abs/path/to/bmad-project",
+  "code_root": "/abs/path/to/code-repository",
   "spec_file": "/abs/path/to/_bmad-output/implementation-artifacts/spec-<story>.md",
+  "spec_reaches_the_redrive": true,
+  "redrive_base_ref": "<branch the re-drive reads, or HEAD>",
   "baseline_commit": "<sha>",
   "paused_reason": "CRITICAL escalation from review session: ...",
   "escalations": [
@@ -44,6 +48,59 @@ These environment variables are set:
   "resolution_path": "/abs/path/to/<run>/resolve/<story>/resolution.json"
 }
 ```
+
+The `escalations` array is ordered newest-first.
+Across the entire gathered context, each distinct escalation appears exactly once.
+
+The interactive session's working directory is always `project_root`. That tree holds
+the BMAD artifacts and specs you inspect or clarify. `code_root` is the tree where the
+run's code and git work belong; it may be different. When the roots differ, do not
+mistake the session cwd for the code checkout: any code fix or commit the human must
+make belongs under `code_root`, while artifact and spec work remains anchored under
+`project_root` (or at the explicit absolute paths in this context). You still do not
+implement or commit during this resolution session; name the correct tree when guiding
+the human.
+
+**`spec_reaches_the_redrive` says whether your edit has a future.** The re-drive
+reads one tree; `spec_file` may name another. Under worktree isolation the run's mount
+is discarded before the re-drive reads anything, so a spec inside that mount is
+destroyed with it. When this field is `false`, every write to `spec_file` still
+SUCCEEDS and is then thrown away — worse than not editing at all, because the session
+looks resolved. `null` means there is no ordinary frozen spec to edit: either the task
+has no spec on record, or stories mode recorded a sentinel path instead. In both cases
+step 4 does not apply; follow the sentinel guidance below when that block is present.
+
+**`redrive_base_ref` tells you which of the two remedies applies.** Read it before you
+tell the human anything: a branch name and `HEAD` mean opposite things.
+
+Do not skip the edit when it is `false` — the corrected spec is what gets carried
+over, and it is the clearest statement of what you and the human agreed. Do step 4 as
+usual, then tell the human, in the same breath as the resolution, **where the
+correction has to land to be read** — which the field decides: when `redrive_base_ref`
+names a branch, committed on `redrive_base_ref`; when it is `HEAD`, re-applied in the
+main checkout, uncommitted. The two paragraphs below carry each arm.
+
+Be precise about this, because the two obvious moves both fail silently:
+
+- Committing from the **main checkout** cannot include the file you edited — it lives
+  in a linked unit worktree, which is a separate working tree.
+- Committing on the **unit's own branch** does not reach the re-drive either. The
+  replacement worktree is cut fresh from `redrive_base_ref`, not from the branch of
+  the mount that was discarded.
+
+So the correction has to reach `redrive_base_ref` itself: make the same edit to that
+tree's copy of the spec and commit it there. The orchestrator names the same ref when
+it re-arms; say it here so they hear it before they close the session rather than
+after.
+
+**When `redrive_base_ref` is `HEAD`, do not tell them to commit anything.** That means
+the re-drive runs in the **main checkout** and reads its WORKING TREE, so an edit there
+is read as-is. `spec_reaches_the_redrive: false` beside a `HEAD` base is the opposite
+problem from the one above: `spec_file` points into a worktree this run has STOPPED
+using, because its isolation policy changed while the story sat escalated. The remedy
+is to make the same edit to the main checkout's copy of the spec — no commit, no
+branch. Telling them to commit here sends them to a tree the re-drive does not read,
+which is the same lost work in the other direction.
 
 In **stories mode** (folder+id dispatch) the context also carries a `stories`
 block — the manifest intent for this story, so you can see WHAT it is meant to do
@@ -95,17 +152,37 @@ case below — omit it entirely for an ordinary resolution.
    especially its `<frozen-after-approval>` block (the intent the dev/review
    sessions treat as authoritative). The escalation is almost always that this
    block is silent on, or contradicts, a case the implementation hit.
-2. **Present the escalation plainly** to the human: what is ambiguous or
-   contradictory, why it blocks safe implementation, and **2–4 concrete
-   resolution options** with a clear recommendation and its trade-offs. Keep it
-   tight — quote the relevant spec lines.
+2. **Present the current pause evidence plainly** to the human:
+   - When the `escalations` array is non-empty, present its recorded entries in
+     their existing newest-first order. Do not replace recorded escalation
+     detail with `paused_reason`.
+   - When the `escalations` array is empty, first require `paused_reason` to be
+     text containing at least one non-whitespace character. If it is missing,
+     `null`, non-text, or blank after trimming, report a malformed resolve
+     context and do not write the resolution marker. Otherwise, present
+     `paused_reason` verbatim as the available evidence for the current pause
+     and disclose that no newer recorded escalation detail is available. Do not
+     read below the watermark, unfilter or recover an older artifact escalation,
+     or synthesize an escalation object from `paused_reason`.
+
+   Using the selected evidence, explain what is ambiguous or contradictory, why
+   it blocks safe implementation, and offer **2–4 concrete resolution options**
+   with a clear recommendation and its trade-offs. Keep it tight — quote the
+   relevant spec lines.
+
 3. **Get the human's decision.** Ask follow-ups if the choice is unclear. Do not
    invent requirements; if the human is unsure, help them reason, don't guess.
 4. **Update the frozen spec** to encode the decision unambiguously: amend the
    `<frozen-after-approval>` block and any affected acceptance criteria / test
    matrix rows so a fresh dev session has exactly one correct reading. Make the
    smallest change that removes the ambiguity. You MAY use the `bmad-spec` or
-   `bmad-correct-course` skills if a larger spec change is warranted.
+   `bmad-correct-course` skills if a larger spec change is warranted. **If
+   `spec_reaches_the_redrive` is `false`, make the same edit and then say plainly
+   that this copy is not the one the re-drive reads, and name the remedy that
+   `redrive_base_ref` selects: on a branch, the correction must be
+   committed on `redrive_base_ref`; on `HEAD`, it must be re-applied in the main
+   checkout, uncommitted** — an unflagged edit here is lost work, and a commit in the
+   wrong tree or on the wrong branch is lost work that looks done.
 5. **Write the resolution marker** at `resolution_path` (schema above), then tell
    the human the resolution is recorded and they can exit this session — the
    orchestrator will offer to **re-arm the story and resume the run** (a clean
@@ -170,7 +247,11 @@ entirely: the orchestrator re-drives from scratch against the corrected intent.
   field — the orchestrator deterministically re-arms the spec status on resume.
   Edit spec **content** only.
 - **Do NOT** implement the story, write feature code, run tests, or commit. Your
-  job ends at a corrected spec + the resolution marker.
+  job ends at a corrected spec + the resolution marker. That holds when
+  `spec_reaches_the_redrive` is `false` too: landing the corrected spec where the
+  re-drive reads it is the HUMAN's step — committing it on `redrive_base_ref` when that
+  names a branch, re-applying it in the main checkout when it is `HEAD`. Tell them it
+  is required, and which one; do not do it yourself.
 - **Do NOT** widen scope. Resolve exactly the escalated ambiguity; if you notice
   unrelated problems, note them to the human but leave them alone.
 
@@ -191,6 +272,16 @@ block inside it. So for a sentinel:
   planning pass can succeed: usually that means clarifying `SPEC.md` (the epic
   spec) or this story's entry in `stories.yaml` — the `title` / `description` /
   `invoke_dev_with` the planner reads — with the human.
+- **`redrive_base_ref` decides where that upstream edit has to land, exactly as it
+  does for a spec.** `spec_reaches_the_redrive` does not answer this — it is about
+  `spec_file`, which for a sentinel is the file being deleted. The artifacts you
+  actually edit are `SPEC.md` / `stories.yaml`, and they face the same question: when
+  `redrive_base_ref` names a **branch**, the re-drive mounts a fresh worktree and
+  re-plans from that branch's COMMITTED tree, so an uncommitted edit is invisible and
+  the re-plan mints the same sentinel again — tell the human it has to be committed
+  there. When it is `HEAD`, the re-drive re-plans in the main checkout's working tree
+  and the edit is read as-is — do not tell them to commit. The orchestrator re-arms on
+  the same rule and will hold the resume until the branch carries it.
 - On **re-arm** the orchestrator does NOT flip the sentinel to `ready-for-dev`
   (there is no plan to route to). It **preserves a copy** of the sentinel under
   `{run}/sentinels/<id>-<kind>.md` as a breadcrumb, **deletes** the sentinel, and

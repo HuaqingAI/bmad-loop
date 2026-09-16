@@ -29,7 +29,6 @@ from .platform_util import (
 )
 from .runs import _project_of_run_dir
 from .statemachine import advance
-from .workspace import discard_worktree
 
 
 def _read_json(path: Path) -> Any:
@@ -537,6 +536,38 @@ class DecisionPrompter:
 # ------------------------------------------------------------ sweep engine
 
 
+def _rearm_generation(task: StoryTask) -> None:
+    """Open a new session-id generation for a sweep task restarting from ESCALATED.
+
+    The restart resets ``attempt`` to 0 for a fresh budget, and that reset is exactly
+    what makes the next dispatch re-mint ``attempt == 1`` — an id byte-equal to the
+    abandoned attempt's, since ``engine._session_task_id`` emits its discriminator only
+    above zero. The artifact a shared id corrupts is ``tasks/<id>/escalation.json``: the
+    sweep skill writes it, and two records carrying one id both name that one mutable
+    file, so the abandoned cycle's escalation is the fresh session's too.
+    ``resolve._gather_escalations`` now opens each distinct ``task_id`` once and
+    de-duplicates entries by content, so it no longer reports the same aliased file
+    twice. Both adapters also unlink cycle outputs in ``start_session``, which stops a
+    healthy restart from inheriting stale contents — but cleanup still leaves the two
+    historical records naming one mutable directory: a healthy restart erases the
+    abandoned cycle's artifact, while a re-escalation replaces it for both records.
+    Minting a fresh id is what preserves one artifact namespace per recorded cycle.
+
+    Same pattern as ``runs.rearm_escalation``, DIFFERENT reason: #705's harm is
+    ``_resumable_session`` verdict replay, which runs only on the dev/review phases and
+    never reaches ``TRIAGE_RUNNING``/``TRIAGE_VERIFY``. ``cmd_resolve`` *can* reach a
+    sweep task (``_escalate`` raises with ``PAUSE_ESCALATION`` and a story key, which
+    the engine persists), and its own bump there is harmless: the re-arm leaves the task
+    PENDING, so this restart arm does not fire on top of it.
+
+    Call ONLY from the ``Phase.ESCALATED`` arm. A non-escalated restart keeps its
+    attempt counter, so ``attempt += 1`` already yields a fresh id; bumping there would
+    move the namespace for nothing and break the "every id already on disk stays
+    byte-identical" property the suffix rule exists to hold.
+    """
+    task.generation += 1
+
+
 class SweepEngine(Engine):
     """Engine variant whose loop processes the deferred-work ledger instead
     of sprint-status. Bundles reuse the inherited story pipeline through the
@@ -805,13 +836,20 @@ class SweepEngine(Engine):
         result. Lifting that is a resume-fidelity change of its own. The
         COMMITTING window IS recovered, though — same as the base engine's
         resume-commit arm (#115)."""
-        isolated = self._isolated and task.worktree_path
+        if task.worktree_path:
+            # Sweep replaces Engine._loop, so it performs Engine._finish_inflight's
+            # mount-relative re-anchor itself. Accepted receipts reopen this mount
+            # regardless of live policy; restart is the only path allowed to release
+            # or discard its ownership before future work begins.
+            task.rebase_spec_paths_on(Path(task.worktree_path))
+        mounted = bool(task.worktree_path)
+        restart_isolated = self._isolated and mounted
         if task.phase == Phase.COMMITTING:
             # the gate+advance save landed pre-death; finish the commit
             # instead of rolling verified bundle work back (see
             # Engine._finalize_commit_phase for the re-drive contract).
             self.journal.append("resume-commit", story_key=task.story_key)
-            if isolated:
+            if mounted:
                 unit = self._reopen_unit(task)
                 prev = self.workspace
                 self.workspace = unit.workspace
@@ -830,7 +868,7 @@ class SweepEngine(Engine):
             and self._accepted_dev_session_matches(task)
         ):
             self._save()
-            if isolated:
+            if mounted:
                 unit = self._reopen_unit(task)
                 prev = self.workspace
                 self.workspace = unit.workspace
@@ -842,14 +880,14 @@ class SweepEngine(Engine):
             else:
                 self._resume_after_dev_verify(task)
             return True
-        if isolated:
+        if restart_isolated:
             # drop the half-built worktree; _run_story mounts a fresh one
-            discard_worktree(
-                self.paths.repo_root, task.worktree_path, task.branch, run_dir=self.run_dir
-            )
-            task.worktree_path = ""
-            task.branch = ""
-        elif task.baseline_commit:
+            self._discard_unit_for_restart(task)
+        elif mounted:
+            # Live in-place policy applies to the replacement attempt, not to an
+            # incomplete attempt's mount-owned baselines, paths, and claims.
+            self._release_orphaned_mount(task)
+        if not restart_isolated and task.baseline_commit:
             # latch resolved_redrive so the corrected spec + restored diff stay
             # protected through every reset of this re-drive, not just this
             # first one; cause="resolved" keeps a human-initiated re-arm
@@ -879,6 +917,7 @@ class SweepEngine(Engine):
             self.journal.append("resume-restart", story_key=MIGRATE_KEY, phase=str(task.phase))
             if task.phase == Phase.ESCALATED:
                 task.attempt = 0  # the human resumed deliberately; fresh budget
+                _rearm_generation(task)  # ...and into a fresh session-id namespace
             if task.baseline_commit and not verify.worktree_clean(self.workspace.root):
                 self._safe_reset(task)  # a session died mid-rewrite; restore our ledger
                 text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
@@ -946,6 +985,12 @@ class SweepEngine(Engine):
             raise RunPaused(reason, PAUSE_STORY_GATE, MIGRATE_KEY)
 
         if not task.baseline_commit:
+            # `self.workspace.root`, which is `paths.repo_root` — the same anchor the
+            # dev writer (`Engine._dev_phase`), the re-arm writer
+            # (`runs.rearm_escalation`) and every proof-of-work probe in
+            # `verify._verify_shared_gates` use. Under the `repo_root` override it is
+            # NOT `paths.project`, and a baseline stamped in one tree and measured in
+            # the other names a commit the measuring repo has never heard of (#716).
             task.baseline_commit = verify.rev_parse_head(self.workspace.root)
             task.baseline_untracked = sorted(verify.untracked_files(self.workspace.root))
 
@@ -1154,6 +1199,7 @@ class SweepEngine(Engine):
             self.journal.append("resume-restart", story_key=triage_key, phase=str(task.phase))
             if task.phase == Phase.ESCALATED:
                 task.attempt = 0  # the human resumed deliberately; fresh budget
+                _rearm_generation(task)  # ...and into a fresh session-id namespace
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition
 
         feedback: Path | None = None
@@ -1858,7 +1904,12 @@ class SweepEngine(Engine):
             self._close_bundle_ledger_when_spec_status(
                 task, task.spec_file, "done", kind="sweep-bundle-reclosed"
             )
-        return verify.verify_review_bundle(task, self.workspace.paths, self.policy)
+        return verify.verify_review_bundle(
+            task,
+            self.workspace.paths,
+            self.policy,
+            on_results=self._review_command_sink(task),
+        )
 
     def _operator_park_enabled(self) -> bool:
         # A bundle carries no sprint-status entry, so the pair a park is verified

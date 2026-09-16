@@ -8,9 +8,16 @@ from pathlib import Path
 
 import pytest
 import yaml
-from conftest import attach_profile, git, install_build_auto_skill, write_gated_ledger, write_spec
+from conftest import (
+    _OK,
+    attach_profile,
+    git,
+    install_build_auto_skill,
+    write_gated_ledger,
+    write_spec,
+)
 
-from bmad_loop import stories
+from bmad_loop import stories, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
@@ -40,6 +47,7 @@ from bmad_loop.policy import (
     Policy,
     ReviewPolicy,
     ScmPolicy,
+    VerifyPolicy,
 )
 from bmad_loop.runs import STOP_REQUEST_FILE, graceful_stop_requested
 from bmad_loop.stories_engine import StoriesEngine
@@ -244,6 +252,34 @@ def test_two_story_happy_path(project):
         assert status_of(read_frontmatter(story_spec(project, sid))) == "done"
     assert engine.state.tasks["1"].phase == Phase.DONE
     assert engine.state.tasks["2"].phase == Phase.DONE
+
+
+def test_story_review_gate_journals_its_verify_commands(project):
+    """`StoriesEngine._verify_review` threads the base engine's review sink, so a
+    stories-mode review-leg verifier pass lands the same `verify-command-result`
+    records the base engine's does.
+
+    Its own row rather than a claim carried by `test_engine.py`: the sink is
+    passed at each override, so dropping it here would leave every stories run
+    silently unrecorded while the base engine's tests stayed green — the shape the
+    #695 root bug already took across these same three gates.
+
+    Ablation: remove `on_results=` from `StoriesEngine._verify_review` and the
+    record assertion fails at zero entries."""
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(
+        project, [], policy=_stories_policy(verify=VerifyPolicy(commands=(_OK,)))
+    )
+    sp = story_spec(project, "1")
+    write_spec(sp, "done", rev_parse_head(project.project))
+    task = StoryTask(story_key="1", epic=1)
+    task.spec_file = str(sp)
+
+    assert engine._verify_review(task).ok
+
+    (record,) = [e for e in engine.journal.entries() if e["kind"] == "verify-command-result"]
+    assert record["verification_stage"] == "review"
+    assert record["command"] == _OK and record["story_key"] == "1"
 
 
 def test_run_state_pins_stories_mode(project):
@@ -951,6 +987,10 @@ def test_plan_checkpoint_pause_then_resume_implements(project):
     assert leg1.prompt.endswith("Halt after planning.")
     assert leg1.env["BMAD_LOOP_PLAN_HALT"] == "1"
     assert _kinds(engine.journal, "plan-halt")
+    (waiver,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    assert waiver["story_key"] == "1"
+    assert waiver["zero_diff"] is True
+    assert "plan_halt" not in waiver  # the result marker remains a separate fact
     assert _kinds(engine.journal, "checkpoint-pause")[-1]["checkpoint"] == "plan"
 
     resumed, radapter = resume_engine(project, engine, [stories_checkpoint_effect()])
@@ -962,6 +1002,192 @@ def test_plan_checkpoint_pause_then_resume_implements(project):
     leg2 = next(s for s in radapter.sessions if s.role == "dev")
     assert "Halt after planning" not in leg2.prompt
     assert "BMAD_LOOP_PLAN_HALT" not in leg2.env
+
+
+@pytest.mark.parametrize(
+    "result_json",
+    [
+        {"workflow": "auto-dev"},
+        {"workflow": "wrong-workflow", "plan_halt": True},
+    ],
+    ids=["marker-absent", "earlier-gate-fails"],
+)
+def test_refused_plan_halt_does_not_journal_a_proof_waiver(project, result_json):
+    """Only a passing artifact outcome earns the plan-halt waiver record.
+
+    Ablation: move the journal append before `verify_dev_stories`, or key it only
+    on a truthy marker, and the relevant row observes a record for a refused leg.
+    """
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _adapter = make_engine(project, [])
+    baseline = rev_parse_head(project.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline)
+    write_spec(story_spec(project, "1"), "ready-for-dev", baseline)
+
+    outcome = engine._verify_dev_artifacts(task, result_json)
+
+    assert not outcome.ok
+    assert not _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+
+
+@pytest.mark.parametrize("zero_diff", [False, None], ids=["residue", "unknown"])
+def test_accepted_plan_halt_journals_the_non_clean_proof_observation(
+    project, monkeypatch, zero_diff
+):
+    """The engine carries the verifier's full tri-state into the accepted-halt
+    record; neither residue nor an unanswerable probe may be rewritten as clean.
+    """
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _adapter = make_engine(project, [])
+    baseline = rev_parse_head(project.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline)
+    write_spec(story_spec(project, "1"), "ready-for-dev", baseline)
+
+    if zero_diff is False:
+        (project.repo_root / "src.txt").write_text("planning residue\n", encoding="utf-8")
+    else:
+
+        def boom(_repo):
+            raise verify.GitError("untracked enumeration failed")
+
+        monkeypatch.setattr(verify, "untracked_files", boom)
+
+    outcome = engine._verify_dev_artifacts(
+        task,
+        {"workflow": "auto-dev", "plan_halt": True},
+    )
+
+    assert outcome.ok
+    (record,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    assert record["zero_diff"] is zero_diff
+
+
+def test_accepted_plan_halt_journal_excludes_engine_written(project, monkeypatch):
+    """The journal projects the gate after excluding orchestrator-owned residue.
+
+    Ablation: stop composing ``engine_written`` into the stories observation and
+    this reports ``zero_diff: false`` even though the session itself wrote no code.
+    """
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _adapter = make_engine(project, [])
+    baseline = rev_parse_head(project.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline)
+    write_spec(story_spec(project, "1"), "ready-for-dev", baseline)
+    (project.repo_root / "engine-owned.txt").write_text(
+        "orchestrator bookkeeping\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(engine, "_harvest_gate_exclude", lambda _task: ("engine-owned.txt",))
+
+    outcome = engine._verify_dev_artifacts(
+        task,
+        {"workflow": "auto-dev", "plan_halt": True},
+    )
+
+    assert outcome.ok
+    (record,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    assert record["zero_diff"] is True
+
+
+def test_replayed_plan_halt_does_not_duplicate_proof_waiver(project):
+    """Crash replay preserves the first observation for one session generation.
+
+    The first verification journals a clean waiver. A host death before the
+    accepted-session save can replay the same result after unrelated residue has
+    appeared; that replay must not append a conflicting second audit record.
+    """
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _adapter = make_engine(project, [])
+    baseline = rev_parse_head(project.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline, generation=2)
+    write_spec(story_spec(project, "1"), "ready-for-dev", baseline)
+    result_json = {"workflow": "auto-dev", "plan_halt": True}
+
+    first = engine._verify_dev_artifacts(task, result_json)
+    (project.repo_root / "late-residue.txt").write_text("later\n", encoding="utf-8")
+    replay = engine._verify_dev_artifacts(task, result_json)
+
+    assert first.ok and first.plan_halt_zero_diff is True
+    assert replay.ok and replay.plan_halt_zero_diff is False
+    (record,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    assert record["generation"] == 2
+    assert record["zero_diff"] is True
+
+
+def test_operator_spec_path_anchors_an_isolated_units_spec(project):
+    """The pause notice is the FIRST surface an operator meets — before any dashboard.
+
+    Every pause here hands a human a path and says "review it, then resume", and the
+    `checkpoint-pause` journal records the same string. `task.spec_file` is persisted
+    RELATIVE to the mounted worktree (`model._serialized_worktree_path`), so the raw
+    value resolved against whatever directory the operator happened to be in — the main
+    checkout, which carries the same `epic-1/stories/...` layout and answers with the
+    wrong tree's copy. The TUI's `_paused_spec` carries a docstring about exactly this;
+    the notification reaches the operator earlier and had none.
+
+    NOT applied to the dev-session prompt at `spec_ref`: that session's cwd IS the
+    mount, so the relative spelling is the correct one there. The anchor belongs to the
+    consumer, not to the field.
+
+    Ablation: change the helper's body to return `task.spec_file` and this reddens.
+    NOTE this row grades the HELPER only — reverting a CALL SITE to a bare
+    `task.spec_file` leaves it green, which is why
+    `test_plan_checkpoint_pause_journals_the_mount_anchored_spec` below pins the
+    journalled value that an actual pause emits.
+    """
+    engine, _adapter = make_engine(project, [])
+    wt = project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1"
+    rel = "epic-1/stories/1-slug.md"
+    task = StoryTask("1", 0, spec_file=rel)
+    task.worktree_path = str(wt)
+
+    assert engine._operator_spec_path(task) == str(wt / rel)
+    # a spec-less task falls back to the story key rather than raising out of a notice
+    assert engine._operator_spec_path(StoryTask("1", 0)) == "1"
+
+
+def test_plan_checkpoint_pause_journals_the_mount_anchored_spec(project):
+    """The CALL SITE, not the helper — the two can regress independently.
+
+    `test_operator_spec_path_anchors_an_isolated_units_spec` calls the helper directly,
+    so every one of the five notification/journal sites could be reverted to a bare
+    `task.spec_file` with the whole suite still green: the stories engine builds its
+    policy with `notify=QUIET`, so no row observes a notification body, and every other
+    `checkpoint-pause` assertion reads `checkpoint` and never `spec`.
+
+    This pins the value an actual pause emits, which is also the premise
+    `diagnostics.py` now records for the `spec` alias field.
+
+    Ablation: revert `_pause_plan_checkpoint`'s `spec=` to `task.spec_file` and this
+    reddens on the bare relative spelling.
+    """
+    from bmad_loop.engine import RunPaused
+
+    engine, _adapter = make_engine(project, [])
+    wt = project.project / ".bmad-loop" / "runs" / "test-run" / "worktrees" / "1"
+    rel = "epic-1/stories/1-slug.md"
+    task = StoryTask("1", 0, spec_file=rel)
+    task.worktree_path = str(wt)
+    engine.state.tasks["1"] = task
+
+    with pytest.raises(RunPaused):
+        engine._pause_plan_checkpoint(task)
+
+    record = _kinds(engine.journal, "checkpoint-pause")[-1]
+    assert record["spec"] == str(wt / rel)
+    assert record["checkpoint"] == "plan"
+
+    # The NOTIFY body, not only the journal: they are separate call sites that regress
+    # independently, and this one is the surface the operator actually reads. `QUIET` is
+    # `NotifyPolicy(desktop=False, file=True)`, so the ATTENTION file is written. Before
+    # this assertion no row in the repo observed ANY `gates.notify` body, so every
+    # notification site could be reverted to a bare `task.spec_file` with the suite green.
+    #
+    # INVERSE ablation: replace only `_pause_plan_checkpoint`'s notification
+    # `_operator_spec_path(task)` call with `task.spec_file`; this focused test
+    # reddens because the bare relpath appears and the anchored path does not.
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert str(wt / rel) in attention
+    assert f"review the planned spec {rel}," not in attention
 
 
 # -------- MAJOR-B: a spec_checkpoint story can never commit without a plan review
@@ -1253,7 +1479,7 @@ def test_blocked_resolve_rearm_then_redispatch_to_done(project):
     assert not any(s.role == "dev" for s in adapter.sessions)  # story 2 not leapfrogged
 
     # human fixed the frozen spec → re-arm (must run while still escalation-paused)
-    runs.rearm_escalation(engine.run_dir, "1")
+    runs.rearm_escalation(engine.run_dir, "1", isolated_redrive=False, resolution_recorded=True)
     assert status_of(read_frontmatter(story_spec(project, "1"))) == "ready-for-dev"
 
     # resume re-drives the re-armed story, then continues the schedule to story 2
@@ -1293,7 +1519,9 @@ def test_resolved_wedge_is_still_gated_on_redispatch(project):
     wedged = load_state(engine.run_dir).tasks["1"]
     assert wedged.phase == Phase.ESCALATED and wedged.attempt == 0 and not wedged.sessions
 
-    runs.rearm_escalation(engine.run_dir, "1")  # human fixed the frozen spec
+    runs.rearm_escalation(
+        engine.run_dir, "1", isolated_redrive=False, resolution_recorded=True
+    )  # human fixed the frozen spec
     assert load_state(engine.run_dir).tasks["1"].rearmed  # ...and the re-drive is armed
     # a gate on story 1 lands while the run is down
     write_gated_ledger(project, {"DW-1": ("open", ["gate: 1"])})
@@ -1327,7 +1555,7 @@ def test_sentinel_rearm_deletes_by_recorded_verdict_e2e(project):
     assert engine.run().paused
     assert load_state(engine.run_dir).tasks["1"].sentinel_kind == "unresolved"  # recorded
 
-    runs.rearm_escalation(engine.run_dir, "1")
+    runs.rearm_escalation(engine.run_dir, "1", isolated_redrive=False, resolution_recorded=True)
     assert not sentinel.exists()  # cleared by the recorded verdict
     assert (engine.run_dir / "sentinels" / "1-unresolved.md").is_file()  # copy preserved
     reloaded = load_state(engine.run_dir)
