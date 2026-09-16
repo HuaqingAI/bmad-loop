@@ -475,7 +475,11 @@ def test_receipt_sidecars_restore_bytes_trackedness_absence_and_dirty_state(proj
     tracked = repo / "tracked-dirt.txt"
     feature = repo / "feature.txt"
     tracked.write_bytes(b"tracked baseline\n")
-    feature.write_bytes(b"feature baseline\n")
+    # No trailing newline on the tracked feature file: it comes back through a
+    # git checkout (`restore --source=<old>`), and Git for Windows' system
+    # `core.autocrlf=true` hands an LF-committed file back as CRLF. The newline
+    # is not what this row grades; the restored bytes are.
+    feature.write_bytes(b"feature baseline")
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "receipt baseline")
     tracked.write_bytes(b"operator tracked dirt\x00")
@@ -492,7 +496,7 @@ def test_receipt_sidecars_restore_bytes_trackedness_absence_and_dirty_state(proj
         ("tracked-dirt.txt", "ignored.bin", "missing-parent/expected-absent.bin"),
     )
     old = verify.rev_parse_head(repo)
-    feature.write_bytes(b"integrated feature\n")
+    feature.write_bytes(b"integrated feature")
     git(repo, "add", "--", feature)
     git(repo, "commit", "-q", "-m", "integrated target")
     new = verify.rev_parse_head(repo)
@@ -517,7 +521,7 @@ def test_receipt_sidecars_restore_bytes_trackedness_absence_and_dirty_state(proj
     assert ignored.read_bytes() == b"operator ignored bytes\xff"
     assert git(repo, "ls-files", "--", "ignored.bin") == ""
     assert not absent.exists()
-    assert feature.read_bytes() == b"feature baseline\n"
+    assert feature.read_bytes() == b"feature baseline"
     assert git(repo, "diff", "--cached", "--name-only") == ""
     assert git(repo, "diff", "--name-only") == "tracked-dirt.txt"
     assert verify.integration_restoration_complete(
@@ -1195,6 +1199,11 @@ def test_receipt_schema_refuses_git_administration_operands(tmp_path):
         )
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "O_DIRECTORY"),
+    reason="directory fsync is POSIX-only: `_fsync_directory` is a no-op without "
+    "os.O_DIRECTORY, and the non-dirfd sidecar writers never call it",
+)
 def test_receipt_capture_fsyncs_sidecar_directory(project, tmp_path, monkeypatch):
     run_dir = tmp_path / "run"
     run_dir.mkdir()

@@ -756,6 +756,25 @@ def test_owned_spec_restore_fallback_refuses_missing_target_appearing_before_sta
     assert spec.read_bytes() == appeared
 
 
+def _replace_target(spec: Path, data: bytes) -> None:
+    """Swap the entry at `spec` for a NEW file holding `data`, distinguishable
+    from the original by the identity the restore guard compares (`samestat`).
+
+    Not `unlink()` then `write_bytes()`: the guard's pre-replace predicate is
+    st_dev/st_ino, and ext4 hands a just-freed inode number straight back to the
+    next creation in the same directory, so on the CI runners that sequence
+    produced a "replacement" the guard could not tell from the original (it
+    differed on the dev box only because that filesystem allocates differently). The
+    replacement is created while the original still exists — two live entries
+    cannot share an inode — and then renamed over it, which is also the only
+    portable spelling: Windows refuses to unlink a file this process holds
+    open, so "hold the original open across the swap" is not an option there.
+    """
+    replacement = spec.with_name(spec.name + ".replacement")
+    replacement.write_bytes(data)
+    os.replace(replacement, spec)
+
+
 @pytest.mark.skipif(
     not platform_util.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only"
 )
@@ -770,8 +789,7 @@ def test_owned_spec_restore_refuses_target_replacement_after_staging(tmp_path, m
         validate = kwargs["_before_replace"]
 
         def replace_then_validate() -> None:
-            spec.unlink()
-            spec.write_bytes(b"replacement")
+            _replace_target(spec, b"replacement")
             validate()
 
         kwargs["_before_replace"] = replace_then_validate
@@ -803,8 +821,7 @@ def test_owned_spec_restore_fallback_refuses_target_replacement_after_staging(
         validate = kwargs["_before_replace"]
 
         def replace_then_validate() -> None:
-            spec.unlink()
-            spec.write_bytes(b"replacement")
+            _replace_target(spec, b"replacement")
             validate()
 
         kwargs["_before_replace"] = replace_then_validate
