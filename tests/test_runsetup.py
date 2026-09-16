@@ -461,6 +461,18 @@ def test_missing_sweep_options_requires_current_state_marker(tmp_path):
         runsetup.load_sweep_resume_options(run_dir, required=True)
 
 
+@pytest.mark.parametrize("contents", ["{}", '{"only": null}'])
+def test_current_sweep_options_require_both_selector_fields(tmp_path, contents):
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    (run_dir / "sweep.json").write_text(contents, encoding="utf-8")
+
+    with pytest.raises(runsetup.SweepOptionsError, match="selector field"):
+        runsetup.load_sweep_resume_options(run_dir, required=True)
+
+    assert runsetup.load_sweep_resume_options(run_dir).only_ids is None
+
+
 @pytest.mark.parametrize(
     "contents",
     [

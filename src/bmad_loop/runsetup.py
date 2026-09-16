@@ -866,7 +866,12 @@ def load_sweep_resume_options(run_dir: Path, *, required: bool = False) -> Sweep
     if not isinstance(loaded, dict):
         raise SweepOptionsError("sweep.json must contain a JSON object")
     opts: dict[str, Any] = loaded
-
+    if required:
+        missing = [key for key in ("only", "min_severity") if key not in opts]
+        if missing:
+            raise SweepOptionsError(
+                "sweep.json is missing current selector field(s): " + ", ".join(missing)
+            )
     raw_only = opts.get("only")
     only_present = "only" in opts
     only_valid = (
