@@ -9,6 +9,21 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Announce a ledger publish that publishes nothing (`sweep-ledger-commit-clean`), for every
+  outcome that publishes nothing. An ignored path reads clean, so a project
+  that gitignores its `implementation_artifacts` skipped every ledger commit with no
+  journal row at all (DW-191).
+
+- Name the published file on every `_commit_ledger` journal row with a `file` field —
+  the lexical basename, never the resolved symlink target's name — so a scrubbed
+  `bmad-loop diagnose` dump still says which of the two published files went
+  uncommitted, where `repo`, `message` and `error` all collapse to presence booleans
+  (DW-192).
+
+- Write each repeat-loop stop's token as a closed-slug `stop_cause` beside
+  `sweep-repeat-done`'s existing `reason`, so a diagnostics dump tells the five stops
+  apart instead of rendering one `reason_present` boolean (DW-201).
+
 - Give each declared journal `**splat` hole a COUNT of the unresolved `**` keyword
   arguments it holds — not write calls, so `append(kind, **a, **b)` counts 2 — and a
   second unresolvable splat inside an already-declared position now reddens instead of
@@ -194,6 +209,21 @@ breaking changes may land in a minor release.
   failing on a lock it never needed.
 
 ### Changed
+
+- Display scrubbed sweep publication and repeat-stop details in the default Markdown diagnostic report.
+
+- Pin the real-tmux xdist grouping guard at EXACT per-module gated-def counts instead of
+  floors: `_EXPECTED_E2E_FLOORS` becomes `_EXPECTED_E2E_DEF_COUNTS` and the assertion is
+  equality, so adding a tmux-gated def now fails the guard just as deleting one does
+  rather than letting the pin silently start trailing again (DW-173).
+
+- Grade `tests/test_stories_e2e.py`'s own module-level AST for the detach-ceiling splice:
+  a third `tests/test_conftest.py` scanner requires the `detach_ack_ceiling_s=` fragment
+  to be followed by `int(<conftest REAL_MUX_HANG_CEILING_S>)` under either import form,
+  with a named expected-site inventory that fails a scan finding nothing. A hardcoded
+  `90` renders byte-identically to the splice and passed the existing rendered-text
+  assert unnoticed; `_run_detach_gate`'s deliberately varying in-def budget stays out of
+  scope because the scan is module-level only (DW-174).
 
 - **The deferred-work ledger-read contract is settled repo-wide** (DW-146).
   `deferredwork` now owns both arms as named readers — `read_for_write` (repair/write:
@@ -408,6 +438,100 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Handle non-dictionary session result documents through existing empty-document
+  paths (DW-206/DW-207). Share read-time normalization across engine, stories,
+  sweep, and verification consumers so malformed results reach the existing
+  refusal paths instead of crashing; preserve dictionary identity and snapshots.
+
+- Validate the target before publishing it in every sweep ledger/pre-answer-store
+  commit (DW-199/203/205). `commit_paths` keeps a missing-but-tracked path as a
+  deletion to stage, so a ledger removed after the phase wrote it was committed AWAY
+  under a `chore(sweep):` message — at the decision phase's commit gate and at the
+  repeat boundary — and a resume whose ledger held undecodable bytes published them
+  before raising on them. Each call site now declares its file family: the five
+  ledger publishers re-take the ledger's repair/write read, the two store prunes
+  check existence. A refusal spawns no git and journals
+  `sweep-ledger-commit-refused` with `refuse_cause` (`target-absent` |
+  `target-unreadable`). The sweep loop's own read still raises on undecodable bytes;
+  only the publish that preceded it is gone.
+
+- Make `escalation._escalation_list` and `sweep._normalize_bundle_names` total on a
+  non-dict JSON result document (DW-181). Return their existing empty results (`[]`
+  and `()`) for wrong-shaped documents, preserving dictionary and `None` behavior.
+  The normalizer previously guarded only `None`, so falsy non-dicts now return
+  `()` too. This hardened direct helper calls only; the earlier engine dereference
+  still crashed before a malformed session document could reach the sweep
+  validators, which DW-206 above closes.
+
+- Close the two ledger write-fault arms the DW-166 pass left bare (DW-182/186). A
+  deferred-work ledger holding undecodable bytes raised out of the pre-answer prune —
+  the LAST call of a sweep cycle — and reported a fully completed cycle as crashed;
+  it now takes the existing `sweep-preanswer-prune-refused` row under a second fixed
+  reason token (`ledger-unreadable`) and keeps every recorded answer, exactly as the
+  absent-ledger arm does. And `record_decision`'s boolean was discarded, so a
+  decision whose id the ledger no longer holds (or a ledger that is gone) counted as
+  closed and emitted `post_decision` for a `decision:` line that was never written;
+  the sweep now journals `sweep-decision-effect-unavailable` — naming which of the
+  two states it was, since a missing ledger loses every line the walk already wrote
+  where a missing entry loses one — and claims nothing. The commit withhold is left
+  untouched by a False return rather than tripped by it: the latch still reports the
+  last attempt that actually READ the ledger, which a False return may never have
+  done. The prune's undecodable refusal is also carried to the repeat boundary: a
+  `--repeat` run ends there on `sweep-repeat-done` `reason="ledger-unreadable"`
+  (counting the cycle that completed) with a best-effort repair notification, and
+  WITHOUT taking the cycle-boundary ledger commit — whose pathspec is the ledger, so
+  a purely local refusal published the very bytes it had just refused to read and
+  the next cycle crashed on them regardless. The completed cycle's work is kept and
+  the undecodable bytes stay dirty for a human to repair. The absent-ledger arm is
+  unchanged: it stays cycle-local and the next cycle ends on `no-open`.
+
+- Narrow every sweep bookkeeping commit to the file the phase actually published
+  (DW-183/185/187/188). `_commit_ledger` now takes that FILE rather than a root: it
+  resolves it — following symlinks, as the atomic writer already does, so a ledger
+  symlinked out of the project commits in the repository holding its target — roots
+  both git calls at the resolved parent, and pathspecs the dirty check and the commit
+  to that one literal name, including symlink targets with Git pathspec magic,
+  and include new files even when Git hides untracked files. Unrelated edits no longer ride into a
+  `chore(sweep):` commit and a prune later in the same cycle no longer publishes the
+  ledger the decision phase withheld. The already-resolved close and the decision
+  phase additionally commit only on a non-empty pass, so a phase that wrote nothing
+  spawns no git.
+
+- Sanitize bundle, untriaged-ID, and migration diagnostics so object values print
+  their position or type instead of their contents (DW-178–180). Preserve string
+  wording and acceptance behavior; render non-string scalar mapping keys without
+  stringification quotes.
+
+- Keep a sweep running when the deferred-work ledger will not read (DW-166). An
+  undecodable ledger during the already-resolved close, or during an attended
+  decision's effect, ended the whole sweep as crashed — on the decision path after the
+  human's answer had already been saved and journaled. Both now journal the fault
+  (`sweep-resolved-close-unavailable`, `sweep-decision-effect-unavailable`) and carry
+  on: the answers stay in the run's `decisions.json` and the entries stay open for the
+  next cycle.
+
+- Commit the deferred-work ledger in the tree that owns it (DW-175). `implementation_artifacts`
+  is configurable to any absolute path, so the ledger may sit under the project, inside
+  a disjoint `repo_root`, or in no git repository at all — and a single fixed root is
+  wrong in two of the three. Ledger commits now name the ledger's own directory and let
+  git resolve the enclosing repository; pre-answer-store commits keep naming the
+  project, which is the tree that store is a bare join off. Where no repository encloses
+  the file, the commit is skipped and journaled (`sweep-ledger-commit-unavailable`,
+  naming the directory and git's error) rather than ending the sweep.
+
+- Stop a sweep wiping every recorded pre-answer when the ledger vanishes mid-cycle
+  (DW-176). An absent ledger read as "nothing is open" and dropped the whole store,
+  committing the wipe; it now journals `sweep-preanswer-prune-refused` and writes
+  nothing. An empty-but-present ledger still prunes.
+
+- Withhold the decision phase's ledger commit when the LAST decision effect faulted
+  (DW-166), so the ledger bytes that would not parse are never published; a later
+  effect that reads and writes the ledger settles the doubt and the commit happens,
+  carrying the earlier decisions' lines with it. The attended hand-back no longer
+  prints `✓ decisions recorded` when any effect missed the ledger — it reports that
+  the answers are saved, that not every decision reached the ledger, and which
+  journal kind names the misses.
+
 - Stop a re-dispatched sweep bundle from carrying the SUPERSEDED bundle's state
   (DW-162, DW-163, DW-165). `Sweep._run_bundle` already adopted a different bundle's
   `dw_ids` onto a task `_recover_inflight_bundle` had reset to PENDING, but every other
@@ -461,9 +585,7 @@ breaking changes may land in a minor release.
   keyword-only `root` and both prune sites pass the store's own; a `verify.GitError` from an
   explicitly-rooted call now degrades to a `sweep-ledger-commit-unavailable` journal row
   naming the tree and the error, so a project that is not a git repository keeps its store
-  write instead of aborting the sweep. The five default-root callers are unchanged: they
-  still fail loud, and they remain wrong in the disjoint shape for the same reason — out of
-  scope here, not fixed.
+  write instead of aborting the sweep.
 
 - Gate the stories E2E's detached-writer fakes on a completed `setsid` transition. `$!`
   names the straggler the instant `fork` returns, but `setsid(2)` runs in that child
