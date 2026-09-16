@@ -1775,9 +1775,17 @@ def _archived_stamp(entry: DWEntry) -> str | None:
 # Field lines a stub must carry when the archived body had them, because
 # downstream readers key on them regardless of status: `gate:` (validate's
 # closed-entry gate report deliberately keeps speaking), `origin:` +
-# `source_spec:` (the engine's status-agnostic harvest-replay dedupe), and the
-# reopenable-close undo tail (`mark_open`'s adjacency requirement).
-_PRESERVED_FIELD_RE = re.compile(r"^(gate:.*|origin:.*|source_spec:.*)$", re.MULTILINE)
+# `source_spec:` (the engine's status-agnostic harvest-replay dedupe), live
+# `severity:`/`priority:` metadata (a reopened stub must remain selectable by a
+# severity floor), and the reopenable-close undo tail (`mark_open`'s adjacency
+# requirement). The severity arm mirrors SEVERITY_FIELD_RE's accepted prefixes
+# and is copied byte-for-byte; `_quoted` below excludes fenced examples.
+_PRESERVED_SEVERITY_LINE = (
+    r"(?i:[ \t]*(?:[-*][ \t]+)?(?:\*\*)?(?:severity|priority)[ \t]*:[ \t]*(?:\*\*)?[^\n]*)"
+)
+_PRESERVED_FIELD_RE = re.compile(
+    rf"^(?:gate:.*|origin:.*|source_spec:.*|{_PRESERVED_SEVERITY_LINE})$", re.MULTILINE
+)
 
 # The exact stub shape :func:`archive_closed` leaves in the live ledger.
 # A done entry that merely carries a hand-written `archived:` line does NOT
@@ -1790,7 +1798,7 @@ _STUB_BODY_RE = re.compile(
     # stricter shape here reads a stub this module just wrote as a live entry
     # and re-archives it on every run, forever, appending nothing (#711).
     r"(?:resolution:[ \t]*[^\n]*\nresolution-undo:[ \t]*[0-9a-f]{64}[ \t]+[^\n]*\n)?"
-    r"(?:(?:gate:|origin:|source_spec:)[^\n]*\n)*"
+    rf"(?:(?:(?:gate:|origin:|source_spec:)[^\n]*|{_PRESERVED_SEVERITY_LINE})\n)*"
     r"archived: [^\n]*\n"
     r"\n?"
 )
@@ -1891,10 +1899,11 @@ def archive_closed(
     done <date>`` line (so :func:`parse_ledger` reads it as done and
     :func:`open_ids` drops it), an ``archived: <date>`` line (so a subsequent
     run skips it rather than re-archiving the stub), and the entry's
-    load-bearing field lines — ``gate:``, ``origin:``/``source_spec:``, and
-    the reopenable-close undo tail — because downstream readers key on those
-    regardless of status (validate's closed-gate report, the engine's
-    harvest-replay dedupe, and sweep bundle rollback respectively).
+    load-bearing field lines — ``gate:``, ``origin:``/``source_spec:``, live
+    ``severity:``/``priority:`` metadata, and the reopenable-close undo tail —
+    because downstream readers key on those regardless of status (validate's
+    closed-gate report, the engine's harvest-replay dedupe, severity selection,
+    and sweep bundle rollback respectively).
 
     ``before`` (ISO ``YYYY-MM-DD``) archives only entries closed strictly
     *before* that date. Entries with ``status: done`` (no date) are always
