@@ -9,6 +9,19 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Prove real-tmux teardown reaps the exact detached child after identity publication fails (DW-149).
+
+- **The accepted-park arm's `_harvest_gate_exclude` join is now graded engine-side**
+  (DW-139). `tests/test_verify.py::test_verify_dev_park_zero_diff_excludes_the_orchestrators_own_writes`
+  hand-spells its `engine_written`, so the producer is never invoked and re-rooting it
+  left that row green. `tests/test_engine.py` gains
+  `test_accepted_park_observation_excludes_the_nested_ledger_under_the_monorepo_shape`,
+  driving an asserted park through `Engine._verify_dev_artifacts` under the nested
+  monorepo shape — where the orchestrator's own append to the NESTED ledger is the only
+  unexcluded residue and a `project`-rooted spelling silently names the outer project's
+  real ledger. Its control trips the producer's stand-down disjunct through the same
+  join, so `park_zero_diff is True` is attributable to the pathspec.
+
 - **The `_usage` stash is now pinned to survive teardown** (DW-129) — the invariant
   DW-117's cap placement rests on, since `read_usage(result)` runs after `run()`/`kill()`
   return. `tests/test_opencode_http.py` gains a row that stashes a session's usage,
@@ -340,6 +353,115 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Adopt the current bundle's deferred-work ids before writing a reset sweep task's
+  intent (DW-144). Keep dispatch and ledger-close ids aligned, and journal both
+  old and new ids as `sweep-bundle-dwids-adopted` when they differ.
+
+- **Retire stale keep-open pre-answers when dropped** (DW-143), so decisions are
+  offered again and fresh sweeps stop repeating stale-answer notifications. Journal
+  the removal and preserve run-local answers and ledger history. A read-only project
+  store raises `PermissionError` after the drop is announced and quarantined; a fresh
+  run retries once the store is writable.
+
+- **Skip an unreadable cached triage instead of failing the read** (DW-145). Widen
+  `decisions.pending_missed_decisions`' except tuple to include `UnicodeDecodeError` —
+  a `ValueError`, not an `OSError`, so non-UTF-8 bytes in one run's `triage*.json`
+  escaped past `cmd_decisions` and `cmd_status` (which catch `BmadConfigError` alone,
+  leaving `main`'s backstop to exit 1 with no `--json` document) and out of the TUI
+  uncaught. Degrades per file: the bad cache is skipped, the other runs still count.
+
+- **Refuse a triage plan whose free-text scalars are not strings** (DW-148). Type-check
+  bundle `name`/`intent`, option `effect`/`intent`/`label`/`resolution`/`bundle_name`
+  and decision `context`/`recommendation` in `validate_triage` instead of `str(...)`-ing
+  them — a list `intent` used to become a truthy Python repr that passed the
+  `effect == "build"` intent gate and rode into `Bundle.intent`, `intent.md` and a dev
+  session (the DW-141 harm, on the plan-input surface). Errors name the decision id or
+  the bundle's position, the field and the type name only, one per fault. Identifiers
+  and ledger-bound notes (`key`, `question`, `id`, `evidence`, `blocker`, `reason`,
+  `dw_ids` members) deliberately keep `str(...)`. Note: a pre-existing cached triage
+  that the stricter check now refuses is skipped by `pending_missed_decisions`, so its
+  decision drops out of `decisions --list`, `status` and the TUI until the next sweep
+  re-triages the still-open entry.
+
+- **Close the last reuse-exposed test child identities** (DW-136, DW-137). Share the
+  pidfd-authentication helpers, publish identities atomically, and sweep authenticated
+  children abandoned during pre-bind failures. The OpenCode row is now Linux-only,
+  and no executable `os.kill(` call remains in `tests/`.
+
+- **A stored decision answer is now screened by SHAPE, not just by container type**
+  (DW-140/141/142). Three gaps behind DW-134's container-level check: a project
+  `.bmad-loop/decisions.json` holding non-UTF-8 bytes raised `UnicodeDecodeError` out of
+  `load_pre_answers` and aborted the whole sweep that read it; the build lane stringified
+  `key`/`label`/`intent`/`bundle_name`, so a list `intent` shipped its truthy Python repr
+  into `intent.md` and a dev session as prose no human wrote; and an answer with a missing
+  or unrecognized `effect` matched no materialize lane while `decisions.pending_missed_decisions`
+  counted it answered, so no reader ever surfaced the id again. `load_pre_answers` now
+  catches the decode fault, and one shared predicate (`sweep.unusable_answer_reason`)
+  screens both readers, so a value the sweep will not act on is one `bmad-loop decisions`
+  re-offers rather than counting answered. It screens only what a reader of THAT effect
+  consumes — `key`/`label` always, `intent`/`bundle_name` for `build` alone, `resolution`
+  and `answered_at` never — because a refused `keep-open` answer stops suppressing its
+  bundle, and `effect: "close"` stays usable (the in-run writer stores it). The lanes'
+  own typed reads (`""` rather than a repr) are now defense-in-depth rather than the
+  production path: the read site rejects such answers first, so the lanes matter only for
+  callers that bypass it — the test suite hands `_materialize_bundles` a map directly.
+  No new journal kinds and no new drop causes; the degrade stays per-value and in-memory,
+  so the two write-backs still re-publish an unusable value verbatim rather than repairing
+  the human's file.
+
+- **The re-stamp row that settles an owed code-root record now records THAT a move
+  happened** (DW-128) — not which trees: the row's `repo` is the new root and a dump
+  reduces it to `repo_present`. `runs.restamp_code_root`'s trailing `rearm-code-root-restamped`
+  append writes `code_root_changed` about THIS call, so the one path where the row is a
+  real move's sole durable trace — call one re-points the root, persists, and its append
+  raises; the retry discharges the record having moved nothing — recorded `false` and read
+  as "nothing moved". That append now also carries `discharged_owed_move`, true exactly
+  when the row settles a record owed by an earlier call's move. `code_root_changed` keeps
+  its exact current value at every append site, and the two sibling discharge appends
+  (which already assert `code_root_changed=true`) are untouched, so an absent key on those
+  rows means "not stated", not `false`.
+
+- **A regenerated sweep bundle no longer vanishes into a finished bundle's key** (DW-125).
+  `_run_bundle`'s terminal-task early return compared only the derived `dw-<name>` key, and
+  the key is a pure function of `(name, cycle)` — so a resume that lost `<run>/triage.json`
+  re-triaged, re-authored the remaining ids under freely chosen names, and any bundle that
+  happened to reuse a completed bundle's name was skipped with its deferred work never run.
+  The skip now also requires the persisted task's `dw_ids` to agree with the bundle's, as set
+  equality (a reordered plan is still the same bundle) and with an empty persisted list
+  counting as agreement (the pre-`dw_ids` `state.json` shape, so no paused run needs
+  migrating). On divergence the bundle takes the same bounded `-2` … `-9` name suffix the
+  decision-bundle site already uses, journaled `sweep-bundle-key-deduped`; exhausting the
+  bound journals `sweep-bundle-key-collision`, notifies, and leaves the ids open rather than
+  swallowing them. In-flight tasks are untouched — they still go through the existing
+  recovery — and the cycle's progress count now grades the key each bundle was resolved to
+  (the one it ran under, or the terminal one it was skipped at) rather than one re-derived
+  from the plan's name.
+
+- **A sweep's decision dispositions now survive a pause/resume of the same run** (DW-124).
+  The two quarantines — ids journaled `decision-skipped-unattended`, and ids whose recorded
+  answer was journaled `sweep-decision-answer-dropped` — moved from `SweepEngine.__init__`
+  set state onto `RunState` (`sweep_skipped_decisions` / `sweep_dropped_decisions`),
+  persisted immediately after each disposition is announced. Once that state publication
+  succeeds, a resumed run no longer re-journals a drop and re-fires its `gates.notify` for an
+  id it already reported, nor revives a bundle when the resumed cycle's re-triage happens to
+  mint an agreeing option. Deliberately
+  run-scoped: a NEW run still re-evaluates every decision, the human's answer in
+  `<run>/decisions.json` is untouched, and a pre-upgrade `state.json` loads both empty.
+
+- **Degrade a malformed `<run>/decisions.json` instead of aborting the sweep** (DW-134).
+  An unreadable file, a non-object top level or a non-object value journals
+  `sweep-decisions-reload-failed` (one record per fault class; per-value records name their
+  store and affected ids) and drops only the unusable answers; the well-shaped rest answer
+  as before, and both `_materialize_bundles` lanes shape-guard the map they are handed. A
+  per-value drop is re-published unchanged by the phase's own write-backs; a whole-file fault
+  has nothing per-value to carry. `bmad-loop decisions` re-offers an id whose stored
+  pre-answer value is unusable, instead of counting the bare key as answered. Also count
+  every decision-answer drop as repeat progress (DW-135): `_cycle` previously counted only
+  the keep-open lane, so a `--repeat` cycle whose sole event was a `no-intent` or
+  `name-collision` drop stopped at `no-progress` even though the drop frees the id for a
+  later cycle's fresh triage. All three lanes now signal, still bounded to one drop per id
+  per run.
+
 - **Make stories E2E reap identity reuse-proof and clean up a live child when either
   protected reap assertion fires** (DW-126, DW-127).
 
@@ -407,6 +529,13 @@ breaking changes may land in a minor release.
   dynamic-kind literalness docstring no longer counts the writes it governs, keeping only
   the ablation-pinned position count, and the kind-literal probe's ablation now maps each
   feeding emit to the rows it reddens instead of crediting one emit with all of them.
+
+- Pin each declared dynamic-kind position's journal-write count in the portability
+  guard (DW-138). `JOURNAL_DYNAMIC_KIND_ALLOW` is now a mapping from position to its
+  expected number of `journalkind` findings, held against the tree by a new row, so a
+  write added or removed inside an already-declared position reddens instead of only
+  falsifying a comment — the waiver is granted per position, so the declaredness gate
+  passes on such a write by construction. Waiver semantics are unchanged.
 
 - Probe both existence arms of the accepted-spec worktree seed through the total
   `_is_file` (DW-103), matching its structural siblings and the DW-101 supersession
