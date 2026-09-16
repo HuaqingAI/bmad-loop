@@ -7434,6 +7434,15 @@ async def test_decision_modal_toasts_an_answer_it_could_not_publish(
             lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
         )
         await pilot.click(await ready(pilot, "#opt-1"))
+        # Wait for DW-2's toast as the sibling no-decision-line row waits for its
+        # own, not merely for the dashboard: `Screen.dismiss` swaps `app.screen`
+        # and hands the result callback to `call_next`, so the modal is gone one
+        # message before `_record_decision` runs for DW-2 — a window the Windows
+        # runners hit (`assert 1 == 2`, DW-1's toast alone).
+        await until(
+            pilot,
+            lambda: any("DW-2: not committed to git" in m for m in notifications(app)),
+        )
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
 
         toasts = [n for n in app._notifications if "not committed to git" in n.message]
