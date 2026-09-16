@@ -438,6 +438,69 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Diagnose a `null` or bare-string member of a migration result's `mapping` list as the
+  shape fault it is — `mapping[0] not an object: NoneType` — instead of reporting
+  `mapping invents unknown key ''` into the migrate-decision journal record, the retry
+  feedback the next migration session is handed, and the attempt-cap escalation
+  reason (DW-190).
+
+- Prevent out-of-band decision answers from committing a vanished ledger's deletion
+  or files the answer did not write. Report refused publication in the CLI and TUI,
+  preserving the recorded count and decision walk (DW-209, DW-213).
+
+- Commit an already-resolved close whose ledger write landed but whose commit never
+  ran. A crash between the two left the resume replaying a triage plan that flipped
+  nothing, so the durable write stayed off HEAD for the rest of a single-cycle run.
+  The close now also publishes when every id the plan named already reads `done` on
+  disk — proved per id, never from ledger dirtiness — and a read fault there degrades
+  through the existing `sweep-resolved-close-unavailable` row. Where the stranded
+  close retired the LAST open entry the phase never ran at all, so the same publish
+  now also happens at the sweep loop's nothing-open exit, gated on this cycle's
+  triage cache already being on disk: a fresh sweep has none and still spawns no git,
+  and a cache or probe fault there journals `sweep-triage-reload-failed` /
+  `sweep-resolved-close-unavailable` and publishes nothing (DW-193).
+
+- Degrade a sweep's ledger read when the OS refuses it, at the three sites that GATE a
+  cycle: the pre-answer prune and `_loop`'s two top-of-cycle reads. The other
+  `read_for_write` calls in `sweep.py` are unchanged and an OS refusal there still ends
+  a run as crashed. An EACCES/EIO reported a completed cycle — or a whole run whose
+  earlier cycles had completed — as crashed. The refusal is journaled
+  (`sweep-preanswer-prune-refused` / `sweep-cycle-ledger-refused`) and ends a run on a
+  new `ledger-inaccessible` stop token, kept distinct from `ledger-unreadable` because
+  the operator repair differs. `deferredwork.read_for_write` is unwidened (DW-197).
+
+- Withhold sweep bundles when a decision effect leaves the ledger unfit to publish,
+  and stop repeating sweeps with repair instructions (DW-194/202/210).
+
+- Stop a decision effect that never landed from speaking for the human at its two
+  stored-answer consumers. A stored `close` for an entry the ledger still lists as
+  open is re-applied on resume instead of being counted consumed, so a crash between
+  the answer write and the effect no longer leaves the decision permanently
+  unapplied and never re-asked (`sweep-decision-effect-reapplied`; the write order is
+  unchanged, and an unreadable or absent ledger re-applies nothing and journals one
+  `sweep-decision-effect-unavailable` per candidate id) — DW-167. That replay is the
+  one caller of `record_decision`'s new keyword-only `require_open`, which re-checks
+  the still-open premise inside the same locked read/edit/write as the mutation, so a
+  rival writer closing the entry between the walk's gate and its write is refused
+  rather than given a second `decision:` line; every other caller is unchanged and
+  still records on an already-closed entry. Keep metadata faults in the refusal's
+  diagnostic probe from aborting the sweep. A `build` answer whose `record_decision`
+  reported writing no line now takes a fourth drop lane
+  (`drop_cause: effect-unlanded`) rather than materializing a bundle and spending a
+  dev session on an id the ledger holds no entry for — DW-200. That verdict is
+  persisted where it is observed (`sweep_unlanded_decisions` on run state, cleared by
+  the drop that announces it), so an interruption between the non-write and the drop
+  resumes into the same refusal instead of reviving the bundle.
+
+- Report a ledger that took no `decision:` line at the two surfaces that answer
+  decisions outside a sweep (DW-198). `decisions.apply_pre_answer` returns
+  `record_decision`'s boolean instead of discarding it, so `bmad-loop decisions` no
+  longer prints `closed now` and the TUI modal no longer counts the answer into
+  `recorded N decision(s)` when the ledger file is gone or a rival writer retired the
+  entry while the prompt blocked. Keep walking with exit 0 even if the CLI's later
+  diagnostic probe fails. Report saved store answers only for build/keep-open;
+  preserve the existing best-effort commit.
+
 - Handle non-dictionary session result documents through existing empty-document
   paths (DW-206/DW-207). Share read-time normalization across engine, stories,
   sweep, and verification consumers so malformed results reach the existing
