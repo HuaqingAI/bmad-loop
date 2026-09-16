@@ -1783,6 +1783,20 @@ def test_sweep_dry_run_projection_ignores_fenced_and_body_dw_references(project,
     assert "triage:" not in captured.out
 
 
+def test_sweep_dry_run_projects_after_an_arbitrarily_large_canonical_id(project, capsys):
+    huge_id = "DW-" + "9" * 5_000
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        f"### {huge_id}: Canonical open\n\norigin: test\nstatus: open\n\n"
+        "## Deferred from: review\n\n- Open legacy item\n",
+        encoding="utf-8",
+    )
+
+    assert cli._sweep_dry_run(project, policy_mod.load(None)) == 0
+    out = capsys.readouterr().out
+    assert "Open legacy item" in out and "pre-migration projection" in out
+
+
 @pytest.mark.parametrize("only_id", ["DW-2", "DW-9"], ids=["projected-done", "unknown"])
 def test_sweep_dry_run_only_refuses_non_open_or_unknown_projected_id(project, capsys, only_id):
     project.deferred_work.write_text(
@@ -1814,7 +1828,12 @@ def test_sweep_dry_run_only_refuses_non_open_or_unknown_projected_id(project, ca
 def test_public_resume_refuses_malformed_selectors_before_mutation(
     project, monkeypatch, capsys, contents
 ):
-    run_dir = _paused_run_for_resume(project, monkeypatch, run_type="sweep")
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+    )
     (run_dir / "sweep.json").write_text(contents, encoding="utf-8")
     state_before = (run_dir / "state.json").read_bytes()
     journal_path = run_dir / "journal.jsonl"
@@ -6157,6 +6176,27 @@ def test_public_resume_refuses_missing_current_sweep_options_before_mutation(
     assert (run_dir / "state.json").read_bytes() == state_before
     assert (journal_path.read_bytes() if journal_path.is_file() else None) == journal_before
     assert (pid_path.read_bytes() if pid_path.is_file() else None) == pid_before
+
+
+def test_public_resume_refuses_a_newer_sweep_options_version_before_mutation(
+    project, monkeypatch, capsys
+):
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION + 1,
+    )
+    (run_dir / "sweep.json").write_text(
+        json.dumps({"only": None, "min_severity": None}), encoding="utf-8"
+    )
+    state_before = (run_dir / "state.json").read_bytes()
+    monkeypatch.setattr(cli, "SweepEngine", lambda **_kwargs: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+
+    assert "unsupported sweep options version" in capsys.readouterr().err
+    assert (run_dir / "state.json").read_bytes() == state_before
 
 
 def test_public_resume_refuses_incomplete_current_sweep_options_before_mutation(

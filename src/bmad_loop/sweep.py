@@ -535,6 +535,10 @@ def validate_migration(
         target = entries.get(dw_id)
         if target is None:
             errors.append(f"mapping {key} -> {dw_id}: no such entry in the ledger")
+        elif dw_id in pre_canonical:
+            errors.append(
+                f"mapping {key} -> {dw_id}: legacy items must map to newly created entries"
+            )
         else:
             sources_by_target.setdefault(dw_id, []).append(source)
             if (first_word(target.status) == "done") != bool(source["done"]):
@@ -1294,6 +1298,7 @@ class SweepEngine(Engine):
         suffix = "" if cycle == 1 else f"-{cycle}"
         triage_path = self.run_dir / f"triage{suffix}.json"
         triage_key = TRIAGE_KEY + suffix
+        selector_cache_mismatch = False
         if triage_path.is_file():
             # already validated this run; the ledger has moved since (closes,
             # decisions), so skip the open-set equality re-check. A cache we
@@ -1313,6 +1318,7 @@ class SweepEngine(Engine):
                     and (self.only_ids is not None or self.min_severity is not None)
                     and plan.open_ids != frozenset(open_now)
                 ):
+                    selector_cache_mismatch = True
                     plan, errors = None, [
                         "cached selected open_ids no longer match the current selector universe"
                     ]
@@ -1327,7 +1333,10 @@ class SweepEngine(Engine):
         elif task.phase != Phase.PENDING:
             # resumed mid-triage or retrying after an escalation: restart
             self.journal.append("resume-restart", story_key=triage_key, phase=str(task.phase))
-            if task.phase == Phase.ESCALATED:
+            if selector_cache_mismatch:
+                task.attempt = 0
+                _rearm_generation(task)
+            elif task.phase == Phase.ESCALATED:
                 task.attempt = 0  # the human resumed deliberately; fresh budget
                 _rearm_generation(task)  # ...and into a fresh session-id namespace
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition

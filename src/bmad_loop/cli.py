@@ -2569,6 +2569,23 @@ def _parse_sweep_only(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(parts))
 
 
+def _next_decimal_digits(value: str) -> str:
+    """Increment arbitrary-length ASCII decimal text without ``int`` limits."""
+    digits = list(value.lstrip("0") or "0")
+    carry = 1
+    for index in range(len(digits) - 1, -1, -1):
+        if not carry:
+            break
+        if digits[index] == "9":
+            digits[index] = "0"
+        else:
+            digits[index] = chr(ord(digits[index]) + 1)
+            carry = 0
+    if carry:
+        digits.insert(0, "1")
+    return "".join(digits)
+
+
 def _sweep_dry_run(
     paths: bmadconfig.ProjectPaths,
     pol,
@@ -2593,12 +2610,16 @@ def _sweep_dry_run(
     entries = deferredwork.parse_ledger(text)
     open_entries = [e for e in entries if e.open]
     legacy = deferredwork.parse_legacy(text)
-    first_projected_id = (
-        max((int(entry.id.removeprefix("DW-")) for entry in entries), default=0) + 1
+    highest_suffix = max(
+        (entry.id.removeprefix("DW-").lstrip("0") or "0" for entry in entries),
+        key=lambda value: (len(value), value),
+        default="0",
     )
-    projected_legacy = [
-        (f"DW-{first_projected_id + index}", entry) for index, entry in enumerate(legacy)
-    ]
+    next_suffix = _next_decimal_digits(highest_suffix)
+    projected_legacy = []
+    for entry in legacy:
+        projected_legacy.append((f"DW-{next_suffix}", entry))
+        next_suffix = _next_decimal_digits(next_suffix)
     projected_open = [(dw_id, entry) for dw_id, entry in projected_legacy if not entry.done]
     closed = len(entries) - len(open_entries)
     print(f"{ledger}: {len(open_entries)} open, {closed} closed/non-open")
@@ -2735,6 +2756,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     sweep_options = None
     if state.run_type == "sweep":
         try:
+            runsetup.validate_sweep_options_version(state.sweep_options_version)
             sweep_options = runsetup.load_sweep_resume_options(
                 run_dir,
                 required=state.sweep_options_version >= runsetup.SWEEP_OPTIONS_VERSION,

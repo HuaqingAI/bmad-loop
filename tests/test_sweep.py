@@ -1037,6 +1037,17 @@ def test_validate_migration_mapping_errors():
     assert "not mapped" in joined  # the open item's key never appeared
 
 
+def test_validate_migration_refuses_mapping_legacy_to_a_pre_existing_entry():
+    before = pre_gated_ledger()
+    manifest = legacy_manifest(before)
+    assert len(manifest) == 1
+    mapping = migrate_result([{"key": manifest[0]["key"], "dw_id": "DW-1"}])
+
+    errors = validate_migration(mapping, manifest, snapshot_canonical(before), before)
+
+    assert any("legacy items must map to newly created entries" in error for error in errors)
+
+
 def test_validate_migration_allows_dedupe_merge():
     # two legacy items of equal done-ness may merge into one DW entry
     text = (
@@ -1183,6 +1194,27 @@ def test_resumed_only_scope_contracts_after_its_entry_closed(project):
     assert "sweep-selection-empty" in journal_kinds(resumed)
 
 
+def test_repeat_only_scope_contracts_after_selected_entry_closes(project):
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1"],
+        already_resolved=[{"id": "DW-1", "evidence": "fixed at src.txt:1"}],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(plan)],
+        only_ids=("DW-1",),
+        repeat=True,
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 1
+    done = [entry for entry in engine.journal.entries() if entry["kind"] == "sweep-repeat-done"]
+    assert done[-1]["reason"] == "no-selected"
+
+
 def test_min_severity_is_fence_safe_and_reports_every_exclusion(project):
     project.deferred_work.write_text(
         "# Deferred Work\n\n"
@@ -1322,6 +1354,29 @@ def test_selector_scope_change_declines_cached_triage(project):
     assert plan.open_ids == frozenset({"DW-2"})
     assert len(adapter.sessions) == 1
     assert "cached selected open_ids no longer match" in journal_text(engine)
+
+
+def test_selector_scope_change_gets_a_fresh_triage_retry_budget(project):
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    stale = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "stale"}])
+    fresh = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "fresh"}])
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(stale), triage_effect(fresh)],
+        min_severity="high",
+    )
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    (engine.run_dir / "triage.json").write_text(json.dumps(stale), encoding="utf-8")
+    task = StoryTask(story_key="sweep-triage", epic=0)
+    task.phase = Phase.DONE
+    task.attempt = engine.policy.sweep.max_triage_attempts
+    engine.state.tasks[task.story_key] = task
+
+    plan = engine._ensure_triage({"DW-2"})
+
+    assert plan.open_ids == frozenset({"DW-2"})
+    assert len(adapter.sessions) == 2
+    assert engine.state.tasks[task.story_key].generation == 1
 
 
 def test_sweep_worktree_bundle_merges_to_target(project):
@@ -4347,6 +4402,33 @@ def test_severity_selector_applies_to_the_post_migration_ledger(project):
         entry for entry in engine.journal.entries() if entry["kind"] == "sweep-selection-excluded"
     ]
     assert excluded[0]["dw_ids"] == ["DW-1"]
+
+
+def test_only_revalidates_against_compacted_post_migration_ids(project):
+    legacy = (
+        "# Deferred Work\n\n"
+        "### D-1: Duplicate wording one\n\nreason: same issue\n\n"
+        "### D-2: Duplicate wording two\n\nreason: same issue\n"
+    )
+    write_legacy_ledger(project, legacy)
+    manifest = legacy_manifest(legacy)
+    mapping = [{"key": item["key"], "dw_id": "DW-1"} for item in manifest]
+    migrated = (
+        "# Deferred Work\n\n"
+        "### DW-1: merged duplicate\n\norigin: migrated\nreason: same issue\nstatus: open\n"
+    )
+    engine, adapter = make_sweep(
+        project,
+        [migrate_effect(project, migrated, mapping)],
+        only_ids=("DW-2",),
+    )
+
+    summary = engine.run()
+
+    assert summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 1
+    assert adapter.sessions[0].role == "triage" and "--migrate" in adapter.sessions[0].prompt
+    assert "must exist and be open: DW-2" in (engine.run_dir / "crash.txt").read_text()
 
 
 def test_migration_validation_failure_restores_ledger_then_escalates(project):

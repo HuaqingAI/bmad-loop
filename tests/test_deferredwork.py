@@ -2978,6 +2978,9 @@ def test_archived_reopenable_stub_preserves_live_severity_for_selection(
     stub = parse_ledger(path.read_text(encoding="utf-8"))[0]
     assert live_field in stub.body
     assert "severity: low" not in stub.body and "priority: minor" not in stub.body
+    archive_before = (path.parent / ARCHIVE_REL).read_bytes()
+    assert archive_closed(path, archive_date="2026-08-25") == []
+    assert (path.parent / ARCHIVE_REL).read_bytes() == archive_before
 
     assert mark_open(path, "DW-1", "sweep bundle", OPERATION_ID) is True
     reopened = parse_ledger(path.read_text(encoding="utf-8"))[0]

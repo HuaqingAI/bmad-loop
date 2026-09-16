@@ -847,6 +847,18 @@ class SweepResumeOptions:
 
 def load_sweep_resume_options(run_dir: Path, *, required: bool = False) -> SweepResumeOptions:
     """Load bounded, non-redirected sweep.json bytes and validate selectors."""
+
+    def corrupt(message: str, *, cause: BaseException | None = None) -> SweepResumeOptions:
+        # Runs from before the selector marker deliberately treated a missing or
+        # malformed options file as the legacy unrestricted shape.  Keep that
+        # compatibility while current selector-capable runs fail closed.
+        if not required:
+            return SweepResumeOptions({}, None, None)
+        error = SweepOptionsError(message)
+        if cause is not None:
+            raise error from cause
+        raise error
+
     opts_path = run_dir / "sweep.json"
     if is_link_like(opts_path):
         raise SweepOptionsError("sweep.json must not be a link-like path")
@@ -884,13 +896,13 @@ def load_sweep_resume_options(run_dir: Path, *, required: bool = False) -> Sweep
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise SweepOptionsError("sweep.json is not valid UTF-8") from exc
+        return corrupt("sweep.json is not valid UTF-8", cause=exc)
     try:
         loaded = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise SweepOptionsError("sweep.json is not valid JSON") from exc
+        return corrupt("sweep.json is not valid JSON", cause=exc)
     if not isinstance(loaded, dict):
-        raise SweepOptionsError("sweep.json must contain a JSON object")
+        return corrupt("sweep.json must contain a JSON object")
     opts: dict[str, Any] = loaded
     if required:
         missing = [key for key in ("only", "min_severity") if key not in opts]
@@ -917,7 +929,7 @@ def load_sweep_resume_options(run_dir: Path, *, required: bool = False) -> Sweep
         assert isinstance(raw_only, list)
         only_ids = tuple(dict.fromkeys(str(value) for value in raw_only))
     else:
-        raise SweepOptionsError("sweep.json has a malformed 'only' selector")
+        return corrupt("sweep.json has a malformed 'only' selector")
 
     raw_min = opts.get("min_severity")
     min_present = "min_severity" in opts
@@ -927,10 +939,10 @@ def load_sweep_resume_options(run_dir: Path, *, required: bool = False) -> Sweep
         assert isinstance(raw_min, str)
         min_severity = raw_min
     else:
-        raise SweepOptionsError("sweep.json has an invalid 'min_severity' selector")
+        return corrupt("sweep.json has an invalid 'min_severity' selector")
 
     if only_ids is not None and min_severity is not None:
-        raise SweepOptionsError("sweep.json cannot contain both 'only' and 'min_severity'")
+        return corrupt("sweep.json cannot contain both 'only' and 'min_severity'")
     # Missing keys are the pre-selector format and remain unrestricted. Explicit
     # nulls are the current unrestricted format; both intentionally converge.
     if not only_present:
@@ -938,6 +950,15 @@ def load_sweep_resume_options(run_dir: Path, *, required: bool = False) -> Sweep
     if not min_present:
         min_severity = None
     return SweepResumeOptions(opts, only_ids, min_severity)
+
+
+def validate_sweep_options_version(version: int) -> None:
+    """Refuse state whose sweep options semantics this binary cannot interpret."""
+    if version < 0 or version > SWEEP_OPTIONS_VERSION:
+        raise SweepOptionsError(
+            f"unsupported sweep options version {version}; this binary supports "
+            f"0 through {SWEEP_OPTIONS_VERSION}"
+        )
 
 
 def _claim_run_dir(run_dir: Path) -> os.stat_result:
@@ -1275,6 +1296,26 @@ def compose_sweep(
     it refuses a child that left nothing behind; under the refused unwind above it
     refuses one that is composed and resumable, which is the better of the two.
     Neither is a second launch, and that is the safe direction for a launcher."""
+    # Validate the typed seam as well as argparse callers: frontends and auto
+    # sweeps call this composer directly, and an invalid or unresumably large
+    # selector must fail before a run directory is published.
+    from .sweep import select_entries
+
+    select_entries((), only_ids=only_ids, min_severity=min_severity)
+    options = {
+        "prompting": prompting,
+        "decisions_only": decisions_only,
+        "max_bundles": max_bundles,
+        "repeat": repeat,
+        "max_cycles": max_cycles,
+        "only": list(only_ids) if only_ids is not None else None,
+        "min_severity": min_severity,
+        "trigger": trigger,
+    }
+    options_text = json.dumps(options, indent=2)
+    if len(options_text.encode("utf-8")) > _MAX_SWEEP_OPTIONS_BYTES:
+        raise SweepOptionsError(f"sweep options exceed {_MAX_SWEEP_OPTIONS_BYTES} bytes")
+
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
     # Same claim, same reason, same placement outside the try as in `compose_run`.
@@ -1295,22 +1336,12 @@ def compose_sweep(
             sweep_options_version=SWEEP_OPTIONS_VERSION,
             trusted_config_digest=trusted_config_digest,
         )
-        options = {
-            "prompting": prompting,
-            "decisions_only": decisions_only,
-            "max_bundles": max_bundles,
-            "repeat": repeat,
-            "max_cycles": max_cycles,
-            "only": list(only_ids) if only_ids is not None else None,
-            "min_severity": min_severity,
-            "trigger": trigger,
-        }
         # Persist the sweep options atomically (tmp + os.replace), the way save_state
         # writes state.json: a resume reads this back to rebuild the SweepEngine, so a
         # crash mid-write must not leave a torn file the recovery path then chokes on.
         sweep_path = run_dir / "sweep.json"
         sweep_tmp = sweep_path.with_suffix(".json.tmp")
-        sweep_tmp.write_text(json.dumps(options, indent=2), encoding="utf-8")
+        sweep_tmp.write_text(options_text, encoding="utf-8")
         atomic_replace(sweep_tmp, sweep_path)
         # Publish selector-capable state only after its required options file is
         # complete. The state lock keeps state.json + pid indivisible to resume;
@@ -1383,6 +1414,8 @@ def compose_resume(
     the new baseline describes the bytes these adapters are built from rather than
     a second read of an agent-writable file (#461 point 4). ``None`` resolves
     fresh."""
+    if state.run_type == "sweep":
+        validate_sweep_options_version(state.sweep_options_version)
     resolved_sweep_options = (
         sweep_options
         if sweep_options is not None
