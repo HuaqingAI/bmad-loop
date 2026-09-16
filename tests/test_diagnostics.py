@@ -1300,13 +1300,21 @@ def test_remaining_journal_sanitization_contract_reaches_both_public_renders(pro
 
 @pytest.mark.parametrize("render_format", ["markdown", "json"])
 @pytest.mark.parametrize(
-    "stop_cause", ["no-open", "no-progress", "max-cycles", "legacy-appeared", "ledger-unreadable"]
+    "stop_cause",
+    [
+        "no-open",
+        "no-progress",
+        "max-cycles",
+        "legacy-appeared",
+        "ledger-unreadable",
+        "no-selected",
+    ],
 )
 def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
     project, render_format, stop_cause
 ):
     """Each public render independently retains all three publication identities,
-    the five stop slugs, and the dropped fields' presence booleans.
+    the six stop slugs, and the dropped fields' presence booleans.
 
     Ablation: remove Markdown's sweep-entry emission, or add file/stop_cause to
     _JOURNAL_DROP_FIELDS, and the corresponding positive assertions fail. Remove

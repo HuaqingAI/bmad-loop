@@ -1453,7 +1453,12 @@ class SweepEngine(Engine):
                 if cycle == 1:
                     self.journal.append("sweep-selection-empty", reason=selector)
                 else:
-                    self.journal.append("sweep-repeat-done", cycles=cycle - 1, reason="no-selected")
+                    self.journal.append(
+                        "sweep-repeat-done",
+                        cycles=cycle - 1,
+                        reason="no-selected",
+                        stop_cause="no-selected",
+                    )
                 return
             if cycle > 1:
                 self.journal.append("sweep-cycle", cycle=cycle, open=len(open_now))

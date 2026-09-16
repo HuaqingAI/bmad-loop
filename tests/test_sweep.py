@@ -10062,7 +10062,14 @@ def test_an_undecodable_prune_in_cycle_two_keeps_the_completed_bundle(project):
 
 
 _REPEAT_STOP_TOKENS = frozenset(
-    {"no-open", "no-progress", "max-cycles", "legacy-appeared", "ledger-unreadable"}
+    {
+        "no-open",
+        "no-progress",
+        "max-cycles",
+        "legacy-appeared",
+        "ledger-unreadable",
+        "no-selected",
+    }
 )
 
 
@@ -10100,13 +10107,16 @@ def test_a_repeat_stop_journals_a_stop_cause_beside_its_reason(project):
 
 
 def test_every_repeat_stop_pairs_its_reason_with_the_same_stop_cause():
-    """The TOTAL half of DW-201: all five `sweep-repeat-done` writes in `sweep.py`,
-    graded at the source rather than by five separate runs.
+    """The TOTAL half of DW-201: all six `sweep-repeat-done` writes in `sweep.py`,
+    graded at the source rather than by six separate runs.
 
     Three claims a behavioral row cannot make together: every write passes BOTH
     fields, the two are the SAME literal on each write (a `stop_cause` that drifted
     from its `reason` would be worse than none — a dump would name a stop the raw
-    journal contradicts), and the tokens are exactly the closed five. The closed set
+    journal contradicts), and the tokens are exactly the closed six. `no-selected` is
+    the selector exit: the stop taken when `--only` / `--min-severity` selection
+    leaves nothing to run on a cycle after the first (cycle 1 journals
+    `sweep-selection-empty` instead). The closed set
     is the reason the field can be declared benign in
     `tests/test_portability_guard.py`: it is an enum of code constants, never
     free text, so nothing an operator authored can reach a dump through it.
@@ -10117,7 +10127,7 @@ def test_every_repeat_stop_pairs_its_reason_with_the_same_stop_cause():
     text to appear mid-run.
 
     Ablation: drop `stop_cause` from any one site and the pairing check reds naming
-    its line; change one site's token to a sixth spelling and the closed-set check
+    its line; change one site's token to a seventh spelling and the closed-set check
     reds; make a site's two tokens disagree and the equality check reds."""
     import ast
 
@@ -10134,7 +10144,7 @@ def test_every_repeat_stop_pairs_its_reason_with_the_same_stop_cause():
     ]
     # premise: the scan found the producers it is grading, so an AST or spelling
     # change cannot turn this into a guard over an empty set
-    assert len(writes) == 5, f"expected 5 sweep-repeat-done writes, found {len(writes)}"
+    assert len(writes) == 6, f"expected 6 sweep-repeat-done writes, found {len(writes)}"
     tokens = {}
     for node in writes:
         keywords = {
