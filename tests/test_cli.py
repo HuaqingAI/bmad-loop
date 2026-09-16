@@ -1235,6 +1235,11 @@ def test_status_json_paused_run(project, capsys):
 
 
 def test_status_text_bounds_critical_reason_while_json_stays_lossless(project, capsys):
+    """The fixture's absolute worktree-local `spec_file` is deliberate: `save_state`
+    persists it worktree-RELATIVE (`StoryTask._serialized_worktree_path`) and
+    `from_dict` reads it back raw, so the `[recovery trail: …]` assertion against the
+    absolute path only holds when the display anchors through `runs.task_spec_path`.
+    Ablated: substituting bare `task.spec_file` renders the relative spelling and fails."""
     from bmad_loop.escalation import CRITICAL_DISPLAY_MAX
     from bmad_loop.journal import save_state
     from bmad_loop.model import PAUSE_ESCALATION, Phase, RunState, StoryTask
