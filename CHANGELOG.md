@@ -456,6 +456,60 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Bind tracked and pending-tracked isolated bundle deliverables to their accepted
+  Git-normalized bytes and validate their exact staged entries before commit (DW-300).
+  Drift now pauses with path-only recovery evidence and retains the source mount;
+  the validated index is committed without a second working-tree staging pass.
+
+- Sample destination pathname identity after streamed artifact probes, refusing observed
+  detachment while retaining checked-fallback races (DW-301).
+
+- Stream artifact destination hashing and equality checks in fixed-size chunks, bounding
+  baseline-capture and publication memory even when operator-owned files are large or grow
+  during validation (DW-298/DW-299).
+
+- Bind explicitly published ignored bundle deliverables to the exact bytes accepted by final
+  dev, repair, or review verification (DW-290). Preparation now refuses post-verification byte
+  or declaration drift before freezing a payload, retains the source mount and evidence for
+  recovery, and cannot refresh authority by replaying the same accepted result after a crash.
+
+- Bound isolated artifact publication payload preparation (DW-289) to measured raw-byte
+  defaults of 5 MiB per ignored file and 10 MiB aggregate. Preflight now rejects an
+  oversize selection before any base64 encoding, bounded reads catch file-growth races,
+  and the existing refusal pause retains the source for a no-redispatch resume. Tracked
+  declarations do not count, exact limits remain legal, and frozen legacy payloads still
+  replay idempotently.
+
+- Refuse concatenated `Artifactonly: true` assertions while preserving accepted
+  separated spellings (DW-291).
+
+- Preserve attempt binding and seed-delivery observer fallbacks when named path
+  resolution guards receive embedded-NUL or lone-surrogate faults (DW-292/DW-294).
+
+- Distinguish ownership-path resolution faults from proven-external paths at the
+  residual deferred-work and sprint-board probes, preserving conservative recovery
+  and carry behavior (DW-293).
+
+- Handle embedded-NUL and lone-surrogate faults at the named observation,
+  configuration, stories, worktree, restore, and recovery resolution guards (DW-287).
+
+- Route terminal isolated sweep harvest-carry read faults through the sweep
+  story-gate repair pause while preserving the engine route for direct defer and
+  ordinary story carries (DW-286).
+
+- Parse independently bold Auto Run `Status` values without allowing bare labels
+  to consume next-line tokens (DW-285).
+
+- Preserve explicit ignored bundle artifacts before isolated worktree teardown; capture
+  destination baselines, refuse conflicting edits, and replay interrupted publication
+  without losing recoverable sources (DW-283).
+
+- Advertise conditional artifact-only receipts in all bundle prompts and sweep
+  triage guidance, including verification gates and isolated-publication limits (DW-284).
+
+- Show unreadable sweep-ledger refusals and repair guidance on dashboard resume
+  before launching a detached window (DW-270).
+
 - Pause existing engine and sweep locked-read repair routes on OS metadata and
   text-read faults, preserving task phase, pending work and ledger bytes (DW-279).
   Wrap these faults as `LedgerReadFault(LedgerReadError)` with the original
@@ -2059,10 +2113,18 @@ decisions` and the TUI decision modal now also catch the state-root failure that
   On POSIX the `sweep-triage-cache-write-failed` `errors[0]` text now names the bare
   filename rather than the full path — the replace is dir_fd-relative.
   Accepted residual, unchanged: the run dir's other writers — the journal, `state.json`,
-  `ATTENTION`, and `_ensure_migration`'s `migrate-manifest.json`/`migrate-result.json` —
-  still go through plain writers. The intent's preceding `mkdir` can still create
-  directories through a redirected parent; a failed cache read can still unlink
-  `triage{suffix}.json` through one. This change confines only the two file writes.
+  and `ATTENTION` — still go through plain writers. The intent's preceding `mkdir` can
+  still create directories through a redirected parent; a failed cache read can still
+  unlink `triage{suffix}.json` through one. This change confines only the two file writes.
+- **Confine migration run-directory record writes to the project root** (DW-288).
+  `_ensure_migration`'s `<run>/migrate-manifest.json` and
+  `<run>/migrate-result.json` used bare `Path.write_text`, so a link planted at any
+  parent beneath the project could aim either record outside it. Both now publish
+  atomically through `atomic_write_text_confined`, rooted at the project that owns the
+  run directory. A manifest refusal still propagates before migration dispatch; a
+  successful-result refusal still propagates before the ledger commit. Their JSON
+  payloads and publication ordering are unchanged; unlike the old umask-derived files
+  (commonly `0644`), both records now land with private `0600` mode.
 - **`bmad-loop diagnose` no longer ships a merge record's target branch verbatim** (#640).
   The leak PRE-DATES the re-arm work this section is otherwise about: all three producers
   and the by-name routing shipped in earlier releases, so any dump of a run that merged a
