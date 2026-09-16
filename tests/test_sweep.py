@@ -3,7 +3,6 @@
 import contextlib
 import json
 import re
-import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -7523,8 +7522,12 @@ def test_a_prune_in_a_non_git_project_keeps_the_store_write_and_journals(project
         )
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
-    # the project stops being a repo; the run dir and the store stay exactly as they are
-    shutil.rmtree(project.project / ".git")
+    # the project stops being a repo; the run dir and the store stay exactly as they are.
+    # Renamed rather than rmtree'd: git's loose objects are READONLY, and on Windows
+    # `os.unlink` refuses those with WinError 5 (`shutil.rmtree` has no retry). Git
+    # discovers a repository by the `.git` NAME alone, so the rename un-repos the
+    # project exactly as removal would.
+    (project.project / ".git").rename(project.project / ".git-gone")
     assert not (project.project / ".git").exists()
 
     engine._prune_pre_answers()  # must not raise
