@@ -600,15 +600,16 @@ def validate_migration(
     # Dry-run projects legacy ids in manifest/file order.  Hold the rewrite to
     # that same contiguous allocation so a selected provisional id cannot name
     # a different issue after migration.  Equal adjacent targets are the one
-    # permitted exception: migration mode may merge duplicate legacy items.
+    # permitted exception: migration mode may merge duplicate legacy items,
+    # including nonadjacent items, onto any target allocated earlier.
     expected_suffix = increment_decimal_digits(pre_max)
-    previous_target: str | None = None
+    allocated_targets: set[str] = set()
     for manifest_item in manifest:
         key = str(manifest_item["key"])
         target = target_by_key.get(key)
         if target is None:
             continue
-        if target == previous_target:
+        if target in allocated_targets:
             continue
         expected_target = f"DW-{expected_suffix}"
         if target != expected_target:
@@ -616,8 +617,8 @@ def validate_migration(
                 f"mapping {key} -> {target}: migration ids must follow manifest order; "
                 f"expected {expected_target}"
             )
+        allocated_targets.add(target)
         expected_suffix = increment_decimal_digits(expected_suffix)
-        previous_target = target
     return errors
 
 

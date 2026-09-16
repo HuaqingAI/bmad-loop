@@ -1085,6 +1085,28 @@ def test_validate_migration_requires_contiguous_ids_in_manifest_order():
     assert any("must follow manifest order; expected DW-1" in error for error in errors)
 
 
+def test_validate_migration_allows_nonadjacent_dedupe_merge():
+    manifest = [
+        {"key": "duplicate-a", "done": False, "severity": None},
+        {"key": "other", "done": False, "severity": None},
+        {"key": "duplicate-c", "done": False, "severity": None},
+    ]
+    rewritten = (
+        "# Deferred Work\n\n"
+        "### DW-1: merged duplicate\n\norigin: migrated\nstatus: open\n\n"
+        "### DW-2: other\n\norigin: migrated\nstatus: open\n"
+    )
+    result = migrate_result(
+        [
+            {"key": "duplicate-a", "dw_id": "DW-1"},
+            {"key": "other", "dw_id": "DW-2"},
+            {"key": "duplicate-c", "dw_id": "DW-1"},
+        ]
+    )
+
+    assert validate_migration(result, manifest, {}, rewritten) == []
+
+
 def test_validate_migration_allows_dedupe_merge():
     # two legacy items of equal done-ness may merge into one DW entry
     text = (
