@@ -1048,6 +1048,19 @@ def test_validate_migration_refuses_mapping_legacy_to_a_pre_existing_entry():
     assert any("legacy items must map to newly created entries" in error for error in errors)
 
 
+def test_validate_migration_compares_arbitrarily_large_dw_ids_without_int_conversion():
+    huge_suffix = "9" * 5_000
+    next_suffix = "1" + "0" * 5_000
+    before = "# Deferred Work\n\n" f"### DW-{huge_suffix}: existing\n\norigin: test\nstatus: open\n"
+    rewritten = (
+        before + "\n" + f"### DW-{next_suffix}: migrated\n\norigin: migrated\nstatus: open\n"
+    )
+    manifest = [{"key": "legacy-1", "done": False, "severity": None}]
+    result = migrate_result([{"key": "legacy-1", "dw_id": f"DW-{next_suffix}"}])
+
+    assert validate_migration(result, manifest, snapshot_canonical(before), rewritten) == []
+
+
 def test_validate_migration_allows_dedupe_merge():
     # two legacy items of equal done-ness may merge into one DW entry
     text = (

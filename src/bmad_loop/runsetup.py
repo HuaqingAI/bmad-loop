@@ -871,7 +871,7 @@ def load_sweep_resume_options(run_dir: Path, *, required: bool = False) -> Sweep
             raise SweepOptionsError("sweep.json is missing for this selector-capable run")
         return SweepResumeOptions({}, None, None)
     except OSError as exc:
-        raise SweepOptionsError(f"sweep.json cannot be opened: {exc}") from exc
+        return corrupt(f"sweep.json cannot be opened: {exc}", cause=exc)
     try:
         opened = os.fstat(fd)
         if not stat.S_ISREG(opened.st_mode):
@@ -887,7 +887,7 @@ def load_sweep_resume_options(run_dir: Path, *, required: bool = False) -> Sweep
             chunks.append(chunk)
             remaining -= len(chunk)
     except OSError as exc:
-        raise SweepOptionsError(f"sweep.json cannot be read: {exc}") from exc
+        return corrupt(f"sweep.json cannot be read: {exc}", cause=exc)
     finally:
         os.close(fd)
     data = b"".join(chunks)

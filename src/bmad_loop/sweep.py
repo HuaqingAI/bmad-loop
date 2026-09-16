@@ -52,6 +52,29 @@ SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 DW_ID_RE = re.compile(r"DW-[0-9]+\Z")
 
 
+def decimal_digits_key(value: str) -> tuple[int, str]:
+    """Order arbitrary-length ASCII decimal text without converting to ``int``."""
+    normalized = value.lstrip("0") or "0"
+    return len(normalized), normalized
+
+
+def increment_decimal_digits(value: str) -> str:
+    """Increment arbitrary-length ASCII decimal text without ``int`` limits."""
+    digits = list(value.lstrip("0") or "0")
+    carry = 1
+    for index in range(len(digits) - 1, -1, -1):
+        if not carry:
+            break
+        if digits[index] == "9":
+            digits[index] = "0"
+        else:
+            digits[index] = chr(ord(digits[index]) + 1)
+            carry = 0
+    if carry:
+        digits.insert(0, "1")
+    return "".join(digits)
+
+
 @dataclass(frozen=True)
 class _BundleNameRepair:
     field: str
@@ -483,7 +506,14 @@ def validate_migration(
     def first_word(status: str) -> str:
         return status.split()[0] if status.split() else ""
 
-    pre_max = max((int(i.split("-")[1]) for i in pre_canonical), default=0)
+    pre_max = (
+        max(
+            (dw_id.removeprefix("DW-") for dw_id in pre_canonical),
+            key=decimal_digits_key,
+            default="0",
+        ).lstrip("0")
+        or "0"
+    )
     for dw_id, pre in pre_canonical.items():
         e = entries.get(dw_id)
         if e is None:
@@ -511,7 +541,7 @@ def validate_migration(
     for dw_id, e in entries.items():
         if dw_id in pre_canonical:
             continue
-        if int(dw_id.split("-")[1]) <= pre_max:
+        if decimal_digits_key(dw_id.removeprefix("DW-")) <= decimal_digits_key(pre_max):
             errors.append(f"new entry {dw_id} does not continue numbering past DW-{pre_max}")
         if first_word(e.status) not in ("open", "done"):
             errors.append(f"new entry {dw_id} has status {e.status!r}; want open or done")

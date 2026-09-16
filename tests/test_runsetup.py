@@ -679,22 +679,35 @@ def test_legacy_corrupt_sweep_options_resume_unrestricted(tmp_path, monkeypatch,
     assert composed.engine.kwargs["min_severity"] is None
 
 
-def test_resume_refuses_an_unreadable_existing_sweep_options_file(tmp_path, monkeypatch):
+@pytest.mark.parametrize("fault_site", ["open", "read"])
+def test_legacy_unreadable_sweep_options_resume_unrestricted_but_current_refuses(
+    tmp_path, monkeypatch, fault_site
+):
     run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
     run_dir.mkdir(parents=True)
     options_path = run_dir / "sweep.json"
     options_path.write_text("{}", encoding="utf-8")
-    real_open = os.open
+    if fault_site == "open":
+        real_open = os.open
 
-    def denied_open(path, flags, *args, **kwargs):
-        if Path(path) == options_path:
-            raise PermissionError("denied in test")
-        return real_open(path, flags, *args, **kwargs)
+        def denied_open(path, flags, *args, **kwargs):
+            if Path(path) == options_path:
+                raise PermissionError("denied in test")
+            return real_open(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(runsetup.os, "open", denied_open)
+        monkeypatch.setattr(runsetup.os, "open", denied_open)
+        message = "cannot be opened"
+    else:
 
-    with pytest.raises(runsetup.SweepOptionsError, match="cannot be opened"):
-        runsetup.load_sweep_resume_options(run_dir)
+        def denied_read(*_args):
+            raise OSError("denied")
+
+        monkeypatch.setattr(runsetup.os, "read", denied_read)
+        message = "cannot be read"
+
+    assert runsetup.load_sweep_resume_options(run_dir).only_ids is None
+    with pytest.raises(runsetup.SweepOptionsError, match=message):
+        runsetup.load_sweep_resume_options(run_dir, required=True)
 
 
 def test_resume_refuses_a_link_like_sweep_options_path(tmp_path, monkeypatch):

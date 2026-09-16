@@ -93,7 +93,14 @@ from .runsetup import make_adapters as _make_adapters
 from .runsetup import mux_reason_label as _mux_reason_label
 from .runsetup import platform_preflight as _platform_preflight
 from .stories_engine import StoriesEngine
-from .sweep import DW_ID_RE, SEVERITY_ORDER, SweepEngine, select_entries
+from .sweep import (
+    DW_ID_RE,
+    SEVERITY_ORDER,
+    SweepEngine,
+    decimal_digits_key,
+    increment_decimal_digits,
+    select_entries,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -2569,23 +2576,6 @@ def _parse_sweep_only(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(parts))
 
 
-def _next_decimal_digits(value: str) -> str:
-    """Increment arbitrary-length ASCII decimal text without ``int`` limits."""
-    digits = list(value.lstrip("0") or "0")
-    carry = 1
-    for index in range(len(digits) - 1, -1, -1):
-        if not carry:
-            break
-        if digits[index] == "9":
-            digits[index] = "0"
-        else:
-            digits[index] = chr(ord(digits[index]) + 1)
-            carry = 0
-    if carry:
-        digits.insert(0, "1")
-    return "".join(digits)
-
-
 def _sweep_dry_run(
     paths: bmadconfig.ProjectPaths,
     pol,
@@ -2612,14 +2602,14 @@ def _sweep_dry_run(
     legacy = deferredwork.parse_legacy(text)
     highest_suffix = max(
         (entry.id.removeprefix("DW-").lstrip("0") or "0" for entry in entries),
-        key=lambda value: (len(value), value),
+        key=decimal_digits_key,
         default="0",
     )
-    next_suffix = _next_decimal_digits(highest_suffix)
+    next_suffix = increment_decimal_digits(highest_suffix)
     projected_legacy = []
     for entry in legacy:
         projected_legacy.append((f"DW-{next_suffix}", entry))
-        next_suffix = _next_decimal_digits(next_suffix)
+        next_suffix = increment_decimal_digits(next_suffix)
     projected_open = [(dw_id, entry) for dw_id, entry in projected_legacy if not entry.done]
     closed = len(entries) - len(open_entries)
     print(f"{ledger}: {len(open_entries)} open, {closed} closed/non-open")
