@@ -551,6 +551,7 @@ def validate_migration(
     if not isinstance(mapping, list):
         return errors + ["mapping must be a list of {key, dw_id}"]
     seen_keys: set[str] = set()
+    target_by_key: dict[str, str] = {}
     sources_by_target: dict[str, list[dict[str, Any]]] = {}
     for item in mapping:
         key = str(item.get("key", "")) if isinstance(item, dict) else ""
@@ -562,6 +563,7 @@ def validate_migration(
         if key in seen_keys:
             errors.append(f"mapping repeats key {key!r}")
         seen_keys.add(key)
+        target_by_key.setdefault(key, dw_id)
         target = entries.get(dw_id)
         if target is None:
             errors.append(f"mapping {key} -> {dw_id}: no such entry in the ledger")
@@ -594,6 +596,28 @@ def validate_migration(
     missing = sorted(set(manifest_by_key) - seen_keys)
     if missing:
         errors.append("manifest keys not mapped: " + ", ".join(missing))
+
+    # Dry-run projects legacy ids in manifest/file order.  Hold the rewrite to
+    # that same contiguous allocation so a selected provisional id cannot name
+    # a different issue after migration.  Equal adjacent targets are the one
+    # permitted exception: migration mode may merge duplicate legacy items.
+    expected_suffix = increment_decimal_digits(pre_max)
+    previous_target: str | None = None
+    for manifest_item in manifest:
+        key = str(manifest_item["key"])
+        target = target_by_key.get(key)
+        if target is None:
+            continue
+        if target == previous_target:
+            continue
+        expected_target = f"DW-{expected_suffix}"
+        if target != expected_target:
+            errors.append(
+                f"mapping {key} -> {target}: migration ids must follow manifest order; "
+                f"expected {expected_target}"
+            )
+        expected_suffix = increment_decimal_digits(expected_suffix)
+        previous_target = target
     return errors
 
 

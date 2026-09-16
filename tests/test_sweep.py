@@ -1061,6 +1061,30 @@ def test_validate_migration_compares_arbitrarily_large_dw_ids_without_int_conver
     assert validate_migration(result, manifest, snapshot_canonical(before), rewritten) == []
 
 
+def test_validate_migration_requires_contiguous_ids_in_manifest_order():
+    legacy = (
+        "# Deferred Work\n\n"
+        "### D-1: first legacy\n\nreason: first\n\n"
+        "### D-2: second legacy\n\nreason: second\n"
+    )
+    manifest = legacy_manifest(legacy)
+    rewritten = (
+        "# Deferred Work\n\n"
+        "### DW-1: second legacy\n\norigin: migrated\nstatus: open\n\n"
+        "### DW-2: first legacy\n\norigin: migrated\nstatus: open\n"
+    )
+    result = migrate_result(
+        [
+            {"key": manifest[0]["key"], "dw_id": "DW-2"},
+            {"key": manifest[1]["key"], "dw_id": "DW-1"},
+        ]
+    )
+
+    errors = validate_migration(result, manifest, {}, rewritten)
+
+    assert any("must follow manifest order; expected DW-1" in error for error in errors)
+
+
 def test_validate_migration_allows_dedupe_merge():
     # two legacy items of equal done-ness may merge into one DW entry
     text = (
