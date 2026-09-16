@@ -9,6 +9,26 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Verify-command seam coverage for the legs the earlier passes left unpinned**
+  (DW-55). `tests/test_verify.py` gains a row driving all three exits of
+  `run_verify_commands`' loop body — completed, timed out, never spawned — in a single
+  call with a further command after each fault, so the timeout arm's `continue` is
+  load-bearing and the two "no exit status" sentinels (`-1` vs `SPAWN_FAULT_RC`) are
+  shown to stay distinguishable when the legs occur together. `tests/test_cli.py` gains
+  three rows calling `cli._reverify` directly with a two-command policy: the first pins
+  that `env_fault_reason` is read ahead of the return code and that a later offender is
+  never what the operator is shown, the second pins the same for an ordinary failure,
+  and an all-green control keeps their absence assertions honest.
+
+- **A fresh mount that supersedes an accepted-but-uncommitted spec now journals
+  `accepted-spec-write-unreachable`** (DW-101). The `pause_after_spec` gate hands the
+  operator a spec that is uncommitted by construction; a re-drive's worktree is a
+  checkout of a commit, so for a tracked artifacts dir it delivers the pre-approval
+  bytes and the existing delivery probe passes on existence alone. The mount's copy is
+  now byte-compared against the main checkout's, and a difference — or a read that
+  fails, recorded as `compared: false` — is journalled with the main-checkout spec path
+  and the target branch to commit it on. Advisory only: the record refuses nothing,
+  pauses nothing and overwrites nothing.
 - **Target deferred-work sweeps.** `bmad-loop sweep --only DW-1,DW-3` selects an
   exact open-id set, while `--min-severity low|medium|high|critical` selects the
   named severity and higher. Selection happens before triage, bundle formation,
@@ -19,14 +39,15 @@ breaking changes may land in a minor release.
   after semantic duplicate merging assigns the actual universe.
 
 - **Journal-kind and refusal-site coverage gates.** `tests/test_portability_guard.py` gains
-  three enumerate-vs-declare inventories: the 204 literal journal kinds (`JOURNAL_KINDS`,
+  three enumerate-vs-declare inventories: the literal journal kinds (`JOURNAL_KINDS`,
   fed by a literal-kind emit that also sees kind-only writes, constructor-inline
   `Journal(run_dir).append(...)` writes — a receiver spelling the journal scan was blind
   to — and every literal reaching a declared dynamic-kind position, by keyword, by
-  POSITION, or as the parameter default; a `kind` argument such a position cannot read —
-  a variable, or a `*args` splat over the slot — fails loud rather than passing as "no
-  literal here", which is the one way an undeclared kind could still reach the journal
-  with the inventory green), the `_refuse_*`/`_reject_*` helper definitions counted with
+  POSITION, through a `**` splat, or as the parameter default; a `kind` argument such a
+  position cannot read — a variable, a `*args` splat over the slot, or a `**` splat the
+  scan cannot read into — fails loud rather than passing as "no literal here", which is
+  the one way an undeclared kind could still reach the journal with the inventory
+  green), the `_refuse_*`/`_reject_*` helper definitions counted with
   multiplicity (`REFUSAL_HELPER_DEFS`), and the eleven #414-family isolation-refusal call
   sites counted with multiplicity (`ISOLATION_CONFLICT_CALLERS`). A new kind, refusal
   helper, or refusal call site reddens CI until its row lands; the row is the PR-time
@@ -300,6 +321,69 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Probe both existence arms of the accepted-spec worktree seed through the total
+  `_is_file` (DW-103), matching its structural siblings and the DW-101 supersession
+  warning. On Python <=3.13 a raw `Path.is_file` raises on an unreadable path, and
+  this call site sits outside every `except` in `run_isolated`, so the fault ended
+  the run instead of allowing dispatch to continue. No change on non-faulting paths.
+
+- Discharge an owed code-root re-stamp record under its original root before
+  resuming (DW-100), preserving the record and integrity pin for retry on failure.
+  Warn only when the configured root differs from the recorded root; a pending
+  record alone no longer triggers the code-root warning.
+
+- **Stopped the real-tmux E2Es contending with each other under `-n logical`**
+  (DW-95). They shared the box with every other worker and could starve past their
+  fixed waits — a load flake, not a defect. All 23 collected cases now carry one
+  `xdist_group`, so loadgroup scheduling serializes them while the rest of the suite
+  still fans out; `--dist loadgroup` is declared in `pyproject.toml` `addopts`, without
+  which the marks are silently inert. Separately, the four completion- and crash-path
+  waits in `tests/test_generic_tmux.py` now share one named 90s hang ceiling — a hang
+  detector, not a performance budget — replacing per-site 30s and 20s walls; the
+  `tests/test_stories_e2e.py` tests keep their own subprocess budgets and rely on the
+  grouping alone. Guards in `tests/test_conftest.py` check repository scheduling
+  declarations and the synthetic scheduling mechanism, and prevent short completion
+  walls from returning while preserving the deliberate 6s triggers. Tests only; no
+  production change.
+
+- **Bound launch-marker snapshot retention in the dev adapters** (DW-96). Each dev
+  session start stored a park-marker snapshot under its task id and nothing removed it;
+  an unpinned launch (no `expected_spec`) snapshots every `*.md` in the artifacts dir,
+  so an adapter driving N such sessions over M files retained O(N x M) entries for its
+  lifetime. The mixin's `run()` now evicts the task's entry in a `finally`, holding only
+  launches still in flight. Eviction is scoped to the returning task id, so a concurrent
+  launch is untouched, and lands after `_post_kill_reconcile`, the last in-lifecycle
+  reader. No verdict changes.
+
+- **Bound four more per-task dev-adapter stores to the session** (DW-106, DW-107).
+  `_fm_fallback_obs`, `_fm_transition_obs`, `_contract_nudge_sent` and the OpenCode
+  transport's `_server_procs` (a live `Popen` per task) grew one entry per session for
+  the adapter's lifetime. All four are now evicted through one `_evict_task_state` seam
+  called from `run()`'s `finally` — past every in-lifecycle reader, including
+  `_post_kill_reconcile`, and still reached when `wait_for_completion` raises. Scoped to
+  the returning task id, so a concurrent session keeps its entries; within-session
+  semantics (the exactly-once contract nudge included) are unchanged.
+  `OpencodeHttpAdapter._usage` is a separate, still-unbounded case: it is keyed by
+  session id and read after `run()` returns, so it cannot use this seam.
+
+- Prevent harvest races from filing cross-spec duplicates for one fingerprint (DW-98).
+
+- **A partial journal flush no longer swallows the writer's next record** (DW-97). A
+  partially flushed `Journal.append` left an unterminated fragment, the next append
+  concatenated its own record onto it, and both readers dropped the combined line — so
+  one fault lost a record that was written whole (a swallowed `unit-merged` re-drives
+  already-merged work). `append` now terminates a fragment on its own line first. That
+  bounds the loss to the torn record for the writer's own next append only; another
+  process tearing a write concurrently can still produce the old pairing, and append
+  durability is unchanged (no fsync, no lock). Both readers (`Journal.entries`,
+  `tui.data.JournalTail.read_new`) now substitute a reader-minted
+  `journal-line-unreadable` marker — kind plus byte count, no timestamp, no line
+  content — for a complete line that will not parse, so the loss is counted in
+  `diagnose --json`'s `kind_histogram` and rendered red in the TUI. That count is a
+  floor on lost records, not an exact one: a single unparseable line can be two
+  concatenated records. An unterminated final line is still withheld by the TUI tail
+  until the heal terminates it; `Journal.entries`, which reads the file whole, marks a
+  trailing fragment straight away.
 - Preserve complete CRITICAL escalation detail in run records while visibly bounding human displays and naming the spec or journal that holds the recovery trail.
 
 - **The TUI's re-arm declines a contended run instead of waiting for it.** The
