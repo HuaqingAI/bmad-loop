@@ -43,7 +43,7 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import deferredwork, platform_util, runs, verify
+from bmad_loop import deferredwork, devcontract, platform_util, runs, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import (
@@ -9684,19 +9684,20 @@ def test_dev_escalation_records_spec_for_rearm(project):
     again on the stale `blocked` status — the loop seen in the live run."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     sp = spec_path(project, "1-1-a")
+    patch = project.implementation_artifacts / "intent-gap-attempt.patch"
+    patch.parent.mkdir(parents=True, exist_ok=True)
+    patch.write_text("saved attempt\n", encoding="utf-8")
+    detail = f"intent gap; saved patch: {patch}"
 
     def halt_blocked(spec):
         write_spec(sp, "blocked", rev_parse_head(project.project))
+        with sp.open("a", encoding="utf-8") as f:
+            f.write(f"\n## Auto Run Result\n\nStatus: blocked\n\n{detail}\n")
+        synthesized = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+        assert synthesized is not None
         return SessionResult(
             status="completed",
-            result_json={
-                "workflow": "auto-dev",
-                "story_key": "1-1-a",
-                "spec_file": str(sp),
-                "escalations": [
-                    {"type": "blocked", "severity": "CRITICAL", "detail": "blocked spec supplied"}
-                ],
-            },
+            result_json=synthesized,
         )
 
     engine, _ = make_engine(project, [halt_blocked])
@@ -9706,11 +9707,71 @@ def test_dev_escalation_records_spec_for_rearm(project):
     task = load_state(engine.run_dir).tasks["1-1-a"]
     assert task.phase == Phase.ESCALATED
     assert task.spec_file and Path(task.spec_file).name == sp.name  # recorded despite HALT
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert f"recovery trail: {sp}" in attention
+    spec_text = sp.read_text(encoding="utf-8")
+    assert str(patch) in spec_text
+    result = task.sessions[-1].result_json
+    assert result is not None
+    assert result["escalations"][0]["spec_file"] == str(sp)
 
     rearm_escalation(
         engine.run_dir, isolated_redrive=False, resolution_recorded=True
     )  # the resolve workflow's re-arm step
     assert read_frontmatter(sp)["status"] == "ready-for-dev"  # re-drive will not HALT
+
+
+def test_long_critical_reason_is_lossless_in_records_and_bounded_only_for_display(project):
+    """The recovery tail survives every durable/machine surface while notices and
+    the run summary identify the blocked spec instead of silently cutting it."""
+    from bmad_loop.documents import status_document
+    from bmad_loop.escalation import CRITICAL_DISPLAY_MAX
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    sp = spec_path(project, "1-1-a")
+    tail = "RECOVERY-TAIL"
+    detail = "x" * 2500 + tail
+
+    def halt_blocked(_spec):
+        write_spec(sp, "blocked", rev_parse_head(project.project))
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": "1-1-a",
+                "spec_file": str(sp),
+                "escalations": [
+                    {
+                        "type": "blocked",
+                        "severity": "CRITICAL",
+                        "detail": detail,
+                        "spec_file": str(sp),
+                    }
+                ],
+            },
+        )
+
+    engine, _ = make_engine(project, [halt_blocked])
+    summary = engine.run()
+    saved = load_state(engine.run_dir)
+
+    assert saved.paused_reason.endswith(tail)
+    assert saved.tasks["1-1-a"].sessions[-1].result_json["escalations"][0]["detail"].endswith(tail)
+    for kind in ("dev-decision", "story-escalated", "run-paused"):
+        (record,) = [entry for entry in engine.journal.entries() if entry["kind"] == kind]
+        assert record["reason"].endswith(tail)
+    assert status_document(saved)["paused_reason"].endswith(tail)
+
+    display = summary.paused_reason
+    assert len(display) <= CRITICAL_DISPLAY_MAX
+    assert "[… truncated; full detail in journal.jsonl]" in display
+    assert f"[recovery trail: {sp}]" in display
+    assert tail not in display
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "[… truncated; full detail in journal.jsonl]" in attention
+    assert f"[recovery trail: {sp}]" in attention
+    assert tail not in attention
+    assert f"PAUSED: {display}" in summary.render()
 
 
 # ------------------------------------------------------ deferred-artifact stash

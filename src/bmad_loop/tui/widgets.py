@@ -25,6 +25,7 @@ from textual.widgets.option_list import Option
 from textual.widgets.tree import TreeNode
 
 from .. import policy
+from ..escalation import display_pause_reason
 from ..model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
@@ -226,7 +227,7 @@ class RunHeader(Static):
                 text.append("  ")
                 text.append(f"[{label}]", style=f"bold {badge_style}")
             if state.paused_reason:
-                text.append(f" — {state.paused_reason}", style="yellow")
+                text.append(f" — {display_pause_reason(state)}", style="yellow")
             # p opens the stage-appropriate review viewer; e resumes; R resolves
             # an escalation (the header only hints the common paths).
             text.append("\n  press p to review · e to resume", style="dim")

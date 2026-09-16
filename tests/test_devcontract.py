@@ -257,6 +257,20 @@ def test_synth_blocked_frontmatter_becomes_critical(tmp_path):
     assert crits[0]["type"] == "blocked"
 
 
+def test_synth_blocked_preserves_full_detail_and_attaches_its_spec(tmp_path):
+    tail = "RECOVERY-TAIL"
+    detail = "x" * 2500 + tail
+    sp = _spec(tmp_path / "s.md", status="blocked", auto_run=None)
+    with sp.open("a", encoding="utf-8") as f:
+        f.write(f"\n## Auto Run Result\n\nStatus: blocked\n\n{detail}\n")
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+    (critical,) = rj["escalations"]
+    assert critical["detail"].endswith(tail)
+    assert len(critical["detail"]) > 2000
+    assert critical["spec_file"] == str(sp)
+
+
 def test_synth_blocked_prose_only_still_escalates(tmp_path):
     # frontmatter not yet flipped, but the prose says blocked: still PAUSE-worthy
     sp = _spec(tmp_path / "s.md", status="in-progress", auto_run="blocked")

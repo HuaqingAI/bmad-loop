@@ -4705,6 +4705,47 @@ async def test_header_counts_parked_stories_only_when_there_are_any(project):
         assert "done 1" in content  # the park did not absorb the done story
 
 
+async def test_tui_pause_surfaces_bound_critical_reason_and_name_the_spec(project):
+    from bmad_loop.escalation import CRITICAL_DISPLAY_MAX, display_pause_reason
+
+    spec = project.implementation_artifacts / "spec-1-1-alpha.md"
+    task = StoryTask(
+        story_key="1-1-alpha",
+        epic=1,
+        phase=Phase.ESCALATED,
+        spec_file=str(spec),
+    )
+    tail = "RECOVERY-TAIL"
+    reason = "CRITICAL escalation from dev session: " + "x" * 2500 + tail
+    state = RunState(
+        run_id="r1",
+        project=str(project.project),
+        started_at="now",
+        tasks={task.story_key: task},
+        paused_stage="escalation",
+        paused_reason=reason,
+        paused_story_key=task.story_key,
+    )
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        header = dashboard(app).query_one("#runheader", RunHeader)
+        header.show_run("r1", data.PAUSED, state)
+        rendered_header = str(header.content)
+        assert "[… truncated; full detail in journal.jsonl]" in rendered_header
+        assert f"[recovery trail: {spec}]" in rendered_header
+        assert tail not in rendered_header
+
+        app.push_screen(ConfirmResumeModal("r1", state, False))
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        await ready(pilot, "#body Static")
+        modal_body = app.screen._body.plain
+        assert "[… truncated; full detail in journal.jsonl]" in modal_body
+        assert f"[recovery trail: {spec}]" in modal_body
+        assert tail not in modal_body
+        assert len(display_pause_reason(state)) <= CRITICAL_DISPLAY_MAX
+
+
 async def test_active_agent_shows_in_header_and_task_cell(project, monkeypatch):
     # End to end: a RUNNING run with an open, adapter-stamped session-start paints
     # the header's live agent line and the task row's agent cell

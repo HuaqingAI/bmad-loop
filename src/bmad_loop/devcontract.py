@@ -427,7 +427,14 @@ def synthesize_result(
     escalations: list[dict[str, Any]] = []
     if status == BLOCKED or arr.status == BLOCKED:
         detail = arr.detail or "generic dev session reported a blocked outcome"
-        escalations.append({"type": "blocked", "severity": "CRITICAL", "detail": detail[:2000]})
+        escalations.append(
+            {
+                "type": "blocked",
+                "severity": "CRITICAL",
+                "detail": detail,
+                "spec_file": str(spec_path),
+            }
+        )
 
     result: dict[str, Any] = {
         "workflow": DEV_WORKFLOW,

@@ -1234,6 +1234,101 @@ def test_status_json_paused_run(project, capsys):
     assert doc["finished"] is False
 
 
+def test_status_text_bounds_critical_reason_while_json_stays_lossless(project, capsys):
+    """The fixture's absolute worktree-local `spec_file` is deliberate: `save_state`
+    persists it worktree-RELATIVE (`StoryTask._serialized_worktree_path`) and
+    `from_dict` reads it back raw, so the `[recovery trail: …]` assertion against the
+    absolute path only holds when the display anchors through `runs.task_spec_path`.
+    Ablated: substituting bare `task.spec_file` renders the relative spelling and fails."""
+    from bmad_loop.escalation import CRITICAL_DISPLAY_MAX
+    from bmad_loop.journal import save_state
+    from bmad_loop.model import PAUSE_ESCALATION, Phase, RunState, StoryTask
+
+    run_id = "20260101-000000-aaaa"
+    run_dir = project.project / ".bmad-loop" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    worktree = project.project / ".bmad-loop" / "runs" / run_id / "worktrees" / "1-1-login"
+    spec = worktree / "_bmad-output" / "implementation-artifacts" / "spec-1-1-login.md"
+    task = StoryTask(
+        story_key="1-1-login",
+        epic=1,
+        phase=Phase.ESCALATED,
+        spec_file=str(spec),
+        worktree_path=str(worktree),
+    )
+    tail = "RECOVERY-TAIL"
+    reason = "CRITICAL escalation from dev session: " + "x" * 2500 + tail
+    save_state(
+        run_dir,
+        RunState(
+            run_id=run_id,
+            project=str(project.project),
+            started_at="now",
+            paused_reason=reason,
+            paused_stage=PAUSE_ESCALATION,
+            paused_story_key=task.story_key,
+            tasks={task.story_key: task},
+        ),
+    )
+
+    assert _status_json(project, capsys)["paused_reason"].endswith(tail)
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    status_line = next(
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("status: PAUSED")
+    )
+    rendered_reason = status_line.split(" — ", 1)[1]
+    assert len(rendered_reason) <= CRITICAL_DISPLAY_MAX
+    assert "[… truncated; full detail in journal.jsonl]" in rendered_reason
+    assert f"[recovery trail: {spec}]" in rendered_reason
+    assert tail not in rendered_reason
+
+
+def test_status_text_handles_missing_task_and_malformed_pause_fields(project, capsys):
+    from bmad_loop.model import PAUSE_ESCALATION
+
+    _make_run_with_state(
+        project.project,
+        "r1",
+        paused_reason=123,
+        paused_stage=PAUSE_ESCALATION,
+        paused_story_key=["unhashable"],
+        tasks={},
+    )
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    assert "status: PAUSED (escalation) — 123" in capsys.readouterr().out
+
+    reason = "x" * 2501
+    _make_run_with_state(
+        project.project,
+        "r2",
+        paused_reason=reason,
+        paused_stage=PAUSE_ESCALATION,
+        paused_story_key="missing",
+        tasks={},
+    )
+    assert cli.main(["status", "--project", str(project.project), "r2"]) == 0
+    rendered = capsys.readouterr().out
+    assert "full detail in journal.jsonl" in rendered
+    assert "recovery trail" not in rendered
+
+
+def test_status_text_leaves_long_non_escalation_reason_byte_identical(project, capsys):
+    reason = "gate:" + "x" * 2500
+    _make_run_with_state(
+        project.project,
+        "r1",
+        paused_reason=reason,
+        paused_stage="story-gate",
+    )
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    status_line = next(
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("status: PAUSED")
+    )
+    assert status_line.split(" — ", 1)[1] == reason
+
+
 def test_status_json_defer_and_commit_are_separate_fields(project, capsys):
     """The text line's trailing cell is `defer_reason or commit_sha` — ambiguous
     free text, the core #190 complaint. The document keeps them apart."""

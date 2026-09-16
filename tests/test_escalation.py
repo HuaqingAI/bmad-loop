@@ -1,12 +1,18 @@
 """Unit tests for the dev/review retry-budget decisions — specifically the
 resolved-escalation guard that re-escalates instead of silently deferring."""
 
+import pytest
+
+from bmad_loop import escalation
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.escalation import (
+    CRITICAL_DISPLAY_MAX,
     Action,
     critical_escalations,
+    critical_session_reason,
     decide_dev,
     decide_review_session,
+    display_critical_reason,
     preference_escalations,
     review_retry_or_exhaust,
 )
@@ -41,6 +47,60 @@ def test_escalation_selectors_reject_every_non_list_shape():
         result = {"escalations": value}
         assert critical_escalations(result) == []
         assert preference_escalations(result) == []
+
+
+@pytest.mark.parametrize("role", ["dev", "review", "fix", "migration", "triage"])
+def test_every_critical_session_role_uses_the_shared_lossless_formatter(role):
+    detail = "begin\n" + "x" * 2500 + "TAIL"
+    reason = critical_session_reason(
+        role,
+        {"escalations": [{"severity": "CRITICAL", "detail": detail}]},
+    )
+    assert reason == f"CRITICAL escalation from {role} session: {detail}"
+    assert reason.endswith("TAIL")
+
+
+def test_critical_display_bound_marks_spec_or_journal_without_touching_short_text():
+    exact = "x" * CRITICAL_DISPLAY_MAX
+    assert display_critical_reason(exact) == exact
+    assert "truncated" not in display_critical_reason(exact)
+
+    with_spec = display_critical_reason(exact + "TAIL", "/tmp/spec.md")
+    without_spec = display_critical_reason(exact + "TAIL")
+    assert len(with_spec) <= CRITICAL_DISPLAY_MAX
+    assert "[… truncated; full detail in journal.jsonl]" in with_spec
+    assert "[recovery trail: /tmp/spec.md]" in with_spec
+    assert len(without_spec) <= CRITICAL_DISPLAY_MAX
+    assert "[… truncated; full detail in journal.jsonl]" in without_spec
+    assert "TAIL" not in with_spec
+
+
+def test_critical_display_preserves_source_spelling_and_compacts_an_overlong_source():
+    spaced = "/tmp/spec.md "
+    assert display_critical_reason("short", spaced) == f"short [recovery trail: {spaced}]"
+
+    source = "/root/" + "middle/" * 300 + "spec.md"
+    displayed = display_critical_reason("R" * 3000, source)
+    assert len(displayed) <= CRITICAL_DISPLAY_MAX
+    assert "R" * 1000 in displayed
+    assert "full detail in journal.jsonl" in displayed
+    assert "recovery trail: /root/" in displayed
+    assert displayed.endswith("spec.md]")
+    assert source not in displayed
+
+
+def test_decide_review_session_calls_the_shared_critical_formatter(monkeypatch):
+    calls = []
+
+    def shared(role, result_json):
+        calls.append((role, result_json))
+        return "shared review reason"
+
+    monkeypatch.setattr(escalation, "critical_session_reason", shared)
+    result = SessionResult(status="completed", result_json={"escalations": []})
+    decision = escalation.decide_review_session(_task(), result, POLICY)
+    assert calls == [("review", result.result_json)]
+    assert decision == escalation.Decision(Action.PAUSE, "shared review reason")
 
 
 def _task(**kw) -> StoryTask:

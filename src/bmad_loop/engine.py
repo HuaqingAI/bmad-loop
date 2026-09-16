@@ -30,9 +30,11 @@ from .bmadconfig import ProjectPaths
 from .escalation import (
     Action,
     Decision,
-    critical_escalations,
+    critical_session_reason,
     decide_dev,
     decide_review_session,
+    display_critical_reason,
+    display_pause_reason,
     env_fault_pause_reason,
     preference_escalations,
     review_exhausted,
@@ -1126,7 +1128,7 @@ class Engine:
             escalated=sum(1 for t in tasks if t.phase == Phase.ESCALATED),
             awaiting_operator=sum(1 for t in tasks if t.phase == Phase.AWAITING_OPERATOR),
             paused=self.state.paused,
-            paused_reason=self.state.paused_reason or "",
+            paused_reason=display_pause_reason(self.state),
             total_tokens=sum(t.tokens.total for t in tasks),
             # Sum PER TASK, not over one aggregated TokenUsage: weighted_total
             # rounds internally, so sum-of-rounds != round-of-sum (they drift by
@@ -6679,10 +6681,9 @@ class Engine:
             # session reporting the same thing fired one. The hook is named for
             # the verification, the verification ran, and a plugin correlating
             # verify passes cannot have half of them silently withheld.
-            crits = critical_escalations(result.result_json)
-            if crits:
-                details = "; ".join(str(e.get("detail", e.get("type", "?"))) for e in crits)
-                self._escalate(task, f"CRITICAL escalation from fix session: {details}")
+            critical_reason = critical_session_reason("fix", result.result_json)
+            if critical_reason is not None:
+                self._escalate(task, critical_reason)
             if result.status != "completed" and result.env_fault:
                 # A fix session whose CLI lost its API connection (#194) did no
                 # repair work — another attempt cannot fix the run environment, so
@@ -7701,11 +7702,12 @@ class Engine:
     def _escalate(self, task: StoryTask, reason: str) -> None:
         advance(task, Phase.ESCALATED)
         self.journal.append("story-escalated", story_key=task.story_key, reason=reason)
+        displayed = display_critical_reason(reason, task.spec_file)
         gates.notify(
             self.policy,
             self.run_dir,
             f"CRITICAL escalation: {task.story_key}",
-            f"{reason} — resolve, then `bmad-loop resume {self.state.run_id}`",
+            f"{displayed} — resolve, then `bmad-loop resume {self.state.run_id}`",
         )
         self._save()
         raise RunPaused(reason, PAUSE_ESCALATION, task.story_key)

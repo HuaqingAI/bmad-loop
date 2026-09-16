@@ -70,6 +70,7 @@ from .documents import (
     validate_document,
 )
 from .engine import Engine
+from .escalation import display_pause_reason
 from .journal import Journal, load_state, save_state, state_lock
 from .model import RunState
 from .platform_util import (
@@ -3914,7 +3915,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     if state.finished:
         print("status: finished")
     elif state.paused:
-        print(f"status: PAUSED ({state.paused_stage}) — {state.paused_reason}")
+        print(f"status: PAUSED ({state.paused_stage}) — {display_pause_reason(state)}")
     elif graceful_pending:
         print("status: in progress — graceful stop pending (will stop after the current item)")
     else:
