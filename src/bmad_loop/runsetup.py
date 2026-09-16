@@ -1269,12 +1269,6 @@ def compose_sweep(
             sweep_options_version=SWEEP_OPTIONS_VERSION,
             trusted_config_digest=trusted_config_digest,
         )
-        # Same indivisible state/pid publication as compose_run.
-        with state_lock(run_dir):
-            save_state(run_dir, state)
-            # Out of the tree, same ordering and same reason as compose_run's stamp.
-            runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
-            runs.write_pid(run_dir)
         options = {
             "prompting": prompting,
             "decisions_only": decisions_only,
@@ -1292,6 +1286,15 @@ def compose_sweep(
         sweep_tmp = sweep_path.with_suffix(".json.tmp")
         sweep_tmp.write_text(json.dumps(options, indent=2), encoding="utf-8")
         atomic_replace(sweep_tmp, sweep_path)
+        # Publish selector-capable state only after its required options file is
+        # complete. The state lock keeps state.json + pid indivisible to resume;
+        # ordering sweep.json ahead of both closes the kill window where a marked
+        # run was visible but could never be resumed without widening its scope.
+        with state_lock(run_dir):
+            save_state(run_dir, state)
+            # Out of the tree, same ordering and same reason as compose_run's stamp.
+            runs.write_trusted_config_digest(project, run_id, trusted_config_digest)
+            runs.write_pid(run_dir)
         adapters = make_adapters(project, run_dir, policy, profiles=profiles)
         journal.append("run-start", run_id=run_id, run_type="sweep", trigger=trigger)
         engine: Engine = sweep_engine_cls(

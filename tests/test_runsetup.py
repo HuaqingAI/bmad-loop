@@ -416,6 +416,81 @@ def test_compose_sweep_persists_and_wires_selectors(tmp_path, only_ids, min_seve
     assert composed.engine.kwargs["min_severity"] == min_severity
 
 
+def test_compose_sweep_publishes_options_before_marked_state_and_pid(tmp_path, monkeypatch):
+    observed: list[str] = []
+    real_save_state = runsetup.save_state
+    real_write_pid = runs.write_pid
+
+    def assert_complete_options(run_dir):
+        options = json.loads((run_dir / "sweep.json").read_text(encoding="utf-8"))
+        assert options["only"] == ["DW-3", "DW-1"]
+        assert options["min_severity"] is None
+
+    def observed_save(run_dir, state):
+        assert_complete_options(run_dir)
+        assert state.sweep_options_version == runsetup.SWEEP_OPTIONS_VERSION
+        observed.append("state")
+        real_save_state(run_dir, state)
+
+    def observed_pid(run_dir):
+        assert_complete_options(run_dir)
+        assert load_state(run_dir).sweep_options_version == runsetup.SWEEP_OPTIONS_VERSION
+        observed.append("pid")
+        real_write_pid(run_dir)
+
+    monkeypatch.setattr(runsetup, "save_state", observed_save)
+    monkeypatch.setattr(runs, "write_pid", observed_pid)
+
+    runsetup.compose_sweep(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        repeat=None,
+        max_cycles=None,
+        trigger="cli",
+        make_adapters=_accepting_adapters,
+        sweep_engine_cls=_CapturingEngine,
+        trusted_config_digest="deadbeef",
+        only_ids=("DW-3", "DW-1"),
+    )
+
+    assert observed == ["state", "pid"]
+
+
+def test_compose_sweep_unwinds_options_when_state_publication_fails(tmp_path, monkeypatch):
+    run_dir = runs.run_dir_for(tmp_path, RUN_ID)
+
+    def fail_after_options(_run_dir, _state):
+        assert (run_dir / "sweep.json").is_file()
+        raise RuntimeError("state publication failed")
+
+    monkeypatch.setattr(runsetup, "save_state", fail_after_options)
+
+    with pytest.raises(RuntimeError, match="state publication failed"):
+        runsetup.compose_sweep(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            policy=policy_mod.loads(""),
+            run_id=RUN_ID,
+            prompting=False,
+            decisions_only=False,
+            max_bundles=None,
+            repeat=None,
+            max_cycles=None,
+            trigger="cli",
+            make_adapters=_accepting_adapters,
+            sweep_engine_cls=_CapturingEngine,
+            trusted_config_digest="deadbeef",
+            only_ids=("DW-1",),
+        )
+
+    assert not run_dir.exists()
+
+
 @pytest.mark.parametrize(
     "contents",
     [None, "{}"],
