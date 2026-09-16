@@ -1798,6 +1798,20 @@ def test_sweep_dry_run_projects_after_an_arbitrarily_large_canonical_id(project,
     assert "Open legacy item" in out and "pre-migration projection" in out
 
 
+def test_sweep_dry_run_normalizes_unicode_decimal_id_before_projection(project, capsys):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-９: Canonical open\n\norigin: test\nstatus: open\n\n"
+        "## Deferred from: review\n\n- Open legacy item\n",
+        encoding="utf-8",
+    )
+
+    assert cli._sweep_dry_run(project, policy_mod.load(None)) == 0
+    out = capsys.readouterr().out
+    assert "DW-10" in out and "Open legacy item" in out
+    assert "DW-：" not in out
+
+
 @pytest.mark.parametrize("only_id", ["DW-2", "DW-9"], ids=["projected-done", "unknown"])
 def test_sweep_dry_run_only_refuses_non_open_or_unknown_projected_id(project, capsys, only_id):
     project.deferred_work.write_text(

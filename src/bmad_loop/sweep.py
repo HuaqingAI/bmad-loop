@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -53,14 +54,16 @@ DW_ID_RE = re.compile(r"DW-[0-9]+\Z")
 
 
 def decimal_digits_key(value: str) -> tuple[int, str]:
-    """Order arbitrary-length ASCII decimal text without converting to ``int``."""
-    normalized = value.lstrip("0") or "0"
+    """Order arbitrary-length Unicode decimal text without converting to ``int``."""
+    normalized = "".join(str(unicodedata.decimal(char)) for char in value)
+    normalized = normalized.lstrip("0") or "0"
     return len(normalized), normalized
 
 
 def increment_decimal_digits(value: str) -> str:
-    """Increment arbitrary-length ASCII decimal text without ``int`` limits."""
-    digits = list(value.lstrip("0") or "0")
+    """Normalize and increment arbitrary-length Unicode decimal text."""
+    ascii_value = "".join(str(unicodedata.decimal(char)) for char in value)
+    digits = list(ascii_value.lstrip("0") or "0")
     carry = 1
     for index in range(len(digits) - 1, -1, -1):
         if not carry:
@@ -506,14 +509,12 @@ def validate_migration(
     def first_word(status: str) -> str:
         return status.split()[0] if status.split() else ""
 
-    pre_max = (
-        max(
-            (dw_id.removeprefix("DW-") for dw_id in pre_canonical),
-            key=decimal_digits_key,
-            default="0",
-        ).lstrip("0")
-        or "0"
+    pre_max = max(
+        (dw_id.removeprefix("DW-") for dw_id in pre_canonical),
+        key=decimal_digits_key,
+        default="0",
     )
+    pre_max = decimal_digits_key(pre_max)[1]
     for dw_id, pre in pre_canonical.items():
         e = entries.get(dw_id)
         if e is None:

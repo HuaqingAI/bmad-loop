@@ -1061,6 +1061,15 @@ def test_validate_migration_compares_arbitrarily_large_dw_ids_without_int_conver
     assert validate_migration(result, manifest, snapshot_canonical(before), rewritten) == []
 
 
+def test_validate_migration_normalizes_unicode_decimal_ids_for_numbering():
+    before = "# Deferred Work\n\n### DW-９: existing\n\norigin: test\nstatus: open\n"
+    rewritten = before + "\n### DW-10: migrated\n\norigin: migrated\nstatus: open\n"
+    manifest = [{"key": "legacy-1", "done": False, "severity": None}]
+    result = migrate_result([{"key": "legacy-1", "dw_id": "DW-10"}])
+
+    assert validate_migration(result, manifest, snapshot_canonical(before), rewritten) == []
+
+
 def test_validate_migration_requires_contiguous_ids_in_manifest_order():
     legacy = (
         "# Deferred Work\n\n"
