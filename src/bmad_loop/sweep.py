@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -48,6 +49,33 @@ _BUNDLE_NAME_SAFE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
 # empty and the split stays unambiguous even for a bundle named "2fix".
 BUNDLE_KEY_RE = re.compile(r"^dw(\d*)-(.+)\Z")
 DECISION_EFFECTS = ("build", "close", "keep-open")
+SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+DW_ID_RE = re.compile(r"DW-\d+\Z")
+
+
+def decimal_digits_key(value: str) -> tuple[int, str]:
+    """Order arbitrary-length Unicode decimal text without converting to ``int``."""
+    normalized = "".join(str(unicodedata.decimal(char)) for char in value)
+    normalized = normalized.lstrip("0") or "0"
+    return len(normalized), normalized
+
+
+def increment_decimal_digits(value: str) -> str:
+    """Normalize and increment arbitrary-length Unicode decimal text."""
+    ascii_value = "".join(str(unicodedata.decimal(char)) for char in value)
+    digits = list(ascii_value.lstrip("0") or "0")
+    carry = 1
+    for index in range(len(digits) - 1, -1, -1):
+        if not carry:
+            break
+        if digits[index] == "9":
+            digits[index] = "0"
+        else:
+            digits[index] = chr(ord(digits[index]) + 1)
+            carry = 0
+    if carry:
+        digits.insert(0, "1")
+    return "".join(digits)
 
 
 @dataclass(frozen=True)
@@ -150,6 +178,59 @@ class TriagePlan:
     blocked: tuple[tuple[str, str], ...] = ()  # (id, blocker)
     skip: tuple[tuple[str, str], ...] = ()  # (id, reason)
     decisions: tuple[Decision, ...] = ()
+
+
+@dataclass(frozen=True)
+class SweepSelection:
+    selected: tuple[deferredwork.DWEntry, ...]
+    excluded: tuple[deferredwork.DWEntry, ...]
+    missing_severity: tuple[deferredwork.DWEntry, ...] = ()
+
+
+def select_entries(
+    entries: Iterable[deferredwork.DWEntry],
+    *,
+    only_ids: tuple[str, ...] | None = None,
+    min_severity: str | None = None,
+    validate_only: bool = False,
+) -> SweepSelection:
+    """Select from canonical open entries without changing the ledger parser's universe."""
+    if only_ids is not None and min_severity is not None:
+        raise ValueError("--only cannot combine with --min-severity")
+    if only_ids is not None:
+        if not only_ids:
+            raise ValueError("--only requires at least one DW-<n> id")
+        malformed = [dw_id for dw_id in only_ids if not DW_ID_RE.fullmatch(dw_id)]
+        if malformed:
+            raise ValueError("--only contains malformed ids: " + ", ".join(malformed))
+    if min_severity is not None and min_severity not in SEVERITY_ORDER:
+        raise ValueError("--min-severity must be one of: " + ", ".join(SEVERITY_ORDER))
+    open_entries = tuple(entry for entry in entries if entry.open)
+    if only_ids is not None:
+        open_ids = {entry.id for entry in open_entries}
+        unavailable = [dw_id for dw_id in only_ids if dw_id not in open_ids]
+        if validate_only and unavailable:
+            raise ValueError("--only ids must exist and be open: " + ", ".join(unavailable))
+        requested = set(only_ids)
+        return SweepSelection(
+            selected=tuple(entry for entry in open_entries if entry.id in requested),
+            excluded=tuple(entry for entry in open_entries if entry.id not in requested),
+        )
+    if min_severity is not None:
+        floor = SEVERITY_ORDER[min_severity]
+        missing = tuple(entry for entry in open_entries if entry.severity is None)
+        selected = tuple(
+            entry
+            for entry in open_entries
+            if entry.severity is not None and SEVERITY_ORDER[entry.severity] >= floor
+        )
+        selected_ids = {entry.id for entry in selected}
+        return SweepSelection(
+            selected=selected,
+            excluded=tuple(entry for entry in open_entries if entry.id not in selected_ids),
+            missing_severity=missing,
+        )
+    return SweepSelection(selected=open_entries, excluded=())
 
 
 def validate_triage(
@@ -356,6 +437,7 @@ class PreCanonical:
 
     status: str
     gate_tokens: tuple[str, ...]
+    severity: str | None
 
 
 def snapshot_canonical(text: str) -> dict[str, PreCanonical]:
@@ -363,7 +445,7 @@ def snapshot_canonical(text: str) -> dict[str, PreCanonical]:
 
     A named function rather than a comprehension inlined at its one call site so
     that the tests grade the snapshot production actually builds: a hand-written
-    ``{"DW-1": PreCanonical("open", ("3-2",))}`` would pass whatever the parser
+    ``{"DW-1": PreCanonical("open", ("3-2",), "high")}`` would pass whatever the parser
     really produces for that entry, and the bug being fixed here lived in the
     snapshot, not in the comparison.
 
@@ -378,7 +460,7 @@ def snapshot_canonical(text: str) -> dict[str, PreCanonical]:
     snapshot: dict[str, PreCanonical] = {}
     for e in deferredwork.parse_ledger(text):
         g = deferredwork.gates(e)
-        snapshot[e.id] = PreCanonical(e.status, g.tokens + g.malformed)
+        snapshot[e.id] = PreCanonical(e.status, g.tokens + g.malformed, e.severity)
     return snapshot
 
 
@@ -427,7 +509,12 @@ def validate_migration(
     def first_word(status: str) -> str:
         return status.split()[0] if status.split() else ""
 
-    pre_max = max((int(i.split("-")[1]) for i in pre_canonical), default=0)
+    pre_max = max(
+        (dw_id.removeprefix("DW-") for dw_id in pre_canonical),
+        key=decimal_digits_key,
+        default="0",
+    )
+    pre_max = decimal_digits_key(pre_max)[1]
     for dw_id, pre in pre_canonical.items():
         e = entries.get(dw_id)
         if e is None:
@@ -435,6 +522,10 @@ def validate_migration(
             continue
         if first_word(e.status) != first_word(pre.status):
             errors.append(f"pre-existing {dw_id} status changed: {pre.status!r} -> {e.status!r}")
+        if e.severity != pre.severity:
+            errors.append(
+                f"pre-existing {dw_id} severity changed: {pre.severity!r} -> {e.severity!r}"
+            )
         # Drops and edits only; an ADDED token is deliberately accepted. The two
         # directions are not the same failure: a dropped token un-gates a story
         # silently, which is what #519 is about, while an added one over-blocks
@@ -451,7 +542,7 @@ def validate_migration(
     for dw_id, e in entries.items():
         if dw_id in pre_canonical:
             continue
-        if int(dw_id.split("-")[1]) <= pre_max:
+        if decimal_digits_key(dw_id.removeprefix("DW-")) <= decimal_digits_key(pre_max):
             errors.append(f"new entry {dw_id} does not continue numbering past DW-{pre_max}")
         if first_word(e.status) not in ("open", "done"):
             errors.append(f"new entry {dw_id} has status {e.status!r}; want open or done")
@@ -461,6 +552,8 @@ def validate_migration(
     if not isinstance(mapping, list):
         return errors + ["mapping must be a list of {key, dw_id}"]
     seen_keys: set[str] = set()
+    target_by_key: dict[str, str] = {}
+    sources_by_target: dict[str, list[dict[str, Any]]] = {}
     for item in mapping:
         key = str(item.get("key", "")) if isinstance(item, dict) else ""
         dw_id = str(item.get("dw_id", "")) if isinstance(item, dict) else ""
@@ -471,15 +564,62 @@ def validate_migration(
         if key in seen_keys:
             errors.append(f"mapping repeats key {key!r}")
         seen_keys.add(key)
+        target_by_key.setdefault(key, dw_id)
         target = entries.get(dw_id)
         if target is None:
             errors.append(f"mapping {key} -> {dw_id}: no such entry in the ledger")
-        elif (first_word(target.status) == "done") != bool(source["done"]):
-            want = "done" if source["done"] else "open"
-            errors.append(f"mapping {key} -> {dw_id}: manifest says {want}, ledger disagrees")
+        elif dw_id in pre_canonical:
+            errors.append(
+                f"mapping {key} -> {dw_id}: legacy items must map to newly created entries"
+            )
+        else:
+            sources_by_target.setdefault(dw_id, []).append(source)
+            if (first_word(target.status) == "done") != bool(source["done"]):
+                want = "done" if source["done"] else "open"
+                errors.append(f"mapping {key} -> {dw_id}: manifest says {want}, ledger disagrees")
+    for dw_id, sources in sources_by_target.items():
+        target = entries[dw_id]
+        source_severities = [source.get("severity") for source in sources]
+        present = [severity for severity in source_severities if severity is not None]
+        expected = max(present, key=SEVERITY_ORDER.__getitem__) if present else None
+        if target.severity != expected:
+            if len(sources) == 1:
+                key = str(sources[0]["key"])
+                errors.append(
+                    f"mapping {key} -> {dw_id}: manifest severity "
+                    f"{expected!r}, ledger has {target.severity!r}"
+                )
+            else:
+                errors.append(
+                    f"merged mapping -> {dw_id}: highest manifest severity "
+                    f"{expected!r}, ledger has {target.severity!r}"
+                )
     missing = sorted(set(manifest_by_key) - seen_keys)
     if missing:
         errors.append("manifest keys not mapped: " + ", ".join(missing))
+
+    # Dry-run projects legacy ids in manifest/file order.  Hold the rewrite to
+    # that same contiguous allocation so a selected provisional id cannot name
+    # a different issue after migration.  Equal adjacent targets are the one
+    # permitted exception: migration mode may merge duplicate legacy items,
+    # including nonadjacent items, onto any target allocated earlier.
+    expected_suffix = increment_decimal_digits(pre_max)
+    allocated_targets: set[str] = set()
+    for manifest_item in manifest:
+        key = str(manifest_item["key"])
+        target = target_by_key.get(key)
+        if target is None:
+            continue
+        if target in allocated_targets:
+            continue
+        expected_target = f"DW-{expected_suffix}"
+        if target != expected_target:
+            errors.append(
+                f"mapping {key} -> {target}: migration ids must follow manifest order; "
+                f"expected {expected_target}"
+            )
+        allocated_targets.add(target)
+        expected_suffix = increment_decimal_digits(expected_suffix)
     return errors
 
 
@@ -582,6 +722,8 @@ class SweepEngine(Engine):
         max_bundles: int | None = None,
         repeat: bool | None = None,
         max_cycles: int | None = None,
+        only_ids: tuple[str, ...] | None = None,
+        min_severity: str | None = None,
         prompter: DecisionPrompter | None = None,
         **kwargs: Any,
     ):
@@ -594,6 +736,12 @@ class SweepEngine(Engine):
         self.max_bundles = max_bundles if max_bundles is not None else self.policy.sweep.max_bundles
         self.repeat = repeat if repeat is not None else self.policy.sweep.repeat
         self.max_cycles = max_cycles if max_cycles is not None else self.policy.sweep.max_cycles
+        self.only_ids = only_ids
+        self.min_severity = min_severity
+        self._selection_started = self.state.sweep_cycle > 1 or any(
+            key == TRIAGE_KEY or key.startswith(f"{TRIAGE_KEY}-") or BUNDLE_KEY_RE.match(key)
+            for key in self.state.tasks
+        )
         self.prompter = prompter or DecisionPrompter()
         # decisions already journaled as skipped this process; without it a
         # persistent decision item would notify once per repeat cycle
@@ -608,7 +756,12 @@ class SweepEngine(Engine):
         try:
             ledger = self.workspace.paths.deferred_work
             text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
-            return len(deferredwork.open_ids(text))
+            selection = select_entries(
+                deferredwork.parse_ledger(text),
+                only_ids=self.only_ids,
+                min_severity=self.min_severity,
+            )
+            return len(selection.selected)
         except Exception:  # a hint must never break the stop
             return None
 
@@ -648,16 +801,45 @@ class SweepEngine(Engine):
                     return
                 self._ensure_migration(text)
                 text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
-            open_now = deferredwork.open_ids(text)
+            entries = deferredwork.parse_ledger(text)
+            selection = select_entries(
+                entries,
+                only_ids=self.only_ids,
+                min_severity=self.min_severity,
+                validate_only=not self._selection_started,
+            )
+            self._selection_started = True
+            open_now = {entry.id for entry in entries if entry.open}
             if not open_now:
                 if cycle == 1:
                     self.journal.append("sweep-nothing-open", ledger=str(ledger))
                 else:
                     self.journal.append("sweep-repeat-done", cycles=cycle - 1, reason="no-open")
                 return
+            selected_ids = {entry.id for entry in selection.selected}
+            selector = "only" if self.only_ids is not None else f"min-severity:{self.min_severity}"
+            if selection.excluded:
+                self.journal.append(
+                    "sweep-selection-excluded",
+                    cycle=cycle,
+                    reason=selector,
+                    dw_ids=[entry.id for entry in selection.excluded],
+                )
+            if selection.missing_severity:
+                self.journal.append(
+                    "sweep-selection-missing-severity",
+                    cycle=cycle,
+                    dw_ids=[entry.id for entry in selection.missing_severity],
+                )
+            if not selected_ids:
+                if cycle == 1:
+                    self.journal.append("sweep-selection-empty", reason=selector)
+                else:
+                    self.journal.append("sweep-repeat-done", cycles=cycle - 1, reason="no-selected")
+                return
             if cycle > 1:
                 self.journal.append("sweep-cycle", cycle=cycle, open=len(open_now))
-            progressed = self._cycle(cycle, open_now)
+            progressed = self._cycle(cycle, selected_ids)
             if self.decisions_only or not self.repeat:
                 return
             if not progressed:
@@ -1171,6 +1353,7 @@ class SweepEngine(Engine):
         suffix = "" if cycle == 1 else f"-{cycle}"
         triage_path = self.run_dir / f"triage{suffix}.json"
         triage_key = TRIAGE_KEY + suffix
+        selector_cache_mismatch = False
         if triage_path.is_file():
             # already validated this run; the ledger has moved since (closes,
             # decisions), so skip the open-set equality re-check. A cache we
@@ -1185,6 +1368,15 @@ class SweepEngine(Engine):
                     plan, errors = validate_triage(cached, None)
                 else:
                     plan, errors = None, [f"not a JSON object: {type(cached).__name__}"]
+                if (
+                    plan is not None
+                    and (self.only_ids is not None or self.min_severity is not None)
+                    and plan.open_ids != frozenset(open_now)
+                ):
+                    selector_cache_mismatch = True
+                    plan, errors = None, [
+                        "cached selected open_ids no longer match the current selector universe"
+                    ]
                 if plan is not None:
                     return plan
                 self.journal.append("sweep-triage-reload-failed", errors=errors)
@@ -1196,7 +1388,10 @@ class SweepEngine(Engine):
         elif task.phase != Phase.PENDING:
             # resumed mid-triage or retrying after an escalation: restart
             self.journal.append("resume-restart", story_key=triage_key, phase=str(task.phase))
-            if task.phase == Phase.ESCALATED:
+            if selector_cache_mismatch:
+                task.attempt = 0
+                _rearm_generation(task)
+            elif task.phase == Phase.ESCALATED:
                 task.attempt = 0  # the human resumed deliberately; fresh budget
                 _rearm_generation(task)  # ...and into a fresh session-id namespace
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition
@@ -1209,7 +1404,7 @@ class SweepEngine(Engine):
             result = self._run_session(
                 task,
                 role="triage",
-                prompt=self._triage_prompt(feedback),
+                prompt=self._triage_prompt(feedback, open_now),
                 seq=task.attempt,
             )
             advance(task, Phase.TRIAGE_VERIFY)
@@ -1266,8 +1461,22 @@ class SweepEngine(Engine):
                 "The triage result.json failed deterministic validation:\n- " + "\n- ".join(errors),
             )
 
-    def _triage_prompt(self, feedback: Path | None) -> str:
+    def _triage_prompt(self, feedback: Path | None, open_now: set[str] | None = None) -> str:
         prompt = "/bmad-loop-sweep"
+        if open_now is not None and (self.only_ids is not None or self.min_severity is not None):
+            ordered = (
+                [dw_id for dw_id in self.only_ids if dw_id in open_now]
+                if self.only_ids is not None
+                else sorted(
+                    open_now,
+                    key=lambda value: (
+                        len(value.removeprefix("DW-").lstrip("0") or "0"),
+                        value.removeprefix("DW-").lstrip("0") or "0",
+                        value,
+                    ),
+                )
+            )
+            prompt += " --only " + ",".join(ordered)
         if feedback is not None:
             prompt += f" --feedback {feedback}"
         return prompt

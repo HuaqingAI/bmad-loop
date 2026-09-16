@@ -41,6 +41,18 @@ def test_run_state_stories_fields_default_and_round_trip():
     assert back.spec_folder == "_bmad-output/epic-1"
 
 
+def test_run_state_sweep_options_version_round_trips_and_defaults_legacy():
+    state = _state(run_type="sweep", sweep_options_version=2, sweep_options_digest="a" * 64)
+    round_tripped = RunState.from_dict(state.to_dict())
+    assert round_tripped.sweep_options_version == 2
+    assert round_tripped.sweep_options_digest == "a" * 64
+    legacy = state.to_dict()
+    del legacy["sweep_options_version"]
+    del legacy["sweep_options_digest"]
+    assert RunState.from_dict(legacy).sweep_options_version == 0
+    assert RunState.from_dict(legacy).sweep_options_digest == ""
+
+
 def test_run_state_code_root_restamp_pending_round_trips_and_defaults_false():
     """The intent marker `runs.restamp_code_root` sets between the moved root and its
     journal record survives the state round trip, and a state.json from before the

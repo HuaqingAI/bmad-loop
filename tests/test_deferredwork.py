@@ -37,6 +37,7 @@ from bmad_loop.deferredwork import (
     parse_legacy,
     record_decision,
 )
+from bmad_loop.sweep import select_entries
 
 OPERATION_ID = "run-20260803T120000/dw-fix"
 
@@ -1199,6 +1200,32 @@ def test_field_severity_forms():
     assert field_severity("priority: blocker") == "critical"
     assert field_severity("severity: n/a") is None
     assert field_severity("no field here") is None
+
+
+def test_canonical_severity_uses_the_whole_file_fence_index():
+    text = """\
+# Deferred Work
+
+### DW-1: live alias follows an example
+
+```markdown
+severity: critical
+```
+priority: minor
+status: open
+
+### DW-2: only an example
+
+~~~markdown
+priority: blocker
+~~~
+status: open
+"""
+
+    first, second = parse_ledger(text)
+
+    assert first.severity == "low"
+    assert second.severity is None
 
 
 # the generic bmad-dev-auto review appender flat shape (step-04 deferral)
@@ -2922,6 +2949,46 @@ def test_archive_stub_preserves_reopenable_undo_tail(tmp_path):
     # ...and mark_open can still undo it (the tail is intact and adjacent)
     assert mark_open(path, "DW-1", "sweep bundle", "op-1") is True
     assert "DW-1" in open_ids(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    ("live_field", "normalized", "floor"),
+    [
+        ("severity: high", "high", "high"),
+        ("- **Priority:** blocker", "critical", "critical"),
+    ],
+    ids=["severity", "priority-alias"],
+)
+def test_archived_reopenable_stub_preserves_live_severity_for_selection(
+    tmp_path, live_field, normalized, floor
+):
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: severity survives archive\n\n"
+        "origin: test\n"
+        "```markdown\nseverity: low\npriority: minor\n```\n"
+        f"{live_field}\n"
+        "status: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert mark_done_many_reopenable(
+        path, ["DW-1"], "2026-05-25", "sweep bundle", OPERATION_ID
+    ) == ["DW-1"]
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    stub = parse_ledger(path.read_text(encoding="utf-8"))[0]
+    assert live_field in stub.body
+    assert "severity: low" not in stub.body and "priority: minor" not in stub.body
+    archive_before = (path.parent / ARCHIVE_REL).read_bytes()
+    assert archive_closed(path, archive_date="2026-08-25") == []
+    assert (path.parent / ARCHIVE_REL).read_bytes() == archive_before
+
+    assert mark_open(path, "DW-1", "sweep bundle", OPERATION_ID) is True
+    reopened = parse_ledger(path.read_text(encoding="utf-8"))[0]
+
+    assert reopened.severity == normalized
+    assert live_field in reopened.body
+    selection = select_entries([reopened], min_severity=floor)
+    assert [entry.id for entry in selection.selected] == ["DW-1"]
 
 
 def test_archive_hand_written_archived_line_still_archives(tmp_path):

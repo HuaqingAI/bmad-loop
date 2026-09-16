@@ -94,7 +94,14 @@ from .runsetup import make_adapters as _make_adapters
 from .runsetup import mux_reason_label as _mux_reason_label
 from .runsetup import platform_preflight as _platform_preflight
 from .stories_engine import StoriesEngine
-from .sweep import SweepEngine
+from .sweep import (
+    DW_ID_RE,
+    SEVERITY_ORDER,
+    SweepEngine,
+    decimal_digits_key,
+    increment_decimal_digits,
+    select_entries,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -2258,6 +2265,8 @@ def _start_sweep(
     repeat: bool | None = None,
     max_cycles: int | None = None,
     trigger: str,
+    only_ids: tuple[str, ...] | None = None,
+    min_severity: str | None = None,
     run_id: str | None = None,
     profiles=None,
     on_started: Callable[[], None] | None = None,
@@ -2285,6 +2294,8 @@ def _start_sweep(
         max_bundles=max_bundles,
         repeat=repeat,
         max_cycles=max_cycles,
+        only_ids=only_ids,
+        min_severity=min_severity,
         trigger=trigger,
         make_adapters=_make_adapters,
         sweep_engine_cls=SweepEngine,
@@ -2295,7 +2306,7 @@ def _start_sweep(
     print(f"sweep {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
     print(summary.render())
-    return 0
+    return ExitCode.FAILURE if summary.crashed and only_ids is not None else ExitCode.OK
 
 
 def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest: str):
@@ -2371,6 +2382,8 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
             decisions_only=False,
             max_bundles=None,
             trigger=trigger,
+            only_ids=None,
+            min_severity=None,
             profiles=profiles,
             on_started=started,
         )
@@ -2384,6 +2397,12 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     project = _project(args)
     paths = bmadconfig.load_paths(project)
 
+    only_arg = getattr(args, "only", None)
+    min_severity = getattr(args, "min_severity", None)
+    if only_arg is not None and min_severity is not None:
+        print("--only cannot combine with --min-severity", file=sys.stderr)
+        return ExitCode.FAILURE
+
     if args.before is not None and not args.archive:
         print("--before requires --archive", file=sys.stderr)
         return ExitCode.FAILURE
@@ -2396,19 +2415,28 @@ def cmd_sweep(args: argparse.Namespace) -> int:
             or args.max_cycles is not None
             or args.no_prompt
             or args.run_id is not None
+            or only_arg is not None
+            or min_severity is not None
         ):
             print(
                 "--archive cannot combine with --decisions-only, --repeat, "
-                "--max-bundles, --max-cycles, --no-prompt, or --run-id",
+                "--max-bundles, --max-cycles, --no-prompt, --run-id, --only, "
+                "or --min-severity",
                 file=sys.stderr,
             )
             return ExitCode.FAILURE
         return _sweep_archive(project, paths, args)
 
+    try:
+        only_ids = _parse_sweep_only(only_arg) if only_arg is not None else None
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return ExitCode.FAILURE
+
     pol = policy_mod.load(_policy_path(project))
 
     if args.dry_run:
-        return _sweep_dry_run(paths, pol)
+        return _sweep_dry_run(paths, pol, only_ids=only_ids, min_severity=min_severity)
 
     if (rc := _reject_under_floor_git(paths.project)) is not None:
         return rc
@@ -2434,6 +2462,8 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         max_bundles=args.max_bundles,
         repeat=args.repeat,
         max_cycles=args.max_cycles,
+        only_ids=only_ids,
+        min_severity=min_severity,
         trigger="cli",
         run_id=args.run_id,
     )
@@ -2537,33 +2567,148 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
     return ExitCode.OK
 
 
-def _sweep_dry_run(paths: bmadconfig.ProjectPaths, pol) -> int:
+def _parse_sweep_only(value: str) -> tuple[str, ...]:
+    parts = [part.strip() for part in value.split(",")]
+    if not parts or any(not part for part in parts):
+        raise ValueError("--only requires a comma-separated list of DW-<n> ids")
+    malformed = [part for part in parts if not DW_ID_RE.fullmatch(part)]
+    if malformed:
+        raise ValueError("--only contains malformed ids: " + ", ".join(malformed))
+    return tuple(dict.fromkeys(parts))
+
+
+def _sweep_dry_run(
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    *,
+    only_ids: tuple[str, ...] | None = None,
+    min_severity: str | None = None,
+) -> int:
     # Before the no-ledger early return below: a broken install is worth saying so
     # about whether or not there is anything to sweep.
     _warn_preflight_would_abort(paths, pol)
     ledger = paths.deferred_work
     if not ledger.is_file():
+        if only_ids is not None:
+            try:
+                select_entries((), only_ids=only_ids, validate_only=True)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return ExitCode.FAILURE
         print(f"no deferred-work ledger at {ledger}")
         return 0
     text = ledger.read_text(encoding="utf-8")
     entries = deferredwork.parse_ledger(text)
     open_entries = [e for e in entries if e.open]
+    legacy = deferredwork.parse_legacy(text)
+    highest_suffix = max(
+        (entry.id.removeprefix("DW-").lstrip("0") or "0" for entry in entries),
+        key=decimal_digits_key,
+        default="0",
+    )
+    next_suffix = increment_decimal_digits(highest_suffix)
+    projected_legacy = []
+    for entry in legacy:
+        projected_legacy.append((f"DW-{next_suffix}", entry))
+        next_suffix = increment_decimal_digits(next_suffix)
+    projected_open = [(dw_id, entry) for dw_id, entry in projected_legacy if not entry.done]
     closed = len(entries) - len(open_entries)
     print(f"{ledger}: {len(open_entries)} open, {closed} closed/non-open")
-    for entry in open_entries:
+    try:
+        selection = select_entries(
+            entries,
+            only_ids=only_ids,
+            min_severity=min_severity,
+            validate_only=only_ids is None,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return ExitCode.FAILURE
+    if only_ids is not None:
+        available = {entry.id for entry in open_entries} | {dw_id for dw_id, _ in projected_open}
+        unavailable = [dw_id for dw_id in only_ids if dw_id not in available]
+        if unavailable:
+            print(
+                "error: --only ids must exist and be open: " + ", ".join(unavailable),
+                file=sys.stderr,
+            )
+            return ExitCode.FAILURE
+    shown = selection.selected if only_ids is not None or min_severity is not None else open_entries
+    for entry in shown:
         print(f"  {entry.id:8s} {entry.title}")
-    legacy = deferredwork.parse_legacy(text)
+    if selection.excluded:
+        print("excluded by sweep selector:")
+        for entry in selection.excluded:
+            print(f"  {entry.id:8s} {entry.title}")
+    if selection.missing_severity:
+        print("excluded for missing or unrecognized severity:")
+        for entry in selection.missing_severity:
+            print(f"  {entry.id:8s} {entry.title}")
     legacy_open = [e for e in legacy if not e.done]
+    projected_selected = projected_open
+    projected_excluded: list[tuple[str, deferredwork.LegacyEntry]] = []
+    projected_missing_severity: list[tuple[str, deferredwork.LegacyEntry]] = []
+    if only_ids is not None:
+        requested = set(only_ids)
+        projected_selected = [item for item in projected_open if item[0] in requested]
+        projected_excluded = [item for item in projected_open if item[0] not in requested]
+    elif min_severity is not None:
+        floor = SEVERITY_ORDER[min_severity]
+        projected_selected = [
+            (dw_id, entry)
+            for dw_id, entry in projected_open
+            if entry.severity is not None and SEVERITY_ORDER[entry.severity] >= floor
+        ]
+        selected_keys = {entry.key for _, entry in projected_selected}
+        projected_excluded = [
+            (dw_id, entry)
+            for dw_id, entry in projected_open
+            if entry.severity is not None and entry.key not in selected_keys
+        ]
+        projected_missing_severity = [
+            (dw_id, entry) for dw_id, entry in projected_open if entry.severity is None
+        ]
     if legacy:
         print(
             f"plus {len(legacy)} legacy (pre-DW-format) entries, {len(legacy_open)} open"
             " — a sweep would first migrate them to DW format"
         )
-        for entry in legacy_open:
-            print(f"  {entry.id or '-':8s} {entry.title}")
-    if open_entries or legacy_open:
+        if projected_selected:
+            print("projected legacy selection (pre-migration; provisional ids):")
+        for dw_id, entry in projected_selected:
+            print(f"  {dw_id:8s} {entry.title}  [pre-migration projection]")
+        if min_severity is not None and projected_selected:
+            print(
+                f"{len(projected_selected)} matching legacy entr"
+                f"{'y' if len(projected_selected) == 1 else 'ies'} will be migrated then triaged"
+            )
+        if projected_excluded:
+            print("projected legacy entries excluded by sweep selector:")
+            for dw_id, entry in projected_excluded:
+                print(f"  {dw_id:8s} {entry.title}  [pre-migration projection]")
+        if projected_missing_severity:
+            print("projected legacy entries excluded for missing or unrecognized severity:")
+            for dw_id, entry in projected_missing_severity:
+                print(f"  {dw_id:8s} {entry.title}  [pre-migration projection]")
+    if selection.selected or projected_selected:
         print("a sweep would triage the open entries in one LLM session, then run bundles")
-        print(f"  triage: {_render_invocation(pol, paths.project, 'triage', '/bmad-loop-sweep')}")
+        if projected_selected and (only_ids is not None or min_severity is not None):
+            print(
+                "  triage: projected legacy ids are provisional; semantic duplicate merging may "
+                "compact them, and the real run revalidates --only against the actual "
+                "post-migration universe"
+            )
+            return 0
+        prompt = "/bmad-loop-sweep"
+        if only_ids is not None or min_severity is not None:
+            selected_ids = {entry.id for entry in selection.selected}
+            ordered = (
+                [dw_id for dw_id in only_ids if dw_id in selected_ids]
+                if only_ids is not None
+                else [entry.id for entry in selection.selected]
+            )
+            prompt += " --only " + ",".join(ordered)
+        print(f"  triage: {_render_invocation(pol, paths.project, 'triage', prompt)}")
     return 0
 
 
@@ -2599,6 +2744,22 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     if state.finished:
         print(f"run {run_dir.name} already finished", file=sys.stderr)
         return 1
+    sweep_options = None
+    if state.run_type == "sweep":
+        try:
+            runsetup.validate_sweep_options_version(state.sweep_options_version)
+            sweep_options = runsetup.load_sweep_resume_options(
+                run_dir,
+                required=state.sweep_options_version >= runsetup.SWEEP_OPTIONS_VERSION,
+                expected_digest=(
+                    state.sweep_options_digest
+                    if state.sweep_options_version == runsetup.SWEEP_OPTIONS_VERSION
+                    else None
+                ),
+            )
+        except runsetup.SweepOptionsError as exc:
+            print(f"cannot resume {run_dir.name}: {exc}", file=sys.stderr)
+            return 1
     pol = policy_mod.load(_policy_path(project))
     # Resume re-reads config.yaml and policy.toml from disk, so it is a second
     # entrypoint into the same engine and gets the same refusal — a run started
@@ -2832,7 +2993,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     # SweepEngine and _make_adapters are handed in from this module's namespace so
     # the test suite's `monkeypatch.setattr(cli, "SweepEngine"/"Engine"/..., ...)`
     # still applies.
-    return paths, state, pol, journal, new_digest, profiles
+    return paths, state, pol, journal, new_digest, profiles, sweep_options
 
 
 def _resume_paused_run(project: Path, run_dir: Path) -> int:
@@ -2857,7 +3018,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         prepared = _prepare_resume_locked(project, run_dir)
     if isinstance(prepared, int):
         return prepared
-    paths, state, pol, journal, new_digest, profiles = prepared
+    paths, state, pol, journal, new_digest, profiles, sweep_options = prepared
 
     # Adapter construction and the engine lifetime are deliberately outside the
     # state hold.  The pid/state publication above makes a rival control command
@@ -2875,10 +3036,15 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         stories_engine_cls=StoriesEngine,
         sweep_engine_cls=SweepEngine,
         profiles=profiles,
+        sweep_options=sweep_options,
     )
     summary = composed.engine.run()
     print(summary.render())
-    return 0
+    return (
+        ExitCode.FAILURE
+        if summary.crashed and sweep_options is not None and sweep_options.only_ids is not None
+        else ExitCode.OK
+    )
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
@@ -5004,6 +5170,17 @@ def main(argv: list[str] | None = None) -> int:
         help="triage + answer decisions + record them; run no bundles",
     )
     sweep_p.add_argument("--max-bundles", type=int, help="override [sweep] max_bundles")
+    selectors = sweep_p.add_mutually_exclusive_group()
+    selectors.add_argument(
+        "--only",
+        metavar="DW-ID,...",
+        help="triage only the named open DW-<n> entries",
+    )
+    selectors.add_argument(
+        "--min-severity",
+        choices=("low", "medium", "high", "critical"),
+        help="triage open entries at this severity or higher",
+    )
     sweep_p.add_argument(
         "--repeat",
         action=argparse.BooleanOptionalAction,

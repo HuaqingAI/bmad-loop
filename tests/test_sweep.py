@@ -34,6 +34,7 @@ from bmad_loop import verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths
+from bmad_loop.engine import RunPaused
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import PAUSE_STORY_GATE, Phase, RunState, StoryTask, TokenUsage
 from bmad_loop.policy import (
@@ -986,7 +987,10 @@ def test_validate_migration_rejects_leftover_legacy():
 def test_validate_migration_guards_pre_existing_canonical():
     manifest = legacy_manifest()
     # DW-1 regressed to done; DW-9 vanished
-    pre = {"DW-1": PreCanonical("open", ()), "DW-9": PreCanonical("open", ())}
+    pre = {
+        "DW-1": PreCanonical("open", (), None),
+        "DW-9": PreCanonical("open", (), None),
+    }
     rj = migrate_result(
         [{"key": manifest[0]["key"], "dw_id": "DW-1"}, {"key": manifest[1]["key"], "dw_id": "DW-2"}]
     )
@@ -996,6 +1000,22 @@ def test_validate_migration_guards_pre_existing_canonical():
     assert "DW-9 disappeared" in joined
     # and the new DW-2 does not continue numbering past DW-9
     assert "does not continue numbering past DW-9" in joined
+
+
+def test_validate_migration_refuses_changed_pre_existing_canonical_severity():
+    before = pre_gated_ledger().replace("status: open", "severity: high\nstatus: open", 1)
+    manifest = legacy_manifest(before)
+    assert len(manifest) == 1
+    rj = migrate_result([{"key": manifest[0]["key"], "dw_id": "DW-2"}])
+    pre = snapshot_canonical(before)
+    assert pre["DW-1"].severity == "high"
+    kept = rewritten_gated_ledger().replace("status: open", "severity: high\nstatus: open", 1)
+    changed = rewritten_gated_ledger().replace("status: open", "severity: low\nstatus: open", 1)
+
+    assert validate_migration(rj, manifest, pre, kept) == []
+    errors = validate_migration(rj, manifest, pre, changed)
+
+    assert errors == ["pre-existing DW-1 severity changed: 'high' -> 'low'"]
 
 
 def test_validate_migration_mapping_errors():
@@ -1015,6 +1035,85 @@ def test_validate_migration_mapping_errors():
     assert "repeats key" in joined
     assert "DW-77: no such entry" in joined
     assert "not mapped" in joined  # the open item's key never appeared
+
+
+def test_validate_migration_refuses_mapping_legacy_to_a_pre_existing_entry():
+    before = pre_gated_ledger()
+    manifest = legacy_manifest(before)
+    assert len(manifest) == 1
+    mapping = migrate_result([{"key": manifest[0]["key"], "dw_id": "DW-1"}])
+
+    errors = validate_migration(mapping, manifest, snapshot_canonical(before), before)
+
+    assert any("legacy items must map to newly created entries" in error for error in errors)
+
+
+def test_validate_migration_compares_arbitrarily_large_dw_ids_without_int_conversion():
+    huge_suffix = "9" * 5_000
+    next_suffix = "1" + "0" * 5_000
+    before = "# Deferred Work\n\n" f"### DW-{huge_suffix}: existing\n\norigin: test\nstatus: open\n"
+    rewritten = (
+        before + "\n" + f"### DW-{next_suffix}: migrated\n\norigin: migrated\nstatus: open\n"
+    )
+    manifest = [{"key": "legacy-1", "done": False, "severity": None}]
+    result = migrate_result([{"key": "legacy-1", "dw_id": f"DW-{next_suffix}"}])
+
+    assert validate_migration(result, manifest, snapshot_canonical(before), rewritten) == []
+
+
+def test_validate_migration_normalizes_unicode_decimal_ids_for_numbering():
+    before = "# Deferred Work\n\n### DW-９: existing\n\norigin: test\nstatus: open\n"
+    rewritten = before + "\n### DW-10: migrated\n\norigin: migrated\nstatus: open\n"
+    manifest = [{"key": "legacy-1", "done": False, "severity": None}]
+    result = migrate_result([{"key": "legacy-1", "dw_id": "DW-10"}])
+
+    assert validate_migration(result, manifest, snapshot_canonical(before), rewritten) == []
+
+
+def test_validate_migration_requires_contiguous_ids_in_manifest_order():
+    legacy = (
+        "# Deferred Work\n\n"
+        "### D-1: first legacy\n\nreason: first\n\n"
+        "### D-2: second legacy\n\nreason: second\n"
+    )
+    manifest = legacy_manifest(legacy)
+    rewritten = (
+        "# Deferred Work\n\n"
+        "### DW-1: second legacy\n\norigin: migrated\nstatus: open\n\n"
+        "### DW-2: first legacy\n\norigin: migrated\nstatus: open\n"
+    )
+    result = migrate_result(
+        [
+            {"key": manifest[0]["key"], "dw_id": "DW-2"},
+            {"key": manifest[1]["key"], "dw_id": "DW-1"},
+        ]
+    )
+
+    errors = validate_migration(result, manifest, {}, rewritten)
+
+    assert any("must follow manifest order; expected DW-1" in error for error in errors)
+
+
+def test_validate_migration_allows_nonadjacent_dedupe_merge():
+    manifest = [
+        {"key": "duplicate-a", "done": False, "severity": None},
+        {"key": "other", "done": False, "severity": None},
+        {"key": "duplicate-c", "done": False, "severity": None},
+    ]
+    rewritten = (
+        "# Deferred Work\n\n"
+        "### DW-1: merged duplicate\n\norigin: migrated\nstatus: open\n\n"
+        "### DW-2: other\n\norigin: migrated\nstatus: open\n"
+    )
+    result = migrate_result(
+        [
+            {"key": "duplicate-a", "dw_id": "DW-1"},
+            {"key": "other", "dw_id": "DW-2"},
+            {"key": "duplicate-c", "dw_id": "DW-1"},
+        ]
+    )
+
+    assert validate_migration(result, manifest, {}, rewritten) == []
 
 
 def test_validate_migration_allows_dedupe_merge():
@@ -1038,6 +1137,54 @@ def test_validate_migration_wrong_workflow():
     assert errors and "workflow" in errors[0]
 
 
+def test_validate_migration_rejects_changed_manifest_severity():
+    manifest = [
+        {
+            "key": "legacy-1",
+            "id": "D-1",
+            "title": "legacy",
+            "section": "",
+            "done": False,
+            "severity": "high",
+        }
+    ]
+    migrated = (
+        "# Deferred Work\n\n### DW-1: legacy\n\norigin: migrated\n" "severity: low\nstatus: open\n"
+    )
+    rj = migrate_result([{"key": "legacy-1", "dw_id": "DW-1"}])
+
+    errors = validate_migration(rj, manifest, {}, migrated)
+
+    assert errors == ["mapping legacy-1 -> DW-1: manifest severity 'high', ledger has 'low'"]
+
+
+def test_validate_migration_uses_highest_severity_for_a_merged_target():
+    manifest = [
+        {"key": "low", "done": False, "severity": "low"},
+        {"key": "critical", "done": False, "severity": "critical"},
+        {"key": "missing", "done": False, "severity": None},
+    ]
+    rj = migrate_result(
+        [
+            {"key": "low", "dw_id": "DW-1"},
+            {"key": "critical", "dw_id": "DW-1"},
+            {"key": "missing", "dw_id": "DW-1"},
+        ]
+    )
+    correct = (
+        "# Deferred Work\n\n### DW-1: merged\n\norigin: migrated\n"
+        "severity: critical\nstatus: open\n"
+    )
+    weakened = correct.replace("severity: critical", "severity: high")
+
+    assert validate_migration(rj, manifest, {}, correct) == []
+    errors = validate_migration(rj, manifest, {}, weakened)
+
+    assert errors == [
+        "merged mapping -> DW-1: highest manifest severity 'critical', ledger has 'high'"
+    ]
+
+
 # ------------------------------------------------------------ engine flow
 
 
@@ -1048,6 +1195,270 @@ def test_sweep_nothing_open(project):
     assert summary.done == 0 and not summary.paused
     assert adapter.sessions == []
     assert "sweep-nothing-open" in journal_text(engine)
+
+
+def test_only_scopes_triage_and_audits_excluded_open_entries(project):
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
+    plan = triage_result(
+        ["DW-3", "DW-1"],
+        skip=[
+            {"id": "DW-1", "reason": "leave it"},
+            {"id": "DW-3", "reason": "leave it too"},
+        ],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(plan)],
+        only_ids=("DW-3", "DW-1"),
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and len(adapter.sessions) == 1
+    assert adapter.sessions[0].prompt == "/bmad-loop-sweep --only DW-3,DW-1"
+    excluded = [
+        entry for entry in engine.journal.entries() if entry["kind"] == "sweep-selection-excluded"
+    ]
+    assert excluded[0]["dw_ids"] == ["DW-2"]
+    assert all(entry.open for entry in ledger_entries(project).values())
+
+
+def test_only_selects_parser_supported_unicode_decimal_id(project):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n### DW-９: unicode id\n\norigin: test\nstatus: open\n",
+        encoding="utf-8",
+    )
+    plan = triage_result(["DW-９"], skip=[{"id": "DW-９", "reason": "leave it"}])
+    engine, adapter = make_sweep(project, [triage_effect(plan)], only_ids=("DW-９",))
+
+    summary = engine.run()
+
+    assert not summary.crashed
+    assert adapter.sessions[0].prompt == "/bmad-loop-sweep --only DW-９"
+
+
+@pytest.mark.parametrize("only_id", ["DW-9", "DW-2"], ids=["unknown", "not-open"])
+def test_only_refuses_an_id_outside_the_initial_open_universe(project, only_id):
+    """Ablation: remove select_entries' validate_only refusal and this finishes silently."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"})
+    engine, adapter = make_sweep(project, [], only_ids=(only_id,))
+
+    summary = engine.run()
+
+    assert summary.crashed
+    assert adapter.sessions == []
+    assert "must exist and be open" in (engine.run_dir / "crash.txt").read_text()
+
+
+def test_only_refuses_when_the_initial_ledger_has_no_open_entries(project):
+    write_ledger(project, {"DW-1": "done 2026-06-01"})
+    engine, adapter = make_sweep(project, [], only_ids=("DW-1",))
+
+    summary = engine.run()
+
+    assert summary.crashed and adapter.sessions == []
+    assert "must exist and be open: DW-1" in (engine.run_dir / "crash.txt").read_text()
+
+
+def test_resumed_only_scope_contracts_after_its_entry_closed(project):
+    write_ledger(project, {"DW-1": "done 2026-06-01", "DW-2": "open"})
+    original, _ = make_sweep(project, [], only_ids=("DW-1",))
+    triage = StoryTask(story_key="sweep-triage", epic=0)
+    triage.phase = Phase.DONE
+    original.state.tasks[triage.story_key] = triage
+    save_state(original.run_dir, original.state)
+    resumed, adapter = resume_sweep(project, original, [], only_ids=("DW-1",))
+
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert adapter.sessions == []
+    assert "sweep-selection-empty" in journal_kinds(resumed)
+
+
+def test_repeat_only_scope_contracts_after_selected_entry_closes(project):
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1"],
+        already_resolved=[{"id": "DW-1", "evidence": "fixed at src.txt:1"}],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(plan)],
+        only_ids=("DW-1",),
+        repeat=True,
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 1
+    done = [entry for entry in engine.journal.entries() if entry["kind"] == "sweep-repeat-done"]
+    assert done[-1]["reason"] == "no-selected"
+
+
+def test_min_severity_is_fence_safe_and_reports_every_exclusion(project):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: high\n\nseverity: high\nstatus: open\n\n"
+        "### DW-2: low\n\npriority: minor\nstatus: open\n\n"
+        "### DW-3: quoted only\n\n```markdown\nseverity: critical\n```\nstatus: open\n",
+        encoding="utf-8",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ledger")
+    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "leave it"}])
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(plan)],
+        min_severity="high",
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed
+    assert adapter.sessions[0].prompt == "/bmad-loop-sweep --only DW-1"
+    records = engine.journal.entries()
+    excluded = [e for e in records if e["kind"] == "sweep-selection-excluded"]
+    missing = [e for e in records if e["kind"] == "sweep-selection-missing-severity"]
+    assert excluded[0]["dw_ids"] == ["DW-2", "DW-3"]
+    assert missing[0]["dw_ids"] == ["DW-3"]
+
+
+def test_repeat_re_evaluates_severity_and_admits_a_new_matching_entry(project):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n### DW-1: first\n\nseverity: high\nstatus: open\n",
+        encoding="utf-8",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ledger")
+    first_plan = triage_result(
+        ["DW-1"], already_resolved=[{"id": "DW-1", "evidence": "fixed at src.txt:1"}]
+    )
+    second_plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "new but not actionable"}])
+
+    def first_triage(_spec):
+        assert (
+            deferredwork.append_entry(
+                project.deferred_work,
+                title="second",
+                origin="repeat test",
+                source_spec="spec-repeat.md",
+                reason="appeared during cycle one",
+                severity="critical",
+            )
+            == "DW-2"
+        )
+        return SessionResult(status="completed", result_json=first_plan)
+
+    engine, adapter = make_sweep(
+        project,
+        [first_triage, triage_effect(second_plan)],
+        min_severity="high",
+        repeat=True,
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed
+    assert [session.prompt for session in adapter.sessions] == [
+        "/bmad-loop-sweep --only DW-1",
+        "/bmad-loop-sweep --only DW-2",
+    ]
+
+
+def test_selection_precedes_max_bundle_truncation(project):
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
+    plan = triage_result(
+        ["DW-2", "DW-3"],
+        bundles=[
+            {"name": "two", "dw_ids": ["DW-2"], "intent": "fix two"},
+            {"name": "three", "dw_ids": ["DW-3"], "intent": "fix three"},
+        ],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(plan)],
+        only_ids=("DW-2", "DW-3"),
+        max_bundles=1,
+        decisions_only=True,
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and len(adapter.sessions) == 1
+    truncated = [e for e in engine.journal.entries() if e["kind"] == "sweep-bundles-truncated"]
+    assert truncated[0]["dropped"] == ["three"]
+    excluded = [e for e in engine.journal.entries() if e["kind"] == "sweep-selection-excluded"]
+    assert excluded[0]["dw_ids"] == ["DW-1"]
+
+
+def test_excluded_entry_still_gates_story_launch(project):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: selected\n\nstatus: open\n\n"
+        "### DW-2: excluded gate\n\nstatus: open\ngate: 1-1\n",
+        encoding="utf-8",
+    )
+    engine, _ = make_sweep(project, [], only_ids=("DW-1",))
+
+    with pytest.raises(RunPaused, match="DW-2"):
+        engine._refuse_gated_story("1-1-story")
+
+
+def test_selector_limits_graceful_stop_remaining_estimate(project):
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [], only_ids=("DW-2",))
+
+    assert engine._remaining_estimate() == 1
+
+
+def test_selector_scope_change_declines_cached_triage(project):
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    fresh = triage_result(
+        ["DW-2"],
+        skip=[{"id": "DW-2", "reason": "fresh selector universe"}],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(fresh)],
+        min_severity="high",
+    )
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    cached = triage_result(
+        ["DW-1"],
+        skip=[{"id": "DW-1", "reason": "stale selector universe"}],
+    )
+    (engine.run_dir / "triage.json").write_text(json.dumps(cached), encoding="utf-8")
+
+    plan = engine._ensure_triage({"DW-2"})
+
+    assert plan.open_ids == frozenset({"DW-2"})
+    assert len(adapter.sessions) == 1
+    assert "cached selected open_ids no longer match" in journal_text(engine)
+
+
+def test_selector_scope_change_gets_a_fresh_triage_retry_budget(project):
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    stale = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "stale"}])
+    fresh = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "fresh"}])
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(stale), triage_effect(fresh)],
+        min_severity="high",
+    )
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    (engine.run_dir / "triage.json").write_text(json.dumps(stale), encoding="utf-8")
+    task = StoryTask(story_key="sweep-triage", epic=0)
+    task.phase = Phase.DONE
+    task.attempt = engine.policy.sweep.max_triage_attempts
+    engine.state.tasks[task.story_key] = task
+
+    plan = engine._ensure_triage({"DW-2"})
+
+    assert plan.open_ids == frozenset({"DW-2"})
+    assert len(adapter.sessions) == 2
+    assert engine.state.tasks[task.story_key].generation == 1
 
 
 def test_sweep_worktree_bundle_merges_to_target(project):
@@ -4062,6 +4473,71 @@ def test_sweep_migrates_legacy_then_triages_and_runs_bundle(project):
     assert [m["key"] for m in written] == [m["key"] for m in manifest]
     # triage ran against the post-migration open set, strict check intact
     assert "--migrate" not in adapter.sessions[1].prompt
+
+
+def test_severity_selector_applies_to_the_post_migration_ledger(project):
+    legacy = (
+        "# Deferred Work\n\n"
+        "### D-1: Low legacy\n\nseverity: low\nreason: low item\n\n"
+        "### D-2: High legacy\n\nseverity: high\nreason: high item\n"
+    )
+    write_legacy_ledger(project, legacy)
+    manifest = legacy_manifest(legacy)
+    assert [item["severity"] for item in manifest] == ["low", "high"]
+    mapping = [
+        {"key": manifest[0]["key"], "dw_id": "DW-1"},
+        {"key": manifest[1]["key"], "dw_id": "DW-2"},
+    ]
+    migrated = (
+        "# Deferred Work\n\n"
+        "### DW-1: Low legacy\n\norigin: migrated\nseverity: low\nstatus: open\n\n"
+        "### DW-2: High legacy\n\norigin: migrated\nseverity: high\nstatus: open\n"
+    )
+    plan = triage_result(
+        ["DW-2"],
+        skip=[{"id": "DW-2", "reason": "selected high entry"}],
+    )
+    engine, adapter = make_sweep(
+        project,
+        [migrate_effect(project, migrated, mapping), triage_effect(plan)],
+        min_severity="high",
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert adapter.sessions[1].prompt == "/bmad-loop-sweep --only DW-2"
+    excluded = [
+        entry for entry in engine.journal.entries() if entry["kind"] == "sweep-selection-excluded"
+    ]
+    assert excluded[0]["dw_ids"] == ["DW-1"]
+
+
+def test_only_revalidates_against_compacted_post_migration_ids(project):
+    legacy = (
+        "# Deferred Work\n\n"
+        "### D-1: Duplicate wording one\n\nreason: same issue\n\n"
+        "### D-2: Duplicate wording two\n\nreason: same issue\n"
+    )
+    write_legacy_ledger(project, legacy)
+    manifest = legacy_manifest(legacy)
+    mapping = [{"key": item["key"], "dw_id": "DW-1"} for item in manifest]
+    migrated = (
+        "# Deferred Work\n\n"
+        "### DW-1: merged duplicate\n\norigin: migrated\nreason: same issue\nstatus: open\n"
+    )
+    engine, adapter = make_sweep(
+        project,
+        [migrate_effect(project, migrated, mapping)],
+        only_ids=("DW-2",),
+    )
+
+    summary = engine.run()
+
+    assert summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 1
+    assert adapter.sessions[0].role == "triage" and "--migrate" in adapter.sessions[0].prompt
+    assert "must exist and be open: DW-2" in (engine.run_dir / "crash.txt").read_text()
 
 
 def test_migration_validation_failure_restores_ledger_then_escalates(project):

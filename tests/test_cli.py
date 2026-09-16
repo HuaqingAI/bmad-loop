@@ -1,6 +1,7 @@
 """CLI command tests — init policy-derived profiles and per-stage dry-run."""
 
 import argparse
+import hashlib
 import io
 import json
 import ntpath
@@ -39,7 +40,7 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import cli, envvars, platform_util
+from bmad_loop import cli, deferredwork, envvars, platform_util
 from bmad_loop import policy as policy_mod
 from bmad_loop import probe as probe_mod
 from bmad_loop import runs, runsetup, verify
@@ -1804,6 +1805,164 @@ def test_sweep_dry_run_reports_legacy_entries(project, capsys):
     assert "triage:" in out  # a sweep still runs even with zero canonical opens
 
 
+def test_sweep_dry_run_applies_severity_floor_to_legacy_entries(project, capsys):
+    from conftest import write_legacy_ledger
+
+    write_legacy_ledger(
+        project,
+        "# Deferred Work\n\n"
+        "### D-1: Low legacy\n\nseverity: low\nreason: low item\n\n"
+        "### D-2: High legacy\n\nseverity: high\nreason: high item\n\n"
+        "### D-3: Missing legacy\n\nreason: missing severity\n",
+        commit=False,
+    )
+
+    assert cli._sweep_dry_run(project, policy_mod.load(None), min_severity="high") == 0
+    out = capsys.readouterr().out
+    assert "High legacy" in out
+    assert "1 matching legacy entry will be migrated then triaged" in out
+    assert "projected legacy entries excluded by sweep selector" in out and "Low legacy" in out
+    assert "projected legacy entries excluded for missing or unrecognized severity" in out
+    assert "Missing legacy" in out
+    assert out.count("Missing legacy") == 1
+    assert "triage: projected legacy ids are provisional" in out
+
+
+def test_sweep_dry_run_only_accepts_a_projected_open_legacy_id(project, capsys):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: Canonical open\n\norigin: test\nstatus: open\n\n"
+        "## Deferred from: review\n\n- Open legacy item\n",
+        encoding="utf-8",
+    )
+
+    assert cli._sweep_dry_run(project, policy_mod.load(None), only_ids=("DW-2",)) == 0
+    out = capsys.readouterr().out
+    assert "DW-2" in out and "Open legacy item" in out
+    assert "pre-migration; provisional ids" in out
+    assert "Canonical open" in out and "excluded by sweep selector" in out
+    assert "real run revalidates --only" in out
+
+
+def test_sweep_dry_run_only_reports_excluded_projected_legacy_ids(project, capsys):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: Canonical open\n\norigin: test\nstatus: open\n\n"
+        "## Deferred from: review\n\n- First legacy item\n- Second legacy item\n",
+        encoding="utf-8",
+    )
+
+    assert cli._sweep_dry_run(project, policy_mod.load(None), only_ids=("DW-2",)) == 0
+    out = capsys.readouterr().out
+    assert "DW-2" in out and "First legacy item" in out
+    assert "projected legacy entries excluded by sweep selector" in out
+    assert "DW-3" in out and "Second legacy item" in out
+
+
+def test_sweep_dry_run_projection_ignores_fenced_and_body_dw_references(project, capsys):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: Canonical open\n\n"
+        "origin: test\nreason: related prose mentions DW-99\nstatus: open\n\n"
+        "```markdown\n### DW-99: quoted example\nstatus: open\n```\n\n"
+        "## Deferred from: review\n\n- Open legacy item\n",
+        encoding="utf-8",
+    )
+
+    assert cli._sweep_dry_run(project, policy_mod.load(None), only_ids=("DW-2",)) == 0
+    out = capsys.readouterr().out
+    assert "DW-2" in out and "Open legacy item" in out
+
+    assert cli._sweep_dry_run(project, policy_mod.load(None), only_ids=("DW-100",)) == 1
+    captured = capsys.readouterr()
+    assert "must exist and be open: DW-100" in captured.err
+    assert "triage:" not in captured.out
+
+
+def test_sweep_dry_run_projects_after_an_arbitrarily_large_canonical_id(project, capsys):
+    huge_id = "DW-" + "9" * 5_000
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        f"### {huge_id}: Canonical open\n\norigin: test\nstatus: open\n\n"
+        "## Deferred from: review\n\n- Open legacy item\n",
+        encoding="utf-8",
+    )
+
+    assert cli._sweep_dry_run(project, policy_mod.load(None)) == 0
+    out = capsys.readouterr().out
+    assert "Open legacy item" in out and "pre-migration projection" in out
+
+
+def test_sweep_dry_run_normalizes_unicode_decimal_id_before_projection(project, capsys):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-９: Canonical open\n\norigin: test\nstatus: open\n\n"
+        "## Deferred from: review\n\n- Open legacy item\n",
+        encoding="utf-8",
+    )
+
+    assert cli._sweep_dry_run(project, policy_mod.load(None)) == 0
+    out = capsys.readouterr().out
+    assert "DW-10" in out and "Open legacy item" in out
+    assert "DW-：" not in out
+
+
+@pytest.mark.parametrize("only_id", ["DW-2", "DW-9"], ids=["projected-done", "unknown"])
+def test_sweep_dry_run_only_refuses_non_open_or_unknown_projected_id(project, capsys, only_id):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: Canonical open\n\norigin: test\nstatus: open\n\n"
+        "## Deferred from: review\n\n"
+        "- ~~Done legacy item~~ -> fixed\n"
+        "- Open legacy item\n",
+        encoding="utf-8",
+    )
+
+    assert cli._sweep_dry_run(project, policy_mod.load(None), only_ids=(only_id,)) == 1
+    captured = capsys.readouterr()
+    assert f"must exist and be open: {only_id}" in captured.err
+    assert "triage:" not in captured.out
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "[]",
+        "{",
+        '{"only": "DW-1", "min_severity": null}',
+        '{"only": null, "min_severity": "urgent"}',
+        '{"only": ["DW-1"], "min_severity": "high"}',
+    ],
+    ids=["non-object", "invalid-json", "only-shape", "severity-value", "both"],
+)
+def test_public_resume_refuses_malformed_selectors_before_mutation(
+    project, monkeypatch, capsys, contents
+):
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(contents.encode("utf-8")).hexdigest(),
+    )
+    (run_dir / "sweep.json").write_text(contents, encoding="utf-8")
+    state_before = (run_dir / "state.json").read_bytes()
+    journal_path = run_dir / "journal.jsonl"
+    journal_before = journal_path.read_bytes() if journal_path.is_file() else None
+    pid_before = (
+        (run_dir / runs.PID_FILE).read_bytes() if (run_dir / runs.PID_FILE).is_file() else None
+    )
+    monkeypatch.setattr(cli, "SweepEngine", lambda **_kwargs: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+
+    assert "cannot resume" in capsys.readouterr().err
+    assert (run_dir / "state.json").read_bytes() == state_before
+    assert (journal_path.read_bytes() if journal_path.is_file() else None) == journal_before
+    pid_path = run_dir / runs.PID_FILE
+    assert (pid_path.read_bytes() if pid_path.is_file() else None) == pid_before
+
+
 def test_sweep_dry_run_renders_triage_adapter_from_policy(project, capsys):
     from conftest import write_ledger
 
@@ -1824,6 +1983,235 @@ def test_sweep_dry_run_renders_triage_adapter_from_policy(project, capsys):
 def test_sweep_dry_run_no_ledger(project, capsys):
     assert cli._sweep_dry_run(project, policy_mod.load(None)) == 0
     assert "no deferred-work ledger" in capsys.readouterr().out
+
+
+def test_sweep_only_parser_trims_and_stably_deduplicates():
+    assert cli._parse_sweep_only(" DW-3, DW-1,DW-3 ") == ("DW-3", "DW-1")
+    assert cli._parse_sweep_only("DW-９") == ("DW-９",)
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("", "comma-separated"),
+        (" ", "comma-separated"),
+        ("DW-1,", "comma-separated"),
+        (",DW-1", "comma-separated"),
+        ("dw-1", "malformed"),
+        ("DW-x", "malformed"),
+    ],
+)
+def test_sweep_rejects_empty_or_malformed_only(project, capsys, value, message):
+    install_bmad_config(project)
+
+    rc = cli.main(["sweep", "--only", value, "--dry-run", "--project", str(project.project)])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--only" in err and message in err
+
+
+def test_sweep_selector_flags_are_mutually_exclusive(project, capsys):
+    install_bmad_config(project)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            [
+                "sweep",
+                "--only",
+                "DW-1",
+                "--min-severity",
+                "high",
+                "--project",
+                str(project.project),
+            ]
+        )
+
+    assert exc.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_cmd_sweep_refuses_both_selectors_without_argparse(project, capsys, monkeypatch):
+    """The explicit combine check in cmd_sweep is the second layer under the
+    argparse group: a caller that builds the namespace by hand (no parser) still
+    gets rc 1 before any policy load or archive work."""
+    install_bmad_config(project)
+    monkeypatch.setattr(
+        cli.policy_mod,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail("policy must not load for a refused selector pair"),
+    )
+    args = argparse.Namespace(
+        project=str(project.project),
+        run_id=None,
+        before=None,
+        archive=False,
+        decisions_only=False,
+        repeat=None,
+        max_bundles=None,
+        max_cycles=None,
+        no_prompt=False,
+        dry_run=True,
+        only="DW-1",
+        min_severity="high",
+    )
+
+    assert cli.cmd_sweep(args) == 1
+    assert "--only cannot combine with --min-severity" in capsys.readouterr().err
+
+
+def test_sweep_dry_run_applies_severity_selector_and_reports_missing(project, capsys):
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: critical\n\nseverity: critical\nstatus: open\n\n"
+        "### DW-2: low\n\nseverity: low\nstatus: open\n\n"
+        "### DW-3: missing\n\nstatus: open\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        cli._sweep_dry_run(
+            project,
+            policy_mod.load(None),
+            min_severity="high",
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "/bmad-loop-sweep --only DW-1" in out
+    assert "excluded by sweep selector" in out and "DW-2" in out
+    assert "missing or unrecognized severity" in out and "DW-3" in out
+
+
+def test_sweep_dry_run_refuses_unknown_or_non_open_only_id(project, capsys):
+    from conftest import write_ledger
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
+
+    assert (
+        cli._sweep_dry_run(
+            project,
+            policy_mod.load(None),
+            only_ids=("DW-2", "DW-9"),
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "must exist and be open: DW-2, DW-9" in captured.err
+    assert "triage:" not in captured.out
+
+
+def test_sweep_dry_run_preserves_valid_only_order_and_reports_exclusions(project, capsys):
+    write_ledger(
+        project,
+        {"DW-1": "open", "DW-2": "open", "DW-3": "open"},
+        commit=False,
+    )
+
+    assert (
+        cli._sweep_dry_run(
+            project,
+            policy_mod.load(None),
+            only_ids=("DW-3", "DW-1"),
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "/bmad-loop-sweep --only DW-3,DW-1" in out
+    assert "excluded by sweep selector" in out and "DW-2" in out
+
+
+def test_sweep_dry_run_refuses_only_when_the_ledger_is_missing(project, capsys):
+    assert (
+        cli._sweep_dry_run(
+            project,
+            policy_mod.load(None),
+            only_ids=("DW-9",),
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "must exist and be open: DW-9" in captured.err
+    assert "no deferred-work ledger" not in captured.out
+
+
+@pytest.mark.parametrize(
+    ("only", "min_severity", "expected_only", "expected_min"),
+    [
+        (" DW-3, DW-1,DW-3 ", None, ("DW-3", "DW-1"), None),
+        (None, "high", None, "high"),
+    ],
+    ids=["only", "min-severity"],
+)
+def test_cmd_sweep_forwards_selector_to_start_sweep(
+    project,
+    monkeypatch,
+    only,
+    min_severity,
+    expected_only,
+    expected_min,
+):
+    install_bmad_config(project)
+    captured = {}
+    monkeypatch.setattr(cli, "_reject_under_floor_git", lambda _project: None)
+    monkeypatch.setattr(cli, "_reject_isolation_conflict", lambda _paths, _pol: None)
+    monkeypatch.setattr(cli.verify, "worktree_clean", lambda _root: True)
+    monkeypatch.setattr(cli, "_require_base_skills", lambda _project, _pol: True)
+    monkeypatch.setattr(cli, "_reconcile_stale", lambda *_args: None)
+    monkeypatch.setattr(
+        cli,
+        "_start_sweep",
+        lambda *_args, **kwargs: captured.update(kwargs) or 0,
+    )
+    args = argparse.Namespace(
+        project=str(project.project),
+        run_id=None,
+        before=None,
+        archive=False,
+        decisions_only=False,
+        repeat=None,
+        max_bundles=None,
+        max_cycles=None,
+        no_prompt=False,
+        dry_run=False,
+        only=only,
+        min_severity=min_severity,
+    )
+
+    assert cli.cmd_sweep(args) == 0
+    assert captured["only_ids"] == expected_only
+    assert captured["min_severity"] == expected_min
+
+
+@pytest.mark.parametrize(
+    ("only_ids", "expected"),
+    [(("DW-9",), 1), (None, 0)],
+    ids=["named-selector", "historical-unrestricted"],
+)
+def test_start_sweep_crash_exit_preserves_existing_modes(project, monkeypatch, only_ids, expected):
+    summary = types.SimpleNamespace(crashed=True, render=lambda: "CRASHED")
+    engine = types.SimpleNamespace(run=lambda: summary)
+    monkeypatch.setattr(
+        runsetup,
+        "compose_sweep",
+        lambda **_kwargs: types.SimpleNamespace(
+            run_id="selector-crash",
+            engine=engine,
+        ),
+    )
+
+    rc = cli._start_sweep(
+        project.project,
+        project,
+        policy_mod.load(None),
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        trigger="cli",
+        only_ids=only_ids,
+    )
+
+    assert rc == expected
 
 
 def test_make_adapters_review_synthesizes_from_spec(project, monkeypatch):
@@ -1964,6 +2352,7 @@ class _StubEngine:
     def run(self):
         class Summary:
             paused = False
+            crashed = False
 
             def render(self):
                 return "stub summary"
@@ -5885,12 +6274,10 @@ def test_resume_migrates_a_legacy_state_without_calling_it_a_move(project, monke
     assert "code root" not in capsys.readouterr().err
 
 
-def test_resume_tolerates_a_corrupt_sweep_json(project, monkeypatch):
-    """A torn/corrupt sweep.json (a crash mid-write on an older run) must not abort
-    resume — the recovery path. compose_resume guards the read and falls back to the
-    same launch defaults as the missing-file arm instead of letting json.loads raise."""
+def test_resume_tolerates_a_missing_legacy_sweep_json(project, monkeypatch):
+    """A pre-option sweep has no sweep.json and resumes unrestricted."""
     run_dir = _paused_run_for_resume(project, monkeypatch, run_type="sweep")
-    (run_dir / "sweep.json").write_text("{ not json", encoding="utf-8")
+    (run_dir / "sweep.json").unlink(missing_ok=True)
 
     captured: dict = {}
 
@@ -5905,6 +6292,124 @@ def test_resume_tolerates_a_corrupt_sweep_json(project, monkeypatch):
     assert captured["prompting"] is False
     assert captured["decisions_only"] is False
     assert captured["max_bundles"] is None
+
+
+def test_public_resume_refuses_missing_current_sweep_options_before_mutation(
+    project, monkeypatch, capsys
+):
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(b"{}").hexdigest(),
+    )
+    (run_dir / "sweep.json").unlink(missing_ok=True)
+    state_before = (run_dir / "state.json").read_bytes()
+    journal_path = run_dir / "journal.jsonl"
+    journal_before = journal_path.read_bytes() if journal_path.is_file() else None
+    pid_path = run_dir / runs.PID_FILE
+    pid_before = pid_path.read_bytes() if pid_path.is_file() else None
+    monkeypatch.setattr(cli, "SweepEngine", lambda **_kwargs: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+
+    assert "missing" in capsys.readouterr().err
+    assert (run_dir / "state.json").read_bytes() == state_before
+    assert (journal_path.read_bytes() if journal_path.is_file() else None) == journal_before
+    assert (pid_path.read_bytes() if pid_path.is_file() else None) == pid_before
+
+
+def test_public_resume_refuses_a_newer_sweep_options_version_before_mutation(
+    project, monkeypatch, capsys
+):
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION + 1,
+    )
+    (run_dir / "sweep.json").write_text(
+        json.dumps({"only": None, "min_severity": None}), encoding="utf-8"
+    )
+    state_before = (run_dir / "state.json").read_bytes()
+    monkeypatch.setattr(cli, "SweepEngine", lambda **_kwargs: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+
+    assert "unsupported sweep options version" in capsys.readouterr().err
+    assert (run_dir / "state.json").read_bytes() == state_before
+
+
+def test_public_resume_refuses_incomplete_current_sweep_options_before_mutation(
+    project, monkeypatch, capsys
+):
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(b"{}").hexdigest(),
+    )
+    (run_dir / "sweep.json").write_text("{}", encoding="utf-8")
+    state_before = (run_dir / "state.json").read_bytes()
+    monkeypatch.setattr(cli, "SweepEngine", lambda **_kwargs: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+
+    assert "selector field" in capsys.readouterr().err
+    assert (run_dir / "state.json").read_bytes() == state_before
+
+
+def test_public_resume_refuses_replacing_targeted_options_with_unrestricted_json(
+    project, monkeypatch, capsys
+):
+    targeted = json.dumps({"only": ["DW-1"], "min_severity": None})
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(targeted.encode("utf-8")).hexdigest(),
+    )
+    (run_dir / "sweep.json").write_text(
+        json.dumps({"only": None, "min_severity": None}), encoding="utf-8"
+    )
+    state_before = (run_dir / "state.json").read_bytes()
+    monkeypatch.setattr(cli, "SweepEngine", lambda **_kwargs: pytest.fail("engine constructed"))
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+
+    assert "bound at launch" in capsys.readouterr().err
+    assert (run_dir / "state.json").read_bytes() == state_before
+
+
+@pytest.mark.parametrize(
+    ("only", "expected"),
+    [(["DW-9"], 1), (None, 0)],
+    ids=["named-only", "unrestricted"],
+)
+def test_resume_crash_exit_is_failure_only_for_persisted_named_scope(
+    project, monkeypatch, only, expected
+):
+    options_text = json.dumps({"only": only, "min_severity": None})
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
+        sweep_options_digest=hashlib.sha256(options_text.encode("utf-8")).hexdigest(),
+    )
+    (run_dir / "sweep.json").write_text(options_text, encoding="utf-8")
+    summary = types.SimpleNamespace(crashed=True, render=lambda: "CRASHED")
+    engine = types.SimpleNamespace(run=lambda: summary)
+    monkeypatch.setattr(
+        runsetup,
+        "compose_resume",
+        lambda **_kwargs: types.SimpleNamespace(engine=engine),
+    )
+
+    assert cli._resume_paused_run(project.project, run_dir) == expected
 
 
 def test_resume_stamps_a_legacy_run_with_no_snapshot(project, monkeypatch):
@@ -11063,7 +11568,7 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
             captured.update(kw)
 
         def run(self):
-            return types.SimpleNamespace(render=lambda: "")
+            return types.SimpleNamespace(crashed=False, render=lambda: "")
 
     monkeypatch.setattr(cli, "SweepEngine", _Recorder)
 
@@ -11076,6 +11581,7 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
         profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
     ), "the swap must actually have landed on disk, or this test proves nothing"
     assert captured["adapter"].profile.binary == "mycli"
+    assert captured["only_ids"] is None and captured["min_severity"] is None
     assert signalled == ["started"]  # #501: the child composed, so the parent may latch
     run_id = captured["state"].run_id
     assert runs.read_trusted_config_digest(project.project, run_id) == pin
@@ -11702,6 +12208,49 @@ def test_sweep_archive_conflicting_flags_refused(project, capsys):
     err = capsys.readouterr().err
     assert "--archive cannot combine with" in err
     assert "--no-prompt" in err
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [("--only", "DW-1"), ("--min-severity", "high")],
+    ids=["only", "min-severity"],
+)
+def test_sweep_archive_refuses_selectors_before_archive_work(project, capsys, selector):
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "done 2026-06-01"}, commit=False)
+    before = project.deferred_work.read_text(encoding="utf-8")
+
+    rc = cli.main(["sweep", "--archive", *selector, "--project", str(project.project)])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--archive cannot combine" in err
+    assert "--only" in err and "--min-severity" in err
+    assert project.deferred_work.read_text(encoding="utf-8") == before
+    assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
+
+
+def test_sweep_before_without_archive_precedes_selector_validation(project, capsys):
+    install_bmad_config(project)
+
+    rc = cli.main(
+        [
+            "sweep",
+            "--before",
+            "2026-06-01",
+            "--only",
+            "bad",
+            "--project",
+            str(project.project),
+        ]
+    )
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--before requires --archive" in err
+    assert "malformed" not in err
 
 
 def test_sweep_archive_empty_before_without_archive_refused(project, capsys):

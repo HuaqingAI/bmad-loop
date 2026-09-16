@@ -63,7 +63,11 @@ commits the migrated ledger after validating it.
      exists (e.g. the text after `→` or a `**Resolution:**` field).
 4. Two manifest items describing the same underlying issue (e.g. a duplicate
    `W1` re-raised in a later review) may merge into ONE DW entry — map both
-   keys to the same `dw_id`. Merge only when their `done` flags match.
+   keys to the same `dw_id`. Merge only when their `done` flags match. The
+   merged entry's severity is the highest normalized manifest severity across
+   all merged items (`critical` > `high` > `medium` > `low`); omit `severity:`
+   only when every merged item has null severity. The orchestrator validates
+   this grouped rule once per target id.
 5. The finished file must contain only the `# Deferred Work` title line and
    canonical `### DW-<n>:` entries. Any leftover freeform section, bullet
    list, or strikethrough item fails the orchestrator's zero-legacy check

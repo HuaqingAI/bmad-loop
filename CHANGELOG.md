@@ -9,6 +9,15 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- **Target deferred-work sweeps.** `bmad-loop sweep --only DW-1,DW-3` selects an
+  exact open-id set, while `--min-severity low|medium|high|critical` selects the
+  named severity and higher. Selection happens before triage, bundle formation,
+  and `--max-bundles`; dry-run and resume preserve the same contract, excluded
+  and missing-severity ids are journaled, and selectors are incompatible with
+  each other and with archive mode. Named dry-runs over mixed legacy ledgers
+  project and label provisional post-migration ids, while real runs revalidate
+  after semantic duplicate merging assigns the actual universe.
+
 - **Journal-kind and refusal-site coverage gates.** `tests/test_portability_guard.py` gains
   three enumerate-vs-declare inventories: the 204 literal journal kinds (`JOURNAL_KINDS`,
   fed by a literal-kind emit that also sees kind-only writes, constructor-inline
@@ -83,7 +92,7 @@ breaking changes may land in a minor release.
 - **`bmad-loop sweep --archive`** moves closed (`status: done <ISO date>`) deferred-work entries to
   a sibling `deferred-work-archive.md`, replacing each with a stub that preserves the DW- id for
   grep and `closes_deferred` cross-references plus the load-bearing field lines (`gate:`,
-  `origin:`/`source_spec:`, reopenable-close undo markers). The live ledger then carries open
+  `origin:`/`source_spec:`, live `severity:`/`priority:`, reopenable-close undo markers). The live ledger then carries open
   entries in full and archived ones as compact stubs, rather than every closed body forever.
   Supports `--before DATE` to archive only entries closed before a cutoff, and `--dry-run` to
   preview. Reopening an archived stub leaves an `archived-body:` line pointing at the archive

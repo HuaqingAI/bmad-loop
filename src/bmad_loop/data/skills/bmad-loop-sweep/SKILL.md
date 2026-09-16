@@ -1,11 +1,11 @@
 ---
 name: bmad-loop-sweep
-description: 'Triage the deferred-work ledger for the bmad-loop orchestrator: verify every open entry against the actual codebase and return a machine-readable partition (bundles, already-resolved, blocked, skip, human decisions). Also migrates legacy pre-DW-format ledgers when invoked with --migrate. Automation-only — invoked by bmad-loop sweep runs, not by humans.'
+description: 'Triage the deferred-work ledger for the bmad-loop orchestrator: verify every selected open entry against the actual codebase and return a machine-readable partition (bundles, already-resolved, blocked, skip, human decisions). Also migrates legacy pre-DW-format ledgers when invoked with --migrate. Automation-only — invoked by bmad-loop sweep runs, not by humans.'
 ---
 
 # Deferred-Work Sweep Triage
 
-**Goal:** Classify every open entry in `{implementation_artifacts}/deferred-work.md`
+**Goal:** Classify every selected open entry in `{implementation_artifacts}/deferred-work.md`
 into a machine-readable triage plan the orchestrator can validate and execute.
 
 This workflow is **read-only and automation-native**: it runs only inside a
@@ -42,14 +42,21 @@ of an entry that was archived and later reopened: it is live work again, but the
 body it carried before that close is still in the archive file, in the block
 stamped with the date the line carries.
 
+If the invocation carries `--only DW-1,DW-2,...`, those ids are the complete
+triage universe for this session. Read the full ledger, but verify and partition
+exactly those named open entries; do not add other raw-open entries to
+`open_ids` or any result category. The orchestrator has already applied the
+operator's named-subset or severity-floor selector and validates your result
+against this exact scope.
+
 If the invocation carries `--feedback <path>`, read that file FIRST — it lists
 the deterministic validation errors your previous attempt's result.json failed
 on. Fix exactly those defects in this attempt's output.
 
-### Step 2: Verify every open entry against the code
+### Step 2: Verify every selected entry against the code
 
 Ledger statuses are known-unreliable: entries are often resolved by later work
-but never marked done. For EACH open entry:
+but never marked done. For EACH entry in the triage universe:
 
 1. Read its `location:` (file/component) in the current tree.
 2. Check whether the described issue still exists — read the code, grep for
@@ -62,7 +69,7 @@ Use sub-agents for parallel verification when available; never ask permission.
 
 ### Step 3: Partition
 
-Classify each open entry into exactly ONE category:
+Classify each entry in the triage universe into exactly ONE category:
 
 - **already_resolved** — the issue no longer exists in the code. Requires
   concrete `evidence` (file:line that now handles it, or the commit that fixed
@@ -89,7 +96,7 @@ Classify each open entry into exactly ONE category:
   non-destructive, and behavior-tightening may be bundled — when in doubt,
   make it a decision.
 
-Every open entry appears in exactly one category. The orchestrator validates
+Every entry in the triage universe appears in exactly one category. The orchestrator validates
 this deterministically; a missed or double-counted entry fails the whole
 result and burns a retry.
 

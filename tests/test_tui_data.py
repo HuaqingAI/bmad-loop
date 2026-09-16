@@ -1015,6 +1015,21 @@ def test_severity_extraction():
         assert deferredwork.field_severity(f"### DW-9: t\n\n{body}status: open\n") == expected, body
 
 
+def test_deferred_entries_does_not_read_severity_from_a_fenced_example(project):
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: quoted severity\n\n"
+        "```markdown\nseverity: critical\n```\nstatus: open\n",
+        encoding="utf-8",
+    )
+
+    items = data.deferred_entries(project.project)
+
+    assert items is not None
+    assert items[0].severity is None
+
+
 def test_deferred_entries_legacy_ledger(project):
     install_bmad_config(project)
     project.deferred_work.write_text(
