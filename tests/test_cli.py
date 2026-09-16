@@ -1936,6 +1936,35 @@ def test_sweep_selector_flags_are_mutually_exclusive(project, capsys):
     assert "not allowed with argument" in capsys.readouterr().err
 
 
+def test_cmd_sweep_refuses_both_selectors_without_argparse(project, capsys, monkeypatch):
+    """The explicit combine check in cmd_sweep is the second layer under the
+    argparse group: a caller that builds the namespace by hand (no parser) still
+    gets rc 1 before any policy load or archive work."""
+    install_bmad_config(project)
+    monkeypatch.setattr(
+        cli.policy_mod,
+        "load",
+        lambda *_args, **_kwargs: pytest.fail("policy must not load for a refused selector pair"),
+    )
+    args = argparse.Namespace(
+        project=str(project.project),
+        run_id=None,
+        before=None,
+        archive=False,
+        decisions_only=False,
+        repeat=None,
+        max_bundles=None,
+        max_cycles=None,
+        no_prompt=False,
+        dry_run=True,
+        only="DW-1",
+        min_severity="high",
+    )
+
+    assert cli.cmd_sweep(args) == 1
+    assert "--only cannot combine with --min-severity" in capsys.readouterr().err
+
+
 def test_sweep_dry_run_applies_severity_selector_and_reports_missing(project, capsys):
     project.deferred_work.write_text(
         "# Deferred Work\n\n"
