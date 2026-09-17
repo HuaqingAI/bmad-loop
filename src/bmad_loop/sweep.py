@@ -1313,7 +1313,7 @@ class SweepEngine(Engine):
             ids.append(dw_id)
         self._save()
 
-    def _owe_ledger_commit(self) -> None:
+    def _owe_ledger_commit(self) -> bool:
         """Latch `state.sweep_ledger_commit_owed` and persist it, BEFORE a ledger
         publish whose commit is gated on that publish's own result.
 
@@ -1330,11 +1330,41 @@ class SweepEngine(Engine):
         mutate-then-`_save()` latch as `_quarantine`, and for the same reason: the
         whole point is that a resume of this run sees it. Set before the write so
         every crash window is covered — a debt latched for a publish that then
-        never happened settles as a `path_clean` no-op. Cleared only by the
-        ledger-family `_commit_ledger` once git says the file is at HEAD;
-        `_loop` settles an outstanding one at the top of a resume."""
-        if not self.state.sweep_ledger_commit_owed:
-            self.state.sweep_ledger_commit_owed = True
+        never happened is RETRACTED by the same invocation
+        (`_retract_ledger_commit`), or, past a crash, settles as a `path_clean`
+        no-op. Otherwise cleared only by the ledger-family `_commit_ledger` once
+        git says the file is at HEAD; `_loop` settles an outstanding one at the
+        top of a resume.
+
+        Returns whether THIS call latched it. A latch already set at entry belongs
+        to a previous invocation whose commit never landed — the settle at the top
+        of `_loop` degraded, say — and only the invocation that latched a debt may
+        retract it: a replay that closes nothing is exactly the shape the debt
+        exists for, and must not read its own empty pass as proof there is
+        nothing to publish."""
+        if self.state.sweep_ledger_commit_owed:
+            return False
+        self.state.sweep_ledger_commit_owed = True
+        self._save()
+        return True
+
+    def _retract_ledger_commit(self, owed_here: bool) -> None:
+        """Clear the debt `_owe_ledger_commit` latched, because the publish it was
+        latched for definitively landed nothing — a fault ahead of the write (the
+        DW-166 degrade arms: a lock never taken, bytes nobody could read), a
+        `LedgerWriteError` (the atomic write failed and the original is
+        untouched), or a mutator that flipped no ids and so wrote no bytes.
+
+        Left set, the latch would outlive the phase as a FALSE debt, and the next
+        resume's settle would commit whatever the ledger file happened to be
+        carrying — an operator's hand-edit, a rival writer's harvest — under a
+        `chore(sweep):` message for a publish that never happened: the DW-183
+        hazard back in a narrower form. `owed_here` is `_owe_ledger_commit`'s
+        answer, so a debt inherited from an earlier invocation is never retracted
+        here (see there). A `LedgerLockReleaseError` never reaches this: the
+        publish LANDED, and that debt is real."""
+        if owed_here and self.state.sweep_ledger_commit_owed:
+            self.state.sweep_ledger_commit_owed = False
             self._save()
 
     def _remaining_estimate(self) -> int | None:
@@ -2680,9 +2710,10 @@ class SweepEngine(Engine):
         # commit of bytes the journal already claims. The debt is persisted ahead
         # of the write instead (`_owe_ledger_commit`), and `_loop` settles it at
         # the top of the resume. Only when there is something to write: an empty
-        # plan spawns no git and owes nothing (DW-183/DW-185).
-        if ids:
-            self._owe_ledger_commit()
+        # plan spawns no git and owes nothing (DW-183/DW-185). And every outcome
+        # below that definitively published nothing RETRACTS it, so a false debt
+        # never outlives this phase to be settled against an operator's edit.
+        owed_here = bool(ids) and self._owe_ledger_commit()
         try:
             closed = deferredwork.mark_done_many(
                 ledger,
@@ -2691,12 +2722,19 @@ class SweepEngine(Engine):
                 "already resolved",
                 notes=[f"already resolved: {entry.evidence}" for entry in plan.already_resolved],
             )
-        except (deferredwork.LedgerWriteError, deferredwork.LedgerLockReleaseError):
+        except deferredwork.LedgerWriteError:
+            # the atomic write failed and the original is untouched: nothing to
+            # settle, so the debt is retracted on the way out
+            self._retract_ledger_commit(owed_here)
+            raise
+        except deferredwork.LedgerLockReleaseError:
             # ...and its sibling: the publish LANDED and the lock's release then
             # faulted. Degrading that reads a close that happened as one that did
-            # not, and skips the commit of bytes already on disk.
+            # not, and skips the commit of bytes already on disk. The debt STAYS:
+            # the bytes are on disk and uncommitted, which is what it is for.
             raise
         except (deferredwork.LedgerReadError, OSError, ValueError, StateRootError) as e:
+            self._retract_ledger_commit(owed_here)  # every arm here is pre-write
             self.journal.append("sweep-resolved-close-unavailable", dw_ids=ids, error=str(e))
             # `post_close_resolved` still fires and 0 is still returned: the phase
             # RAN, it just closed nothing, and a plugin watching the phase boundary
@@ -2744,6 +2782,9 @@ class SweepEngine(Engine):
                 path=self.workspace.paths.deferred_work,
                 family="ledger",
             )
+        else:
+            # zero ids flipped is zero bytes written: nothing to settle
+            self._retract_ledger_commit(owed_here)
         self._emit("post_close_resolved")
         return len(closed)
 
@@ -2902,6 +2943,10 @@ class SweepEngine(Engine):
         ledger_in_doubt = False
         any_effect_faulted = False
         any_effect_landed = False
+        # whether THIS walk latched the commit debt (`_owe_ledger_commit`); a walk
+        # that lands no effect retracts it at the end, and a `LedgerWriteError`
+        # ahead of any landed effect retracts it on the way out
+        owed_here = False
         if not self.prompting:
             pending = [d for d in pending if d.id not in self.state.sweep_skipped_decisions]
             for decision in pending:
@@ -2989,11 +3034,18 @@ class SweepEngine(Engine):
                 # commit replays with the answer already saved — nothing pending,
                 # no effect applied, the `decision:` line dirty and unpublished.
                 # Idempotent, so one `_save()` per walk however many decisions.
-                self._owe_ledger_commit()
+                owed_here = self._owe_ledger_commit() or owed_here
                 try:
                     recorded = self._apply_decision_effect(decision, option)
-                except (deferredwork.LedgerWriteError, deferredwork.LedgerLockReleaseError):
+                except deferredwork.LedgerWriteError:
+                    # the atomic write failed and the original is untouched. An
+                    # EARLIER effect in this walk may have landed, and that debt
+                    # is real; only a walk that landed nothing retracts.
+                    if not any_effect_landed:
+                        self._retract_ledger_commit(owed_here)
                     raise
+                except deferredwork.LedgerLockReleaseError:
+                    raise  # the publish LANDED: the debt stays
                 except (
                     deferredwork.LedgerReadError,
                     OSError,
@@ -3108,6 +3160,12 @@ class SweepEngine(Engine):
                 path=self.workspace.paths.deferred_work,
                 family="ledger",
             )
+        elif not any_effect_landed:
+            # every effect faulted ahead of its write or wrote no line: nothing
+            # this walk published, so nothing to settle. The withheld case —
+            # an effect landed, then the LAST one faulted on undecodable bytes —
+            # keeps the debt: those landed lines are on disk and uncommitted.
+            self._retract_ledger_commit(owed_here)
         if answered_interactively:
             self._return_after_decisions(every_effect_landed=not any_effect_faulted)
         return answers, closed

@@ -9097,6 +9097,163 @@ def test_a_publish_an_interrupted_phase_left_uncommitted_is_committed_on_resume(
     assert load_state(resumed.run_dir).sweep_ledger_commit_owed is False  # ...and settled
 
 
+def _close_plan(*ids):
+    return TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}),
+        already_resolved=tuple(ResolvedEntry(i, "fixed by a1b2c3d") for i in ids),
+    )
+
+
+def _decision_plan():
+    return TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}), decisions=(_close_or_keep_decision("DW-1"),)
+    )
+
+
+def _close_resolved_pre_write_fault(engine, monkeypatch):
+    """The DW-166 degrade arm: the lock faults before anything is written."""
+    monkeypatch.setattr(
+        deferredwork, "mark_done_many", _raiser(OSError(11, "Resource deadlock avoided"))
+    )
+    assert engine._close_resolved(_close_plan("DW-1")) == 0
+    return None
+
+
+def _close_resolved_write_fault(engine, monkeypatch):
+    """The publish itself fails: the atomic writer leaves the original untouched."""
+    monkeypatch.setattr(deferredwork, "atomic_write_text", _raiser(OSError(28, "No space left")))
+    with pytest.raises(deferredwork.LedgerWriteError):
+        engine._close_resolved(_close_plan("DW-1"))
+
+
+def _close_resolved_nothing_flipped(engine, monkeypatch):
+    """Every id is already `done`: the mutator flips nothing and writes no bytes."""
+    assert engine._close_resolved(_close_plan("DW-9")) == 0  # no such entry
+
+
+def _decisions_phase_effect_fault(engine, monkeypatch):
+    """The effect faults ahead of its write, the walk degrades and carries on."""
+    engine.prompting = True
+    engine.prompter = DecisionPrompter(input_fn=lambda _p: "1", print_fn=lambda _l: None)
+    monkeypatch.setattr(
+        deferredwork, "record_decision", _raiser(OSError(11, "Resource deadlock avoided"))
+    )
+    _, closed = engine._decisions_phase(_decision_plan())
+    assert closed == 0
+
+
+def _decisions_phase_write_fault(engine, monkeypatch):
+    engine.prompting = True
+    engine.prompter = DecisionPrompter(input_fn=lambda _p: "1", print_fn=lambda _l: None)
+    monkeypatch.setattr(deferredwork, "atomic_write_text", _raiser(OSError(28, "No space left")))
+    with pytest.raises(deferredwork.LedgerWriteError):
+        engine._decisions_phase(_decision_plan())
+
+
+def _decisions_phase_no_line_written(engine, monkeypatch):
+    """`record_decision` answers False (DW-186): the ledger holds no entry for the id."""
+    engine.prompting = True
+    engine.prompter = DecisionPrompter(input_fn=lambda _p: "1", print_fn=lambda _l: None)
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}), decisions=(_close_or_keep_decision("DW-9"),)
+    )
+    _, closed = engine._decisions_phase(plan)
+    assert closed == 0
+
+
+def _raiser(exc):
+    def boom(*_args, **_kwargs):
+        raise exc
+
+    return boom
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        _close_resolved_pre_write_fault,
+        _close_resolved_write_fault,
+        _close_resolved_nothing_flipped,
+        _decisions_phase_effect_fault,
+        _decisions_phase_write_fault,
+        _decisions_phase_no_line_written,
+    ],
+    ids=[
+        "close-resolved/pre-write-fault",
+        "close-resolved/write-fault",
+        "close-resolved/nothing-flipped",
+        "decisions-phase/effect-fault",
+        "decisions-phase/write-fault",
+        "decisions-phase/no-line-written",
+    ],
+)
+def test_a_phase_that_published_nothing_retracts_its_commit_debt(project, monkeypatch, phase):
+    """The other edge of the debt above: it is latched BEFORE the publish, so every
+    outcome that then definitively lands nothing — a fault ahead of the write (the
+    DW-166 degrade arms), a `LedgerWriteError` (the atomic writer leaves the
+    original untouched), a mutator that flipped no ids, an effect that wrote no
+    line (DW-186) — must retract it. Left set, it is a FALSE debt, and the next
+    resume's settle commits whatever the ledger file happens to be carrying under a
+    `chore(sweep):` message for a publish that never happened.
+
+    Graded on that hazard, not just the flag: an operator's hand-edit of the ledger
+    is planted after the phase, the run is resumed with nothing in flight, and the
+    edit must still be theirs — HEAD unchanged, tree dirty, no `sweep-ledger-commit`
+    row. The persisted latch is asserted too, so the shape on disk is pinned.
+
+    Ablation: drop any one of the `_retract_ledger_commit` calls and its rows red
+    with the operator's edit committed by the resume."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    phase(engine, monkeypatch)
+    monkeypatch.undo()
+
+    assert load_state(engine.run_dir).sweep_ledger_commit_owed is False  # retracted
+    # an operator's in-flight edit of the ledger, AFTER the phase that published nothing
+    project.deferred_work.write_text(
+        project.deferred_work.read_text(encoding="utf-8") + "\n<!-- operator note -->\n",
+        encoding="utf-8",
+    )
+    head = git(project.project, "rev-parse", "HEAD")
+    dirty_before = git(project.project, "status", "--porcelain")
+
+    resumed, _ = resume_sweep(project, engine, [])
+    resumed._finish_inflight_bundles = lambda: 0
+    resumed._cycle = lambda *_a, **_k: False
+    resumed._loop()
+
+    # a phase that published nothing may not have journalled AT ALL, and a journal
+    # that was never created is the stronger form of the same claim
+    if (resumed.run_dir / "journal.jsonl").exists():
+        assert _records(resumed, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head  # the edit was not published
+    assert git(project.project, "status", "--porcelain") == dirty_before  # ...and stays theirs
+
+
+def test_an_inherited_commit_debt_survives_a_replay_that_closes_nothing(project):
+    """Only the invocation that latched a debt may retract it. A replay whose ids
+    are already `done` is exactly the shape the debt exists for — the previous
+    invocation published and died before committing — and if the settle at the top
+    of `_loop` could not clear it (a tree git cannot interrogate degrades and leaves
+    the latch set), the replay's own empty pass says nothing about those bytes.
+
+    Ablation: make `_retract_ledger_commit` ignore `owed_here` and this reds with
+    the inherited debt cleared by the replay."""
+    write_ledger(project, {"DW-1": "done 2026-01-01", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    engine.state.sweep_ledger_commit_owed = True  # inherited from a previous invocation
+    engine._save()
+
+    assert engine._close_resolved(_close_plan("DW-1")) == 0  # already done: nothing flipped
+
+    assert (
+        load_state(engine.run_dir).sweep_ledger_commit_owed is True
+    )  # not this phase's to retract
+
+
 # The sanctioned `path=` spellings, by family. Compared as `ast.unparse` text,
 # which is exact for these and stable across formatting. The ledger family is ONE
 # fully-qualified spelling on purpose: a bare `ledger` is name-scoped, and

@@ -453,7 +453,11 @@ breaking changes may land in a minor release.
   sites now persist the debt on `state.json` (`sweep_ledger_commit_owed`) before the
   write; the ledger-family `_commit_ledger` clears it once git says the file is at
   HEAD, and a resume settles an outstanding one at the top of `_loop`, before triage
-  or a bundle baseline reads the ledger.
+  or a bundle baseline reads the ledger. An outcome that definitively published
+  nothing — a fault ahead of the write, a failed atomic write, a mutator that flipped
+  no ids — retracts the debt in the same invocation, so a false one never survives to
+  be settled against an operator's edit; a debt inherited from an earlier invocation
+  is never retracted by a replay that closes nothing.
 
 - Handle non-dictionary session result documents through existing empty-document
   paths (DW-206/DW-207). Share read-time normalization across engine, stories,
