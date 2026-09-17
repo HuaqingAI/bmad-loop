@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -76,6 +76,81 @@ def increment_decimal_digits(value: str) -> str:
     if carry:
         digits.insert(0, "1")
     return "".join(digits)
+
+
+# The scalars a stored answer's consumers read as strings, split by WHO reads them.
+# `_agreeing_option` runs on both `_materialize_bundles` lanes, so `key`/`label` are
+# consumed whatever the effect; `intent`/`bundle_name` are read by the BUILD lane
+# alone. Order within each tuple is the order a defect is reported in.
+_ANSWER_STR_FIELDS = ("key", "label")
+_BUILD_ANSWER_STR_FIELDS = ("intent", "bundle_name")
+
+
+def unusable_answer_reason(value: Any) -> str | None:
+    """Why `value` is not a usable persisted decision answer, or None when it is.
+
+    ONE schema for the two readers of a stored answer — `SweepEngine._decisions_phase`'s
+    read loops and `decisions.pending_missed_decisions` — because they have to agree
+    (DW-142): a value one accepted and the other rejected was an id that either got
+    silently ignored by every sweep while this command counted it answered, or the
+    reverse. The returned string is the `malformed` row's reason, so it names ids,
+    fields and TYPE names only, never a stored answer's prose.
+
+    The checks are exactly what the consumers assume, no more — because rejecting is
+    not free: an answer refused here stops being seeded, and for `keep-open` that
+    means it stops SUPPRESSING bundles, so a later cycle can bundle and build work
+    the human explicitly asked to leave alone. A field is therefore screened only
+    where a reader of THIS effect actually consumes it.
+
+    `effect` must be a recognized `DECISION_EFFECTS` member because
+    `_materialize_bundles` routes on it and an unrecognized one matches no lane — the
+    answer counts as given while nothing acts on it. `key` and `label`, when present,
+    must be strings for every effect: `_agreeing_option` reads both and runs on both
+    lanes. `intent` and `bundle_name` are screened for `build` ONLY, the sole lane
+    that reads them — a list `intent` used to reach `Bundle.intent` as its truthy
+    Python repr and ship into a dev session (DW-141), while the same corrupt field on
+    a keep-open answer is inert prose no reader touches. Fields no reader consumes
+    (`resolution`, `answered_at`) are not validated for any effect.
+
+    `close` is usable even though `record_pre_answer` never stores it: the
+    interactive writer in `_decisions_phase` records `effect: "close"` for a
+    decision answered `close` this run, so rejecting it would re-ask a decision the
+    human already answered inside the same run.
+
+    Rejecting is never a repair — the caller keeps the value and re-publishes it
+    unchanged; see `_decisions_phase`'s `unusable` map and `load_pre_answers`."""
+    if not isinstance(value, dict):
+        return f"not a JSON object: {type(value).__name__}"
+    if "effect" not in value:
+        return "effect missing"
+    effect = value["effect"]
+    if not isinstance(effect, str) or effect not in DECISION_EFFECTS:
+        return "effect not recognized"
+    fields = _ANSWER_STR_FIELDS
+    if effect == "build":
+        fields += _BUILD_ANSWER_STR_FIELDS
+    for field in fields:
+        if field in value and not isinstance(value[field], str):
+            return f"{field} not a string: {type(value[field]).__name__}"
+    return None
+
+
+def _answer_str(answer: dict[str, Any], field: str) -> str:
+    """A stored answer's scalar read as a string, or "" when it is anything else.
+
+    `str(answer.get(field, ""))` was the old spelling and it never failed: a list
+    became "['a', 'b']" and a dict "{...}" — truthy prose no human authored, which
+    the build lane then shipped as a `Bundle.intent` (DW-141). "" instead, so each
+    site's EXISTING fallback chain handles it: an agreeing option's value, then the
+    site's own default or its drop cause. No new branch, no new drop cause.
+
+    Defense-in-depth, not the production path: `_decisions_phase` already rejects
+    at the read site (`unusable_answer_reason`) every field a reader of that effect
+    consumes, so in production each site here only ever sees strings. It stays
+    because the test suite hands `_materialize_bundles` a map directly, past that
+    read site — the same reason each lane holds its own `isinstance` guard."""
+    value = answer.get(field)
+    return value if isinstance(value, str) else ""
 
 
 @dataclass(frozen=True)
@@ -233,6 +308,34 @@ def select_entries(
     return SweepSelection(selected=open_entries, excluded=())
 
 
+def _plan_str(container: dict[str, Any], field: str, where: str, errors: list[str]) -> str | None:
+    """One LLM-authored free-text scalar off a triage plan, or None when it is
+    not a string — the plan-input twin of `unusable_answer_reason` (DW-148).
+
+    `str(value)` was the old spelling and it never failed: a list `intent`
+    became the truthy repr "['do', 'x']", which satisfied the
+    `effect == "build" and not intent` gate, landed in `DecisionOption.intent`
+    and rode into `Bundle.intent`, `intent.md` and a dev session — the DW-141
+    harm, on the plan surface instead of the persisted-answer store. A malformed
+    plan is REFUSED and re-driven instead, through the `errors` channel that
+    already exists; there is no repair path and no new drop cause.
+
+    The message names the decision id or the bundle's POSITION, the field and
+    the type name only, never the offending value's prose — the same rule, and
+    the same wording, as `unusable_answer_reason`.
+
+    Callers thread the `None` through rather than falling back to "": "" would
+    re-enter the field's own empty/invalid-value branch and double-report, and
+    one error per fault is the convention here (see
+    `test_validate_triage_reports_one_error_when_a_name_fails_both_gates`). The
+    dataclasses are constructed with `value or ""` at the end."""
+    value = container.get(field, "")
+    if isinstance(value, str):
+        return value
+    errors.append(f"{where}: {field} not a string: {type(value).__name__}")
+    return None
+
+
 def validate_triage(
     rj: dict[str, Any] | None, expected_open_ids: set[str] | None
 ) -> tuple[TriagePlan | None, list[str]]:
@@ -277,33 +380,48 @@ def validate_triage(
 
     bundles = []
     names: set[str] = set()
-    for item in rj.get("bundles", []):
-        name = str(item.get("name", ""))
-        if not BUNDLE_NAME_RE.match(name):
-            errors.append(f"bundle name {name!r} invalid (want {BUNDLE_NAME_RE.pattern})")
-        # The one rule BUNDLE_NAME_RE cannot express. A cycle-1 bundle's name IS its
-        # directory (`_write_intent`), and the reserved Windows device basenames --
-        # CON, NUL, AUX, PRN, COM<N>, LPT<N> -- are `[a-z0-9-]`-legal names that no
-        # Windows filesystem will accept as one (matched case-insensitively, so
-        # lowercase is no reprieve). Testing `safe_segment` identity rather than a
-        # hand-written device list keeps this gate in lockstep with the sanitizer
-        # that defines the set: the identical idiom, for the identical reason, as
-        # `runs.is_valid_run_id`. Guarded on the match above so one bad name yields
-        # one error and not two.
-        if BUNDLE_NAME_RE.match(name) and safe_segment(name) != name:
-            errors.append(f"bundle name {name!r} is not a legal path segment")
-        if name in names:
-            errors.append(f"duplicate bundle name {name!r}")
-        names.add(name)
+    for bundle_index, item in enumerate(rj.get("bundles", [])):
+        # Positional, not by name: the name itself may be the non-string field,
+        # so it cannot be the thing that identifies the bundle in an error. Same
+        # label shape as `_normalize_bundle_names`, which ran above.
+        where = f"bundles[{bundle_index}]"
+        name = _plan_str(item, "name", where, errors)
+        # `repr(name)` for every message that already named the bundle by name;
+        # the position stands in when there is no name to print.
+        label = repr(name) if name is not None else where
+        if name is not None:
+            if not BUNDLE_NAME_RE.match(name):
+                errors.append(f"bundle name {name!r} invalid (want {BUNDLE_NAME_RE.pattern})")
+            # The one rule BUNDLE_NAME_RE cannot express. A cycle-1 bundle's name IS its
+            # directory (`_write_intent`), and the reserved Windows device basenames --
+            # CON, NUL, AUX, PRN, COM<N>, LPT<N> -- are `[a-z0-9-]`-legal names that no
+            # Windows filesystem will accept as one (matched case-insensitively, so
+            # lowercase is no reprieve). Testing `safe_segment` identity rather than a
+            # hand-written device list keeps this gate in lockstep with the sanitizer
+            # that defines the set: the identical idiom, for the identical reason, as
+            # `runs.is_valid_run_id`. Guarded on the match above so one bad name yields
+            # one error and not two.
+            if BUNDLE_NAME_RE.match(name) and safe_segment(name) != name:
+                errors.append(f"bundle name {name!r} is not a legal path segment")
+            if name in names:
+                errors.append(f"duplicate bundle name {name!r}")
+            # Only a string name is registered, so a type-failed bundle is invisible
+            # to the option loop's `bundle_name in names` duplicate check. That gap
+            # is covered by the refusal: its type error is already in `errors`, and a
+            # non-empty `errors` returns `(None, errors)` before any duplicate could
+            # matter.
+            names.add(name)
         dw_ids = [str(i) for i in item.get("dw_ids", [])]
         if not dw_ids:
-            errors.append(f"bundle {name!r} has no dw_ids")
+            errors.append(f"bundle {label} has no dw_ids")
         for dw_id in dw_ids:
-            claim(dw_id, f"bundle {name!r}")
-        intent = str(item.get("intent", "")).strip()
-        if not intent:
-            errors.append(f"bundle {name!r} has no intent")
-        bundles.append(Bundle(name, tuple(dw_ids), intent))
+            claim(dw_id, f"bundle {label}")
+        intent = _plan_str(item, "intent", where, errors)
+        if intent is not None:
+            intent = intent.strip()
+            if not intent:
+                errors.append(f"bundle {label} has no intent")
+        bundles.append(Bundle(name or "", tuple(dw_ids), intent or ""))
 
     blocked = []
     for item in rj.get("blocked", []):
@@ -333,59 +451,85 @@ def validate_triage(
         options = []
         keys: set[str] = set()
         decision_bundle_names: set[str] = set()
-        for raw in item.get("options", []):
-            key = str(raw.get("key", ""))
-            effect = str(raw.get("effect", ""))
-            intent = str(raw.get("intent", "")).strip()
+        for option_index, raw in enumerate(item.get("options", [])):
+            raw_key = raw.get("key", "")
+            key = str(raw_key)
+            # Positional until the key is known to be a string, for the reason the
+            # `bundles` loop is positional: `key` is NOT type-checked here (it stays
+            # `str(...)`, see the note above), so an object key would otherwise print
+            # its own prose into a message this file promises carries type names only
+            # -- and these reach a journal. A string key keeps today's wording byte
+            # for byte, empty ones included.
+            where = (
+                f"decision {dw_id} option {key}"
+                if isinstance(raw_key, str)
+                else f"decision {dw_id} options[{option_index}]"
+            )
+            # Every free-text scalar this option contributes downstream, screened
+            # before any of them is read. A field that failed the type check is
+            # None from here on, and each value check below is guarded on that --
+            # one error per fault, never a type error plus the empty-value error
+            # a "" fallback would also have tripped.
+            effect = _plan_str(raw, "effect", where, errors)
+            intent = _plan_str(raw, "intent", where, errors)
+            if intent is not None:
+                intent = intent.strip()
+            option_label = _plan_str(raw, "label", where, errors)
+            if option_label is not None:
+                option_label = option_label.strip()
+            resolution = _plan_str(raw, "resolution", where, errors)
+            if resolution is not None:
+                resolution = resolution.strip()
+            bundle_name = _plan_str(raw, "bundle_name", where, errors)
             if not key or key in keys:
                 errors.append(f"decision {dw_id}: missing/duplicate option key {key!r}")
             keys.add(key)
-            if effect not in DECISION_EFFECTS:
-                errors.append(f"decision {dw_id} option {key}: bad effect {effect!r}")
-            if effect == "build" and not intent:
-                errors.append(f"decision {dw_id} option {key}: effect 'build' needs intent")
-            bundle_name = str(raw.get("bundle_name", ""))
-            if bundle_name and not BUNDLE_NAME_RE.match(bundle_name):
-                errors.append(f"decision {dw_id} option {key}: bad bundle_name {bundle_name!r}")
-            # The second site that mints a bundle directory, gated for the reason
-            # stated at the `bundles` loop above. A build-effect option's
-            # `bundle_name` becomes `Bundle.name` in `_materialize_bundles`, so it
-            # reaches `_write_intent`'s cycle-1 directory by the identical path --
-            # `BUNDLE_NAME_RE` is no more able to express the rule here than there.
-            # Guarded on the match above so one bad name yields one error, and on
-            # nothing else: an absent `bundle_name` fails that match already.
-            if BUNDLE_NAME_RE.match(bundle_name) and safe_segment(bundle_name) != bundle_name:
-                errors.append(
-                    f"decision {dw_id} option {key}: bundle_name {bundle_name!r} "
-                    "is not a legal path segment"
-                )
-            if effect == "build" and bundle_name:
-                if bundle_name in names:
-                    errors.append(f"duplicate bundle name {bundle_name!r}")
-                decision_bundle_names.add(bundle_name)
+            if effect is not None and effect not in DECISION_EFFECTS:
+                errors.append(f"{where}: bad effect {effect!r}")
+            if effect == "build" and intent is not None and not intent:
+                errors.append(f"{where}: effect 'build' needs intent")
+            if bundle_name is not None:
+                if bundle_name and not BUNDLE_NAME_RE.match(bundle_name):
+                    errors.append(f"{where}: bad bundle_name {bundle_name!r}")
+                # The second site that mints a bundle directory, gated for the reason
+                # stated at the `bundles` loop above. A build-effect option's
+                # `bundle_name` becomes `Bundle.name` in `_materialize_bundles`, so it
+                # reaches `_write_intent`'s cycle-1 directory by the identical path --
+                # `BUNDLE_NAME_RE` is no more able to express the rule here than there.
+                # Guarded on the match above so one bad name yields one error, and on
+                # nothing else: an absent `bundle_name` fails that match already.
+                if BUNDLE_NAME_RE.match(bundle_name) and safe_segment(bundle_name) != bundle_name:
+                    errors.append(
+                        f"{where}: bundle_name {bundle_name!r} is not a legal path segment"
+                    )
+                if effect == "build" and bundle_name:
+                    if bundle_name in names:
+                        errors.append(f"duplicate bundle name {bundle_name!r}")
+                    decision_bundle_names.add(bundle_name)
             options.append(
                 DecisionOption(
                     key=key,
-                    label=str(raw.get("label", "")).strip() or key,
-                    effect=effect,
-                    intent=intent,
-                    resolution=str(raw.get("resolution", "")).strip(),
-                    bundle_name=bundle_name,
+                    label=option_label or key,
+                    effect=effect or "",
+                    intent=intent or "",
+                    resolution=resolution or "",
+                    bundle_name=bundle_name or "",
                 )
             )
         names.update(decision_bundle_names)
         if len(options) < 2:
             errors.append(f"decision {dw_id} needs at least 2 options")
-        recommendation = str(item.get("recommendation", ""))
-        if recommendation not in keys:
+        recommendation = _plan_str(item, "recommendation", f"decision {dw_id}", errors)
+        if recommendation is not None and recommendation not in keys:
             errors.append(f"decision {dw_id}: recommendation {recommendation!r} not an option")
+        context = _plan_str(item, "context", f"decision {dw_id}", errors)
         decisions.append(
             Decision(
                 dw_id,
                 question,
-                str(item.get("context", "")).strip(),
+                (context or "").strip(),
                 tuple(options),
-                recommendation,
+                recommendation or "",
             )
         )
 
@@ -743,10 +887,34 @@ class SweepEngine(Engine):
             for key in self.state.tasks
         )
         self.prompter = prompter or DecisionPrompter()
-        # decisions already journaled as skipped this process; without it a
-        # persistent decision item would notify once per repeat cycle
-        self._skipped_decisions: set[str] = set()
+        # The two decision quarantines — ids already journaled as skipped, and
+        # ids whose recorded answer was already journaled as DROPPED (and
+        # notified) — live on `state` (`sweep_skipped_decisions` /
+        # `sweep_dropped_decisions`), not here. Without them a persistent
+        # decision item notifies once per repeat cycle, and a cycle whose
+        # re-triage happens to mint an AGREEING option revives a decision the
+        # operator was already told had been dropped: `_materialize_bundles`
+        # leaves the run-level `answers` entry alone (it is the human's recorded
+        # answer and stays auditable on disk), so `_decisions_phase` re-reads it
+        # every cycle. They are persisted run state (DW-124), deliberately:
+        # the disposition is the RUN's — so a pause/resume of the same run must
+        # not re-announce it, while a NEW run re-evaluates from scratch — and
+        # the answer is the human's.
         self.state.run_type = "sweep"
+
+    def _quarantine(self, ids: list[str], dw_id: str) -> None:
+        """Add `dw_id` to one of `state`'s decision quarantines if absent, and
+        persist immediately — mirroring `Engine._run_auto_sweep`'s
+        mutate-then-`_save()` latch, since the whole point of the list is that a
+        resume of this run sees it.
+
+        Every call site runs this AFTER its journal row and its notify, so the
+        residual crash window (announced, not yet persisted) resumes into a
+        re-announcement rather than into a silent quarantine — the safe
+        direction for a record an operator reads."""
+        if dw_id not in ids:
+            ids.append(dw_id)
+        self._save()
 
     def _remaining_estimate(self) -> int | None:
         """Sweep override of the graceful-stop hint: how many deferred-work
@@ -914,20 +1082,31 @@ class SweepEngine(Engine):
     def _cycle(self, cycle: int, open_now: set[str]) -> bool:
         """One triage -> close -> decide -> bundle pass. Returns whether the
         cycle completed any addressable work — the repeat loop's progress
-        predicate. Caveat: on crash-resume of a cycle whose only progress was
-        already-resolved closes, the replayed (idempotent) closes report 0 and
-        the run stops with no-progress; errs toward stopping, never loops."""
+        predicate. Dropping a recorded decision answer counts (DW-123, widened
+        from the keep-open lane to all three drop lanes by DW-135): the drop
+        releases its id from a stored answer nothing can act on, so a later
+        cycle's fresh triage can address it. It cannot spin the loop —
+        `_materialize_bundles` bounds each id to one drop per run, and since
+        DW-124 that bound is persisted on `state`, so it holds across a
+        pause/resume too and the signal fires at most once per id. Caveat: on
+        crash-resume of a cycle whose only progress was already-resolved closes,
+        the replayed (idempotent) closes report 0 and the run stops with
+        no-progress; the same now goes for a cycle whose only would-be event is a
+        drop the pre-crash run already announced and persisted, which the
+        quarantine skips rather than re-signalling. Errs toward stopping, never
+        loops."""
         self._emit("pre_sweep_cycle", phase=str(cycle))
         self._warn_stranded_bundles()
         plan = self._ensure_triage(open_now, cycle)
         closed = self._close_resolved(plan)
         answers, decisions_closed = self._decisions_phase(plan)
-        bundles = self._materialize_bundles(plan, answers)
+        bundles, answer_dropped = self._materialize_bundles(plan, answers)
         if self.decisions_only:
             self.journal.append("sweep-decisions-only", bundles_not_run=len(bundles))
             self._prune_pre_answers()
             self._emit("post_sweep_cycle", phase=str(cycle))
             return False
+        graded_keys: list[str] = []
         for bundle in bundles:
             # Item boundary: a request during bundle N lets N finish through
             # commit; bundle N+1 never starts. A request landing during triage
@@ -936,15 +1115,24 @@ class SweepEngine(Engine):
             # persisted, triage.json is cached, closes are idempotent, and
             # terminal tasks are skipped on re-drive.
             self._check_stop_request()
-            self._run_bundle(bundle, cycle)
-        bundles_done = sum(
-            1
-            for b in bundles
-            if self.state.tasks[self._bundle_key(b.name, cycle)].phase == Phase.DONE
-        )
+            key = self._run_bundle(bundle, cycle)
+            if key is not None:
+                graded_keys.append(key)
+        # Grade the key each bundle was actually resolved to — the one it ran
+        # under, or the terminal one it was skipped as already-finished at,
+        # which counts here exactly as it always has. What is never used is a
+        # key re-derived from `bundle.name`: since DW-125 a bundle whose own key
+        # is held by a terminal task carrying different dw_ids runs under a
+        # DEDUPED name, so the re-derived key named the wrong task — the
+        # finished one, whose DONE phase counted a bundle this cycle never ran,
+        # in both the deduped case and the name-collision drop that runs nothing
+        # at all. Reading the reported keys also keeps the lookup total: every
+        # key returned here has a task by construction, where a re-derived one
+        # need not.
+        bundles_done = sum(1 for key in graded_keys if self.state.tasks[key].phase == Phase.DONE)
         self._prune_pre_answers()
         self._emit("post_sweep_cycle", phase=str(cycle))
-        return closed > 0 or decisions_closed > 0 or bundles_done > 0
+        return closed > 0 or decisions_closed > 0 or bundles_done > 0 or answer_dropped
 
     def _prune_pre_answers(self) -> None:
         """Drop consumed pre-answers — entries built or closed this cycle have
@@ -968,6 +1156,80 @@ class SweepEngine(Engine):
             self.journal.append("decision-preanswers-pruned", dw_ids=dropped)
             self._commit_ledger("chore(sweep): drop consumed deferred-work pre-answers")
 
+    def _prune_dropped_pre_answer(
+        self, dw_id: str, drop_cause: str, answer: dict[str, Any]
+    ) -> None:
+        """Retire the PROJECT-level pre-answer a just-dropped stale answer came
+        from (DW-143). Part of the drop itself, not a later cleanup. `answer` is
+        the value this run just dropped, and the store entry goes ONLY while it
+        still equals it — see the provenance guard below.
+
+        Why it exists: DW-124's quarantine is RUN-scoped by design, so it bounds
+        the drop to one announcement per run and a NEW run re-evaluates from
+        scratch. But the answer that feeds a stale drop lives in the project store,
+        `pending_missed_decisions` filters out any id already usably answered
+        there, and `_prune_pre_answers` retires an entry only once a later cycle
+        bundles the id and closes it. While triage keeps re-asking the id as a
+        DECISION instead, that never happens: every new run re-read the same stale
+        answer, re-dropped it and re-notified, and no surface re-offered the id.
+        Removing the entry at the drop breaks that loop from both ends — the next
+        run reads no stale answer, and `bmad-loop decisions` offers the id again.
+
+        Keep-open-only, deliberately. A dropped `build` answer (`no-intent`,
+        `name-collision`) leaves its entry open to be re-asked with the stored
+        answer still meaningful, where a dropped keep-open answer has no payload
+        left beyond the option it named — there is nothing to preserve.
+
+        Called AFTER `_quarantine`, which is the announce-then-persist order that
+        method's docstring promises: the residual crash window (announced,
+        quarantined, store not yet pruned) resumes into the DW-124 skip and the
+        entry is pruned by the next run that re-drops it. The reverse order would
+        leave a window in which a human's answer is already gone while the run has
+        no record of having dropped it.
+
+        Reaches the project store ONLY. `<run>/decisions.json` keeps the answer
+        (the run-local audit trail is untouched by design) and so does the ledger
+        `decision:` line `_apply_decision_effect` wrote. The journal row carries the
+        id and the drop cause alone — no answer prose, no store path.
+
+        Retires the entry ONLY while it still holds the value that was dropped.
+        The dropped `answer` is this run's RUN-LOCAL copy, and `_decisions_phase`
+        lets that copy win over the project store for the rest of the run — so a
+        human who re-answers the id out of band while the run is paused
+        (`pending_missed_decisions` screens against the store alone, never against
+        a run's `decisions.json`) leaves a NEWER store entry this run has never
+        evaluated. Keyed on the id alone, the removal deleted that replacement, and
+        committed the deletion, on the strength of a stale copy the human had
+        already superseded. `drop_pre_answer` compares before it deletes: a seeded
+        copy round-trips through JSON unchanged and so equals the entry it came
+        from, while a re-answer differs in at least `answered_at`, and an
+        interactive in-run answer never equals a store entry at all. The surviving
+        replacement is left for the NEXT run to evaluate from scratch, exactly as
+        a fresh answer would be; this run stays on its own record."""
+        from . import decisions as decisions_store  # lazy: decisions imports sweep
+
+        # `_project_of_run_dir`, never `self.workspace.root`: under the `repo_root`
+        # override the two diverge and only the run dir stays anchored to the
+        # project that owns the store (see `_decisions_phase` and
+        # `_prune_pre_answers`, which resolve it the same way).
+        if not decisions_store.drop_pre_answer(
+            _project_of_run_dir(self.run_dir), dw_id, answer=answer
+        ):
+            # Either no store entry (a run-local-only answer) or an entry that is
+            # no longer the value dropped (a human's later replacement): no write,
+            # no row — the store's bytes are untouched either way.
+            return
+        self.journal.append(
+            "sweep-decision-preanswer-pruned", decision=dw_id, drop_cause=drop_cause
+        )
+        # Committed like `_prune_pre_answers`': `_materialize_bundles` runs ahead of
+        # this cycle's bundles, and bundles need a clean baseline. Same reach as
+        # every other `_commit_ledger` caller, and the same limit: it commits
+        # `workspace.root`, so under a `repo_root` override whose project dir is
+        # NOT inside the code repo this edit — like the ledger's own — stays on
+        # disk uncommitted (DW-335; the store write above is the durable part).
+        self._commit_ledger("chore(sweep): drop stale deferred-work pre-answer")
+
     def _drive_story(self, task: StoryTask) -> None:
         # no spec-approval gate for bundles: the bundle intent came from the
         # validated triage plan (and, for decision bundles, from the human).
@@ -981,23 +1243,138 @@ class SweepEngine(Engine):
     def _bundle_key(self, name: str, cycle: int) -> str:
         return f"dw-{name}" if cycle == 1 else f"dw{cycle}-{name}"
 
-    def _run_bundle(self, bundle: Bundle, cycle: int) -> None:
-        key = self._bundle_key(bundle.name, cycle)
+    def _bundle_name_for(self, bundle: Bundle, cycle: int) -> tuple[str, int] | None:
+        """The name this bundle runs under and the attempt that found it, or
+        None when no key is available. Pure apart from the exhaustion record:
+        the dedupe record belongs to `_run_bundle`, which is the only caller
+        that knows whether the bundle went on to USE the deduped name.
+
+        The terminal-task early return below is what makes a resume cheap: a
+        bundle already finished this run is skipped rather than re-driven. It
+        used to compare the KEY alone (DW-125), and the key is a pure function of
+        `(name, cycle)` — so when a resume loses `<run>/triage.json`,
+        `_ensure_triage` regenerates a plan whose names are re-authored freely,
+        and a fresh bundle that happens to reuse a finished bundle's name was
+        silently swallowed with its ids never run. `_materialize_bundles`'
+        uniqueness pass cannot see this: it compares names against THIS cycle's
+        list, never against persisted state.
+
+        The bundle's identity is its `dw_ids`, so agreement is tested on those,
+        as SET equality — a regenerated triage may emit the same ids in a
+        different order, and treating that as a new bundle would re-run finished
+        work on every cache-loss resume, a worse regression than the bug. A
+        persisted EMPTY list agrees with anything: it is the pre-`dw_ids`
+        `state.json` shape (`model.py` loads a missing key as `[]`), and reading
+        it as divergence would re-run every bundle of every legacy paused run.
+
+        On divergence the name gains the same bounded `-2` … `-9` suffix
+        `_materialize_bundles` applies to a colliding stored name — deduping the
+        NAME rather than the key alone is what keeps `_bundle_key`, the intent
+        dirname and `_ensure_bundle_intent`'s key→name round-trip consistent.
+        This is the third collision remedy in this file and must not be confused
+        with the other two: `_materialize_bundles` DISCARDS a colliding stored
+        `bundle_name` (it has `decision-<id>` beneath it) and SUFFIXES that
+        fallback (which has nothing beneath it). Here a validated plan name
+        collides with PERSISTED state, and suffixing is the only repair — there
+        is no fallback name to reach for.
+
+        Scoped to TERMINAL tasks deliberately: an in-flight task at the key still
+        goes through `_recover_inflight_bundle` exactly as before
+        (`_finish_inflight_bundles` drives persisted bundles terminal before a
+        cycle picks new work, and `_warn_stranded_bundles` says so loudly when
+        one survives)."""
+        wanted = set(bundle.dw_ids)
+        for attempt in range(1, 10):
+            name = bundle.name if attempt == 1 else f"{bundle.name}-{attempt}"
+            task = self.state.tasks.get(self._bundle_key(name, cycle))
+            if task is not None and task.terminal and task.dw_ids and set(task.dw_ids) != wanted:
+                continue
+            return name, attempt
+        # Bounded, so the search is provably finite — and loud on both surfaces,
+        # because the alternative is the swallowed bundle this guard exists to
+        # prevent. The ids stay open for the next sweep.
+        self.journal.append(
+            "sweep-bundle-key-collision", name=bundle.name, dw_ids=list(bundle.dw_ids)
+        )
+        # Spell the KEYS, not the bare name: from cycle 2 they are `dw<N>-...`,
+        # so a name-only message names nothing the operator can grep state.json
+        # for.
+        first = self._bundle_key(bundle.name, cycle)
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            f"sweep bundle {bundle.name!r} could not be named",
+            f"every key from {first} through {first}-9 (cycle {cycle}) is held by a "
+            "finished bundle carrying different deferred-work ids; not run: "
+            + ", ".join(bundle.dw_ids),
+        )
+        return None
+
+    def _run_bundle(self, bundle: Bundle, cycle: int) -> str | None:
+        """Run one bundle; returns the task key it ran under, or None when no key
+        was available (see `_bundle_name_for`). `_cycle` grades progress on the
+        returned keys, so it must never be re-derived from `bundle.name`."""
+        resolved = self._bundle_name_for(bundle, cycle)
+        if resolved is None:
+            return None
+        name, attempt = resolved
+        key = self._bundle_key(name, cycle)
         task = self.state.tasks.get(key)
         if task is not None and task.terminal:
-            return  # finished (or adjudicated) in a previous resume cycle
+            return key  # finished (or adjudicated) in a previous resume cycle
+        if attempt > 1:
+            # Below the skip deliberately: the ordinary second-resume shape has
+            # the deduped key ALREADY terminal and agreeing, and journaling the
+            # rename up in the resolver re-announced it once per resume for a
+            # bundle nothing then renamed. `original=` + `name=` so the record
+            # stands on its own, the way its sibling `sweep-bundle-name-deduped`
+            # does; `dw_ids` say which work the new key carries.
+            self.journal.append(
+                "sweep-bundle-key-deduped",
+                original=bundle.name,
+                name=name,
+                attempt=attempt,
+                dw_ids=list(bundle.dw_ids),
+            )
         if task is None:
             task = StoryTask(story_key=key, epic=0, dw_ids=list(bundle.dw_ids))
             self.state.tasks[key] = task
             self.journal.append("bundle-start", story_key=key, dw_ids=list(bundle.dw_ids))
         elif self._recover_inflight_bundle(task):
-            return
-        dirname = bundle.name if cycle == 1 else f"c{cycle}-{bundle.name}"
-        task.bundle_file = str(self._write_intent(bundle, dirname))
+            return key
+        else:
+            # DW-144. Recovery reset the task to PENDING and handed the dispatch
+            # back to us — and the intent written below is THIS bundle's, not the
+            # one the persisted task was minted for. `_bundle_name_for`'s dedupe
+            # is scoped to TERMINAL tasks, so a non-terminal task at the key keeps
+            # the key whatever its ids are. Stale task ids can reject a dev result
+            # for this bundle or make `_close_bundle_ledger_when_spec_status`
+            # derive `bundle_closes_intended` from the previous bundle's ids.
+            #
+            # Journal only on divergence but assign unconditionally: a bundle's
+            # identity is its ids under SET equality (a regenerated triage may
+            # reorder them, per `_bundle_name_for`), so a pure reorder is not
+            # worth announcing once per resume. A persisted EMPTY list is the
+            # pre-`dw_ids` `state.json` shape and reads as divergence here, which
+            # is right — that task genuinely has no ids and must take these.
+            if set(task.dw_ids) != set(bundle.dw_ids):
+                self.journal.append(
+                    "sweep-bundle-dwids-adopted",
+                    story_key=key,
+                    previous_dw_ids=list(task.dw_ids),
+                    dw_ids=list(bundle.dw_ids),
+                )
+            task.dw_ids = list(bundle.dw_ids)
+        dirname = name if cycle == 1 else f"c{cycle}-{name}"
+        # The document has to agree with the directory it lands in and with the
+        # name `_ensure_bundle_intent` recovers back out of the story key.
+        written = bundle if name == bundle.name else replace(bundle, name=name)
+        task.bundle_file = str(self._write_intent(written, dirname))
         self._save()
         self._emit("pre_bundle", task)
         self._run_story(task)
         self._emit("post_bundle", task)
+        return key
 
     def _recover_inflight_bundle(self, task: StoryTask) -> bool:
         """Recover a bundle task interrupted mid-flight (or re-armed after a
@@ -1507,7 +1884,12 @@ class SweepEngine(Engine):
         self._emit("post_close_resolved")
         return len(closed)
 
-    def _decisions_phase(self, plan: TriagePlan) -> tuple[dict[str, dict[str, str]], int]:
+    # `dict[str, Any]` per answer, not `dict[str, str]`: `unusable_answer_reason`
+    # deliberately screens only the fields a reader consumes, so `resolution` and
+    # `answered_at` can legitimately hold non-strings and a keep-open answer may
+    # carry a corrupt `intent`. The narrower annotation read as a guarantee that
+    # would justify deleting `_answer_str`; it never was one.
+    def _decisions_phase(self, plan: TriagePlan) -> tuple[dict[str, dict[str, Any]], int]:
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
         decisions_path = self.run_dir / "decisions.json"
@@ -1519,9 +1901,50 @@ class SweepEngine(Engine):
         # silently ignored the store. Derived from the run dir's own shape, which
         # no workspace swap moves.
         project_root = _project_of_run_dir(self.run_dir)
-        answers: dict[str, dict[str, str]] = (
-            _read_json(decisions_path) if decisions_path.is_file() else {}
-        )
+        # The orchestrator writes this store itself, but a crash mid-write, a hand
+        # edit or an out-of-band writer can still leave it unreadable or wrongly
+        # shaped — and every consumer below calls `.get(...)` on its values, so the
+        # bare read let one malformed byte abort the whole sweep. Degrade exactly
+        # the way `_ensure_triage`'s cache reload does (journal it, carry on with
+        # what is usable): a decision left with no usable answer simply goes back
+        # down the pending/skip path, which is where it was before anyone answered
+        # it. Per-VALUE, not all-or-nothing, so one bad entry does not cost the
+        # well-shaped rest their answers.
+        #
+        # `unusable` keeps the PER-VALUE drops so the two write-backs below
+        # re-publish their parsed values unchanged: on that arm the degrade really is
+        # in-memory and this method neither repairs nor trims the file. The two
+        # WHOLE-FILE arms cannot offer that — an unreadable file and a non-object
+        # top level leave nothing per-value to carry — so `unusable` stays empty
+        # there and the next write this phase makes for its own reasons (a seeded
+        # pre-answer, an in-run answer) replaces the corrupt file wholesale.
+        answers: dict[str, dict[str, Any]] = {}
+        unusable: dict[str, Any] = {}
+        malformed: list[str] = []
+        if decisions_path.is_file():
+            try:
+                stored = _read_json(decisions_path)
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+                self.journal.append("sweep-decisions-reload-failed", errors=[f"unreadable: {exc}"])
+            else:
+                if isinstance(stored, dict):
+                    for stored_id, value in stored.items():
+                        key = str(stored_id)
+                        # `unusable_answer_reason`, not a local `isinstance`: the
+                        # SAME schema `decisions.pending_missed_decisions` screens
+                        # by (DW-142), so an id this loop refuses to answer is one
+                        # that command re-offers instead of counting answered.
+                        reason = unusable_answer_reason(value)
+                        if reason is None:
+                            answers[key] = value
+                        else:
+                            unusable[key] = value
+                            malformed.append(f"{key}: {reason} (<run>/decisions.json)")
+                else:
+                    self.journal.append(
+                        "sweep-decisions-reload-failed",
+                        errors=[f"not a JSON object: {type(stored).__name__}"],
+                    )
         closed = 0
         # Adopt out-of-band pre-answers (a human answered decisions an earlier
         # unattended/abandoned sweep left). The ledger edits were already applied
@@ -1532,13 +1955,35 @@ class SweepEngine(Engine):
         for decision in plan.decisions:
             if decision.id in answers or decision.id not in pre:
                 continue
-            answers[decision.id] = pre[decision.id]
+            pre_answer = pre[decision.id]
+            pre_reason = unusable_answer_reason(pre_answer)
+            if pre_reason is not None:
+                # `load_pre_answers` validates only the TOP level (decisions.py),
+                # so a value here can be any JSON at all. Same degrade as the
+                # run-local store above — same predicate, too — and journaled in
+                # the same record, which is why each entry names the store it came
+                # from: the two files are different, and only one of them is the
+                # one to hand-fix. Nothing is written back to the project store:
+                # this phase never repairs either file, and re-answering the
+                # decision out of band is what overwrites the unusable value.
+                malformed.append(f"{decision.id}: {pre_reason} (project .bmad-loop/decisions.json)")
+                continue
+            answers[decision.id] = pre_answer
             self.journal.append(
                 "decision-preanswered",
                 dw_id=decision.id,
-                effect=pre[decision.id].get("effect"),
+                effect=pre_answer.get("effect"),
             )
             seeded = True
+        if malformed:
+            # The PER-VALUE record: one, however many values it covers, naming the
+            # ids that lost their answer and the store each came from. It is not
+            # the only one a read can write — a whole-file fault above journals its
+            # own, so a run-local store that will not parse AND a malformed
+            # pre-answer behind it produce two records, one per fault class. Ids,
+            # store names and type names only: an answer's prose stays out of the
+            # journal, the way `sweep-decision-option-mismatch` keeps it out.
+            self.journal.append("sweep-decisions-reload-failed", errors=malformed)
         if seeded:
             # Same helper as `decisions._write_store` (#363), but NOT for #363's
             # reason: `decisions_path` here is the PER-RUN file under
@@ -1557,16 +2002,19 @@ class SweepEngine(Engine):
             # would refuse nothing.
             atomic_write_text_confined(
                 decisions_path,
-                json.dumps(answers, indent=2),
+                # `unusable` first so a well-shaped answer always wins the key:
+                # the entries it holds are the ones the read above could not use,
+                # re-published unchanged rather than dropped by a write this
+                # method makes for an unrelated reason.
+                json.dumps({**unusable, **answers}, indent=2),
                 confine_root=project_root,
             )
         pending = [d for d in plan.decisions if d.id not in answers]
         answered_interactively = False
         if not self.prompting:
-            pending = [d for d in pending if d.id not in self._skipped_decisions]
+            pending = [d for d in pending if d.id not in self.state.sweep_skipped_decisions]
             for decision in pending:
                 self.journal.append("decision-skipped-unattended", dw_id=decision.id)
-                self._skipped_decisions.add(decision.id)
             if pending:
                 gates.notify(
                     self.policy,
@@ -1574,6 +2022,14 @@ class SweepEngine(Engine):
                     f"{len(pending)} deferred-work decisions pending",
                     "run `bmad-loop sweep` interactively to answer them",
                 )
+            # Quarantine LAST — after the journal rows AND the notify above, the
+            # order `_quarantine`'s docstring promises. Persisting inside the loop
+            # instead would leave a crash window between the last `_save()` and
+            # the notify in which a resume finds every id already quarantined,
+            # filters `pending` empty and never writes the ATTENTION line at all:
+            # silently swallowing the announcement rather than repeating it.
+            for decision in pending:
+                self._quarantine(self.state.sweep_skipped_decisions, decision.id)
         else:
             for decision in pending:
                 # announce before blocking on input so observers (TUI, ATTENTION
@@ -1597,7 +2053,7 @@ class SweepEngine(Engine):
                 }
                 atomic_write_text_confined(  # same file, same reasoning as above (#363, #593)
                     decisions_path,
-                    json.dumps(answers, indent=2),
+                    json.dumps({**unusable, **answers}, indent=2),  # as above
                     confine_root=project_root,
                 )
                 self.journal.append(
@@ -1675,7 +2131,15 @@ class SweepEngine(Engine):
 
     def _commit_ledger(self, message: str) -> None:
         """Commit pending orchestrator ledger edits; bundles need a clean
-        baseline. No-op when the tree is already clean."""
+        baseline. No-op when the tree is already clean.
+
+        Reaches `workspace.root` — the CODE repo — while every edit it is asked
+        to commit (the ledger, the project pre-answer store) is project-rooted.
+        The two coincide by default and in the monorepo shape the `repo_root`
+        override targets (project inside the code repo, where `add -A` reaches
+        it); with the project dir OUTSIDE the code repo the edits stay on disk
+        uncommitted and this is a no-op or commits unrelated code-repo residue.
+        DW-335 owns that gap for the whole family of callers."""
         if verify.worktree_clean(self.workspace.root):
             return
         sha = verify.commit_story(self.workspace.root, message)
@@ -1683,38 +2147,165 @@ class SweepEngine(Engine):
 
     # ---------------------------------------------------------- bundles
 
+    def _agreeing_option(
+        self, decision: Decision, answer: dict[str, Any], answer_key: str
+    ) -> DecisionOption | None:
+        """The stored answer's key resolved against THIS cycle's decision, but only
+        when the option it lands on is still the one the human answered.
+
+        `Decision.option` matches on KEY ALONE, and a key is a position in a list a
+        later triage re-authors freely: `_ensure_triage` mints a fresh
+        `triage-<n>.json` per repeat cycle while `answers` persists for the whole run
+        in `<run>/decisions.json`, and a pre-answer is resolved against a triage
+        minted after it was recorded. Either provenance can hand a caller ONE
+        question's answer beside a DIFFERENT question's option (DW-118: a stored
+        `build` answer keyed "1" met a fresh option "1" spelled "Close as decayed",
+        and the bundle shipped the stale intent under the close label). `label` +
+        `effect` is the whole agreement test — the only two fields BOTH provenances
+        always carry (`record_pre_answer` stores the chosen option's full semantics;
+        an in-run answer is written with key/label/effect/answered_at) — and a
+        disagreeing option is discarded outright, its mismatch journaled the way
+        `sweep-bundle-name-discarded` is.
+
+        ONE agreement discipline for both lanes of `_materialize_bundles` (DW-123):
+        the build lane had this test inline while the keep-open lane trusted the
+        stored `effect` with no resolution at all, so a renumbered option let a stale
+        keep-open answer suppress a bundle under a `human-chose-keep-open` skip that
+        reads as the human's decision. What the two lanes still differ on is the
+        DISPOSITION of a `None` — see each call site.
+        """
+        option = decision.option(answer_key)
+        if option is None:
+            return None  # nothing resolved, so there is nothing to describe
+        label_matched = option.label == _answer_str(answer, "label")
+        if label_matched and option.effect == _answer_str(answer, "effect"):
+            return option
+        # No triage prose in the record (labels, questions): the fields are closed
+        # effect enums and a bare boolean. `answer_effect` says which LANE wrote the
+        # record — it is the stored answer's own effect, invariant per lane but no
+        # longer invariant across the two that reach here, and it is what separates a
+        # discarded build option from a discarded keep-open one in a journal both
+        # write with the same kind.
+        self.journal.append(
+            "sweep-decision-option-mismatch",
+            decision=decision.id,
+            key=answer_key,
+            option_effect=option.effect,
+            label_matched=label_matched,
+            answer_effect=_answer_str(answer, "effect"),
+        )
+        return None
+
     def _materialize_bundles(
-        self, plan: TriagePlan, answers: dict[str, dict[str, str]]
-    ) -> list[Bundle]:
+        self, plan: TriagePlan, answers: dict[str, dict[str, Any]]
+    ) -> tuple[list[Bundle], bool]:
+        """This cycle's bundles, and whether ANY recorded answer was dropped by one
+        of the three drop lanes below — `_cycle`'s progress signal.
+
+        Every drop is progress for the same reason (DW-123, widened to the build
+        lanes by DW-135): it quarantines the id in `state.sweep_dropped_decisions`,
+        so the id stops being bound to a stored answer nothing can act on and a
+        later cycle's fresh triage is free to address it. The signal stays finite
+        because that same list bounds each id to ONE drop per run — persisted, so
+        the bound holds across a pause/resume too (DW-124) — and a given id can
+        raise it at most once however many repeat cycles run.
+        """
         self._emit("pre_materialize_bundles")
         bundles = list(plan.bundles)
+        answer_dropped = False
         for decision in plan.decisions:
             answer = answers.get(decision.id)
-            if not answer or answer.get("effect") != "build":
+            # `isinstance` rather than truthiness: `answers`' annotation is a
+            # contract this method cannot enforce, and the test suite is the caller
+            # that hands it a map directly rather than through `_cycle`. Inside
+            # `src/` the only caller IS `_cycle` (a resume re-enters there too), so
+            # `_decisions_phase`'s read-site guard covers the production path — but
+            # a lane that trusts the annotation aborts materialization on a
+            # `.get(...)` the moment anything else supplies the map. A silent skip
+            # either way: an unusable answer is journaled where it is read, not
+            # once per lane that declines to use it.
+            if not isinstance(answer, dict) or answer.get("effect") != "build":
                 continue
-            # An in-run answer maps cleanly to a current option; a pre-answer
-            # (answered out of band against an earlier triage) may not — a fresh
-            # triage can renumber options — so fall back to the stored option
-            # semantics carried in the answer itself.
-            option = decision.option(str(answer.get("key")))
-            intent = (option.intent if option else "") or str(answer.get("intent", ""))
+            if decision.id in self.state.sweep_dropped_decisions:
+                continue  # announced dropped earlier this run (see __init__)
+            # ONE spelling of the key for the whole loop body: the lookup, the
+            # mismatch record and the note below must name the same string, and
+            # `str(answer.get("key"))` stringified a missing key to the literal
+            # "None" while the record spelled it "" — and a non-string key to its
+            # repr, which `_answer_str` reads as "" instead (DW-141).
+            answer_key = _answer_str(answer, "key")
+            # `matched` is exactly "an agreeing option was resolved": the helper
+            # collapses the two ways that can fail (no such key / a re-authored one)
+            # because this lane treats them alike. It tolerates BOTH — a build answer
+            # carries its own `intent` payload and can still build from it — and
+            # drops only when that payload is missing, a few lines below. The
+            # keep-open lane has no payload to fall back on, so it cannot.
+            option = self._agreeing_option(decision, answer, answer_key)
+            matched = option is not None
+            # The stored answer is the PAYLOAD; an agreeing option fills only what
+            # the answer omits (`answer or option`, not the reverse). That single
+            # expression routes both provenances without a provenance flag:
+            # `record_pre_answer` stores the chosen option's full semantics and
+            # `validate_triage` requires `intent` on every build option, so a build
+            # PRE-answer always carries its own intent and never picks up prose
+            # freshly re-authored by a triage the human never read; an IN-RUN
+            # answer is written with only key/label/effect/answered_at, so it draws
+            # intent and bundle_name from the option — but only an agreeing one.
+            intent = _answer_str(answer, "intent") or (option.intent if option else "")
             if not intent:
+                # A stale in-run answer: nothing to build from. Dropping it is the
+                # only safe action here — `_apply_decision_effect` already wrote
+                # this decision's ledger line in the cycle that answered it, so
+                # re-asking or re-applying would double-apply — but a recorded
+                # human `build` decision must not vanish on a journal line alone.
+                # The ledger entry is untouched, so the next sweep re-triages and
+                # re-asks it through `_decisions_phase`.
+                # `drop_cause` is a closed three-value enum (`no-intent` here,
+                # `name-collision` below, `stale-option` in the keep-open lane) so
+                # the drop lanes are discriminated by an enum rather than by free
+                # text or by a second journal kind (`reason` is deliberately not a
+                # benign journal field).
+                self.journal.append(
+                    "sweep-decision-answer-dropped",
+                    decision=decision.id,
+                    drop_cause="no-intent",
+                )
+                gates.notify(
+                    self.policy,
+                    self.run_dir,
+                    f"decision {decision.id}: recorded build decision discarded",
+                    "its triage option changed and the stored answer carries no "
+                    "intent of its own — the entry stays open for the next sweep",
+                )
+                self._quarantine(self.state.sweep_dropped_decisions, decision.id)
+                answer_dropped = True  # progress: see this method's docstring
                 continue
-            label = (option.label if option else "") or str(answer.get("label", "")) or "build"
-            bundle_name = (option.bundle_name if option else "") or str(
-                answer.get("bundle_name", "")
+            label = _answer_str(answer, "label") or (option.label if option else "") or "build"
+            bundle_name = _answer_str(answer, "bundle_name") or (
+                option.bundle_name if option else ""
             )
-            # A pre-answer's bundle_name never passed `validate_triage` — it was
+            # A stored answer's bundle_name never passed `validate_triage` — it was
             # answered out of band against an earlier triage, and a fresh one can
-            # renumber or drop the option it named — so this fallback lane was the
-            # one route by which a name failing the two option-site gates (#637)
-            # still reached `_write_intent` as a directory. Gate it with the same
-            # two rules, but by DISCARD rather than by error: the human's build
-            # decision is the payload and `decision-<id>` below is the always-legal
-            # name it falls back to anyway, so the discard is journaled the way
-            # `_normalize_bundle_names`'s repairs are and the sweep proceeds.
+            # renumber or drop the option it named — so this lane was the one route
+            # by which a name failing the two option-site gates (#637) still reached
+            # `_write_intent` as a directory. Gate it with the same two rules, plus
+            # the THIRD rule that site enforces as `duplicate bundle name`: a stored
+            # name equal to one already on this list makes both bundles hash to one
+            # `_bundle_key` and share one intent directory, so one of them is
+            # silently lost. All three by DISCARD rather than by error: the human's
+            # build decision is the payload and `decision-<id>` below is the
+            # always-legal name it falls back to anyway, so the discard is journaled
+            # the way `_normalize_bundle_names`'s repairs are and the sweep proceeds.
+            # Why a colliding STORED name is discarded here while the fallback below
+            # is SUFFIXED, two remedies for one collision condition: a stored name
+            # has somewhere to fall back TO, and falling back is the better repair —
+            # it is unvalidated prose carried by an answer whose option may be gone,
+            # so a `widen-x-2` variant of it claims a name nothing authored. The
+            # fallback has nothing below it, so suffixing is the only repair left.
             if bundle_name and (
-                not BUNDLE_NAME_RE.match(bundle_name) or safe_segment(bundle_name) != bundle_name
+                not BUNDLE_NAME_RE.match(bundle_name)
+                or safe_segment(bundle_name) != bundle_name
+                or any(b.name == bundle_name for b in bundles)
             ):
                 self.journal.append(
                     "sweep-bundle-name-discarded",
@@ -1722,8 +2313,69 @@ class SweepEngine(Engine):
                     original=bundle_name,
                 )
                 bundle_name = ""
-            key = (option.key if option else "") or str(answer.get("key", "")) or "?"
+            key = (option.key if option else "") or answer_key or "?"
             name = bundle_name or "decision-" + decision.id.lower()
+            # `decision-<id>` READS like a reserved namespace and is not one:
+            # `validate_triage` builds its duplicate-name set from plan bundle
+            # names and build-option `bundle_name`s only, so a triage plan may
+            # legally author a bundle literally named `decision-dw-118` and
+            # nothing ever compares this fallback against it. Downstream,
+            # `_bundle_key` is a pure function of the name, so two same-named
+            # `Bundle`s become ONE task: `_run_bundle` returns early on a
+            # terminal task, or writes the second's `intent.md` over the first's
+            # under the same dirname, and the human's decision bundle disappears
+            # without a record. Reserving the prefix upstream was rejected (it
+            # changes the triage-plan contract, escalates one unlucky
+            # LLM-authored name into a whole-plan rejection, and still misses a
+            # STORED name shaped `decision-<other-id>`, which never passes
+            # `validate_triage` at all), so uniqueness is re-established here —
+            # the one site where validated plan names, validated option names,
+            # unvalidated stored-answer names and the fallback all meet. The
+            # taken set is recomputed per decision, never snapshotted before the
+            # loop: it must cover the decision bundles appended by earlier
+            # iterations, which collide with each other the same way.
+            taken = {b.name for b in bundles}
+            if name in taken:
+                for attempt in range(2, 10):
+                    candidate = f"{name}-{attempt}"
+                    if candidate not in taken:
+                        # `name=` so the record stands on its own, the way its
+                        # sibling `sweep-bundle-name-discarded` carries `original=`:
+                        # without it the resulting name has to be re-derived by hand
+                        # from the id and the suffix.
+                        self.journal.append(
+                            "sweep-bundle-name-deduped",
+                            decision=decision.id,
+                            attempt=attempt,
+                            name=candidate,
+                        )
+                        name = candidate
+                        break
+                else:
+                    # The one point in NAME ASSIGNMENT at which a buildable stored
+                    # answer yields no bundle — a naming impossibility, not a
+                    # mismatch disposition, and bounded so the loop is provably
+                    # finite. (Scoped to this step deliberately: an already-named
+                    # decision bundle can still be removed further down by the
+                    # failed/keep-open skip or by the max_bundles truncation.) Loud
+                    # on both surfaces, like the no-intent drop it shares a kind
+                    # with.
+                    self.journal.append(
+                        "sweep-decision-answer-dropped",
+                        decision=decision.id,
+                        drop_cause="name-collision",
+                    )
+                    gates.notify(
+                        self.policy,
+                        self.run_dir,
+                        f"decision {decision.id}: recorded build decision discarded",
+                        f"its bundle could not be given a name unique among this "
+                        f"cycle's bundles ({name} and every -2..-9 suffix are "
+                        "taken) — the entry stays open for the next sweep",
+                    )
+                    self._quarantine(self.state.sweep_dropped_decisions, decision.id)
+                    answer_dropped = True  # progress: see this method's docstring
+                    continue
             bundles.append(
                 Bundle(
                     name=name,
@@ -1732,6 +2384,15 @@ class SweepEngine(Engine):
                     decision_note=(
                         f"The human chose option {key} ({label}) for the "
                         f"question: {decision.question}"
+                        if matched
+                        # Never quote `decision.question` here: the option this
+                        # answer names has since been re-authored, so the question
+                        # now on file is not the one the human answered.
+                        else f"The human chose option {key} ({label}) against an "
+                        f"earlier triage of {decision.id}, whose options have "
+                        "since changed. The stored answer's own intent above is "
+                        "the contract; the question now on file is not the one "
+                        "it answered."
                     ),
                 )
             )
@@ -1745,8 +2406,116 @@ class SweepEngine(Engine):
             for i in t.dw_ids
         }
         # ids a human explicitly chose to keep open: a later triage must not
-        # override that answer (bundle dev sessions mark their dw_ids done)
-        keep_open_ids = {dw_id for dw_id, a in answers.items() if a.get("effect") == "keep-open"}
+        # override that answer (bundle dev sessions mark their dw_ids done). Held to
+        # the SAME agreement test the build lane above runs (DW-123): this set is
+        # read straight off `answers`, whose entries outlive the triage they were
+        # answered against, so an unresolved `effect == "keep-open"` let a stale
+        # answer suppress an overlapping bundle — journaled only as a
+        # `human-chose-keep-open` skip, which reads as the human's decision on a
+        # question this cycle never asked.
+        #
+        # DW-133 proposed gating the stale-option drop below on overlap with THIS
+        # cycle's bundles. REFUTED (2026-09-06, human-resolved) — do not
+        # re-propose. Two placements are possible and both are wrong:
+        #
+        # At the drop itself the gate is UNREACHABLE, so it buys nothing.
+        # `validate_triage`'s `claim()` (see :178) records every id in one `seen`
+        # map and errors on "appears in both", so `plan.bundles` and
+        # `plan.decisions` are disjoint by validation; the drop is reached only
+        # when `by_id.get(dw_id)` is not None — the id IS in `decisions`, hence in
+        # no plan bundle — and a keep-open answer mints no decision bundle of its
+        # own (that needs `effect == "build"`, which this lane's own guard
+        # excludes). Measured: with the condition replaced by a `raise`, the whole
+        # of tests/test_sweep.py passes — it never once fires.
+        #
+        # Hoisted ABOVE the `decision is None` arm it stops being a no-op and
+        # starts doing harm, since that arm is exactly where a kept answer DOES
+        # overlap a bundle: it suppresses that bundle, which is what keep-open
+        # means. Measured: three tests red, `test_repeat_keep_open_answer_blocks_rebundle`
+        # among them — the gate breaks legitimate suppression rather than the drop.
+        #
+        # Underneath both: the drop's forward-looking timing is load-bearing BY
+        # DESIGN. It must fire in the cycle that PROVES the answer stale — where
+        # the id is in `decisions` and so in no bundle — so that a LATER cycle's
+        # bundle is not silently suppressed. `tests/test_sweep.py`'s
+        # `test_keep_open_answer_whose_option_was_re_authored_stops_suppressing_bundles`
+        # is the shape to keep in view: its cycle 2 holds DW-1 in `decisions` with
+        # no bundles (where the drop must fire) and only cycle 3 bundles DW-1, so
+        # any rule keyed on this cycle's bundles can never see them together.
+        by_id = {d.id: d for d in plan.decisions}
+        keep_open_ids: set[str] = set()
+        for dw_id, answer in answers.items():
+            # Shape-guarded for the same reason the build lane above is.
+            if not isinstance(answer, dict) or answer.get("effect") != "keep-open":
+                continue
+            if dw_id in self.state.sweep_dropped_decisions:
+                continue  # announced dropped earlier this run (see __init__)
+            decision = by_id.get(dw_id)
+            if decision is None:
+                # No decision for this id THIS cycle — the fresh triage bundled or
+                # closed it directly instead of re-asking. There is no option to
+                # disagree with, so the answer is the only record of the human's
+                # choice and it stands: suppressing the bundle is exactly what
+                # keep-open means.
+                keep_open_ids.add(dw_id)
+                continue
+            answer_key = _answer_str(answer, "key")
+            if self._agreeing_option(decision, answer, answer_key) is not None:
+                keep_open_ids.add(dw_id)
+                continue
+            # Unlike the build lane, a keep-open answer has no payload beyond
+            # "keep-open" itself, so without a currently-resolvable, agreeing option
+            # there is nothing left to trust and the answer is dropped. Hence a THIRD
+            # `drop_cause` covering both failures — a renumbered option (which wrote
+            # a mismatch record just now) and a vanished one (which could not) —
+            # rather than one named for the mismatch alone. Dropping is deliberately
+            # the loud direction: honouring a stale keep-open answer silently skips
+            # work the human never protected, while dropping it is journaled and
+            # notified. What this drop does that the build lanes' do not is UNBLOCK
+            # the id: a keep-open answer actively suppresses bundles, so removing it
+            # makes the id eligible for a bundle a later valid triage cycle can run
+            # and close the entry with, where a dropped build answer simply leaves
+            # the entry open to be re-asked. Both count as repeat progress (DW-135;
+            # this method's docstring says why). The
+            # RUN-LOCAL record is what survives — the answer stays auditable in
+            # `<run>/decisions.json` and the ledger line `_apply_decision_effect`
+            # wrote is unchanged — while an out-of-band pre-answer in the PROJECT
+            # store is pruned by the drop itself, below (DW-143): waiting for
+            # `_prune_pre_answers` to retire it once a later bundle closed the entry
+            # never came due while triage kept re-asking the id as a decision, so
+            # every new run re-read the same stale answer and re-dropped it.
+            self.journal.append(
+                "sweep-decision-answer-dropped",
+                decision=dw_id,
+                drop_cause="stale-option",
+            )
+            # Which of the two failures fired, named rather than left to the
+            # journal: the notify is the surface an operator actually reads, and
+            # "changed" is wrong for a key this triage simply does not offer.
+            fate = (
+                "is gone from this cycle's triage"
+                if decision.option(answer_key) is None
+                else "has been re-authored since"
+            )
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"decision {dw_id}: recorded keep-open decision discarded",
+                f"the option it answered ({answer_key}) {fate}, so the keep-open "
+                f"protection is discarded and {dw_id} is eligible for bundling again",
+            )
+            self._quarantine(self.state.sweep_dropped_decisions, dw_id)
+            # After the row, the notify and the quarantine — announce-then-persist,
+            # so a crash mid-drop resumes into the DW-124 skip rather than into a
+            # silent removal (the helper's docstring has the full argument). Keep-
+            # open only: the build lanes' `no-intent`/`name-collision` drops leave
+            # their stored answer alone, since it still carries a payload to re-ask
+            # against. `<run>/decisions.json` and the ledger are untouched either
+            # way — only the PROJECT store entry goes, and only while it is still
+            # THIS answer: a replacement a human recorded out of band since this
+            # run last read the store is not the value being dropped, and survives.
+            self._prune_dropped_pre_answer(dw_id, "stale-option", answer)
+            answer_dropped = True
         kept = []
         for b in bundles:
             overlap = sorted(set(b.dw_ids) & (failed_ids | keep_open_ids))
@@ -1769,7 +2538,7 @@ class SweepEngine(Engine):
             self.journal.append("sweep-bundles-truncated", dropped=dropped)
             bundles = bundles[: self.max_bundles]
         self._emit("post_materialize_bundles")
-        return bundles
+        return bundles, answer_dropped
 
     def _write_intent(self, bundle: Bundle, dirname: str) -> Path:
         ledger = self.workspace.paths.deferred_work

@@ -12,7 +12,7 @@ from pathlib import Path
 from conftest import install_bmad_config, refuse_to_resolve, write_sprint
 
 from bmad_loop import bmadconfig, deferredwork, policy
-from bmad_loop.journal import Journal, save_state
+from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, save_state
 from bmad_loop.model import RunState
 from bmad_loop.runs import RUNS_DIR
 from bmad_loop.tui import data
@@ -106,6 +106,26 @@ def test_pending_missed_decisions_uses_loaded_project_root(project, monkeypatch)
     assert data.pending_missed_decisions(original_spelling) is pending
     assert paths.project in data._missed_cache
     assert original_spelling not in data._missed_cache
+
+
+def test_pending_missed_decisions_survives_an_undecodable_triage(project):
+    """DW-145 at the one surface where the fault escaped UNCAUGHT. This reader
+    catches `(BmadConfigError, OSError)`, and `UnicodeDecodeError` is a
+    `ValueError`: one run's cached triage holding non-UTF-8 bytes raised straight
+    out of `decisions.pending_missed_decisions`, past this handler, into the
+    dashboard's render. The good run's DW-1 still lists, so the widened except
+    tuple degrades per FILE rather than blanking the panel.
+    Ablation: revert that tuple to `(json.JSONDecodeError, OSError)` and this
+    reddens with `UnicodeDecodeError` rather than returning ["DW-1"]."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _write_triage_decision(make_run(project.project, "20260101-000000-aaaa"))
+    bad = make_run(project.project, "20260102-000000-bbbb")
+    (bad / "triage.json").write_bytes(b'{"workflow": "deferred-sweep-triage", "x": "\xff"}')
+
+    assert [d.id for d in data.pending_missed_decisions(project.project)] == ["DW-1"]
 
 
 def test_pending_missed_decisions_empty_for_uninitialized(tmp_path):
@@ -259,11 +279,86 @@ def test_journal_tail_resets_on_truncation(tmp_path):
     assert [e["kind"] for e in tail.read_new()] == ["run-start"]
 
 
-def test_journal_tail_skips_unparseable_lines(tmp_path):
+def test_journal_tail_reports_unparseable_lines_as_a_marker(tmp_path):
+    """An unreadable line is REPORTED in the live pane, not skipped: the shared
+    `journal.unreadable_line_entry` takes its stream position, so the operator sees
+    that a record was lost rather than a gap they cannot detect. (Inverted from
+    `test_journal_tail_skips_unparseable_lines` by DW-97.)
+
+    Ablation: restore `except json.JSONDecodeError: continue` in `read_new` and this
+    reddens with the marker absent."""
     path = tmp_path / "journal.jsonl"
     path.write_text('not json\n{"ts": 1, "kind": "run-start"}\n')
     tail = data.JournalTail(tmp_path)
+    assert tail.read_new() == [
+        {"kind": UNREADABLE_LINE_KIND, "bytes": len("not json")},
+        {"ts": 1, "kind": "run-start"},
+    ]
+
+
+def test_journal_tail_marker_matches_the_journal_entries_marker(tmp_path):
+    """Both readers mint the SAME shape from the same helper — the whole reason the
+    minter lives in `journal.py` rather than twice.
+
+    The torn line carries a MULTI-BYTE character, so `bytes` can distinguish the raw
+    line (15 bytes) from the decoded string this reader parses (14 characters). With
+    an ASCII-only fixture the two are equal and `len(raw)` vs `len(line)` is
+    untestable — and they must not diverge, or the two readers would report different
+    counts for one line.
+
+    Ablation: count `len(line)` (the decoded string) in `read_new` instead of
+    `len(raw)` and this reddens, 14 != 15."""
+    path = tmp_path / "journal.jsonl"
+    torn = '{"kind": "café'  # 14 characters, 15 UTF-8 bytes
+    path.write_text(f'{torn}\n{{"ts": 1, "kind": "run-start"}}\n', encoding="utf-8")
+    assert len(torn) == 14 and len(torn.encode("utf-8")) == 15  # the two spellings differ
+
+    tail_entries = data.JournalTail(tmp_path).read_new()
+    assert tail_entries == Journal(tmp_path).entries()
+    assert tail_entries[0] == {"kind": UNREADABLE_LINE_KIND, "bytes": 15}
+
+
+def test_journal_tail_withholds_a_fragment_until_its_newline_lands(tmp_path):
+    """The byte offset only advances past complete lines, so a partially flushed
+    record is not read as a truncated entry — and `Journal.append`'s heal is what
+    guarantees that newline eventually arrives on the fragment's OWN line."""
+    path = tmp_path / "journal.jsonl"
+    path.write_text('{"ts": 1, "kind": "run-start"}\n{"ts": 2, "kind": "unit-merge-star')
+    tail = data.JournalTail(tmp_path)
     assert [e["kind"] for e in tail.read_new()] == ["run-start"]
+    assert tail.read_new() == []  # nothing new; the fragment is still withheld
+
+
+def test_journal_tail_sees_both_records_after_a_healed_append(tmp_path):
+    """The two-record regression at the TUI's reader: one partial flush costs one
+    record, and the SUCCESSOR of the healing append is intact.
+
+    Ablation: drop the `_tail_is_terminated` prepend in `Journal.append` and this
+    reddens — `unit-merged` is swallowed with the fragment."""
+    path = tmp_path / "journal.jsonl"
+    path.write_text('{"ts": 2, "kind": "unit-merge-star')
+    tail = data.JournalTail(tmp_path)
+    assert tail.read_new() == []
+
+    journal = Journal(tmp_path)
+    journal.append("unit-merged", unit="u1")
+    journal.append("run-complete")
+    assert [e["kind"] for e in tail.read_new()] == [
+        UNREADABLE_LINE_KIND,
+        "unit-merged",
+        "run-complete",
+    ]
+
+
+def test_journal_tail_marker_at_the_tail_clears_a_pending_decision(tmp_path):
+    """`data.pending_decision` (and `launch.decision_pending`) read the LAST entry
+    only, on the documented ground that any later entry means the prompt moved on. A
+    marker is a later entry, so the alert clears — read-only evidence, asserted here
+    so the coupling is not rediscovered by an operator staring at a stuck alert."""
+    entries = [{"kind": "decision-pending", "dw_id": "DW-1", "question": "?"}]
+    assert data.pending_decision(entries) is not None
+    entries.append({"kind": UNREADABLE_LINE_KIND, "bytes": 12})
+    assert data.pending_decision(entries) is None
 
 
 # ------------------------------------------------------------------ LogView

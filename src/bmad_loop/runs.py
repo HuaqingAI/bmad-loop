@@ -4078,8 +4078,9 @@ def _redrive_spec_status(state: RunState, task: StoryTask, *, isolated_redrive: 
 def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
     """Re-point a paused run's persisted code-root mirror at `repo_root` — the tree
     the caller is about to act in — and return the warning an operator must see when
-    that MOVED a root the run had recorded (`None` when it already agreed, or when the
-    run predates the field).
+    that MOVED a root the run had recorded (`None` when it already agreed, when the run
+    predates the field, or when this call only discharged a record an earlier call's
+    move still owed).
 
     Exists because `rearm_escalation` reads that mirror OUT OF PROCESS
     (`RunState.code_root`) and has no `ProjectPaths` to consult, while `repo_root:` is
@@ -4097,13 +4098,22 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
 
     The message names neither tree, like resume's: what an operator needs is that the
     run has changed repositories, and the paths are the half that would put an
-    attacker-controlled string on their terminal.
+    attacker-controlled string on their terminal. It names a move THIS call made, never
+    a record merely owed by an earlier one — `cli._prepare_resume_locked` draws the same
+    line on the same seam, so the re-arm surfaces and plain `resume` agree about when an
+    operator is warned.
     """
     with state_lock(run_dir):
         state = load_state(run_dir)
         new = str(repo_root)
         if state.repo_root == new and not state.code_root_restamp_pending:
             return None
+        # Whether THIS call re-pointed a root the run had RECORDED — deliberately not
+        # "re-pointed the field", which the empty→`new` legacy migration below also
+        # does: `bool(state.repo_root)` excludes that migration by design, because a
+        # missing value is not a divergent one. Distinct from the marker below, which
+        # only says a record is OWED — for this call's move or an earlier one's.
+        moved = False
         if state.repo_root != new:
             # Discharge an OWED record before the root it names is overwritten.
             # The marker is a bare bool, so the only surviving description of the
@@ -4146,24 +4156,59 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
         # diagnose registry (`diagnostics._JOURNAL_DROP_FIELDS`), so the path never
         # reaches a dump.
         #
+        # This line is ALSO reached with nothing moved, discharging a record owed by an
+        # EARLIER call's move whose own append failed. Two booleans, because one cannot
+        # say both things: `code_root_changed` keeps its THIS-CALL meaning on THIS append
+        # (so it writes `false` here, agreeing with resume's `run-resume` boolean in the
+        # same state — the two sibling discharge appends are a different shape and
+        # hardcode `true`), while `discharged_owed_move` carries the EARLIER move the row
+        # is settling. That path's row is the only durable trace that move ever leaves —
+        # call one raised instead of returning the warning, this call returns `None`,
+        # and a later plain `resume` computes `code_root_changed=false` too because the
+        # mirror already agrees — so without the second boolean the record reads as
+        # "nothing moved" (DW-128). Together the two make it complete.
+        #
+        # Stamped on THIS append alone, never on the two sibling discharge rows
+        # (`runs.py`'s pre-move discharge above, `cli._prepare_resume_locked`'s): those
+        # assert `code_root_changed=true` outright, so the move they settle is already
+        # named and a second boolean would be redundant. A consumer must therefore read
+        # an ABSENT key as "not stated", never as `false` — the kind has three producers
+        # and only one of them speaks to this.
+        #
         # AFTER the persisted move, never before it: a record written first would
         # assert a completed move that a failed save then never made. And the
         # marker is cleared only once the append has returned: an append that
         # fails leaves it set, so the retry re-enters here and writes the record
         # the move still owes — or, when the operator runs plain `resume` instead,
-        # `cli._prepare_resume_locked` reads the marker as a move, journals it on
-        # its own `run-resume` line and clears it on the same write that persists
-        # the resume. The one residual is a clearing save that fails after
-        # a successful append, which costs a duplicate — true — record on the
-        # retry; a duplicate is recoverable from the journal, a missing record and a
-        # false one are not.
+        # `cli._prepare_resume_locked` discharges it the same way this call does:
+        # its own `rearm-code-root-restamped` append naming the root the marker
+        # still describes, ahead of the re-stamp that overwrites it, cleared on the
+        # same write that persists the resume. The one residual is a clearing save
+        # that fails after a successful append, which costs a duplicate — true —
+        # record on the retry; a duplicate is recoverable from the journal, a
+        # missing record and a false one are not.
+        #
+        # `code_root_restamp_pending` is written `True` in exactly one place
+        # (`= moved`, off `bool(state.repo_root)`), so it is only ever opened by a
+        # genuine move; this append is reached only with it set. Hence `not moved`
+        # here is precisely "a record owed by an EARLIER call's real move" — no new
+        # state and no new read.
+        discharged_owed_move = not moved
         Journal(run_dir).append(
             "rearm-code-root-restamped",
             repo=new,
-            code_root_changed=True,
+            code_root_changed=moved,
+            discharged_owed_move=discharged_owed_move,
         )
         state.code_root_restamp_pending = False
         save_state(run_dir, state)
+    # Sits with the existing return below so the two exits read as one decision about
+    # what the caller is told. Reached only via the discharge above: the record was
+    # owed by an EARLIER call's move and has now landed, but nothing moved here, so
+    # there is nothing to warn an operator about — the same answer
+    # `cli._prepare_resume_locked` gives.
+    if not moved:
+        return None
     return (
         f"run {run_dir.name}: the code root in _bmad/bmm/config.yaml has changed since "
         "this run started — the re-drive works in the tree configured now, while the "

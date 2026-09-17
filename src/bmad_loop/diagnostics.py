@@ -180,7 +180,17 @@ _JOURNAL_ALIAS_FIELDS = {
     # `rearm-baseline-restamp-skipped`, `rearm-baseline-restamped`); the fifth,
     # `rearm-aborted`, is written by `runs._rollback_rearm` from the transaction guard's
     # error path — a DIFFERENT function, which is why "the only producer" is no longer
-    # the right shape for this note. Routing is by field NAME, not by kind, so the list
+    # the right shape for this note. A SIXTH and a SEVENTH kind,
+    # `accepted-spec-write-unreachable` and `accepted-spec-delivery-unreachable`, are
+    # NOT re-arm records at all: both are written mid-run, from another module
+    # entirely, by `worktree_flow` — the first by `_warn_accepted_spec_superseded`
+    # when a fresh mount supersedes an accepted-but-uncommitted spec (DW-101), the
+    # second by `_warn_accepted_spec_undelivered` when the mount cannot be shown to
+    # carry that spec at all (DW-104, DW-115). Both carry the same two
+    # hazardous fields as `rearm-spec-write-unreachable` — `spec_file` here and
+    # `target_branch` above — plus one bare boolean discriminator apiece, `compared`
+    # and `located`, declared benign in the routing guard. Routing is by field NAME,
+    # not by kind, so the list
     # is documentation rather than a gate — but an enumeration that undercounts is how
     # the next reader concludes a kind is unrouted, so it is corrected rather than
     # left to age. `rearm-aborted` also carries `error` (dropped as free text) and
@@ -228,7 +238,9 @@ _JOURNAL_ALIAS_FIELDS = {
 # already landed. The scrub is what is wrong, so the scrub is where the fix belongs.
 #
 # Any new branch producer should pick a name the by-name table already routes
-# (`branch`, or `target_branch` — see `runs.rearm_escalation`) rather than add a target
+# (`branch`, or `target_branch` — see `runs.rearm_escalation`, and from OUTSIDE
+# that family `worktree_flow._warn_accepted_spec_superseded`) rather than add a
+# target
 # row here. `sentinel` is scoped for a different reason: its sole producer carries a
 # spec basename, so that known shape is aliased without making the same claim about a
 # future kind that reuses the generic name.
@@ -337,6 +349,19 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # `story_key` already correlates these records, so aliasing adds no value;
         # drop it because the fallback redacts separator-bearing paths but lets a
         # bare feature- or spec-named patch through verbatim.
+        #
+        # This set routes by field NAME, so the drop reaches EVERY kind spelling
+        # `patch`, not only the operator-selected restore pair the sentence above
+        # describes: `stale-restore-unparseable` and `stale-restore-excluded`
+        # (`runs.py`), `attempt-restore-failed` and `attempt-restored`
+        # (`recovery_flow.py`), and `unit-closed` (`worktree_flow.py`). The drop is
+        # the right answer on each of them for the same reason — each carries a path
+        # the fallback cannot be relied on to redact — but the reach is a property of
+        # the rule, not of that reasoning, so a FURTHER kind would inherit it silently.
+        # `tests/test_portability_guard.py::JOURNAL_PATCH_KINDS` pins the list and
+        # reddens when a producer joins or leaves it; when it does, this comment and
+        # `tests/test_diagnostics.py::_PATCH_PATH_ROUTING_ROWS` — which asserts the
+        # drop per kind at the routing seam — both need updating by hand.
         "patch",
         # The absolute deferred-stash target embeds the run directory, story key,
         # and spec filename. Drop rather than create a second spec correlation;
@@ -366,6 +391,14 @@ _JOURNAL_KEYLIST_FIELDS = frozenset({"keys", "dw_ids", "story_keys"})
 # adds no diagnostic value and would put the proprietary names into the legend.
 _JOURNAL_KIND_KEYLIST_FIELDS: dict[str, dict[str, str]] = {
     "stale-restore-commits": {"commits": "commit"},
+    # `sweep-bundle-dwids-adopted` carries TWO deferred-work id lists: the ids the
+    # reset task held and the ids it adopted from the bundle now being run. The
+    # new ones ride the by-name `dw_ids` rule above; the previous ones are the
+    # same kind of identifier and must land in the SAME `dw` namespace, or one
+    # dump would carry two aliases for one ledger entry — and unrouted they would
+    # ship verbatim, `scrub_json` being the identity on a list of
+    # identifier-shaped strings.
+    "sweep-bundle-dwids-adopted": {"previous_dw_ids": "dw"},
 }
 _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
     "merge-preflight-refused": frozenset({"tolerated"}),

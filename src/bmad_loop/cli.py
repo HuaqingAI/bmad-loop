@@ -2877,16 +2877,18 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     # before the field existed, and read back as "" — out of the comparison: it is a
     # missing value, not a divergent one, and the re-stamp migrates it silently.
     #
-    # The `code_root_restamp_pending` half is a move `runs.restamp_code_root` already
-    # persisted whose `rearm-code-root-restamped` record never landed: the mirror then
-    # already agrees with config, so the compare alone would read "no move" on the one
-    # gesture that still owes the operator its record and its warning. This resume
-    # CONSUMES that outstanding re-stamp — the retry the marker keeps possible may
-    # arrive through plain `resume` rather than through `resolve`, and a run that
-    # finishes from here would otherwise leave the move unrecorded for good.
-    code_root_changed = (
-        bool(state.repo_root) and state.repo_root != str(paths.repo_root)
-    ) or state.code_root_restamp_pending
+    # `code_root_restamp_pending` is deliberately NOT part of this compare. That marker
+    # is a RECORD DEBT — a move `runs.restamp_code_root` already persisted whose
+    # `rearm-code-root-restamped` record never landed — and not a move of its own: the
+    # mirror it left behind already agrees with config, which is precisely why the
+    # compare reads "no move". Counting it as one made resume warn that "the code root
+    # has changed since this run started" on a resume whose tree IS the tree the run
+    # started in, and discharged the owed record with a `run-resume` boolean that
+    # carries no root at all — so an operator who edited `repo_root:` between the failed
+    # append and the resume had the owed A→B row answered by a row describing a
+    # different move, unreconstructable after the fact. The debt is discharged just
+    # below, on its own line, under the root the marker still names.
+    code_root_changed = bool(state.repo_root) and state.repo_root != str(paths.repo_root)
     fields: dict[str, object] = {
         # Scalars only, per the note above: a bool records THAT the pinned surface
         # moved without journaling a command, a binary path or a plugin name.
@@ -2907,6 +2909,28 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     prior_weight = state.cache_read_weight()
     if prior_weight != pol.limits.cache_read_weight:
         fields["cache_read_weight_was"] = prior_weight
+    # Discharge an OWED record FIRST — before the `run-resume` row, before the pin
+    # re-baseline below, and before `state.repo_root` is overwritten. The twin of
+    # `runs.restamp_code_root`'s own discharge, same shape and same field names, and
+    # the same at-least-once bargain: this is the FIRST fallible write of the resume,
+    # so an append that raises here leaves journal, pin and run state intact — no
+    # resume row to duplicate, no re-baselined pin to silence the host-exec advisory
+    # on the retry, and a root and marker still exactly as the retry needs them.
+    # First also puts it in
+    # chronological order: the owed move pre-dates this resume, so its row must
+    # pre-date the `run-resume` row too, the way the twin appends it. The marker is a
+    # bare bool, so `state.repo_root` here — still the pre-overwrite value — is the
+    # only surviving description of the root the unlanded record was owed for; once
+    # the re-stamp below re-points it, that record can never be reconstructed. The one
+    # residual is the twin's: a `save_state` that fails after a successful append
+    # costs a duplicate — but TRUE — record on the retry, and a duplicate is
+    # recoverable from the journal where a missing or a false record is not.
+    if state.code_root_restamp_pending:
+        journal.append(
+            "rearm-code-root-restamped",
+            repo=state.repo_root,
+            code_root_changed=True,
+        )
     journal.append("run-resume", **fields)
     if security_config_changed:
         # STATIC category names — the ones config_digest covers. A single sha256
@@ -2976,9 +3000,12 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     # is the tree `runs.rearm_escalation` must read back. Unconditional, so it also
     # migrates a pre-field state.json onto the root it was already using.
     state.repo_root = str(paths.repo_root)
-    # The `run-resume` record above IS the record an outstanding re-stamp owed, so the
-    # marker clears on the same write that persists the resume — never a separate
-    # one, which could land without it and leave the run owing a record it has.
+    # The debt the marker carried was discharged on its own line above, under its own
+    # root, ahead of the `run-resume` row — a `run-resume` boolean, which names no
+    # root, can no longer stand in for it. Unconditional, and on the same write that
+    # persists the resume: a separate write could land without the append and leave
+    # the run owing a record it has already written, or clear the marker for a record
+    # that never landed.
     state.code_root_restamp_pending = False
     state.clear_pause()
     runs.write_pid(run_dir)

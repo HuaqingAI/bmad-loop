@@ -33,7 +33,7 @@ from rich.text import Text
 
 from .. import bmadconfig, deferredwork, policy, sprintstatus, stories
 from ..gates import ATTENTION_FILE
-from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state
+from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state, unreadable_line_entry
 from ..model import RunState
 from ..platform_util import resolve_or_lexical
 
@@ -121,8 +121,19 @@ class JournalTail:
     """Incremental journal.jsonl reader.
 
     The byte offset only ever advances past complete lines, so a partially
-    flushed append is withheld until its newline lands. Truncation
-    (size < offset) resets to the start; unparseable lines are skipped.
+    flushed append is withheld until its newline lands — and ``Journal.append``'s
+    tail heal is what makes that newline arrive, on the fragment's own line,
+    rather than as the head of the next record. Truncation (size < offset) resets
+    to the start.
+
+    A COMPLETE line (one its newline has landed for) that will not parse is
+    reported as :func:`journal.unreadable_line_entry` in the position it occupied,
+    so a lost record is visible in the live pane rather than skipped. An
+    UNTERMINATED final line is not a marker here — it is still withheld, because
+    this reader cannot yet tell a torn record from one being written. That is the
+    one place this reader deliberately diverges from ``Journal.entries``, which
+    reads the file whole and so mints a marker for a trailing fragment
+    immediately: here the marker appears once the heal terminates the fragment.
     """
 
     def __init__(self, run_dir: Path):
@@ -154,6 +165,10 @@ class JournalTail:
             try:
                 entry = json.loads(line)
             except json.JSONDecodeError:
+                # The shared minter, never a local dict: one shape for this reader and
+                # `Journal.entries`. Byte length off the RAW line, before the
+                # `errors="replace"` decode above, which can change the count.
+                entries.append(unreadable_line_entry(len(raw)))
                 continue
             if isinstance(entry, dict):
                 entries.append(entry)

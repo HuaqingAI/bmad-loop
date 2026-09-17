@@ -206,6 +206,66 @@ def _artifact_flow(tmp_path, *, artifacts: Path | None = None) -> WorktreeFlow:
     return _make_flow(tmp_path, paths=paths, policy=_policy(isolation="worktree"))
 
 
+@pytest.mark.parametrize("fault_target", ["spec", "root"])
+def test_accepted_spec_delivery_resolution_fault_records_uncertainty(
+    tmp_path, monkeypatch, fault_target
+):
+    """A containment resolve after a successful file probe stays advisory.
+
+    Arm the fault at the mounted file probe, after the locator has resolved both
+    ends. This reaches the advisory's own exception handler without mocking the
+    locator or letting an absent file short-circuit the containment expression.
+    Ablation: replace that handler's `delivered = False` with `raise`.
+    """
+    flow = _artifact_flow(tmp_path)
+    flow.state.target_branch = "main"
+    rel = "_bmad-output/implementation-artifacts/accepted.md"
+    source = flow.paths.project / rel
+    source.write_bytes(b"accepted bytes\n")
+    worktree = tmp_path / "wt"
+    mounted = worktree / rel
+    mounted.parent.mkdir(parents=True)
+    mounted.write_bytes(b"accepted bytes\n")
+    source_name = str(source.resolve())
+    task = StoryTask(story_key="1-1", epic=1, spec_file=rel)
+    refused = mounted if fault_target == "spec" else worktree
+    real_is_file = Path.is_file
+    real_resolve = Path.resolve
+    probed: list[bool] = []
+    faulted: list[Path] = []
+
+    def probe(self, *args, **kwargs):
+        result = real_is_file(self, *args, **kwargs)
+        if self == mounted:
+            probed.append(result)
+        return result
+
+    def resolve(self, *args, **kwargs):
+        if probed and self == refused:
+            faulted.append(self)
+            raise OSError("injected containment resolution fault")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_file", probe)
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+    flow._warn_accepted_spec_undelivered(task, worktree)
+
+    assert probed == [True]
+    assert faulted == [refused]
+    assert flow.journal.entries == [
+        (
+            "accepted-spec-delivery-unreachable",
+            {
+                "story_key": "1-1",
+                "spec_file": source_name,
+                "target_branch": "main",
+                "located": True,
+            },
+        )
+    ]
+
+
 def test_ledger_seed_names_a_ledger_the_checkout_cannot_deliver(tmp_path):
     """The default shape: a gitignored ledger is absent from a tracked-only
     checkout, so the orchestrator's own close would be written to — and read back

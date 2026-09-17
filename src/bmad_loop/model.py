@@ -582,6 +582,13 @@ class StoryTask:
         symlink-external absolute values keep their original spelling. Resolving
         both sides before containment prevents a lexical in-project path through an
         outward symlink from being redirected into a replacement checkout.
+
+        Every probe sits INSIDE the ``try``, the regular-file one included (DW-116).
+        ``run_isolated`` calls this before its first ``except``, so an ``OSError`` out
+        of ``target.is_file()`` — a TOCTOU against the ``strict=True`` resolve just
+        above it, or a non-EACCES fault — killed the run rather than leaving the
+        spelling alone. Non-raising behavior is byte-identical: a false probe still
+        returns without relativizing, and so now does a raising one.
         """
         raw = self.spec_file
         if not raw or not Path(raw).is_absolute():
@@ -590,9 +597,9 @@ class StoryTask:
             project_root = project.resolve(strict=True)
             target = Path(raw).resolve(strict=True)
             relative = target.relative_to(project_root)
+            if not target.is_file():
+                return
         except (OSError, RuntimeError, ValueError):
-            return
-        if not target.is_file():
             return
         self.spec_file = relative.as_posix()
 
@@ -703,9 +710,12 @@ class RunState:
     # in one step; this flag rides the state write itself, which is what lets a
     # retry tell "moved and recorded" from "moved, record still owed" — the one
     # distinction that keeps the record retryable without ever asserting a move
-    # that was not persisted. Consumed by whichever surface retries first: a second
-    # `restamp_code_root` writes its own record, and a plain `resume` folds the
-    # move into its `run-resume` line. Deliberately absent from `documents.py`'s `--json`
+    # that was not persisted. Consumed by whichever surface retries first, and by
+    # both the same way: a second `restamp_code_root` and a plain `resume` each
+    # discharge the debt with their own `rearm-code-root-restamped` append naming
+    # the root THIS field's `repo_root` still describes, before overwriting it —
+    # never by folding it into another line, which would answer an A→B debt with a
+    # row that names no root. Deliberately absent from `documents.py`'s `--json`
     # projection (schema 1), like `rearmed` / `resolved_redrive`.
     code_root_restamp_pending: bool = False
     policy_snapshot: dict[str, Any] = field(default_factory=dict)
@@ -779,6 +789,16 @@ class RunState:
     # sweep runs only: the triage->bundles cycle in progress; 1 maps to the
     # legacy (unsuffixed) artifact names so old paused runs resume unchanged
     sweep_cycle: int = 1
+    # sweep runs only: the run's own dispositions of deferred-work decisions —
+    # ids already journaled as skipped-unattended, and ids whose recorded answer
+    # this run already journaled as DROPPED (and notified). Persisted so a
+    # pause/resume of the SAME run does not re-announce a disposition it already
+    # made; deliberately run-scoped, so a NEW run re-evaluates every decision
+    # from scratch. Deliberately NOT the human's answer either: that stays in
+    # `<run>/decisions.json`, auditable and untouched — only the disposition the
+    # run reached about it lives here.
+    sweep_skipped_decisions: list[str] = field(default_factory=list)
+    sweep_dropped_decisions: list[str] = field(default_factory=list)
     # auto-sweep triggers already fired this run (e.g. "epic-1", "run-end");
     # guards re-fire on resume
     sweeps_triggered: list[str] = field(default_factory=list)
@@ -870,6 +890,8 @@ class RunState:
             "source": self.source,
             "spec_folder": self.spec_folder,
             "sweep_cycle": self.sweep_cycle,
+            "sweep_skipped_decisions": self.sweep_skipped_decisions,
+            "sweep_dropped_decisions": self.sweep_dropped_decisions,
             "sweeps_triggered": self.sweeps_triggered,
             "sweeps_refused": self.sweeps_refused,
             "target_branch": self.target_branch,
@@ -904,6 +926,8 @@ class RunState:
             source=str(d.get("source", "sprint-status")),
             spec_folder=str(d.get("spec_folder", "")),
             sweep_cycle=int(d.get("sweep_cycle", 1)),
+            sweep_skipped_decisions=[str(s) for s in d.get("sweep_skipped_decisions", [])],
+            sweep_dropped_decisions=[str(s) for s in d.get("sweep_dropped_decisions", [])],
             sweeps_triggered=[str(s) for s in d.get("sweeps_triggered", [])],
             sweeps_refused={str(k): str(v) for k, v in d.get("sweeps_refused", {}).items()},
             target_branch=str(d.get("target_branch", "")),

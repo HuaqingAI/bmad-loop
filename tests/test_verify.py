@@ -2297,7 +2297,11 @@ def test_a_spawn_fault_unrelated_to_the_cwd_translates_too(tmp_path, monkeypatch
     own refusals for real.
 
     Ablation: restore a message hardcoding the cwd as the cause (`could not run
-    in {cwd}: ...`) and the "does not blame the directory" assertion fails."""
+    in {cwd}: ...`) and the "does not blame the directory" assertion fails. That
+    assertion excludes the whole phrase, not just the `" in"` spelling, because
+    the whole phrase is what the production comment promises to omit — it is
+    `cli._reverify` that prefixes "could not run", and any reintroduction here
+    stutters it, however the rest of the sentence is worded."""
     real_run = subprocess.run
 
     def out_of_memory(*args, **kwargs):
@@ -2314,7 +2318,7 @@ def test_a_spawn_fault_unrelated_to_the_cwd_translates_too(tmp_path, monkeypatch
     assert "Cannot allocate memory" in result.spawn_error  # the real cause survives
     # the cwd is context, not a verdict: it appears, but not as the diagnosis
     assert str(tmp_path) in result.spawn_error
-    assert "could not run in" not in result.spawn_error
+    assert "could not run" not in result.spawn_error
 
     out = verify.verify_command_results_outcome([result], tmp_path)
     assert not out.ok and out.env_fault and not out.retryable
@@ -2442,6 +2446,57 @@ def test_timeout_stays_an_ordinary_fixable_retry_with_no_spawn_error(tmp_path, m
 
     out = verify.verify_command_results_outcome([result], tmp_path)
     assert not out.ok and out.retryable and out.fixable and not out.env_fault
+
+
+def test_completed_timed_out_and_never_spawned_legs_survive_one_another(tmp_path, monkeypatch):
+    """All three exits of the loop body in ONE call, each followed by a further
+    command, so every arm's ``continue`` is load-bearing and the three stay
+    distinguishable when they occur together.
+
+    The existing timeout row configures only the timed-out command, leaving the
+    timeout arm's ``continue`` unpinned: with one command the result is identical
+    whether the loop continues or breaks, so `break` there keeps that row green.
+    Only a command AFTER a timeout can tell the two apart — and the documented "one
+    CommandResult apiece" is a claim about a mixed list, not about three separate
+    single-command runs.
+
+    The discriminators are asserted against each other, not just against
+    themselves: the timed-out leg carries ``-1``/``"timed out"`` with NO
+    ``spawn_error``, the never-spawned leg carries `SPAWN_FAULT_RC` (deliberately
+    not ``-1``) WITH one, so neither leg can be read as the other.
+
+    Ablation: `break` instead of `continue` in the timeout arm and the list comes
+    back two long; remove ``ValueError`` from the spawn handler and the raw
+    exception escapes before the fifth command runs; set `SPAWN_FAULT_RC = -1` and
+    the two no-exit-status legs stop being distinguishable by rc.
+    """
+    monkeypatch.setattr(verify, "COMMAND_TIMEOUT_S", 0.5)
+    sleeper = tmp_path / "sleeper.py"
+    sleeper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    hangs = f'"{sys.executable}" "{sleeper}"'
+    never_spawns = f"{_OK}\x00ignored"  # rejected pre-spawn: embedded NUL
+    commands = (_OK, hangs, _OK, never_spawns, _OK)
+    policy = Policy(verify=VerifyPolicy(commands=commands))
+
+    results = verify.run_verify_commands(policy, tmp_path)
+
+    # one apiece, in the configured order — a short list is the failure
+    assert [result.command for result in results] == list(commands)
+    completed, timed_out, after_timeout, never_started, after_spawn_fault = results
+
+    assert completed.returncode == 0 and completed.spawn_error is None
+
+    assert timed_out.returncode == -1
+    assert timed_out.output_tail == "timed out"
+    assert timed_out.spawn_error is None  # it RAN; only a child that never started faults
+
+    assert never_started.returncode == verify.SPAWN_FAULT_RC
+    assert never_started.returncode != timed_out.returncode  # the two sentinels stay apart
+    assert never_started.spawn_error is not None and "ValueError" in never_started.spawn_error
+
+    # the commands each fault was followed by still ran, which is what `continue` buys
+    assert after_timeout.returncode == 0 and after_timeout.spawn_error is None
+    assert after_spawn_fault.returncode == 0 and after_spawn_fault.spawn_error is None
 
 
 def test_verify_commands_bound_a_stream_instead_of_holding_it_whole(tmp_path, monkeypatch):
@@ -6351,6 +6406,80 @@ def test_stories_relpaths_separates_the_two_roots_in_a_monorepo(project):
         "app/_bmad-output/implementation-artifacts/spec-x/stories",
         "app/_bmad-output/implementation-artifacts/spec-x/stories.yaml",
     )
+
+
+def test_verify_dev_park_zero_diff_excludes_engine_writes_under_the_monorepo_shape(
+    project,
+):
+    """The collapsed sibling park row cannot distinguish exclusion roots because
+    its project and repo root are the same directory. Nested, the correct spelling
+    gains ``app/`` while the plausible wrong spelling names a real outer ledger,
+    so the two spellings produce opposite ``park_zero_diff`` observations.
+
+    Ablation performed: drop ``+ mode_exclude`` from ``proof_of_work_probe``'s
+    exclusion composition and this row reddens on the correct spelling's
+    ``park_zero_diff is True`` assertion; restoring the composition makes it green.
+    """
+    paths = nested_repo_root_paths(project)
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+
+    outer_ledger = project.implementation_artifacts / "deferred-work.md"
+    outer_ledger.write_text("- DW-132 outer decoy\n", encoding="utf-8")
+    git(
+        paths.repo_root,
+        "add",
+        outer_ledger.relative_to(paths.repo_root).as_posix(),
+    )
+    git(paths.repo_root, "commit", "-q", "-m", "seed outer deferred-work decoy")
+
+    task, sp = _residue_free(
+        paths, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
+    )
+    paths.deferred_work.write_text("- DW-132 harvested by the orchestrator\n", encoding="utf-8")
+
+    from_code_root = paths.deferred_work.relative_to(paths.repo_root).as_posix()
+    from_project = paths.deferred_work.relative_to(paths.project).as_posix()
+    assert (
+        from_code_root
+        in git(
+            paths.repo_root,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--",
+            from_code_root,
+        ).splitlines()
+    )
+    assert from_code_root == f"app/{from_project}"
+    assert (paths.repo_root / from_project).is_file()
+    assert (paths.repo_root / from_project) != paths.deferred_work
+
+    out = verify.verify_dev(
+        task,
+        paths,
+        dev_result(sp, park_asserted=True),
+        review_enabled=False,
+        operator_park=True,
+        engine_written=(from_code_root,),
+    )
+
+    assert out.ok
+    assert out.park_proof_skipped is True
+    assert out.park_zero_diff is True
+
+    misrooted = verify.verify_dev(
+        task,
+        paths,
+        dev_result(sp, park_asserted=True),
+        review_enabled=False,
+        operator_park=True,
+        engine_written=(from_project,),
+    )
+
+    assert misrooted.ok
+    assert misrooted.park_proof_skipped is True
+    assert misrooted.park_zero_diff is False
 
 
 def test_verify_dev_refuses_a_bare_spec_flip_under_the_monorepo_shape(project):

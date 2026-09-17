@@ -5,10 +5,12 @@ save_state still rides it end to end."""
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import threading
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 
@@ -377,3 +379,264 @@ def test_write_verify_stream_refuses_a_junctioned_verify_directory(tmp_path, mon
 
     with pytest.raises(OSError, match=r"redirected verify directory"):
         Journal(run_dir).write_verify_stream("v.stdout.log", "verifier output")
+
+
+# ------------------------------------------------- append tail heal (DW-97)
+
+
+def _journal_path(run_dir):
+    return run_dir / "journal.jsonl"
+
+
+def test_append_leaves_a_terminated_tail_alone(tmp_path):
+    """The common case pays nothing: a journal ending in a newline gains exactly
+    one line and no blank one.
+
+    Ablation: heal unconditionally (drop the `_tail_is_terminated` guard) and this
+    reddens on the blank line between the two records."""
+    journal = Journal(tmp_path)
+    journal.append("run-start")
+    journal.append("session-start", task_id="t0")
+
+    raw = _journal_path(tmp_path).read_text(encoding="utf-8")
+    assert "\n\n" not in raw
+    assert [e["kind"] for e in journal.entries()] == ["run-start", "session-start"]
+
+
+def test_append_to_an_absent_or_empty_journal_writes_no_leading_newline(tmp_path):
+    """A missing file and a zero-length one are both "terminated": there is no
+    fragment to close, so neither may gain a leading blank line."""
+    journal = Journal(tmp_path)
+    assert not _journal_path(tmp_path).exists()
+    journal.append("run-start")
+    assert _journal_path(tmp_path).read_text(encoding="utf-8").startswith('{"ts"')
+
+    other = tmp_path / "other"
+    other.mkdir()
+    _journal_path(other).write_text("", encoding="utf-8")
+    Journal(other).append("run-start")
+    assert _journal_path(other).read_text(encoding="utf-8").startswith('{"ts"')
+
+
+def test_append_heals_an_unterminated_tail(tmp_path):
+    """A partially flushed record ends the file mid-line. The next append must
+    terminate that fragment on its OWN line rather than concatenating onto it, so
+    the new record stays parseable."""
+    _journal_path(tmp_path).write_text('{"ts": 1, "kind": "unit-merge-star', encoding="utf-8")
+    journal = Journal(tmp_path)
+    journal.append("unit-merged", unit="u1")
+
+    lines = _journal_path(tmp_path).read_text(encoding="utf-8").splitlines()
+    assert lines[0] == '{"ts": 1, "kind": "unit-merge-star'
+    assert json.loads(lines[1])["kind"] == "unit-merged"
+    kinds = [e["kind"] for e in journal.entries()]
+    assert kinds == [journal_mod.UNREADABLE_LINE_KIND, "unit-merged"]
+
+
+def test_one_partial_flush_costs_one_record_not_two(tmp_path):
+    """The regression this defect is about: WITHOUT the heal the first append
+    concatenates onto the fragment and both are dropped as one unparseable line, so
+    a single fault costs TWO records — and a swallowed `unit-merged` re-drives
+    already-merged work in `engine._replay_unlatched_ledger_carries`.
+
+    Ablation: delete the `if not self._tail_is_terminated()` prepend in
+    `Journal.append` and this reddens — `unit-merged` is missing from the kinds and
+    only two entries come back (verified)."""
+    _journal_path(tmp_path).write_text('{"ts": 1, "kind": "unit-merge-star', encoding="utf-8")
+    journal = Journal(tmp_path)
+    journal.append("unit-merged", unit="u1")
+    journal.append("run-complete")
+
+    entries = journal.entries()
+    assert [e["kind"] for e in entries] == [
+        journal_mod.UNREADABLE_LINE_KIND,
+        "unit-merged",
+        "run-complete",
+    ]
+    assert entries[1]["unit"] == "u1"
+
+
+def test_append_heals_when_the_probe_cannot_open_an_existing_journal(tmp_path, monkeypatch):
+    """An unknown tail fails TOWARD the heal. The probe's `open` can fail on a file
+    that exists — a transient EACCES/EMFILE, or the Windows sharing violation
+    `atomic_replace` already retries for — and answering "already terminated" there
+    would skip the heal over a real fragment and reproduce the two-record loss on
+    exactly the unlucky path this change exists to close. Costs at worst one blank
+    line, which both readers skip.
+
+    Only `FileNotFoundError` may answer True, and its own test above
+    (`test_append_to_an_absent_or_empty_journal_writes_no_leading_newline`) is what
+    keeps that arm honest — otherwise every fresh journal would open with a blank
+    line.
+
+    Ablation: widen the arm back to `except OSError: return True` and this reddens —
+    `unit-merged` is swallowed by the fragment (verified)."""
+    _journal_path(tmp_path).write_text('{"ts": 1, "kind": "unit-merge-star', encoding="utf-8")
+    journal = Journal(tmp_path)
+
+    real_open = Path.open
+    seen: list[str] = []
+
+    def deny_the_probe(self, mode="r", *args, **kwargs):
+        # Fail ONLY the "rb" probe read; the append's own "a" open must proceed, or
+        # the test would prove nothing about which direction the probe answered.
+        if mode == "rb" and self == journal.path:
+            seen.append(mode)
+            raise PermissionError(13, "denied")
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_the_probe)
+    journal.append("unit-merged", unit="u1")
+    monkeypatch.undo()
+
+    assert seen == ["rb"], "the probe never ran; the test would be vacuous"
+    lines = _journal_path(tmp_path).read_text(encoding="utf-8").splitlines()
+    assert lines[0] == '{"ts": 1, "kind": "unit-merge-star'
+    assert json.loads(lines[1])["kind"] == "unit-merged"
+    assert [e["kind"] for e in journal.entries()] == [
+        journal_mod.UNREADABLE_LINE_KIND,
+        "unit-merged",
+    ]
+
+
+def test_append_heals_only_once_per_fragment(tmp_path):
+    """Two appends after one fragment leave one blank-free join: the second append
+    sees a terminated tail and adds nothing.
+
+    The blank-line count alone would stay green if the second append wrote NOTHING,
+    so the kinds are asserted too — the claim is "adds no blank line", not "adds
+    nothing"."""
+    _journal_path(tmp_path).write_text("frag", encoding="utf-8")
+    journal = Journal(tmp_path)
+    journal.append("a")
+    journal.append("b")
+    assert _journal_path(tmp_path).read_text(encoding="utf-8").count("\n\n") == 0
+    assert [e["kind"] for e in journal.entries()] == [
+        journal_mod.UNREADABLE_LINE_KIND,
+        "a",
+        "b",
+    ]
+
+
+def test_append_preserves_a_complete_record_left_without_a_final_newline(tmp_path):
+    """An unterminated tail is not always a TORN record: a whole record whose final
+    newline never landed is complete JSON, and the heal must give it its own line so
+    it still parses. Without the prepend the next record concatenates onto it and BOTH
+    are lost — the same two-record fault, with the first record intact on disk.
+
+    Ablation: drop the `if not self._tail_is_terminated()` prepend and this reddens —
+    only the marker comes back (verified)."""
+    _journal_path(tmp_path).write_text('{"ts": 1, "kind": "unit-merged"}', encoding="utf-8")
+    journal = Journal(tmp_path)
+    journal.append("run-complete")
+
+    assert [e["kind"] for e in journal.entries()] == ["unit-merged", "run-complete"]
+
+
+def test_append_leaves_an_existing_crlf_tail_alone(tmp_path):
+    r"""A journal written through Windows text mode ends `\r\n`, whose LAST byte is
+    still `\n` — so the probe reads it as terminated and no blank line is added, and
+    the CRLF record still parses (`entries()` strips the `\r`).
+
+    This is the CRLF half of a two-file pin; `test_append_leaves_a_terminated_tail_alone`
+    is the LF half. The mutation only THIS half catches is a probe that reads a `\r\n`
+    tail as a foreign writer's torn record and heals it —
+    `tail.endswith(b"\n") and not tail.endswith(b"\r\n")` — which leaves the LF sibling
+    green and reddens the blank-line assertion here (verified)."""
+    _journal_path(tmp_path).write_bytes(b'{"ts": 1, "kind": "run-start"}\r\n')
+    journal = Journal(tmp_path)
+    journal.append("session-start", task_id="t0")
+
+    # read_text normalizes `\r\n` to `\n`, so this catches a wrongly-healed blank line
+    # in either spelling — including the `\r\n` one Windows text mode would write it as.
+    assert _journal_path(tmp_path).read_text(encoding="utf-8").count("\n\n") == 0
+    assert [e["kind"] for e in journal.entries()] == ["run-start", "session-start"]
+
+
+def test_rearm_journal_subclass_inherits_the_heal(tmp_path):
+    """`runs._RearmJournal.append` forwards to `super().append`, so the heal is not
+    something a subclass has to remember."""
+    _journal_path(tmp_path).write_text('{"kind": "frag', encoding="utf-8")
+    runs._RearmJournal(tmp_path).append("rearm-ok", story_key="1-1")
+    assert [e["kind"] for e in Journal(tmp_path).entries()] == [
+        journal_mod.UNREADABLE_LINE_KIND,
+        "rearm-ok",
+    ]
+
+
+# ------------------------------------------- entries() unreadable-line marker
+
+
+def test_entries_reports_an_unreadable_line_in_its_stream_position(tmp_path):
+    """The marker takes the lost record's SLOT, so its position still carries the
+    ordering information the entry itself would have.
+
+    The torn line is deliberately PADDED with leading and trailing whitespace, so the
+    `bytes` count can distinguish the raw line (12) from the stripped spelling the
+    parse was attempted on (8). With an unpadded fixture both spellings give the same
+    number and the choice is untestable.
+
+    Ablation: restore `except json.JSONDecodeError: continue` and this reddens with
+    the marker absent; count `len(line.encode(...))` (the stripped spelling) instead
+    of the raw line and the `bytes` assertion reddens 8 != 12."""
+    torn = "  not json  "
+    _journal_path(tmp_path).write_text(
+        f'{torn}\n{{"ts": 1, "kind": "run-start"}}\n', encoding="utf-8"
+    )
+    entries = Journal(tmp_path).entries()
+    assert entries == [
+        {"kind": journal_mod.UNREADABLE_LINE_KIND, "bytes": 12},
+        {"ts": 1, "kind": "run-start"},
+    ]
+    assert len(torn) == 12 and len(torn.strip()) == 8  # the two spellings differ
+
+
+def test_entries_marker_carries_no_ts_and_no_line_content(tmp_path):
+    """`diagnostics.summarize_journal` derives first_ts/last_ts/duration_s from
+    entry timestamps, so a fabricated `ts` would corrupt them; and a journal line
+    can carry session text, so only a byte count is reported."""
+    secret = '{"kind": "dev-decision", "note": "swordfish"'
+    _journal_path(tmp_path).write_text(secret + "\n", encoding="utf-8")
+    (marker,) = Journal(tmp_path).entries()
+    assert marker == {"kind": journal_mod.UNREADABLE_LINE_KIND, "bytes": len(secret)}
+    assert "swordfish" not in json.dumps(marker)
+
+
+def test_entries_still_skips_blank_lines(tmp_path):
+    """A blank line lost no record — and the heal itself can introduce one when a
+    rival appender terminated the tail first — so blanks stay silent."""
+    _journal_path(tmp_path).write_text('{"kind": "a"}\n\n\n{"kind": "b"}\n   \n', encoding="utf-8")
+    assert [e["kind"] for e in Journal(tmp_path).entries()] == ["a", "b"]
+
+
+def test_entries_still_passes_through_a_non_mapping_line(tmp_path):
+    """A bare `3` PARSES, so it is not an unreadable line: it survives unchanged, as
+    today, and `runs.journal_entries_or_none` is where non-dicts are filtered."""
+    _journal_path(tmp_path).write_text('3\n{"kind": "a"}\n', encoding="utf-8")
+    assert Journal(tmp_path).entries() == [3, {"kind": "a"}]
+
+
+def test_entries_still_propagates_invalid_utf8(tmp_path):
+    """Only `JSONDecodeError` becomes a marker. `runs.journal_entries_or_none`
+    catches `UnicodeDecodeError` deliberately to return None (a journal it cannot
+    read) rather than an empty list, and widening the marker to cover it would take
+    that distinction away.
+
+    Ablation: catch `UnicodeDecodeError` in `entries()` too and this fails
+    `DID NOT RAISE`."""
+    _journal_path(tmp_path).write_bytes(b'{"kind": "a"}\n\xff\xfe\n')
+    with pytest.raises(UnicodeDecodeError):
+        Journal(tmp_path).entries()
+    assert runs.journal_entries_or_none(tmp_path) is None
+
+
+def test_marker_survives_the_journal_entries_or_none_dict_filter(tmp_path):
+    """The marker must be a plain dict: `journal_entries_or_none` drops non-dicts,
+    and both its callers DIFF two reads on `len(before)` — a marker that vanished
+    from one read and not the other would move the re-arm watermark."""
+    _journal_path(tmp_path).write_text('bad\n{"kind": "a"}\n', encoding="utf-8")
+    before = runs.journal_entries_or_none(tmp_path)
+    after = runs.journal_entries_or_none(tmp_path)
+    assert before is not None and after is not None
+    assert len(before) == 2 and before == after
+    assert before[0]["kind"] == journal_mod.UNREADABLE_LINE_KIND

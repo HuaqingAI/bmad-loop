@@ -321,15 +321,18 @@ A run driven on another host (shared checkout) always shows `unknown`, never
 falsely `interrupted`. Legacy runs without a pid file fall back to probing the
 per-run tmux session, which can prove `alive` but never `dead`.
 
-Journal kinds are styled by substring, first match wins:
+Journal kinds are styled by substring, first match wins — except the reader-minted
+marker below, which is matched by EQUALITY before the substring table runs, so a
+producer kind that merely contains its spelling is not restyled:
 
-| Substring                                       | Color  | Examples                                        |
-| ----------------------------------------------- | ------ | ----------------------------------------------- |
-| `escalat`, `failed`                             | red    | `preference-escalation`, `review-verify-failed` |
-| `done`, `complete`, `finished`                  | green  | `story-done`, `run-complete`                    |
-| `decision`, `deferred`, `boundary`, `truncated` | yellow | `decision-pending`, `epic-boundary`             |
-| `start`, `resume`                               | cyan   | `session-start`, `run-resume`                   |
-| anything else                                   | dim    |                                                 |
+| Match                                                 | Color  | Examples                                                                                                                                                                                                                    |
+| ----------------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `journal-line-unreadable` (exact kind, matched first) | red    | a journal line that could not be parsed; reader-minted, never written by the engine. Renders `bytes=<n>` and nothing else — deliberately no timestamp (unknowable) and no content from the line (it can carry session text) |
+| `escalat`, `failed`                                   | red    | `preference-escalation`, `review-verify-failed`                                                                                                                                                                             |
+| `done`, `complete`, `finished`                        | green  | `story-done`, `run-complete`                                                                                                                                                                                                |
+| `decision`, `deferred`, `boundary`, `truncated`       | yellow | `decision-pending`, `epic-boundary`                                                                                                                                                                                         |
+| `start`, `resume`                                     | cyan   | `session-start`, `run-resume`                                                                                                                                                                                               |
+| anything else                                         | dim    |                                                                                                                                                                                                                             |
 
 ## Key bindings
 

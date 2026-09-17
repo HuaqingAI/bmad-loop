@@ -3,11 +3,16 @@ that simulate the side effects skill sessions would have on disk."""
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
+import os
 import shutil
+import signal
 import subprocess
 import sys
+import warnings
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,6 +72,221 @@ needs_strict_codec = pytest.mark.skipif(
     reason="host codec decodes 0xff (e.g. an ISO-8859-x locale), so nothing here "
     "would exercise the strict decode this fix is about",
 )
+
+
+# The single xdist scheduling group every real-multiplexer E2E joins. Spelled once
+# here so the two E2E modules and the guard in tests/test_conftest.py read the same
+# constant; a second spelling is a group that silently does not collide with this one.
+REAL_MUX_XDIST_GROUP = "real_mux_e2e"
+
+# Pin every test that spawns a REAL tmux server onto one xdist worker (DW-95). These
+# E2Es are the suite's only wall-clock-sensitive tests: each waits on a live session
+# reaching a hook event, so when several land on different workers at once they
+# contend for the same box and starve each other past their waits — the 2026-09-02
+# py3.13 CI leg failed exactly that way. `loadgroup` schedules every test sharing a
+# group name onto a single worker, so they serialize against each other while the
+# rest of the suite still fans out.
+#
+# INERT WITHOUT `--dist loadgroup`: under the default `load` scheduler xdist ignores
+# the mark entirely and no error is raised, which is why pyproject.toml declares the
+# flag in `addopts` (so local runs and CI schedule identically) and why the guard in
+# tests/test_conftest.py asserts that declaration alongside the marks.
+real_mux_e2e = pytest.mark.xdist_group(REAL_MUX_XDIST_GROUP)
+
+# Hang ceiling for a real-tmux wait. Three consumer classes ride it: the hook-completion
+# waits; the window-death wait in `test_tmux_crash_detected`, which reaches its verdict
+# through a dead window rather than a hook event; and the descendant-reap poll deadlines
+# in `tests/test_stories_e2e.py` (DW-108), which wait on a killed child disappearing
+# rather than on any session event.
+#
+# This is a HANG DETECTOR, not a performance budget: it answers "is this session
+# wedged?" and nothing else. It is deliberately NOT tuned to observed runtimes — never
+# lower it to make a slow test loud, and never read a passing run as evidence about
+# how fast the work is.
+#
+# Sized from both ends. Floor: the waits measure ~1.0s locally and 3.4-4.2s on the CI
+# runner, and the worst starvation ever observed was 30.14s, so 90s is ~21x the CI
+# work and ~3x that starvation — far outside anything the scheduler can do to it.
+# Ceiling: `--dist loadgroup` now serializes every one of these onto ONE worker, so a
+# SYSTEMIC regression pays the wait once per test rather than in parallel, and the
+# Linux test job is capped at `timeout-minutes: 15` — 900s (.github/workflows/ci.yml).
+# Nine collected uses (five hook-completion cases, one crash case, and the three stories
+# reap polls) can consume up to 810s for these waits alone. The stories subprocess
+# budgets (`_run(..., timeout=90/120)`) and other overhead sit OUTSIDE this constant and
+# are additional, so this ceiling does not guarantee the whole job fits within its cap.
+REAL_MUX_HANG_CEILING_S = 90.0
+
+
+# --------------------------------------------------- reap-identity helpers (Linux)
+# The identity model DW-126/DW-127 put behind every signal a test sends to a process
+# it did not spawn itself: never trust a bare pid, which the kernel is free to recycle
+# the instant the process is reaped. A child is named by the pair (pid, /proc start
+# time) captured at spawn; a signal goes out only through a pidfd bound while that
+# pair still matched. Shared here because two modules now need one model — the stories
+# reap E2Es and the opencode detached-descendant row — and conftest is this suite's
+# only proven cross-module import target (`tests/` has no `__init__.py`; pytest's
+# prepend import mode is what puts it on sys.path).
+#
+# Every function below is Linux-only AT CALL TIME (/proc, os.pidfd_open). Nothing here
+# touches either at import time, because this file also loads on Windows.
+
+
+def positive_ascii_decimal(token: str) -> bool:
+    return bool(token) and token.isascii() and token.isdecimal() and any(ch != "0" for ch in token)
+
+
+def proc_starttime(pid: int) -> str | None:
+    """Return /proc stat field 22, or ``None`` only when the process is gone."""
+    try:
+        stat = Path("/proc", str(pid), "stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+    # The comm field is parenthesized and may itself contain spaces and parens, so
+    # split after the last close-paren exactly as process_host does. Malformed records
+    # are observation failures, not evidence that the child disappeared.
+    starttime = stat[stat.rindex(")") + 1 :].split()[19]
+    if not positive_ascii_decimal(starttime):
+        raise ValueError(f"malformed start time in /proc/{pid}/stat: {starttime!r}")
+    return starttime
+
+
+def recorded_child(pid_file: Path) -> tuple[int, str]:
+    """Parse the fake CLI's exact positive-ASCII ``<pid> <starttime>`` identity."""
+    raw = pid_file.read_text(encoding="utf-8")
+    fields = raw[:-1].split(" ") if raw.endswith("\n") else []
+    diagnostic = (
+        f"{pid_file} must hold exactly two positive ASCII-decimal tokens "
+        f"('<pid> <starttime>'), got {raw!r}"
+    )
+    valid = (
+        raw.count("\n") == 1
+        and len(fields) == 2
+        and all(positive_ascii_decimal(field) for field in fields)
+    )
+    assert valid, diagnostic
+    try:
+        pid = int(fields[0])
+    except ValueError:
+        raise AssertionError(diagnostic) from None
+    return pid, fields[1]
+
+
+def preflight_pidfd_support() -> None:
+    """Fail before a fake child is spawned if pidfd open or signalling is unavailable."""
+    fd = os.pidfd_open(os.getpid())
+    try:
+        signal.pidfd_send_signal(fd, 0)
+    finally:
+        os.close(fd)
+
+
+def bind_recorded_child(pid: int, starttime: str) -> int | None:
+    """Bind a pidfd to the authenticated child, or return ``None`` once it is gone."""
+    if proc_starttime(pid) != starttime:
+        return None
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return None
+
+    # Authenticate -> bind -> re-authenticate. Once this second check agrees, the
+    # pidfd names the recorded process even if its numeric pid is later recycled.
+    try:
+        still_matches = proc_starttime(pid) == starttime
+    except BaseException:
+        os.close(fd)
+        raise
+    if not still_matches:
+        os.close(fd)
+        return None
+    return fd
+
+
+def kill_recorded_child(fd: int | None) -> None:
+    """SIGKILL through a bound pidfd and close it; ignore only proven disappearance."""
+    if fd is None:
+        return
+    try:
+        try:
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    finally:
+        os.close(fd)
+
+
+# Where a fake CLI records `<pid> <starttime>` for the child a teardown must reap:
+# one file per task directory, under the run tree the E2E's sandbox root owns.
+RECORDED_CHILD_GLOB = ".bmad-loop/runs/*/tasks/*/fake-child.pid"
+
+
+@contextlib.contextmanager
+def recorded_children_swept(root: Path, *, glob: str = RECORDED_CHILD_GLOB) -> Iterator[None]:
+    """Reap recorded children a block abandoned before it could bind their pidfds.
+
+    The window this closes is exactly the one in which NO fd exists yet: a test
+    spawns its child inside a subprocess run and can only bind an identity after the
+    run directory and its `fake-child.pid` have been discovered, so a run timeout or
+    any assertion in between used to leave an otherwise valid recorded child alive.
+    Cleanup there must rediscover identities from disk and authenticate them again,
+    exactly as the happy path would have. Missing or malformed identities remain
+    unsignalled by design because they cannot safely identify a process.
+
+    ``glob`` names the channel the caller published on, relative to ``root``.
+    It defaults to ``RECORDED_CHILD_GLOB``; callers publishing elsewhere must name
+    that channel so the pre-bind cleanup can find their identities.
+
+    Fires on exception ONLY. On a clean exit the block has already bound the fds and
+    its own ``finally`` owns them; sweeping there would re-bind the same identity and
+    duplicate the kill, so unwinding-only keeps exactly one owner per identity. A
+    just-killed zombie can still carry its recorded start time, so a sweep that races
+    an inner ``finally`` binds a zombie and SIGKILLs it — bound, therefore harmless.
+
+    Cleanup never masks the failure that triggered it: a per-file parse or bind
+    failure is downgraded to a warning naming the path left unswept, and the original
+    exception always propagates.
+    """
+    try:
+        yield
+    except BaseException:
+        pid_files: list[Path] = []
+        try:
+            pid_files.extend(root.glob(glob))
+        except Exception as exc:
+            _warn_unswept_child(root, exc)
+        for pid_file in sorted(pid_files):
+            try:
+                kill_recorded_child(bind_recorded_child(*recorded_child(pid_file)))
+            # Deliberately the widest net short of BaseException, against the repo's
+            # usual typed-escalation doctrine: this is a best-effort cleanup running
+            # DURING someone else's unwind, so anything it raises would REPLACE the
+            # in-flight exception (demoting it to __context__) and abandon the
+            # remaining identity files. The reachable failures alone already span
+            # AssertionError (the strict parser), UnicodeDecodeError/ValueError (a
+            # non-UTF-8 or malformed record, and proc_starttime's own raise),
+            # IndexError (a truncated /proc line) and OSError (bind/kill); enumerating
+            # them invites the next unlisted one to abort the sweep. BaseException
+            # still passes, so a KeyboardInterrupt is never swallowed here.
+            except Exception as exc:
+                _warn_unswept_child(pid_file, exc)
+        raise
+
+
+def _warn_unswept_child(path: Path, exc: Exception) -> None:
+    """Report best-effort cleanup failure without replacing an active exception."""
+    try:
+        warnings.warn(
+            f"unauthenticated survivor left at {path}: {exc!r}",
+            # 4, not 2: the helper and @contextmanager generator frames precede
+            # contextlib's __exit__, so the warning should name the leaking `with`.
+            stacklevel=4,
+        )
+    except Exception:
+        # Warning filters may promote UserWarning to an exception, and custom warning
+        # hooks can fail too. Cleanup is already handling somebody else's exception;
+        # neither may replace it or prevent later identities from being swept.
+        pass
 
 
 def assert_run_state_lock_held(run_dir: Path) -> None:

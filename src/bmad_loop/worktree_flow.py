@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import json
 from collections.abc import Collection, Sequence
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, NoReturn
@@ -91,6 +92,12 @@ _SETUP_MCP_AGENT_IDS = {"claude": "claude-code"}
 def _setup_mcp_agent_id(profile_name: str) -> str:
     """Map a CLI profile name to its Unity-MCP `setup-mcp` agent id."""
     return _SETUP_MCP_AGENT_IDS.get(profile_name, profile_name)
+
+
+def _crlf_normalized(data: bytes) -> bytes:
+    """``data`` with every CRLF read as LF — the one translation a git checkout
+    under ``core.autocrlf`` applies on its own (see `_warn_accepted_spec_superseded`)."""
+    return data.replace(b"\r\n", b"\n")
 
 
 def _worktree_skill_copy_candidates(repo_root: Path, tree: str) -> tuple[str, ...]:
@@ -1227,6 +1234,44 @@ def provision_worktree(
     return skipped
 
 
+@dataclass(frozen=True)
+class _AcceptedSpecEnds:
+    """What :meth:`WorktreeFlow._accepted_spec_pair` actually resolved.
+
+    Replaces the ``tuple | None`` the locator returned until DW-104, whose ``None``
+    collapsed four distinct outcomes into one silence: not applicable, a source that
+    would not resolve, a source resolving outside the project, and a destination
+    escaping the mount. Telling those apart is the whole point — two of them are
+    losses a unit dispatches straight through, and two of them are spellings this
+    path has no claim on at all.
+
+    Encoding, from least to most resolved:
+
+    - not applicable (empty/absolute ``spec_file``) or the source resolve raised:
+      every field ``None``. ``faulted`` is what separates the two — the locator
+      could not RESOLVE the spec at all (a swallowed filesystem fault, or a
+      spelling that no longer resolves because the path is gone) versus a spelling
+      that was never this path's business. It is deliberately not narrower than
+      that: one ``except`` covers the whole source resolve, and the two causes are
+      indistinguishable from inside it.
+    - source resolved but outside the project: ``source`` set, ``relative`` None.
+      An out-of-tree artifacts dir the mount reads directly; no claim, no record.
+    - destination escapes the mount (or the mount root will not resolve):
+      ``source`` and ``relative`` set, ``destination`` None. The containment
+      refusal — the rel IS known, which is what lets it be nominated as a seed.
+    - usable: every field set.
+
+    Existence of neither end is asserted here; that stays the caller's arm (the
+    seed copies only into an ABSENT destination, the supersession warning compares
+    only against a PRESENT one).
+    """
+
+    source: Path | None = None
+    relative: str | None = None
+    destination: Path | None = None
+    faulted: bool = False
+
+
 class WorktreeFlow:
     """Provision, drive, integrate and reclaim per-unit git worktrees.
 
@@ -1499,10 +1544,97 @@ class WorktreeFlow:
         lacks its corresponding path. Absolute/external spellings pass through;
         prior-attempt binding fields remain authoritative until fresh binding
         replaces them after the mount is provisioned.
+
+        Both existence arms probe through ``_is_file``, total over ``OSError``,
+        rather than ``Path.is_file``: on Python <=3.13 the raw probe RAISES on an
+        entry below an unsearchable parent (3.14 answers false, as
+        :func:`install._is_file` records), and this call site sits outside every
+        ``except`` in ``run_isolated``, so such a fault killed the run instead of
+        allowing dispatch to continue.
+
+        Which arm a given fault can actually reach differs, because the locator
+        resolves the two ends differently. A parent that is merely unsearchable
+        does NOT reach the source arm on any interpreter: ``_accepted_spec_pair``
+        resolves the source ``strict=True``, which raises first and folds the pair
+        to ``None``. The source arm is reachable only by TOCTOU between that
+        resolve and this stat, or by a non-EACCES ``OSError``. The DESTINATION is
+        resolved ``strict=False``, which can leave an inaccessible suffix unresolved;
+        other resolution failures are still caught by the locator. A source probe
+        fault omits the seed; a destination probe fault treats that end as absent
+        and leaves delivery to the seed loop. This uses the same total probe as
+        :meth:`_ledger_seed`, :meth:`_board_seed` and
+        :meth:`_warn_accepted_spec_superseded` (DW-103).
+
+        A rel whose DESTINATION escapes the mount is nominated anyway (DW-104).
+        Until then the locator's containment refusal returned ``()``, so the rel
+        reached neither ``seed_files`` nor ``skipped_seeds`` nor
+        ``undelivered_seeds`` and no journal named it. Returning it is safe only
+        because the copier judges containment for itself: ``provision_worktree``
+        re-derives ``dst`` and ``continue``s on ``not dst.is_relative_to(worktree)``
+        before any copy, so nothing is written outside the mount, and
+        :func:`worktree_seed_undelivered` then reports the same rel because its own
+        ``contained(dst, worktree)`` arm fails. This return is a NOMINATION, not a
+        permission — never rely on this method's judgement to keep a copy inside
+        the mount.
+        """
+        ends = self._accepted_spec_pair(task, worktree, project_relative_only=project_relative_only)
+        relative, source = ends.relative, ends.source
+        # One narrowing, not a refusal: the locator sets `relative` only alongside
+        # `source`, so this pair is either both present or there is nothing to seed.
+        if relative is None or source is None:
+            return ()
+        # ONE existence arm for both branches below. A source that is not a regular
+        # file is nominated by neither: `provision_worktree` would recurse a DIRECTORY
+        # into the mount, and a containment refusal that came from an unresolvable
+        # mount root rather than a real escape can still leave the copier a contained
+        # `dst` to copy that tree onto.
+        if not _is_file(source):
+            return ()
+        if ends.destination is None:
+            return (relative,)
+        if _is_file(ends.destination):
+            return ()
+        return (relative,)
+
+    def _accepted_spec_pair(
+        self,
+        task: StoryTask,
+        worktree: Path,
+        *,
+        project_relative_only: bool = False,
+    ) -> _AcceptedSpecEnds:
+        """Locate the accepted project-local spec's (rel, main-checkout, mount) ends.
+
+        The ONE locator :meth:`_accepted_spec_seed`,
+        :meth:`_warn_accepted_spec_superseded` and
+        :meth:`_warn_accepted_spec_undelivered` all decide on. Extracted rather than
+        restated so a record can never report a loss against a pair the seed was
+        not looking at: two copies of this derivation drift the moment one of them
+        learns something about spec spellings the other does not, and the record
+        would then name a file whose delivery its own gate never measured.
+
+        Returns :class:`_AcceptedSpecEnds` rather than the ``tuple | None`` it
+        answered until DW-104 — see that class for the encoding. What changed is
+        only how much of the outcome is REPORTED: the refusals are the same
+        refusals, and every caller that wanted "usable or nothing" still gets it by
+        requiring the fields it needs. The two states the widening exists for are
+        ``destination is None`` with a known ``relative`` (the containment refusal,
+        which can now be nominated as a seed and named in `worktree-seed-dropped`)
+        and ``faulted`` — the source would not resolve at all, whether because a
+        filesystem fault was swallowed or because the spelling no longer resolves.
+        Either way it is not the same silence as a spelling this path has no claim
+        on.
+
+        Not a canonical project-local accepted artifact, and all-None with
+        ``faulted=False``: an empty or absolute ``spec_file`` (an external spelling
+        passes through untouched). Deliberately asserts the existence of NEITHER end
+        — that is the caller's arm, and the callers want opposite answers to it (the
+        seed copies only into an ABSENT destination; the supersession warning
+        compares only against a PRESENT one).
         """
         raw = task.spec_file
         if not raw or Path(raw).is_absolute():
-            return ()
+            return _AcceptedSpecEnds()
         try:
             project = self.paths.project.resolve(strict=True)
             source = (
@@ -1510,15 +1642,210 @@ class WorktreeFlow:
                 if project_relative_only
                 else verify.resolve_spec_path(raw, self.paths)
             ).resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            # The whole source resolve, so `faulted` means "could not resolve it",
+            # not "a filesystem fault occurred": a `strict=True` resolve of a path
+            # that is simply gone lands here too, and nothing inside can tell the
+            # two apart. The record it feeds says exactly that much and no more.
+            return _AcceptedSpecEnds(faulted=True)
+        try:
             relative = source.relative_to(project)
+        except ValueError:
+            # Resolves outside the project: an out-of-tree artifacts dir the mount
+            # already reads directly. A spelling with no claim, not a fault.
+            return _AcceptedSpecEnds(source=source)
+        rel = relative.as_posix()
+        try:
             destination = (worktree / relative).resolve(strict=False)
             mounted_root = worktree.resolve(strict=True)
             destination.relative_to(mounted_root)
         except (OSError, RuntimeError, ValueError):
-            return ()
-        if not source.is_file() or destination.is_file():
-            return ()
-        return (relative.as_posix(),)
+            # The containment refusal (and an unresolvable mount root, which cannot
+            # prove containment either). The REL is known, which is what lets
+            # `_accepted_spec_seed` nominate it and `worktree_seed_undelivered`
+            # name it.
+            return _AcceptedSpecEnds(source=source, relative=rel)
+        return _AcceptedSpecEnds(source=source, relative=rel, destination=destination)
+
+    def _warn_accepted_spec_superseded(
+        self,
+        task: StoryTask,
+        worktree: Path,
+        *,
+        project_relative_only: bool = False,
+    ) -> None:
+        """Journal when a fresh mount's copy of the accepted spec is not the
+        operator's (DW-101).
+
+        The ``pause_after_spec`` approval gate hands the operator a spec that is
+        UNCOMMITTED by construction. For a TRACKED artifacts dir a re-drive's
+        ``git worktree add`` then delivers the COMMITTED bytes into the mount,
+        :meth:`_accepted_spec_seed` skips (its destination already exists) and the
+        ``accepted_delivered`` probe in :meth:`run_isolated` passes on existence and
+        containment alone — so the corrections the operator just made are silently
+        superseded by the pre-approval text. The escalation path already answers this
+        exact loss with ``rearm-spec-write-unreachable``; this is the approval path's
+        equivalent.
+
+        ADVISORY ONLY, and deliberately so on both counts: this method refuses,
+        pauses and rewrites NOTHING. It does not overwrite the mount's copy — a dirty
+        TRACKED file inside the mount is not covered by the worktree-local
+        ``info/exclude`` fold, so ``finalize_commit``'s ``git add -A`` would merge the
+        operator's in-progress edits into the story commit. And it does not refuse the
+        mount, which would hard-fail every isolated unit in a project that tracks its
+        artifacts dir. What happens to the unit afterwards is not this method's claim
+        to make (the ready gate may still veto the dispatch); the remedy is the
+        operator's, and it is the record's whole payload: commit the corrected spec on
+        the named branch.
+
+        Field shapes are routing decisions, not taste. ``spec_file`` carries the
+        MAIN-CHECKOUT absolute path — the file the operator has to commit, not the
+        mount's copy of it — and rides ``diagnostics._JOURNAL_ALIAS_FIELDS``' ``spec``
+        namespace. The branch is spelled ``target_branch`` rather than a fresh name
+        because that scrub routes by field NAME and ``target_branch`` is already
+        aliased to the ``branch`` namespace, while any new spelling falls through to
+        ``scrub_json``, which waves an identifier-shaped branch name through verbatim.
+        The discriminator is a bare boolean ``compared`` rather than a ``reason``/
+        ``error`` string for the mirror-image reason: both of those names are in
+        ``_JOURNAL_DROP_FIELDS`` and would ship as a presence marker instead of the
+        distinction the record exists to draw.
+
+        Silent for the two legs that are not this loss: a destination the mount never
+        delivered is the seed's own case (and a hard delivery fault has already
+        escalated above this call), and identical bytes are no loss at all. A read
+        that raises answers ``compared: false`` — the probe cannot PROVE the mount
+        reads the operator's bytes, and an unprovable delivery is exactly what this
+        record is for. Nothing here may raise out: the locator swallows its own
+        faults, ``_is_file`` is total over them, and the comparison is wrapped.
+
+        "Identical" is read with line endings normalized (CRLF ≡ LF). The mount is
+        a git CHECKOUT, so under Git-for-Windows' system ``core.autocrlf=true`` an
+        LF-authored spec comes back CRLF there while the main checkout keeps the
+        LF bytes the spec writer laid down — a difference git itself folds away on
+        the next commit, and one this record must not report as a lost correction.
+        Only that translation is folded: a lone CR, a missing final newline, or any
+        other byte still counts, since git would carry those into the commit.
+        """
+        ends = self._accepted_spec_pair(task, worktree, project_relative_only=project_relative_only)
+        source, destination = ends.source, ends.destination
+        # A FULLY USABLE pair or nothing. Every refusal the locator now reports in
+        # more detail (DW-104) is still a refusal here: there is nothing to compare
+        # against a destination that escapes the mount, and comparing against a
+        # source outside the project would name a file this path has no claim on.
+        if source is None or destination is None or ends.relative is None:
+            return
+        if not _is_file(source) or not _is_file(destination):
+            return
+        try:
+            identical = _crlf_normalized(source.read_bytes()) == _crlf_normalized(
+                destination.read_bytes()
+            )
+        except (OSError, RuntimeError, ValueError):
+            compared = False
+        else:
+            if identical:
+                return
+            compared = True
+        self.journal.append(
+            "accepted-spec-write-unreachable",
+            story_key=task.story_key,
+            spec_file=str(source),
+            target_branch=self.state.target_branch,
+            compared=compared,
+        )
+
+    def _warn_accepted_spec_undelivered(
+        self,
+        task: StoryTask,
+        worktree: Path,
+        *,
+        project_relative_only: bool = False,
+    ) -> None:
+        """Journal when the mount cannot be shown to carry the accepted spec at all
+        (DW-104 + DW-115).
+
+        The silence this record ends had two mouths and one shape. Before DW-104
+        :meth:`_accepted_spec_pair`'s containment arm refused a spec whose mounted
+        parent escapes the worktree, and :meth:`_accepted_spec_seed` returned ``()``
+        for it: the rel reached neither ``seed_files`` nor ``skipped_seeds`` nor
+        ``undelivered_seeds``. DW-115 is the second mouth: the locator's own
+        ``except`` swallows everything that stops the source RESOLVING — a real
+        filesystem fault, or a spelling that no longer resolves because the path is
+        gone — and produces the SAME ``()``. For
+        a spec already spelled project-relative — ``accepted_spec_relocated`` false,
+        which is the spelling a resume persists — the escalating ``accepted_delivered``
+        probe in :meth:`run_isolated` does not run either, so the unit dispatched
+        against a mount lacking the operator's spec, fell back to the bare story key,
+        and nothing in the journal named why. The seed widening restores the first
+        mouth's visibility through ``worktree-seed-dropped``; this record covers both,
+        and is the only thing that covers the swallowed fault.
+
+        ADVISORY ONLY. It refuses nothing, pauses nothing, writes nothing into the
+        mount and is read by no gate. The RELOCATED leg is deliberately not its
+        business: that leg already escalates on the same loss a few lines above the
+        call site, so a RECORD here as well would be a second advisory naming a unit
+        that never reaches a session. (The relocated leg does still emit a
+        ``worktree-seed-dropped`` entry for a containment refusal — that is the seed
+        report, not this one.) The human decision dated 2026-09-04 on DW-104 is record,
+        do not escalate — the escalating probe's ``if accepted_spec_relocated:`` gate
+        does not move.
+
+        Silent for the spellings this path has no claim on, which is why the locator's
+        detail is required rather than a bare "not delivered": an empty or absolute
+        ``spec_file`` and one resolving OUTSIDE the project (a shared out-of-tree
+        artifacts dir the mount reads directly) have no ``relative`` and are not
+        ``faulted``; an external source can still be set. They return before any probe. The two entry conditions are a project-local
+        rel the locator RESOLVED, and ``faulted`` — the source would not resolve at
+        all, so the rel is unknown and ``task.spec_file`` is the best spelling
+        available.
+
+        Field shapes are routing decisions, mirroring
+        :meth:`_warn_accepted_spec_superseded` for the reasons stated there:
+        ``spec_file`` carries the MAIN-CHECKOUT path (the locator's ``source`` when it
+        resolved, else ``self.paths.project / task.spec_file`` — both reduce to the
+        same basename alias in ``diagnostics``) and rides the ``spec`` namespace, and
+        the branch is spelled ``target_branch`` because that name is already aliased
+        to the ``branch`` namespace while a fresh spelling falls through to
+        ``scrub_json`` and ships an identifier-shaped branch name verbatim. The
+        discriminator is a bare boolean ``located`` — whether the locator resolved a
+        project-local rel at all, i.e. which of the two mouths this is: ``false``
+        says the spec could not be resolved (faulted or gone), ``true`` says it was
+        resolved and the MOUNT could not be shown to carry it — rather than a
+        ``reason``/``error`` string, because both of those names are in
+        ``diagnostics._JOURNAL_DROP_FIELDS`` and would ship as a presence marker
+        instead of the distinction the record exists to draw.
+
+        Nothing here may raise out: the locator swallows its own faults, ``_is_file``
+        is total over them, and the containment resolve is wrapped. A probe that
+        cannot resolve has not PROVEN delivery, which is exactly what the record is
+        for, so every fault answers "not delivered" rather than propagating.
+        """
+        ends = self._accepted_spec_pair(task, worktree, project_relative_only=project_relative_only)
+        if ends.relative is None and not ends.faulted:
+            return
+        probe = worktree / (ends.relative or str(task.spec_file))
+        # File-ness alone is not delivery, for the reason the escalating probe states:
+        # a parent that is a real directory in the main checkout but a committed
+        # OUTWARD symlink in the mounted commit lands the probe on an unrelated
+        # external artifact, which answers true. Require containment as well.
+        try:
+            delivered = _is_file(probe) and probe.resolve(strict=False).is_relative_to(
+                worktree.resolve()
+            )
+        except (OSError, RuntimeError, ValueError):
+            delivered = False
+        if delivered:
+            return
+        source = (
+            ends.source if ends.source is not None else self.paths.project / str(task.spec_file)
+        )
+        self.journal.append(
+            "accepted-spec-delivery-unreachable",
+            story_key=task.story_key,
+            spec_file=str(source),
+            target_branch=self.state.target_branch,
+            located=ends.relative is not None,
+        )
 
     def run_isolated(self, task: StoryTask, drive: Callable[[StoryTask], None]) -> None:
         """Run one unit's `drive` body in a fresh per-unit worktree, then merge
@@ -1686,10 +2013,13 @@ class WorktreeFlow:
             )
 
         # The last guard standing over a relocated accepted spec, and the only one
-        # that can see this particular loss at all: `_accepted_spec_seed` refuses on
-        # its own containment arm SILENTLY — the rel reaches neither `seed_files` nor
-        # `skipped_seeds` nor `undelivered_seeds`, so neither journal above names it.
-        # File-ness alone is therefore not enough to call the spec delivered.
+        # that STOPS a bind to an outside file. `_accepted_spec_seed` refuses on its
+        # own containment arm — since DW-104 not silently: the refused rel is
+        # nominated into `seed_files` anyway, `provision_worktree` re-derives `dst`
+        # and copies nothing because it escapes, and `worktree-seed-dropped` above
+        # names it. That report is informational, though, and this probe is what
+        # keeps the unit from dispatching against someone else's bytes.
+        # File-ness alone is not enough to call the spec delivered.
         # `_is_file` follows symlinks and asks only "are there bytes here", so a
         # parent that is a real directory in the main checkout but a committed
         # OUTWARD symlink in the commit this mount was cut from lands the probe on an
@@ -1782,6 +2112,37 @@ class WorktreeFlow:
             )
             self.escalate_unit(task, reason)  # always raises RunPaused
 
+        # The residue the delivery probe above cannot see, stated as a warning rather
+        # than a write: a spec the mount DID deliver, whose bytes are the committed
+        # ones rather than the operator's uncommitted corrections (DW-101). Ungated by
+        # `accepted_spec_relocated` on purpose — a hard delivery fault has already
+        # escalated above, and a spec the task already spelled project-relative
+        # reaches exactly the same loss without ever passing through the normalizer.
+        #
+        # LAST, below every gate that escalates: each of the three above always raises,
+        # so a call placed among them would record "the mount superseded your spec" for
+        # a unit that then never got near a session. Here the only things left are the
+        # ready gate's veto and drive() itself.
+        self._warn_accepted_spec_superseded(
+            task, unit.path, project_relative_only=accepted_spec_relocated
+        )
+        # The residue neither the seed journals nor the probe above can see, for the
+        # ONE leg that has no escalating guard at all: a spec the task already spelled
+        # project-relative whose delivery the mount cannot PROVE (DW-104 + DW-115) —
+        # the locator refused on containment, or swallowed a filesystem fault, and
+        # either way the unit dispatches against a mount lacking the operator's spec.
+        # Gated on `not accepted_spec_relocated` because the relocated leg already
+        # escalated a few lines up, so a RECORD there too would be a second advisory
+        # naming a unit that never reaches a session — the `worktree-seed-dropped`
+        # entry that leg still emits is the seed's report, not this one.
+        # LAST, beside the DW-101 warning and for its stated
+        # reason: below every gate that raises, so the record cannot name a unit that
+        # never dispatched.
+        if not accepted_spec_relocated:
+            # `False` literally, not `accepted_spec_relocated`: inside this gate the
+            # flag cannot be anything else, and spelling it as a variable would read
+            # as if it varied the way it does at the call two lines above.
+            self._warn_accepted_spec_undelivered(task, unit.path, project_relative_only=False)
         self._save()
         prev = self._workspace_get()
         self._workspace_set(unit.workspace)

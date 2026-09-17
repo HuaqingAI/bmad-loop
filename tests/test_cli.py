@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 import yaml
 from conftest import (
+    _OK,
+    MISSING_TOOL_CMD,
     PROJECT_MARKER_CMD,
     REPO_ROOT_MARKER_CMD,
     UNRESOLVABLE,
@@ -691,6 +693,40 @@ def test_decisions_json_config_error_leaves_stdout_empty(project, capsys):
     out, err = capsys.readouterr()
     assert out == ""
     assert "error:" in err
+
+
+def test_decisions_json_survives_an_undecodable_triage_cache(project, capsys):
+    """DW-145 end to end, at the surface a caller actually sees. `cmd_decisions`
+    catches `BmadConfigError` alone, so a `UnicodeDecodeError` out of
+    `pending_missed_decisions` — a `ValueError`, not an `OSError` — fell through
+    to `main`'s broad backstop: exit 1 with `error: 'utf-8' codec can't decode…`
+    on stderr and NO document on stdout, so one unreadable byte in one run's
+    cached triage took the whole listing down. The good run's DW-1 still lists,
+    so the widening degrades per file rather than emptying the document.
+    Ablation: revert the except tuple in `pending_missed_decisions` to
+    `(json.JSONDecodeError, OSError)` and this reddens — exit 1, empty stdout."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    bad = project.project / ".bmad-loop" / "runs" / "20260102-000000-bbbb"
+    bad.mkdir(parents=True, exist_ok=True)
+    (bad / "state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "20260102-000000-bbbb",
+                "project": str(project.project),
+                "started_at": "now",
+                "run_type": "sweep",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (bad / "triage.json").write_bytes(b'{"workflow": "deferred-sweep-triage", "x": "\xff"}')
+
+    doc = _decisions_json(project, capsys, "--list")
+    assert [d["id"] for d in doc["decisions"]] == ["DW-1"]
 
 
 def test_decisions_answer_records_and_carries_forward(project, capsys, monkeypatch):
@@ -6094,6 +6130,14 @@ def _resume_entry(run_dir):
     return entry
 
 
+def _restamp_records(run_dir):
+    """Every `rearm-code-root-restamped` row, in journal order — a discharged code-root
+    record debt, never this resume's own re-stamp."""
+    from bmad_loop.journal import Journal
+
+    return [e for e in Journal(run_dir).entries() if e["kind"] == "rearm-code-root-restamped"]
+
+
 def test_resume_restamps_policy_snapshot_before_the_engine_runs(project, monkeypatch):
     """#189: resume reloads policy.toml and enforces it (the per-story budget,
     every SessionSpec) but used to leave the launch-time snapshot in place, so
@@ -6194,6 +6238,9 @@ def test_resume_restamps_the_code_root_when_the_config_moved(project, monkeypatc
     (at_start,) = seen
     assert at_start.code_root == moved.resolve()
     assert _resume_entry(run_dir)["code_root_changed"] is True
+    # A move with no debt behind it discharges nothing: the record below is for an
+    # unlanded `restamp_code_root` row, never for this resume's own re-stamp.
+    assert _restamp_records(run_dir) == []
     err = capsys.readouterr().err
     assert "the code root in _bmad/bmm/config.yaml has changed" in err
     # the warning names neither tree: a journalled scalar, an operator-facing sentence
@@ -6218,39 +6265,159 @@ def test_resume_reports_no_code_root_change_when_the_config_did_not_move(
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
     assert _resume_entry(run_dir)["code_root_changed"] is False
+    assert _restamp_records(run_dir) == []  # no debt, no discharge
     assert "code root" not in capsys.readouterr().err
 
 
-def test_resume_consumes_an_outstanding_code_root_restamp(project, monkeypatch, capsys):
+def test_resume_discharges_an_outstanding_code_root_restamp(project, monkeypatch, capsys):
     """A move `runs.restamp_code_root` persisted whose record never landed reaches
-    resume with the mirror ALREADY agreeing with config — the compare alone reads "no
-    move" on the one gesture that still owes the operator its record and its warning.
+    resume with the mirror ALREADY agreeing with config. The marker is a RECORD DEBT,
+    not a move: resume discharges it with its own `rearm-code-root-restamped` append
+    naming the root the marker still describes, and the compare — which sees mirror and
+    config agreeing, because they do — records `false` and stays quiet. Folding the debt
+    into the `run-resume` boolean instead warned that the code root "has changed since
+    this run started" on a resume whose tree IS the tree the run started in, and
+    answered an A->B debt with a row that names no root at all.
 
-    The intent marker exists so a retry writes that record; the retry may arrive
-    through plain `resume` rather than `resolve`, and a run that finished from here
-    would leave the move unrecorded for good — the audit gap the marker closes. So the
-    marker counts as a move for the `run-resume` line and the stderr warning, and is
-    consumed on the same state write that persists the resume.
-
-    Ablation: drop the `or state.code_root_restamp_pending` half of the compare and this
-    reddens on the journal field (`assert False is True`); drop the clearing line
-    instead and it reddens on the persisted marker.
+    Ablation: delete the `if state.code_root_restamp_pending:` discharge append above
+    `state.repo_root = ...` and this reddens on the empty record list; drop the clearing
+    line instead and it reddens on the persisted marker; restore the retired
+    `or state.code_root_restamp_pending` clause and it reddens on both the `run-resume`
+    field and the absent-warning assertion.
     """
     from bmad_loop.journal import load_state
 
+    root = str(Path(project.project).resolve())
     run_dir = _paused_run_for_resume(
         project,
         monkeypatch,
-        repo_root=str(Path(project.project).resolve()),
+        repo_root=root,
         code_root_restamp_pending=True,
     )
     monkeypatch.setattr(cli, "Engine", _StubEngine)
 
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
-    assert _resume_entry(run_dir)["code_root_changed"] is True
+    records = _restamp_records(run_dir)
+    assert [r["repo"] for r in records] == [root]
+    assert [r["code_root_changed"] for r in records] == [True]
+    # The debt is discharged on its own line; the compare reports the truth beside it.
+    assert _resume_entry(run_dir)["code_root_changed"] is False
     assert load_state(run_dir).code_root_restamp_pending is False
+    assert "code root" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("retry_root", ["was", "third"])
+def test_resume_discharges_the_owed_record_under_the_root_the_marker_names(
+    project, monkeypatch, capsys, retry_root
+):
+    """The owed record names the root the MARKER still describes, never the root config
+    now names. `code_root_restamp_pending` is a bare bool, so `state.repo_root` at entry
+    is the only surviving description of the root an unlanded record was owed for — an
+    operator who re-points `repo_root:` between the failed append and the resume
+    (restoring the original, or moving to a third tree) would otherwise have the owed
+    A->B row answered by a row describing a different move, unreconstructable after the
+    fact. The twin of `runs.restamp_code_root`'s own discharge, and the same reason.
+
+    Ablation: move the discharge append BELOW `state.repo_root = str(paths.repo_root)`
+    and this reddens on the recorded `repo` — it names the config's root, not the
+    marker's; delete the append and it reddens on the empty record list.
+    """
+    from bmad_loop.journal import load_state
+
+    owed = project.project / "owed-code"
+    owed.mkdir()
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        repo_root=str(owed),
+        code_root_restamp_pending=True,
+    )
+    # After the harness wrote config.yaml: "was" leaves the launch root in place, the
+    # operator having restored it; "third" re-points it at a tree neither side names.
+    again = Path(project.project).resolve() if retry_root == "was" else project.project / "third"
+    if retry_root != "was":
+        again.mkdir()
+        _configure_repo_root(project, again)
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    assert [r["repo"] for r in _restamp_records(run_dir)] == [str(owed)]
+    # The config really did move away from the mirror, so THIS resume is a move too.
+    assert _resume_entry(run_dir)["code_root_changed"] is True
     assert "the code root in _bmad/bmm/config.yaml has changed" in capsys.readouterr().err
+    persisted = load_state(run_dir)
+    assert persisted.repo_root == str(again.resolve())
+    assert persisted.code_root_restamp_pending is False
+
+
+def test_resume_leaves_the_owed_root_and_marker_intact_when_the_discharge_fails(
+    project, monkeypatch, capsys
+):
+    """The at-least-once bargain, driven through the RETRY leg — asserting a retry is
+    possible would pass for every reason the values could still be there.
+
+    The discharge is the FIRST fallible write of the resume: ahead of the `run-resume`
+    row, the pin re-baseline and every state mutation. So an append that raises has
+    left the journal, integrity pin and run state unchanged — no orphan `run-resume`
+    row for the retry to duplicate, and a root and marker still describing the tree
+    the record is owed for — and the retry
+    writes that record, once, under the owed root.
+
+    Ablation: move the discharge append below `journal.append("run-resume", **fields)`
+    and this reddens on the orphan row — the failed attempt leaves a `run-resume` entry
+    behind and the retry makes two. Move it below `save_state` instead and it reddens
+    on the persisted root and marker, the resume being durable while its record is not.
+    Move the integrity-pin write before the discharge and the OLDPIN assertion fails.
+    """
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal, load_state
+
+    owed = project.project / "owed-code"
+    owed.mkdir()
+    run_dir = _paused_run_for_resume(
+        project,
+        monkeypatch,
+        repo_root=str(owed),
+        code_root_restamp_pending=True,
+    )
+    monkeypatch.setattr(cli, "Engine", _StubEngine)
+    runs.write_trusted_config_digest(project.project, run_dir.name, "OLDPIN")
+    real_append = Journal.append
+
+    def append_failing_the_discharge(self, kind, **fields):
+        if kind == "rearm-code-root-restamped":
+            raise OSError(30, "Read-only file system")
+        real_append(self, kind, **fields)
+
+    monkeypatch.setattr(Journal, "append", append_failing_the_discharge)
+
+    with pytest.raises(OSError):
+        cli._resume_paused_run(project.project, run_dir)
+
+    assert runs.read_trusted_config_digest(project.project, run_dir.name) == "OLDPIN"
+    persisted = load_state(run_dir)
+    assert persisted.repo_root == str(owed)
+    assert persisted.code_root_restamp_pending is True
+    assert persisted.paused is True
+    # No journal row landed before the failed discharge.
+    assert _restamp_records(run_dir) == []
+    assert _resume_entries(run_dir) == []
+
+    monkeypatch.setattr(Journal, "append", real_append)  # the write surface recovers
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+
+    # The retry writes the owed record, ONCE, under the root the marker still named.
+    assert [r["repo"] for r in _restamp_records(run_dir)] == [str(owed)]
+    # Exactly one `run-resume` row across BOTH attempts — the failed one left none to
+    # duplicate. `True` because the owed root and the config root really do differ
+    # here; the discharge above still names the owed one, not the config's.
+    assert _resume_entry(run_dir)["code_root_changed"] is True
+    assert _resume_entry(run_dir)["security_config_changed"] is True
+    assert "host-exec config pinned at launch has changed" in capsys.readouterr().err
+    assert load_state(run_dir).code_root_restamp_pending is False
 
 
 def test_resume_migrates_a_legacy_state_without_calling_it_a_move(project, monkeypatch, capsys):
@@ -6271,6 +6438,7 @@ def test_resume_migrates_a_legacy_state_without_calling_it_a_move(project, monke
 
     assert load_state(run_dir).repo_root == str(Path(project.project).resolve())
     assert _resume_entry(run_dir)["code_root_changed"] is False
+    assert _restamp_records(run_dir) == []  # a migration owes no record either
     assert "code root" not in capsys.readouterr().err
 
 
@@ -9833,6 +10001,36 @@ def test_confirm_reverify_success_lets_the_flip_through(project, capsys, monkeyp
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
 
 
+def _spawn_fault(cwd: Path) -> tuple[str, str]:
+    """What a real spawn into `cwd` raises: `(class name, "Class: message")`, both
+    derived rather than written.
+
+    POSIX raises `FileNotFoundError` for a missing cwd; Windows raises a different
+    `OSError` subclass, and the errno/strerror text differs again. Both halves of
+    `verify.run_verify_commands`' `spawn_error` — `type(exc).__name__` and `exc` —
+    are therefore platform-shaped, so a literal would pin one platform and quietly
+    stop grading anything on the other. Asking the platform is the same move
+    `tests/test_verify.py::test_unusable_cwd_escalates_as_an_environment_fault`
+    makes, one layer down; the second element extends it to the message, which is
+    the half that says WHY the child never started.
+
+    Catches what the arm it mirrors catches — `(OSError, ValueError)`, the latter
+    for the embedded-NUL cwd that arm documents — rather than `OSError` alone, so
+    a future caller passing such a cwd gets the derived name or the `pytest.fail`
+    below, not a raw error from the helper.
+
+    Fails loudly rather than degrading if the spawn succeeds: a `cwd` that turned
+    out to be usable means the caller's fixture no longer sets up the fault its
+    row is about, and a silently skipped assertion would hide that.
+    """
+    try:
+        subprocess.run([sys.executable, "-c", ""], cwd=cwd, check=False)
+    except (OSError, ValueError) as exc:
+        return type(exc).__name__, f"{type(exc).__name__}: {exc}"
+    else:  # pragma: no cover - a missing cwd is not spawnable
+        pytest.fail(f"spawn into {cwd} unexpectedly succeeded; the fixture no longer faults")
+
+
 def test_confirm_reverify_reports_an_unusable_cwd_instead_of_crashing(
     project, tmp_path, capsys, monkeypatch
 ):
@@ -9847,7 +10045,28 @@ def test_confirm_reverify_reports_an_unusable_cwd_instead_of_crashing(
 
     The park record and the board must be untouched, for the same reason the
     red-command row beside this one asserts it: a refused `--reverify` has to
-    leave every record exactly where it found it."""
+    leave every record exactly where it found it.
+
+    The COUNT is what holds the no-stutter coupling on the operator-visible
+    surface (DW-119): `_reverify` prefixes its own "could not run" and
+    `run_verify_commands`' spawn-fault arm omits the phrase for exactly that
+    reason, so a membership assertion alone stays green if the phrase comes back
+    twice in the stderr the operator actually reads.
+
+    The DIAGNOSIS is asserted too (DW-122). The phrase count and the cwd are both
+    satisfied by a reason that says only where the spawn was attempted, so
+    together they let `_reverify`'s `f"... could not run: {fault}"` be reduced to
+    the cwd alone while an operator loses the one line telling them WHY the child
+    never started. Both halves of the producer's payload are pinned, not just the
+    class name: `run_verify_commands` mints `"{type(exc).__name__}: {exc}"` and
+    `env_fault_reason` returns it unchanged, so dropping the message half would
+    still leave a class-name-only assertion green while the errno/strerror text an
+    operator diagnoses from is gone. Both are derived from a real spawn into the
+    same cwd rather than written down, because the platforms disagree on each.
+
+    Ablation: replace that interpolation with a cwd-only string, or drop the
+    `: {exc}` half of `spawn_error`, and this reddens while every assertion above
+    it stays green."""
     from bmad_loop import operatoractions, sprintstatus
 
     install_bmad_config(project)
@@ -9863,9 +10082,54 @@ def test_confirm_reverify_reports_an_unusable_cwd_instead_of_crashing(
     err = capsys.readouterr().err
     assert "--reverify failed" in err and "NOT confirmed" in err
     assert "could not run" in err and str(missing) in err
+    assert err.count("could not run") == 1
+    exc_name, diagnosis = _spawn_fault(missing)
+    assert err.count(exc_name) == 1
+    assert diagnosis in err
     assert sp.read_text() == before
     assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "awaiting-operator"
     assert "1-1-a" in operatoractions.load(project.project)
+
+
+def test_reverify_does_not_stutter_the_could_not_run_prefix(project, tmp_path):
+    """The phrase appears ONCE across the two halves of the coupling (DW-119).
+
+    `verify.run_verify_commands`' spawn-fault arm omits "could not run" from its
+    `spawn_error` precisely BECAUSE `cli._reverify`'s env-fault branch prefixes
+    its own; the comment on each side records that the two once stuttered.
+
+    Graded at the `_reverify` seam rather than on captured stderr: `reason` is the
+    exact string both comments describe, so the count cannot be diluted by
+    surrounding CLI text. The end-to-end row above counts the same phrase on the
+    stderr an operator reads; this row pins the seam that produces it.
+
+    The same row also pins the DIAGNOSIS the prefix introduces (DW-122): the count
+    and the cwd are jointly satisfied by a reason that names only the directory, so
+    on their own they permit `f"{result.command!r} could not run: {fault}"` to
+    collapse to the cwd and drop the cause the operator needs. The whole payload
+    `env_fault_reason` hands back is pinned — `"{type(exc).__name__}: {exc}"`, not
+    the class name alone — because trimming the message half leaves a name-only
+    assertion green while the errno/strerror text disappears. `_spawn_fault`
+    derives both halves from a real spawn into this same missing cwd, since POSIX
+    and Windows agree on neither the `OSError` subclass nor its message.
+
+    Ablation: put "could not run" phrasing back into the `spawn_error=` string in
+    `verify.run_verify_commands` and the count assertion reddens. Replace
+    `cli._reverify`'s `f"{result.command!r} could not run: {fault}"` with a
+    cwd-only interpolation, or trim `spawn_error` to drop its `: {exc}` half, and
+    the diagnosis assertions redden instead.
+    """
+    _write_policy(project.project, '[verify]\ncommands = ["python -c \\"pass\\""]\n')
+    missing = tmp_path / "no-such-cwd"
+
+    reason = cli._reverify(project.project, missing)
+
+    assert reason is not None
+    assert "could not run" in reason and str(missing) in reason
+    assert reason.count("could not run") == 1
+    exc_name, diagnosis = _spawn_fault(missing)
+    assert reason.count(exc_name) == 1
+    assert diagnosis in reason
 
 
 def _diverge_repo_root(paths, code_root: Path) -> None:
@@ -9989,6 +10253,153 @@ def test_confirm_reverify_says_so_when_nothing_is_configured(project, capsys, mo
     out = capsys.readouterr().out
     assert "no [verify] commands are configured" in out
     assert "verify commands passed" not in out
+
+
+def _sentinel_writer_cmd(tmp_path: Path, sentinel: Path, *, rc: int, stem: str) -> str:
+    """A host-shell verify command that creates `sentinel`, then exits `rc`.
+
+    A `sys.executable` script rather than `touch` / `type nul >` + `exit`, because
+    verify commands run through the host shell and the rows below have to ask the
+    same question on `sh -c` and on `cmd /c`. `stem` only names the script and its
+    sentinel after the row using them — each row gets its own `tmp_path`, so the
+    paths are already distinct — which is what makes a failure message point at the
+    row it came from.
+    """
+    writer = tmp_path / f"{stem}.py"
+    writer.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"Path({str(sentinel)!r}).write_text('ran', encoding='utf-8')\n"
+        f"sys.exit({rc})\n",
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{writer}"'
+
+
+def _noisy_failure_cmd(tmp_path: Path, marker: str) -> str:
+    """A host-shell verify command that prints `marker`, then exits 1.
+
+    A `sys.executable` script rather than a shell `echo`, for the same cross-shell
+    reason as the writer above — and because what an ordinary failing check emits
+    is the diagnostic `_reverify` appends to its reason, so a silent `exit 1` would
+    leave that half of the message unexercised.
+    """
+    script = tmp_path / "failing_check.py"
+    script.write_text(f"import sys\nprint({marker!r})\nsys.exit(1)\n", encoding="utf-8")
+    return f'"{sys.executable}" "{script}"'
+
+
+def _reverify_pair(tmp_path: Path, first: str, *, rc: int, stem: str) -> tuple[Path, str]:
+    """Write a two-command `[verify]` policy under `tmp_path` — `first`, then a
+    command that witnesses its own execution — and return `(sentinel, second)`.
+
+    A sentinel FILE rather than a spy on `run_verify_commands`: what the second
+    command did is a fact about the child process, and a spy is precisely what
+    would replace the child. `_reverify` needs nothing but a policy file, so the
+    `cmd_confirm` scaffolding the rows above carry (park record, board, `_confirm`
+    monkeypatch) is noise for what these pin.
+    """
+    sentinel = tmp_path / f"{stem}-ran"
+    second = _sentinel_writer_cmd(tmp_path, sentinel, rc=rc, stem=stem)
+    _write_policy(tmp_path, f"[verify]\ncommands = {json.dumps([first, second])}\n")
+    return sentinel, second
+
+
+def test_reverify_answers_with_the_first_environment_fault_not_a_later_failure(tmp_path, capsys):
+    """`_reverify` reads `env_fault_reason` BEFORE the return code and RETURNS on
+    the first command that answers either — so a second offender is never what the
+    operator is shown.
+
+    What this row and its counterpart uniquely pin is WHICH offender is reported.
+    The eleven pre-existing `--reverify` rows configure exactly one command apiece,
+    so none of them has a second offender the first could be confused with; they
+    already catch a `return` weakened to `continue`, because with one command that
+    exhausts the loop and reports a pass over a red command. The choice between the
+    FIRST offender and a later one is invisible to all of them.
+
+    `MISSING_TOOL_CMD` is an environment fault on both shells (sh 127, cmd exits 1
+    with "is not recognized") and ALSO carries a non-zero rc, which is what makes
+    the ordering observable: swap the two checks and the same command comes back as
+    `failed (rc ...)` — the operator's own environment misread as their story
+    having regressed.
+
+    Note what the short-circuit is and is not: `run_verify_commands` has already
+    run every command by the time this loop starts, so the sentinel EXISTS. The
+    `return` short-circuits the CLASSIFICATION, not the execution, and asserting
+    the sentinel here is what keeps a reader from inferring the stronger claim.
+
+    Ablation: record every offence and return the LAST one instead of the first —
+    only this row and its counterpart redden, while all eleven pre-existing
+    `--reverify` rows stay green, which is what makes it the discriminating one.
+    Also: replace the `fault` `return` with `continue` and the reason names the
+    writer instead; read `result.returncode` before `env_fault_reason` and the
+    reason flips to `failed (rc ...)` — rc 127 under sh, rc 1 under cmd.
+    """
+    sentinel, second = _reverify_pair(tmp_path, MISSING_TOOL_CMD, rc=1, stem="envfault")
+
+    reason = cli._reverify(tmp_path, tmp_path)
+
+    assert reason is not None
+    assert "could not run" in reason and "failed (rc" not in reason
+    assert MISSING_TOOL_CMD in reason  # names the command the operator has to fix
+    assert second not in reason  # and stops there rather than reporting the next one
+    assert sentinel.is_file()  # every command ran; only the reporting short-circuits
+    assert "verify commands passed" not in capsys.readouterr().out
+
+
+def test_reverify_answers_with_the_first_ordinary_failure_not_a_later_one(tmp_path, capsys):
+    """The other `return` in the same loop: a command that RAN and merely failed
+    also ends the walk, and is reported as a failure rather than as a broken
+    environment.
+
+    The counterpart to the row above — together they pin that neither exit falls
+    through to the next result, and that the two are told apart rather than
+    collapsed. The second command exits 3 so the two rc readings cannot be
+    confused for one another.
+
+    The first command also EMITS a line, which is the other half of this branch's
+    message: `_reverify` appends `result.output_tail` after the rc, and that tail is
+    the diagnostic the operator acts on. `_FAIL` (`exit 1`) is silent, and so is the
+    `raise SystemExit(3)` the pre-existing failure row uses, so nothing covered it.
+
+    Ablation: record every offence and return the LAST one instead of the first and
+    this row reddens on `failed (rc 1)` (it comes back naming the writer at rc 3),
+    while all eleven pre-existing `--reverify` rows stay green. Drop the
+    `output_tail` from the message and the marker assertion fails; drop the
+    command identity and the `repr(first)` assertion fails. Replacing the rc
+    `return` with `continue` reddens this row too, but for a blunter reason: with
+    the fault `return` intact neither command answers, so `_reverify` falls out of
+    the loop and returns None and the row fails on `reason is not None`.
+    """
+    marker = "check-42-did-not-hold"
+    first = _noisy_failure_cmd(tmp_path, marker)
+    sentinel, second = _reverify_pair(tmp_path, first, rc=3, stem="plainfail")
+
+    reason = cli._reverify(tmp_path, tmp_path)
+
+    assert reason is not None
+    assert "failed (rc 1)" in reason and "could not run" not in reason
+    assert marker in reason  # the tail is what tells the operator WHAT failed
+    assert repr(first) in reason  # preserve the identity as rendered by the CLI
+    assert "failed (rc 3)" not in reason and second not in reason
+    assert sentinel.is_file()
+    assert "verify commands passed" not in capsys.readouterr().out
+
+
+def test_reverify_walks_every_command_when_they_all_pass(tmp_path, capsys):
+    """The control for the two rows above: with nothing to return on, the walk
+    reaches the end and reports the pass.
+
+    The failure rows independently witness the second command with their sentinel
+    assertions. This control additionally pins the successful return and printed
+    pass message for a policy containing multiple commands.
+    """
+    sentinel, _second = _reverify_pair(tmp_path, _OK, rc=0, stem="allgreen")
+
+    assert cli._reverify(tmp_path, tmp_path) is None
+
+    assert sentinel.is_file()
+    assert "verify commands passed" in capsys.readouterr().out
 
 
 def test_confirm_survives_a_non_git_project(project, capsys, monkeypatch):

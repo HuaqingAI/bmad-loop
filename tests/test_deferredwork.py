@@ -3519,6 +3519,127 @@ def test_append_entries_matches_serial_append_entry_bytes(tmp_path):
     )
 
 
+CROSS_SPEC_ORIGIN = "spec-deferred abc123"
+
+CROSS_SPEC_SEED = """\
+# Deferred Work
+
+### DW-1: Retry loop has no ceiling
+origin: spec-deferred abc123
+location: src/retry.py:88
+source_spec: `spec-9-9-z.md`
+reason: harvested from another spec.
+status: {status}
+"""
+
+
+def _cross_spec_spec(source_spec: str = "spec-1-1-a.md", **over) -> EntrySpec:
+    return EntrySpec(
+        title="Retry loop has no ceiling",
+        origin=CROSS_SPEC_ORIGIN,
+        location="src/retry.py:88",
+        source_spec=source_spec,
+        reason="harvested here too",
+        **over,
+    )
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [pytest.param(True, [None], id="on"), pytest.param(False, ["DW-2"], id="off")],
+)
+def test_cross_spec_dedupe_suppresses_an_open_twin_only_when_opted_in(tmp_path, flag, expected):
+    """An open cross-spec twin suppresses only the opted-in producer.
+
+    Ablation: remove the origin-only flag arm and the ``on`` row files DW-2;
+    force the arm for every producer and the ``off`` row suppresses DW-2."""
+    path = write_ledger(tmp_path, CROSS_SPEC_SEED.format(status="open"))
+
+    assert append_entries(path, [_cross_spec_spec(cross_spec_dedupe=flag)]) == expected
+    assert [entry.id for entry in parse_ledger(path.read_text(encoding="utf-8"))] == (
+        ["DW-1"] if flag else ["DW-1", "DW-2"]
+    )
+
+
+@pytest.mark.parametrize("flag", [True, False], ids=["on", "off"])
+def test_cross_spec_dedupe_stays_open_only(tmp_path, flag):
+    """A closed cross-spec twin files fresh with the flag on or off.
+
+    Ablation: remove the open-entry guard and the opted-in row returns ``None``
+    instead of minting DW-2."""
+    path = write_ledger(tmp_path, CROSS_SPEC_SEED.format(status="done 2026-06-01"))
+
+    assert append_entries(path, [_cross_spec_spec(cross_spec_dedupe=flag)]) == ["DW-2"]
+    entries = parse_ledger(path.read_text(encoding="utf-8"))
+    assert [entry.id for entry in entries] == ["DW-1", "DW-2"]
+    assert not entries[0].open and entries[1].open
+
+
+@pytest.mark.parametrize("flag", [True, False], ids=["on", "off"])
+def test_cross_spec_dedupe_leaves_same_spec_replays_unchanged(tmp_path, flag):
+    """The existing exact-pair replay suppresses with either flag value.
+
+    Ablation: replace widening with flag-selected matching and the default row
+    files a duplicate instead of returning ``None``."""
+    path = write_ledger(tmp_path, CROSS_SPEC_SEED.format(status="open"))
+    spec = _cross_spec_spec(source_spec="spec-9-9-z.md", cross_spec_dedupe=flag)
+
+    assert append_entries(path, [spec]) == [None]
+    assert [entry.id for entry in parse_ledger(path.read_text(encoding="utf-8"))] == ["DW-1"]
+
+
+def test_cross_spec_dedupe_collapses_two_source_specs_inside_one_batch(tmp_path):
+    """The second spec sees and suppresses the first spec's evolving-text row.
+
+    Ablation: fold both specs over the original preimage and this mints two rows
+    rather than ``[DW-1, None]``."""
+    path = write_ledger(tmp_path, "# Deferred Work\n")
+
+    minted = append_entries(
+        path,
+        [
+            _cross_spec_spec(source_spec="spec-1-1-a.md", cross_spec_dedupe=True),
+            _cross_spec_spec(source_spec="spec-2-2-b.md", cross_spec_dedupe=True),
+        ],
+    )
+
+    assert minted == ["DW-1", None]
+    entries = parse_ledger(path.read_text(encoding="utf-8"))
+    assert [entry.id for entry in entries] == ["DW-1"]
+    assert "source_spec: `spec-1-1-a.md`" in entries[0].body
+
+
+def test_cross_spec_advisory_suppression_is_rechecked_under_the_lock(tmp_path, monkeypatch):
+    """A twin closed after the advisory probe no longer suppresses recurrence.
+
+    The initial open twin makes the advisory fold return ``None``. Opted-in
+    batches must still acquire the lock and re-fold after the scripted close.
+
+    Ablation: restore the unconditional all-deduped early return and no lock is
+    acquired, the result stays ``None``, and both assertions fail."""
+    path = write_ledger(tmp_path, CROSS_SPEC_SEED.format(status="open"))
+    real_lock = deferredwork.ledger_lock
+    acquisitions = []
+
+    @contextlib.contextmanager
+    def close_twin_before_lock(p):
+        acquisitions.append(p)
+        p.write_text(
+            p.read_text(encoding="utf-8").replace("status: open", "status: done 2026-06-01", 1),
+            encoding="utf-8",
+        )
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", close_twin_before_lock)
+
+    assert append_entries(path, [_cross_spec_spec(cross_spec_dedupe=True)]) == ["DW-2"]
+    assert acquisitions == [path]
+    entries = parse_ledger(path.read_text(encoding="utf-8"))
+    assert [entry.id for entry in entries] == ["DW-1", "DW-2"]
+    assert not entries[0].open and entries[1].open
+
+
 def test_append_entries_validates_all_specs_before_writing(tmp_path, monkeypatch):
     """A bad spec anywhere in the sequence writes nothing — and is caught before
     the lock is even taken.

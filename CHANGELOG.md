@@ -9,6 +9,58 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Prove real-tmux teardown reaps the exact detached child after identity publication fails (DW-149).
+
+- **The accepted-park arm's `_harvest_gate_exclude` join is now graded engine-side**
+  (DW-139). `tests/test_verify.py::test_verify_dev_park_zero_diff_excludes_the_orchestrators_own_writes`
+  hand-spells its `engine_written`, so the producer is never invoked and re-rooting it
+  left that row green. `tests/test_engine.py` gains
+  `test_accepted_park_observation_excludes_the_nested_ledger_under_the_monorepo_shape`,
+  driving an asserted park through `Engine._verify_dev_artifacts` under the nested
+  monorepo shape — where the orchestrator's own append to the NESTED ledger is the only
+  unexcluded residue and a `project`-rooted spelling silently names the outer project's
+  real ledger. Its control trips the producer's stand-down disjunct through the same
+  join, so `park_zero_diff is True` is attributable to the pathspec.
+
+- **The `_usage` stash is now pinned to survive teardown** (DW-129) — the invariant
+  DW-117's cap placement rests on, since `read_usage(result)` runs after `run()`/`kill()`
+  return. `tests/test_opencode_http.py` gains a row that stashes a session's usage,
+  drives a real `kill()` -> `_teardown()` (nothing stubbed) over a live child process and
+  a real log handle, and asserts `read_usage` still resolves that session id. Until now
+  the invariant was only observed incidentally, by three fake-binary E2E rows that happen
+  to read usage after teardown; this one pins it directly at the kill seam.
+
+- **Verify-command seam coverage for the legs the earlier passes left unpinned**
+  (DW-55). `tests/test_verify.py` gains a row driving all three exits of
+  `run_verify_commands`' loop body — completed, timed out, never spawned — in a single
+  call with a further command after each fault, so the timeout arm's `continue` is
+  load-bearing and the two "no exit status" sentinels (`-1` vs `SPAWN_FAULT_RC`) are
+  shown to stay distinguishable when the legs occur together. `tests/test_cli.py` gains
+  three rows calling `cli._reverify` directly with a two-command policy: the first pins
+  that `env_fault_reason` is read ahead of the return code and that a later offender is
+  never what the operator is shown, the second pins the same for an ordinary failure,
+  and an all-green control keeps their absence assertions honest.
+
+- **A fresh mount that supersedes an accepted-but-uncommitted spec now journals
+  `accepted-spec-write-unreachable`** (DW-101). The `pause_after_spec` gate hands the
+  operator a spec that is uncommitted by construction; a re-drive's worktree is a
+  checkout of a commit, so for a tracked artifacts dir it delivers the pre-approval
+  bytes and the existing delivery probe passes on existence alone. The mount's copy is
+  now byte-compared against the main checkout's, and a difference — or a read that
+  fails, recorded as `compared: false` — is journalled with the main-checkout spec path
+  and the target branch to commit it on. Advisory only: the record refuses nothing,
+  pauses nothing and overwrites nothing.
+
+- **A mount that cannot be shown to carry the accepted spec at all now journals
+  `accepted-spec-delivery-unreachable`** (DW-104, DW-115). Fires only for a spec the
+  task already spells project-relative — the spelling a resume persists, and the one
+  leg with no escalating guard above it — when the mounted parent escapes the
+  worktree, or the spec could not be resolved at all (a swallowed filesystem fault,
+  or a spelling that no longer resolves). Carries the main-checkout spec path, the
+  target branch, and `located`, a bare boolean saying which of the two silences it
+  ended: `true` the spec was resolved and the mount could not be shown to carry it,
+  `false` the spec itself could not be resolved. Advisory only: nothing reads it as a
+  gate, and the relocated leg still escalates instead of recording.
 - **Target deferred-work sweeps.** `bmad-loop sweep --only DW-1,DW-3` selects an
   exact open-id set, while `--min-severity low|medium|high|critical` selects the
   named severity and higher. Selection happens before triage, bundle formation,
@@ -19,14 +71,15 @@ breaking changes may land in a minor release.
   after semantic duplicate merging assigns the actual universe.
 
 - **Journal-kind and refusal-site coverage gates.** `tests/test_portability_guard.py` gains
-  three enumerate-vs-declare inventories: the 204 literal journal kinds (`JOURNAL_KINDS`,
+  three enumerate-vs-declare inventories: the literal journal kinds (`JOURNAL_KINDS`,
   fed by a literal-kind emit that also sees kind-only writes, constructor-inline
   `Journal(run_dir).append(...)` writes — a receiver spelling the journal scan was blind
   to — and every literal reaching a declared dynamic-kind position, by keyword, by
-  POSITION, or as the parameter default; a `kind` argument such a position cannot read —
-  a variable, or a `*args` splat over the slot — fails loud rather than passing as "no
-  literal here", which is the one way an undeclared kind could still reach the journal
-  with the inventory green), the `_refuse_*`/`_reject_*` helper definitions counted with
+  POSITION, through a `**` splat, or as the parameter default; a `kind` argument such a
+  position cannot read — a variable, a `*args` splat over the slot, or a `**` splat the
+  scan cannot read into — fails loud rather than passing as "no literal here", which is
+  the one way an undeclared kind could still reach the journal with the inventory
+  green), the `_refuse_*`/`_reject_*` helper definitions counted with
   multiplicity (`REFUSAL_HELPER_DEFS`), and the eleven #414-family isolation-refusal call
   sites counted with multiplicity (`ISOLATION_CONFLICT_CALLERS`). A new kind, refusal
   helper, or refusal call site reddens CI until its row lands; the row is the PR-time
@@ -300,6 +353,299 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Adopt the current bundle's deferred-work ids before writing a reset sweep task's
+  intent (DW-144). Keep dispatch and ledger-close ids aligned, and journal both
+  old and new ids as `sweep-bundle-dwids-adopted` when they differ.
+
+- **Retire stale keep-open pre-answers when dropped** (DW-143), so decisions are
+  offered again and fresh sweeps stop repeating stale-answer notifications. Journal
+  the removal and preserve run-local answers and ledger history. A read-only project
+  store raises `PermissionError` after the drop is announced and quarantined; a fresh
+  run retries once the store is writable. The retirement removes the entry only while
+  it still holds the value that was dropped: a paused run's stale run-local copy wins
+  over the store on resume, so a replacement a human recorded out of band meanwhile
+  is left in place for the next run instead of being deleted and committed away. The
+  store's three writers now serialize on a state-root sidecar lock (`decisions.store_lock`,
+  the store's `ledger_lock`), so that compare-and-delete and a concurrent `bmad-loop
+decisions` re-answer cannot interleave.
+
+- **Skip an unreadable cached triage instead of failing the read** (DW-145). Widen
+  `decisions.pending_missed_decisions`' except tuple to include `UnicodeDecodeError` —
+  a `ValueError`, not an `OSError`, so non-UTF-8 bytes in one run's `triage*.json`
+  escaped past `cmd_decisions` and `cmd_status` (which catch `BmadConfigError` alone,
+  leaving `main`'s backstop to exit 1 with no `--json` document) and out of the TUI
+  uncaught. Degrades per file: the bad cache is skipped, the other runs still count.
+
+- **Refuse a triage plan whose free-text scalars are not strings** (DW-148). Type-check
+  bundle `name`/`intent`, option `effect`/`intent`/`label`/`resolution`/`bundle_name`
+  and decision `context`/`recommendation` in `validate_triage` instead of `str(...)`-ing
+  them — a list `intent` used to become a truthy Python repr that passed the
+  `effect == "build"` intent gate and rode into `Bundle.intent`, `intent.md` and a dev
+  session (the DW-141 harm, on the plan-input surface). Errors name the decision id or
+  the bundle's position, the field and the type name only, one per fault. Identifiers
+  and ledger-bound notes (`key`, `question`, `id`, `evidence`, `blocker`, `reason`,
+  `dw_ids` members) deliberately keep `str(...)`. Note: a pre-existing cached triage
+  that the stricter check now refuses is skipped by `pending_missed_decisions`, so its
+  decision drops out of `decisions --list`, `status` and the TUI until the next sweep
+  re-triages the still-open entry.
+
+- **Close the last reuse-exposed test child identities** (DW-136, DW-137). Share the
+  pidfd-authentication helpers, publish identities atomically, and sweep authenticated
+  children abandoned during pre-bind failures. The OpenCode row is now Linux-only,
+  and no executable `os.kill(` call remains in `tests/`.
+
+- **A stored decision answer is now screened by SHAPE, not just by container type**
+  (DW-140/141/142). Three gaps behind DW-134's container-level check: a project
+  `.bmad-loop/decisions.json` holding non-UTF-8 bytes raised `UnicodeDecodeError` out of
+  `load_pre_answers` and aborted the whole sweep that read it; the build lane stringified
+  `key`/`label`/`intent`/`bundle_name`, so a list `intent` shipped its truthy Python repr
+  into `intent.md` and a dev session as prose no human wrote; and an answer with a missing
+  or unrecognized `effect` matched no materialize lane while `decisions.pending_missed_decisions`
+  counted it answered, so no reader ever surfaced the id again. `load_pre_answers` now
+  catches the decode fault, and one shared predicate (`sweep.unusable_answer_reason`)
+  screens both readers, so a value the sweep will not act on is one `bmad-loop decisions`
+  re-offers rather than counting answered. It screens only what a reader of THAT effect
+  consumes — `key`/`label` always, `intent`/`bundle_name` for `build` alone, `resolution`
+  and `answered_at` never — because a refused `keep-open` answer stops suppressing its
+  bundle, and `effect: "close"` stays usable (the in-run writer stores it). The lanes'
+  own typed reads (`""` rather than a repr) are now defense-in-depth rather than the
+  production path: the read site rejects such answers first, so the lanes matter only for
+  callers that bypass it — the test suite hands `_materialize_bundles` a map directly.
+  No new journal kinds and no new drop causes; the degrade stays per-value and in-memory,
+  so the two write-backs still re-publish an unusable value verbatim rather than repairing
+  the human's file.
+
+- **The re-stamp row that settles an owed code-root record now records THAT a move
+  happened** (DW-128) — not which trees: the row's `repo` is the new root and a dump
+  reduces it to `repo_present`. `runs.restamp_code_root`'s trailing `rearm-code-root-restamped`
+  append writes `code_root_changed` about THIS call, so the one path where the row is a
+  real move's sole durable trace — call one re-points the root, persists, and its append
+  raises; the retry discharges the record having moved nothing — recorded `false` and read
+  as "nothing moved". That append now also carries `discharged_owed_move`, true exactly
+  when the row settles a record owed by an earlier call's move. `code_root_changed` keeps
+  its exact current value at every append site, and the two sibling discharge appends
+  (which already assert `code_root_changed=true`) are untouched, so an absent key on those
+  rows means "not stated", not `false`.
+
+- **A regenerated sweep bundle no longer vanishes into a finished bundle's key** (DW-125).
+  `_run_bundle`'s terminal-task early return compared only the derived `dw-<name>` key, and
+  the key is a pure function of `(name, cycle)` — so a resume that lost `<run>/triage.json`
+  re-triaged, re-authored the remaining ids under freely chosen names, and any bundle that
+  happened to reuse a completed bundle's name was skipped with its deferred work never run.
+  The skip now also requires the persisted task's `dw_ids` to agree with the bundle's, as set
+  equality (a reordered plan is still the same bundle) and with an empty persisted list
+  counting as agreement (the pre-`dw_ids` `state.json` shape, so no paused run needs
+  migrating). On divergence the bundle takes the same bounded `-2` … `-9` name suffix the
+  decision-bundle site already uses, journaled `sweep-bundle-key-deduped`; exhausting the
+  bound journals `sweep-bundle-key-collision`, notifies, and leaves the ids open rather than
+  swallowing them. In-flight tasks are untouched — they still go through the existing
+  recovery — and the cycle's progress count now grades the key each bundle was resolved to
+  (the one it ran under, or the terminal one it was skipped at) rather than one re-derived
+  from the plan's name.
+
+- **A sweep's decision dispositions now survive a pause/resume of the same run** (DW-124).
+  The two quarantines — ids journaled `decision-skipped-unattended`, and ids whose recorded
+  answer was journaled `sweep-decision-answer-dropped` — moved from `SweepEngine.__init__`
+  set state onto `RunState` (`sweep_skipped_decisions` / `sweep_dropped_decisions`),
+  persisted immediately after each disposition is announced. Once that state publication
+  succeeds, a resumed run no longer re-journals a drop and re-fires its `gates.notify` for an
+  id it already reported, nor revives a bundle when the resumed cycle's re-triage happens to
+  mint an agreeing option. Deliberately
+  run-scoped: a NEW run still re-evaluates every decision, the human's answer in
+  `<run>/decisions.json` is untouched, and a pre-upgrade `state.json` loads both empty.
+
+- **Degrade a malformed `<run>/decisions.json` instead of aborting the sweep** (DW-134).
+  An unreadable file, a non-object top level or a non-object value journals
+  `sweep-decisions-reload-failed` (one record per fault class; per-value records name their
+  store and affected ids) and drops only the unusable answers; the well-shaped rest answer
+  as before, and both `_materialize_bundles` lanes shape-guard the map they are handed. A
+  per-value drop is re-published unchanged by the phase's own write-backs; a whole-file fault
+  has nothing per-value to carry. `bmad-loop decisions` re-offers an id whose stored
+  pre-answer value is unusable, instead of counting the bare key as answered. Also count
+  every decision-answer drop as repeat progress (DW-135): `_cycle` previously counted only
+  the keep-open lane, so a `--repeat` cycle whose sole event was a `no-intent` or
+  `name-collision` drop stopped at `no-progress` even though the drop frees the id for a
+  later cycle's fresh triage. All three lanes now signal, still bounded to one drop per id
+  per run.
+
+- **Make stories E2E reap identity reuse-proof and clean up a live child when either
+  protected reap assertion fires** (DW-126, DW-127).
+
+- **`runs.restamp_code_root` now warns only when THAT call moved the code root**
+  (DW-114). A set `code_root_restamp_pending` with the mirror already equal to the
+  incoming root made the function fall past the "already agrees" exit, discharge the
+  owed record with a hardcoded `code_root_changed=True`, and return the "the code root
+  in `_bmad/bmm/config.yaml` has changed" warning that `bmad-loop resolve` and the TUI's
+  re-arm print — on a call that re-pointed nothing, and on the same seam where
+  `cli._prepare_resume_locked` stays quiet. The marker is a record DEBT, not a move: the
+  trailing record now reports whether THIS invocation re-pointed the root, and the call
+  returns `None` when it did not, so the re-arm surfaces and plain `resume` now agree
+  about whether an operator is warned in that state. They still differ on the journal:
+  this record reads `code_root_changed=false` where resume's own discharge row keeps
+  `true`, because resume's names the pre-overwrite root and this one names the call that
+  moved nothing. The at-least-once discharge is unchanged — the record
+  still lands exactly once under the root now recorded, the marker still clears only
+  after the append returns, and the pre-overwrite discharge still names the previous
+  root with `code_root_changed=True`. A genuine move still warns.
+
+- **Stop stale `keep-open` answers from suppressing later deferred-work bundles**
+  when triage options are renumbered or removed (DW-123).
+
+- **A stored deferred-work decision answer is now validated against the triage
+  option its key resolves to before the two are blended** (DW-118). `Decision.option`
+  matches on key alone and a key is a position in a list every triage re-authors, so a
+  renumbering re-triage attributed one question's answer to another question's option:
+  on DW-55 a stored `build` answer keyed "1" met a fresh option "1" spelled "Close as
+  decayed", and the bundle shipped the stale review intent under the close label while
+  quoting a question the human never answered. The answer's own `label` and `effect` —
+  the two fields both provenances carry — are now compared first, and a disagreeing
+  option is discarded outright: it contributes no intent, label or bundle name, the
+  mismatch is journaled (`sweep-decision-option-mismatch`), and the decision note cites
+  the earlier triage rather than the current question. Precedence is flipped with it, so
+  even an agreeing option fills only the fields the stored answer omits and re-authored
+  triage prose can no longer reach a bundle the human chose against different prose.
+  Covers the in-run lane too — `--repeat` re-triages each cycle while answers persist for
+  the whole run — where a discarded option can leave nothing to build from: that answer
+  is journaled (`sweep-decision-answer-dropped`) and notified instead of vanishing, and
+  its ledger entry stays open for the next sweep to re-ask. A dropped decision is
+  quarantined for the rest of the sweep process, so a later cycle whose re-triage agrees
+  with it again neither revives it nor re-notifies it; the quarantine is instance state
+  and is never persisted, so a resumed run re-evaluates the decision. The
+  `decision-<id>` fallback name is also made unique now: it is a fallback, not a
+  reserved namespace, so a plan bundle may legally carry it and the two would have
+  hashed to one task key and one intent directory, silently losing the human's bundle. A
+  taken name gains a bounded numeric suffix (`-2` … `-9`, first free wins, journaled
+  `sweep-bundle-name-deduped`); exhausting the bound is the one point in name assignment
+  at which a buildable answer yields no bundle, journaled with
+  `drop_cause: name-collision` and notified.
+
+- Inventory keyword and splat journal kinds only over an empty positional slot,
+  preserving literalness and field findings (DW-109); give unresolved-kind failures
+  call-site advice and prohibit sentinel declarations (DW-113); remove stale guard
+  counts (DW-110, DW-112) and pin every kind covered by the by-name `patch` drop
+  (DW-78).
+
+- Name the property instead of counting siblings in the portability guard's last three
+  journal-kind comments (DW-120): a kind-only write is one passing no keyword arguments
+  at all, not even a `**` splat, and the other class is a literal reaching a declared
+  dynamic-kind position from outside its body — a caller's `kind=` keyword or the
+  position's own parameter default. A fifth of either no longer falsifies the prose.
+
+- Retire two unpinned prose claims in the portability guard (DW-130, DW-131): the
+  dynamic-kind literalness docstring no longer counts the writes it governs, keeping only
+  the ablation-pinned position count, and the kind-literal probe's ablation now maps each
+  feeding emit to the rows it reddens instead of crediting one emit with all of them.
+
+- Pin each declared dynamic-kind position's journal-write count in the portability
+  guard (DW-138). `JOURNAL_DYNAMIC_KIND_ALLOW` is now a mapping from position to its
+  expected number of `journalkind` findings, held against the tree by a new row, so a
+  write added or removed inside an already-declared position reddens instead of only
+  falsifying a comment — the waiver is granted per position, so the declaredness gate
+  passes on such a write by construction. Waiver semantics are unchanged.
+
+- Probe both existence arms of the accepted-spec worktree seed through the total
+  `_is_file` (DW-103), matching its structural siblings and the DW-101 supersession
+  warning. On Python <=3.13 a raw `Path.is_file` raises on an unreadable path, and
+  this call site sits outside every `except` in `run_isolated`, so the fault ended
+  the run instead of allowing dispatch to continue. No change on non-faulting paths.
+
+- Name the two silent refusals on the accepted-spec delivery path (DW-104, DW-115).
+  The worktree seed's containment refusal now nominates its rel anyway, so
+  `worktree-seed-dropped` reports it — the copier re-checks destination containment
+  itself, so still nothing is written outside the mount — and both that refusal and a
+  source the locator could not resolve at all (a swallowed filesystem fault, or a
+  spelling that no longer resolves) are journalled as
+  `accepted-spec-delivery-unreachable` on the non-relocated leg. Previously the rel reached no journal and, for a
+  project-relative spec, no gate either: the unit dispatched against a mount lacking
+  the operator's spec and fell back to the bare story key. Nothing new escalates.
+
+- Probe the accepted spec for file-ness inside `relativize_project_local_accepted_spec`'s
+  own `except` (DW-116). `run_isolated` calls the method before its first `try`, so a
+  TOCTOU or non-EACCES `OSError` at that probe ended the run; it now leaves the
+  spelling unchanged, as a false probe already did.
+
+- Discharge an owed code-root re-stamp record under its original root before
+  resuming (DW-100), preserving the record and integrity pin for retry on failure.
+  Warn only when the configured root differs from the recorded root; a pending
+  record alone no longer triggers the code-root warning.
+
+- **Stopped the real-tmux E2Es contending with each other under `-n logical`**
+  (DW-95). They shared the box with every other worker and could starve past their
+  fixed waits — a load flake, not a defect. All 23 collected cases now carry one
+  `xdist_group`, so loadgroup scheduling serializes them while the rest of the suite
+  still fans out; `--dist loadgroup` is declared in `pyproject.toml` `addopts`, without
+  which the marks are silently inert. Separately, the four completion- and crash-path
+  waits in `tests/test_generic_tmux.py` now share one named 90s hang ceiling — a hang
+  detector, not a performance budget — replacing per-site 30s and 20s walls; the
+  `tests/test_stories_e2e.py` subprocess `timeout=` budgets stay their own and rely on
+  the grouping alone. Guards in `tests/test_conftest.py` check repository scheduling
+  declarations and the synthetic scheduling mechanism, and prevent short completion
+  walls from returning while preserving the deliberate 6s triggers. Tests only; no
+  production change.
+
+- **Put the last two load-sensitive real-tmux walls on the shared hang ceiling**
+  (DW-108). The descendant-reap polls in `tests/test_stories_e2e.py` deadlined on a
+  fixed `time.monotonic() + 10`, which a starved scheduler can blow through — the class
+  DW-95 removed from the generic-tmux waits but left in the one module its guard
+  excludes. Both now spell the imported `REAL_MUX_HANG_CEILING_S`; the trade-off is
+  deliberate, a merely slow reaper is caught at 90s rather than at 10s while a broken
+  one still fails. A second scanner in `tests/test_conftest.py` keeps them there,
+  rejecting any `time.monotonic() + <budget>` in a tmux-gated test in that file that is
+  not the imported constant, with a named expected-site inventory so it cannot pass by
+  scanning nothing and must-flag / must-stay-silent probe rows through the same function.
+  The subprocess `timeout=` budgets in that file stay out of scope. Tests only; no
+  production change.
+
+- **Bound launch-marker snapshot retention in the dev adapters** (DW-96). Each dev
+  session start stored a park-marker snapshot under its task id and nothing removed it;
+  an unpinned launch (no `expected_spec`) snapshots every `*.md` in the artifacts dir,
+  so an adapter driving N such sessions over M files retained O(N x M) entries for its
+  lifetime. The mixin's `run()` now evicts the task's entry in a `finally`, holding only
+  launches still in flight. Eviction is scoped to the returning task id, so a concurrent
+  launch is untouched, and lands after `_post_kill_reconcile`, the last in-lifecycle
+  reader. No verdict changes.
+
+- **Bound four more per-task dev-adapter stores to the session** (DW-106, DW-107).
+  `_fm_fallback_obs`, `_fm_transition_obs`, `_contract_nudge_sent` and the OpenCode
+  transport's `_server_procs` (a live `Popen` per task) grew one entry per session for
+  the adapter's lifetime. All four are now evicted through one `_evict_task_state` seam
+  called from `run()`'s `finally` — past every in-lifecycle reader, including
+  `_post_kill_reconcile`, and still reached when `wait_for_completion` raises. Scoped to
+  the returning task id, so a concurrent session keeps its entries; within-session
+  semantics (the exactly-once contract nudge included) are unchanged.
+  `OpencodeHttpAdapter._usage` is a separate case: it is keyed by session id and read
+  after `run()` returns, so it cannot use this seam — it is capacity-bounded instead
+  (DW-117).
+
+- **Bound the OpenCode HTTP adapter's session usage stash** (DW-117).
+  `OpencodeHttpAdapter._usage` was written once per session in `_capture_usage` and
+  never popped, so it grew O(sessions) for the adapter's lifetime. It cannot join the
+  `_evict_task_state` seam — it is keyed by session id, not task id, and the engine
+  calls `read_usage(result)` after `run()` returns, so evicting there would zero token
+  accounting. The write site now enforces a fixed `USAGE_STASH_CAP` (256), dropping the
+  oldest entries first and only when the key is new, so a re-stash of a live session
+  never evicts a peer. The cap sits orders of magnitude above any plausible in-flight
+  session count, and `read_usage`'s contract — signature, idempotence, `None` for a
+  missing or absent session id — is unchanged.
+
+- Prevent harvest races from filing cross-spec duplicates for one fingerprint (DW-98).
+
+- **A partial journal flush no longer swallows the writer's next record** (DW-97). A
+  partially flushed `Journal.append` left an unterminated fragment, the next append
+  concatenated its own record onto it, and both readers dropped the combined line — so
+  one fault lost a record that was written whole (a swallowed `unit-merged` re-drives
+  already-merged work). `append` now terminates a fragment on its own line first. That
+  bounds the loss to the torn record for the writer's own next append only; another
+  process tearing a write concurrently can still produce the old pairing, and append
+  durability is unchanged (no fsync, no lock). Both readers (`Journal.entries`,
+  `tui.data.JournalTail.read_new`) now substitute a reader-minted
+  `journal-line-unreadable` marker — kind plus byte count, no timestamp, no line
+  content — for a complete line that will not parse, so the loss is counted in
+  `diagnose --json`'s `kind_histogram` and rendered red in the TUI. That count is a
+  floor on lost records, not an exact one: a single unparseable line can be two
+  concatenated records. An unterminated final line is still withheld by the TUI tail
+  until the heal terminates it; `Journal.entries`, which reads the file whole, marks a
+  trailing fragment straight away.
 - Preserve complete CRITICAL escalation detail in run records while visibly bounding human displays and naming the spec or journal that holds the recovery trail.
 
 - **The TUI's re-arm declines a contended run instead of waiting for it.** The

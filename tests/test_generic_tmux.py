@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 import regex
-from conftest import json_recursion_payload
+from conftest import REAL_MUX_HANG_CEILING_S, json_recursion_payload, real_mux_e2e
 
 from bmad_loop import devcontract, runs
 from bmad_loop.adapters import base as adapter_base
@@ -3852,6 +3852,7 @@ def _write_fake_cli(tmp_path, script: str = FAKE_CLI):
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+@real_mux_e2e
 @pytest.mark.parametrize("profile_name", ["claude", "codex", "gemini"])
 def test_tmux_end_to_end_with_fake_cli(tmp_path, profile_name):
     """Spawn a real tmux window running a fake CLI that behaves like a
@@ -3872,7 +3873,7 @@ def test_tmux_end_to_end_with_fake_cli(tmp_path, profile_name):
         prompt="/bmad-dev-auto 1-1-a",
         cwd=tmp_path,
         env=spec_env,
-        timeout_s=30.0,
+        timeout_s=REAL_MUX_HANG_CEILING_S,
     )
     try:
         result = adapter.run(spec)
@@ -3889,6 +3890,7 @@ def test_tmux_end_to_end_with_fake_cli(tmp_path, profile_name):
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+@real_mux_e2e
 def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path):
     """A re-armed run reuses the task_id. A prior cycle's Stop event + result.json
     must NOT replay: start_session clears the stale result, and the launch-time
@@ -3916,7 +3918,7 @@ def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path):
             "BMAD_LOOP_EVENTS_DIR": str(adapter.watcher.events_dir),
             "BMAD_LOOP_TASK_ID": task_id,
         },
-        timeout_s=30.0,
+        timeout_s=REAL_MUX_HANG_CEILING_S,
     )
     try:
         result = adapter.run(spec)
@@ -3929,6 +3931,7 @@ def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path):
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+@real_mux_e2e
 def test_tmux_end_to_end_with_a_relay_that_only_knows_the_legacy_dir(tmp_path):
     """The version-skew guard, end to end through real tmux: a CURRENT
     orchestrator (it exports BMAD_LOOP_EVENTS_DIR and waits on the out-of-tree
@@ -3939,8 +3942,8 @@ def test_tmux_end_to_end_with_a_relay_that_only_knows_the_legacy_dir(tmp_path):
     `session_timeout_min` instead of completing.
 
     Ablation guard: drop `legacy_dir` from `SignalWatcher._dirs()` and this fails
-    (as a 30s timeout, not an assertion — which is precisely the production
-    symptom)."""
+    (as a wait that idles all the way to the hang ceiling, not an assertion — which
+    is precisely the production symptom)."""
     assert "$BMAD_LOOP_EVENTS_DIR" not in LEGACY_EVENTS_FAKE_CLI, "the twin still reads the new var"
     assert LEGACY_EVENTS_FAKE_CLI != FAKE_CLI, "the swap did not take"
 
@@ -3956,7 +3959,7 @@ def test_tmux_end_to_end_with_a_relay_that_only_knows_the_legacy_dir(tmp_path):
             "BMAD_LOOP_EVENTS_DIR": str(adapter.watcher.events_dir),
             "BMAD_LOOP_TASK_ID": "t-legacy-1",
         },
-        timeout_s=30.0,
+        timeout_s=REAL_MUX_HANG_CEILING_S,
     )
     try:
         result = adapter.run(spec)
@@ -3972,6 +3975,7 @@ def test_tmux_end_to_end_with_a_relay_that_only_knows_the_legacy_dir(tmp_path):
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+@real_mux_e2e
 def test_tmux_crash_detected(tmp_path):
     """A session that dies without writing result.json -> crashed. Also the
     SessionEnd-less path (codex profile) relies on this window-death check."""
@@ -3988,7 +3992,7 @@ def test_tmux_crash_detected(tmp_path):
         prompt="x",
         cwd=tmp_path,
         env={"BMAD_LOOP_RUN_DIR": str(adapter.run_dir), "BMAD_LOOP_TASK_ID": "t-crash"},
-        timeout_s=20.0,
+        timeout_s=REAL_MUX_HANG_CEILING_S,
     )
     try:
         result = adapter.run(spec)
@@ -3999,6 +4003,7 @@ def test_tmux_crash_detected(tmp_path):
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+@real_mux_e2e
 def test_tmux_timeout_with_flushed_spec_rescued_post_kill(tmp_path):
     """End-to-end #61 (total hook loss): the session writes its terminal spec but
     never emits any hook event, so the wait loop idles to `timeout` — a path that
@@ -4065,6 +4070,7 @@ def test_tmux_timeout_with_flushed_spec_rescued_post_kill(tmp_path):
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
+@real_mux_e2e
 def test_tmux_timeout_silent_session_not_rescued(tmp_path):
     """The #261 counterpart of the rescue above, same call path, one delta: the CLI
     wedges instantly and renders NOTHING. A qualifying spec still appears in the
@@ -4843,7 +4849,8 @@ def test_wait_loop_heartbeat_drives_observe_tick(tmp_path, monkeypatch):
 # spec finalized to a terminal frontmatter status but missing its `## Auto Run
 # Result` marker), the dev adapter sends ONE targeted nudge asking the skill to
 # append the section it owed — repairing the omission at the source. Sent exactly
-# once per session via a never-cleared set (marked before the send), gated by
+# once per session via a set never cleared within the session (marked before the
+# send; `run()`'s finally evicts it afterwards, DW-107), gated by
 # `limits.dev_contract_nudge`, and touching no stall counters. Frontmatter
 # synthesis stays the backstop for a session that never complies.
 
@@ -4876,7 +4883,8 @@ def test_contract_nudge_sent_on_first_pending_observation(tmp_path, monkeypatch)
 
 def test_contract_nudge_exactly_once_across_mtime_reset(tmp_path, monkeypatch):
     """#149's refill hazard cannot apply: an mtime bump resets the observation
-    counter to 1, but the nudge budget is the never-cleared set, so a second
+    counter to 1, but the nudge budget is the set that is never cleared within the
+    session (evicted afterwards by `run()`'s finally), so a second
     first-observation Stop over the same session sends nothing more."""
     adapter, impl = make_dev_adapter(tmp_path)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
@@ -5415,6 +5423,409 @@ def test_unreadable_launch_spec_fails_closed_after_becoming_readable(tmp_path, m
 
     rj = adapter._result_json(handle, spec, wait=False)
     assert rj is not None and rj["park_asserted"] is False
+
+
+# ------------------------------ per-task store retention bound (DW-96, DW-107)
+#
+# `_launch_auto_run_results` holds one dict per launch, sized by the artifacts
+# directory, so retaining an entry per session grew O(sessions x files) for the
+# adapter's lifetime; its three siblings (`_fm_fallback_obs`, `_fm_transition_obs`,
+# `_contract_nudge_sent`) grew O(sessions) the same way. The mixin's `run()` override
+# calls `_evict_task_state` in a `finally` — the first point after every in-lifecycle
+# reader (`wait_for_completion`'s read-back, `_observe_tick`'s sampler and the nudge
+# budget, AND `_post_kill_reconcile`'s post-teardown rescue) that is still reached when
+# `wait_for_completion` raises. Ablations: deleting the `finally` fails every row, but
+# only on the entry's ABSENCE — every row stubs `adapter.kill`, so moving the pop into
+# `kill()` removes it outright and proves nothing about ordering. The ablation that
+# discriminates ordering is evicting at the TOP of `_post_kill_reconcile`: that fails
+# only `test_launch_snapshot_outlives_the_post_kill_reconcile_readback`, on
+# `verdicts[-1] is True`. Dropping a single store from `_evict_task_state` fails only
+# that store's rows, and evicting by store rather than by task id fails the two
+# `..._only_the_returning_task_id...` rows.
+
+_PARK_MARKER_SPEC = (
+    "---\nstatus: awaiting-operator\nbaseline_revision: abc123\n"
+    "operator_actions:\n  - publish the TXT record\n---\n\n# Story\n\n"
+    "## Auto Run Result\n\nStatus: awaiting-operator\nParked.\n"
+)
+
+
+def _markerless_launch(path: Path) -> int:
+    """Write a marker-less in-progress spec and return the launch mtime floor, so a
+    marker the session appends later is unambiguously session-authored. The floor is
+    one nanosecond PAST the file's own mtime because the read-back's freshness gates
+    are `>= launched_ns`: a floor equal to the pre-launch mtime would accept the spec
+    as already written by this session, before it wrote anything."""
+    path.write_text("---\nstatus: in-progress\nbaseline_revision: abc123\n---\n\n# Story\n")
+    return path.stat().st_mtime_ns + 1
+
+
+def test_run_evicts_the_launch_snapshot_it_captured(tmp_path, monkeypatch):
+    """The bound itself: the snapshot lives for the whole session — the wait loop's
+    own read-back still resolves ownership from it, so the verdict a normal session
+    returns is unchanged — and is gone once run() returns. Asserting presence DURING
+    the wait keeps the row non-vacuous: a capture that never happened would satisfy
+    the post-run absence assertion too."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    launch_floor = _markerless_launch(ours)
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+    seen = {}
+
+    def wait(handle, running_spec):
+        seen["present"] = running_spec.task_id in adapter._launch_auto_run_results
+        ours.write_text(_PARK_MARKER_SPEC)  # this session appended the park marker
+        os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
+        # stands in for the real wait loop's Stop handling, which read-backs here
+        return SessionResult(
+            status="completed",
+            result_json=adapter._result_json(handle, running_spec, wait=False),
+            session_id="sess",
+            transcript_path="/t.jsonl",
+        )
+
+    adapter.wait_for_completion = wait
+    adapter.kill = lambda handle: None
+
+    result = adapter.run(spec)
+
+    assert seen["present"] is True
+    # the in-lifecycle read-back answered from the snapshot, not from a missing key
+    assert result.result_json["park_asserted"] is True
+    assert spec.task_id not in adapter._launch_auto_run_results
+
+
+def test_launch_snapshot_outlives_the_post_kill_reconcile_readback(tmp_path, monkeypatch):
+    """Eviction must land after the LAST in-lifecycle reader, not at the kill: the
+    rescue re-runs the read-back once the window is dead, and a snapshot dropped
+    earlier would silently answer `False` — indistinguishable from a legitimate
+    fails-closed verdict. Records the verdict the real reconcile computed."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    launch_floor = _markerless_launch(ours)
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+
+    def wait(_handle, _spec):
+        ours.write_text(_DONE_SPEC)  # this session appended the terminal marker
+        os.utime(ours, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
+        return _unvouched("stalled")  # ... and lost its Stop
+
+    adapter.wait_for_completion = wait
+    adapter.kill = lambda handle: None
+    adapter._window_alive = lambda handle: False  # dead → the rescue runs
+
+    verdicts = []
+    real_authored = adapter._park_marker_session_authored
+
+    def recording(spec_path, running_spec):
+        verdict = real_authored(spec_path, running_spec)
+        verdicts.append(verdict)
+        return verdict
+
+    adapter._park_marker_session_authored = recording
+
+    result = adapter.run(spec)
+
+    # the reconcile's read-back still had attempt-relative evidence to answer from
+    assert verdicts and verdicts[-1] is True
+    assert result.status == "completed"
+    assert result.result_json["post_kill_reconciled"] is True
+    assert result.result_json["park_asserted"] is False  # a `done` marker never parks
+    assert spec.task_id not in adapter._launch_auto_run_results
+
+
+def test_transition_observation_outlives_the_post_kill_reconcile_rescue(tmp_path, monkeypatch):
+    """The same ordering contract for `_fm_transition_obs`, which is a VERDICT input
+    to the rescue, not just evidence: `_snapshot_verdict` returns PROVEN only while
+    the entry is present, and PROVEN is what outranks the #276 M1 hash gate. This
+    session finishes by writing its launch bytes back verbatim, so with the entry
+    the fallback synthesizes and the rescue upgrades; evicted a moment earlier the
+    verdict drops to REFUSE, `_frontmatter_fallback` returns None, and the session
+    stays `stalled` — a silently disabled rescue, not a visibly missing key."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text(_MARKERLESS_DONE)  # launch state: terminal `done`, no marker
+    spec = dataclasses.replace(
+        _snapshotted_spec(tmp_path, ours), expected_spec=str(ours)
+    )  # carries the M1 launch snapshot: hash + `done`
+    monkeypatch.setattr(
+        generic.GenericAdapter, "start_session", lambda _adapter, _spec: _dev_handle()
+    )
+
+    def wait(handle, running_spec):
+        # the review flips the spec live — the transition the tick records...
+        ours.write_text("---\nstatus: in-review\n---\n\n# Story\n\nReviewing.\n")
+        adapter._observe_tick(handle, running_spec)
+        # ...then finishes by restoring byte-identical launch content, which the
+        # M1 hash gate alone would refuse as an unmodified spec
+        ours.write_text(_MARKERLESS_DONE)
+        return _unvouched("stalled")  # ... and lost its Stop
+
+    adapter.wait_for_completion = wait
+    adapter.kill = lambda handle: None
+    adapter._window_alive = lambda handle: False  # dead → the rescue runs
+
+    result = adapter.run(spec)
+
+    assert result.status == "completed"
+    assert result.result_json["post_kill_reconciled"] is True
+    assert spec.task_id not in adapter._fm_transition_obs
+
+
+def test_run_evicts_the_launch_snapshot_when_wait_raises(tmp_path, monkeypatch):
+    """A raising wait_for_completion never reaches _post_kill_reconcile, so a
+    post-return eviction would leak exactly the sessions an operator stop or a
+    transport fault produces. The exception must reach the caller unchanged."""
+    adapter, _impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(
+        generic.GenericAdapter, "start_session", lambda _adapter, _spec: _dev_handle()
+    )
+    spec = _dev_spec(tmp_path)
+
+    def raising(_handle, _spec):
+        raise RuntimeError("stop requested")
+
+    adapter.wait_for_completion = raising
+    adapter.kill = lambda handle: None
+
+    with pytest.raises(RuntimeError, match="stop requested"):
+        adapter.run(spec)
+
+    assert spec.task_id not in adapter._launch_auto_run_results
+
+
+def test_run_evicts_only_the_returning_task_id(tmp_path, monkeypatch):
+    """Scoped to `spec.task_id`: one adapter can have another launch in flight, and
+    its snapshot must still answer the ownership question afterwards."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    theirs = impl / "spec-3-2-bar.md"
+    launch_floor = _markerless_launch(theirs)
+    monkeypatch.setattr(
+        generic.GenericAdapter,
+        "start_session",
+        lambda _adapter, _spec: _dev_handle(launched_ns=launch_floor),
+    )
+    other = dataclasses.replace(_dev_spec(tmp_path), task_id="3-2-dev-1", expected_spec=str(theirs))
+    adapter.start_session(other)  # still in flight when the first session returns
+
+    mine = _dev_spec(tmp_path)
+    adapter.wait_for_completion = lambda handle, spec: _unvouched("crashed")
+    adapter.kill = lambda handle: None
+    adapter.run(mine)
+
+    assert mine.task_id not in adapter._launch_auto_run_results
+    assert other.task_id in adapter._launch_auto_run_results
+    # and the surviving snapshot is still usable, not merely present
+    theirs.write_text(_PARK_MARKER_SPEC)
+    os.utime(theirs, ns=(launch_floor + _MTIME_TICK_NS, launch_floor + _MTIME_TICK_NS))
+    assert adapter._park_marker_session_authored(theirs, other) is True
+
+
+def test_run_evicts_the_frontmatter_fallback_and_nudge_budget(tmp_path, monkeypatch):
+    """DW-107 on the two stores the read-back fills. Both are written by the real
+    in-lifecycle reader (two Stops over a marker-less terminal spec), keep their
+    within-session semantics while the session runs — the nudge fires exactly once,
+    the second sighting synthesizes — and are gone once `run()` returns. Asserting
+    presence DURING the wait keeps the row non-vacuous: stores that were never
+    written would satisfy the post-run absence assertions too."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(
+        generic.GenericAdapter, "start_session", lambda _adapter, _spec: _dev_handle()
+    )
+    sent = _record_sent(adapter)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(spec_file))
+    seen = {}
+
+    def wait(handle, running_spec):
+        # Stop 1: pending fingerprint recorded, plus the one contract nudge
+        assert adapter._result_json(handle, running_spec, wait=True) is None
+        seen["nudges_after_stop_1"] = len(sent)
+        # Stop 2: same fingerprint, second sighting -> synthesis, no second nudge
+        rj = adapter._result_json(handle, running_spec, wait=True)
+        seen["synthesized"] = rj is not None and rj.get("synthesized_from_frontmatter")
+        seen["nudges"] = len(sent)
+        seen["obs"] = running_spec.task_id in adapter._fm_fallback_obs
+        seen["budget"] = running_spec.task_id in adapter._contract_nudge_sent
+        return SessionResult(
+            status="completed", result_json=rj, session_id="sess", transcript_path="/t.jsonl"
+        )
+
+    adapter.wait_for_completion = wait
+    adapter.kill = lambda handle: None
+
+    result = adapter.run(spec)
+
+    assert seen == {
+        "nudges_after_stop_1": 1,
+        "synthesized": True,
+        "nudges": 1,  # the budget held for the whole session
+        "obs": True,
+        "budget": True,
+    }
+    assert result.result_json["synthesized_from_frontmatter"] is True
+    assert spec.task_id not in adapter._fm_fallback_obs
+    assert spec.task_id not in adapter._contract_nudge_sent
+
+
+def test_run_evicts_the_transition_observation(tmp_path, monkeypatch):
+    """DW-107 on `_fm_transition_obs`, whose writer is the heartbeat sampler rather
+    than the read-back. The tick records the transition mid-session and a second
+    tick still finds it (recorded once, never re-crumbed — the within-session
+    semantics); `run()`'s `finally` is what ends its life."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(
+        generic.GenericAdapter, "start_session", lambda _adapter, _spec: _dev_handle()
+    )
+    spec_file = impl / "spec-3-1-foo.md"
+    spec = _transitioned_spec(tmp_path, spec_file)
+    seen = {}
+
+    def wait(handle, running_spec):
+        adapter._observe_tick(handle, running_spec)
+        adapter._observe_tick(handle, running_spec)
+        seen["obs"] = dict(adapter._fm_transition_obs)
+        seen["crumbs"] = len(_lifecycle_events(adapter, "spec-status-transition-observed"))
+        return _unvouched("stalled")
+
+    adapter.wait_for_completion = wait
+    adapter.kill = lambda handle: None
+    adapter._window_alive = lambda handle: True  # kill "failed": no rescue, no upgrade
+
+    adapter.run(spec)
+
+    assert seen["obs"] == {"3-1-dev-1": "in-review"}
+    assert seen["crumbs"] == 1
+    assert spec.task_id not in adapter._fm_transition_obs
+
+
+def test_run_evicts_the_sibling_stores_when_wait_raises(tmp_path, monkeypatch):
+    """The siblings need the same `finally` the launch snapshot has: a raising
+    `wait_for_completion` never reaches `_post_kill_reconcile`, so a post-return
+    eviction would leak exactly the sessions an operator stop or a transport fault
+    produces. The exception must still reach the caller unchanged."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(
+        generic.GenericAdapter, "start_session", lambda _adapter, _spec: _dev_handle()
+    )
+    _record_sent(adapter)
+    spec_file = impl / "spec-3-1-foo.md"
+    spec_file.write_text(_MARKERLESS_DONE)
+    spec = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(spec_file))
+
+    def raising(handle, running_spec):
+        # one real Stop first, so there is something to leak
+        assert adapter._result_json(handle, running_spec, wait=True) is None
+        adapter._fm_transition_obs[running_spec.task_id] = "in-review"
+        raise RuntimeError("stop requested")
+
+    adapter.wait_for_completion = raising
+    adapter.kill = lambda handle: None
+
+    with pytest.raises(RuntimeError, match="stop requested"):
+        adapter.run(spec)
+
+    assert spec.task_id not in adapter._fm_fallback_obs
+    assert spec.task_id not in adapter._fm_transition_obs
+    assert spec.task_id not in adapter._contract_nudge_sent
+
+
+def test_run_evicts_only_the_returning_task_ids_sibling_stores(tmp_path, monkeypatch):
+    """Scoped to `spec.task_id`, like the launch snapshot: a second dev session in
+    flight on the same adapter keeps its observation AND its spent nudge budget —
+    clearing by store rather than by task id would re-nudge a session that had
+    already been nudged, the exact #149 refill hazard the budget exists to close."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(
+        generic.GenericAdapter, "start_session", lambda _adapter, _spec: _dev_handle()
+    )
+    sent = _record_sent(adapter)
+
+    theirs = impl / "spec-3-2-bar.md"
+    theirs.write_text(_MARKERLESS_DONE)
+    other = dataclasses.replace(
+        _dev_spec(tmp_path, "3-2"), task_id="3-2-dev-1", expected_spec=str(theirs)
+    )
+    other_handle = SessionHandle(task_id="3-2-dev-1", native_id="@2")
+    # the other session is mid-flight: nudged once, with a pending fingerprint
+    assert adapter._result_json(other_handle, other, wait=True) is None
+    adapter._fm_transition_obs[other.task_id] = "in-review"
+
+    ours = impl / "spec-3-1-foo.md"
+    ours.write_text(_MARKERLESS_DONE)
+    mine = dataclasses.replace(_dev_spec(tmp_path), expected_spec=str(ours))
+
+    def wait(handle, running_spec):
+        assert adapter._result_json(handle, running_spec, wait=True) is None
+        adapter._fm_transition_obs[running_spec.task_id] = "in-review"
+        return _unvouched("crashed")
+
+    adapter.wait_for_completion = wait
+    adapter.kill = lambda handle: None
+    adapter._window_alive = lambda handle: True
+
+    adapter.run(mine)
+
+    assert mine.task_id not in adapter._fm_fallback_obs
+    assert mine.task_id not in adapter._fm_transition_obs
+    assert mine.task_id not in adapter._contract_nudge_sent
+    # the in-flight session's entries survive...
+    assert adapter._fm_transition_obs[other.task_id] == "in-review"
+    assert other.task_id in adapter._fm_fallback_obs
+    # ...and are still usable: its spec is rewritten, resetting the observation
+    # counter to 1 — the surviving budget is what keeps that from re-nudging.
+    nudges_before = len(sent)
+    os.utime(theirs, ns=(3 * _MTIME_TICK_NS, 3 * _MTIME_TICK_NS))
+    assert adapter._result_json(other_handle, other, wait=True) is None
+    assert len(sent) == nudges_before
+
+
+def test_eviction_is_a_noop_when_start_session_raised_pre_capture(tmp_path, monkeypatch):
+    """Eviction must never manufacture an exception. `start_session` runs INSIDE the
+    `try` the mixin's `finally` guards, so a launch that dies before anything was
+    recorded still reaches `_evict_task_state` with four empty stores — and the
+    operator must see the transport fault, not a `KeyError` raised while cleaning
+    up after it. This is why the seam uses `pop(..., None)` / `discard`, never
+    `del` / `remove`: `del` on an absent key would REPLACE the real exception."""
+    adapter, _impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+
+    def boom(_cwd):
+        # raises from inside `_capture_launch_auto_run_results`, before its
+        # `self._launch_auto_run_results[spec.task_id] = ...` assignment
+        raise RuntimeError("artifacts dir unreadable")
+
+    adapter._artifact_dirs = boom
+    adapter.kill = lambda handle: None
+    spec = _dev_spec(tmp_path)  # no expected_spec -> the capture takes the scan path
+
+    with pytest.raises(RuntimeError, match="artifacts dir unreadable"):
+        adapter.run(spec)
+
+    assert adapter._launch_auto_run_results == {}
+    assert adapter._fm_fallback_obs == {}
+    assert adapter._fm_transition_obs == {}
+    assert adapter._contract_nudge_sent == set()
 
 
 def test_expected_spec_ignores_foreign_markerless_spec(tmp_path, monkeypatch):
