@@ -24,6 +24,12 @@ breaking changes may land in a minor release.
   `sweep-repeat-done`'s existing `reason`, so a diagnostics dump tells the five stops
   apart instead of rendering one `reason_present` boolean (DW-201).
 
+- Declare a journal schema for the five sweep kinds `bmad-loop diagnose` prints as a JSON
+  block in the default Markdown dump (`sweep-ledger-commit`, `-clean`, `-refused`,
+  `-unavailable`, `sweep-repeat-done`), so a field a future producer adds without
+  routing collapses to `<name>_present` instead of riding the generic scrub into the
+  pasted block.
+
 - Give each declared journal `**splat` hole a COUNT of the unresolved `**` keyword
   arguments it holds — not write calls, so `append(kind, **a, **b)` counts 2 — and a
   second unresolvable splat inside an already-declared position now reddens instead of
