@@ -518,7 +518,10 @@ breaking changes may land in a minor release.
   (`ENOSPC`, `EROFS`, a failed rename) now raises `deferredwork.LedgerWriteError` — an
   `OSError` subclass, so the CLI and TUI degrade arms are unchanged — and both sweep
   sites re-raise it ahead of the degrade, since a repair write that failed is not a
-  phase that closed nothing.
+  phase that closed nothing. Its sibling `LedgerLockReleaseError` covers the far side:
+  the publish landed and the ledger lock's release then faulted (Windows `LK_UNLCK`,
+  `os.close`), which the same arm had read as "nothing was written" while the closure
+  was already on disk.
 
 - Commit the deferred-work ledger in the tree that owns it (DW-175). `implementation_artifacts`
   is configurable to any absolute path, so the ledger may sit under the project, inside

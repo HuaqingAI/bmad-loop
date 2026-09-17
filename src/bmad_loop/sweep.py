@@ -2645,7 +2645,10 @@ class SweepEngine(Engine):
                 "already resolved",
                 notes=[f"already resolved: {entry.evidence}" for entry in plan.already_resolved],
             )
-        except deferredwork.LedgerWriteError:
+        except (deferredwork.LedgerWriteError, deferredwork.LedgerLockReleaseError):
+            # ...and its sibling: the publish LANDED and the lock's release then
+            # faulted. Degrading that reads a close that happened as one that did
+            # not, and skips the commit of bytes already on disk.
             raise
         except (deferredwork.LedgerReadError, OSError, ValueError, StateRootError) as e:
             self.journal.append("sweep-resolved-close-unavailable", dw_ids=ids, error=str(e))
@@ -2931,7 +2934,7 @@ class SweepEngine(Engine):
                 # ledger could not record.
                 try:
                     recorded = self._apply_decision_effect(decision, option)
-                except deferredwork.LedgerWriteError:
+                except (deferredwork.LedgerWriteError, deferredwork.LedgerLockReleaseError):
                     raise
                 except (
                     deferredwork.LedgerReadError,

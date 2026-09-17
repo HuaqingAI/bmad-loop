@@ -114,12 +114,20 @@ so a bookkeeping phase cannot crash a sweep — swallowed the write fault with t
 reporting a phase that closed nothing where a repair write had failed. Both now
 re-raise this type ahead of that arm. The rule they follow is the one in
 ``AGENTS.md``: observation may degrade, repair writes must raise.
+
+Its sibling is :class:`LedgerLockReleaseError`, for the fault on the far side of
+the publish: the body of :func:`ledger_lock` completed and the lock's release
+then raised. The bytes ARE on disk there, so a degrade arm that read the bare
+``OSError`` as "nothing was written" reported a landed close or decision as one
+that never happened. Same ``OSError``-subclass reasoning, same two re-raise
+sites.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
+import sys
 import threading
 from bisect import bisect_right
 from collections.abc import Iterator, Sequence
@@ -153,6 +161,23 @@ class LedgerWriteError(OSError):
     arm was written for lock and decode faults, and which a lost publish reached
     looking exactly like a lost lock. Raised only by :func:`_publish`, with the
     original ``OSError`` chained as ``__cause__``.
+    """
+
+
+class LedgerLockReleaseError(OSError):
+    """:func:`ledger_lock` published its body and then could not RELEASE the lock.
+
+    The publish landed — that is the whole point of the type. Acquisition faults
+    are already typed (:class:`~bmad_loop.platform_util.LockUnavailableError`),
+    and a fault on the way OUT — Windows' ``msvcrt.locking(LK_UNLCK)`` or the
+    ``lseek`` ahead of it, ``os.close`` on any platform — reached callers as the
+    same bare ``OSError`` a failed ``os.open`` does, with the bytes already on
+    disk. A sweep degrade arm reading that as "nothing was written" then reported
+    a landed close or decision as one that never happened. An ``OSError`` subclass
+    for the same reason :class:`LedgerWriteError` is: every ``except OSError``
+    caller is unchanged, and the one that must fail loud can name it. Raised only
+    when the BODY completed — a body that raised keeps its own exception, with
+    ``with``-statement semantics for a release fault on top of it.
     """
 
 
@@ -983,8 +1008,27 @@ def ledger_lock(path: Path) -> Iterator[None]:
     lock_path = runs.lock_path_for(path)
     _LOCK_STATE.held = True
     try:
-        with file_lock(lock_path):
+        # Spelled out rather than `with file_lock(...)`: the one thing the
+        # statement cannot express is "the body completed, and THEN the release
+        # faulted", which is the case `LedgerLockReleaseError` names. Acquisition
+        # faults leave `__enter__` untouched (`LockUnavailableError`, or a bare
+        # `OSError` from the sidecar's `mkdir`/`open`), and a body that raised
+        # gets the statement's own semantics from `__exit__`.
+        lock = file_lock(lock_path)
+        lock.__enter__()
+        try:
             yield
+        except BaseException:
+            if not lock.__exit__(*sys.exc_info()):
+                raise
+        else:
+            try:
+                lock.__exit__(None, None, None)
+            except OSError as e:
+                raise LedgerLockReleaseError(
+                    f"published, then could not release the ledger lock: "
+                    f"{type(e).__name__}: {e}"
+                ) from e
     finally:
         _LOCK_STATE.held = False
 

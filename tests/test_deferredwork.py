@@ -1846,6 +1846,55 @@ def test_a_failed_publish_leaves_as_a_typed_ledger_write_error(tmp_path, monkeyp
     assert p.read_bytes() == before
 
 
+def test_a_release_fault_after_a_landed_publish_is_typed_and_the_bytes_stay(tmp_path, monkeypatch):
+    """`ledger_lock` releases AFTER the body published, and the release can fault
+    — Windows' `LK_UNLCK`, `os.close` anywhere. Before this, that reached callers
+    as the same bare `OSError` a failed `os.open` does, while the bytes were on
+    disk: a degrade arm read a landed close as one that never happened. It leaves
+    as `LedgerLockReleaseError` (an `OSError`, so degrade callers are unchanged),
+    with the release fault chained, and the ledger carries the closure.
+
+    The second half pins what the type is NOT: a release fault on top of a body
+    fault is not a landed publish, so it never wears this type. It surfaces the
+    way a `with` statement decides it — the release's bare `OSError`, with the
+    body's fault chained as `__context__` — which is the behavior the spelled-out
+    form preserves rather than a new one.
+
+    Ablation: restore `with file_lock(lock_path): yield` in `ledger_lock` and the
+    `isinstance(..., LedgerLockReleaseError)` assertion reds while `OSError` still
+    passes."""
+    import contextlib
+
+    p = tmp_path / "deferred-work.md"
+    p.write_text(LEDGER, encoding="utf-8")
+    real_file_lock = deferredwork.file_lock
+
+    @contextlib.contextmanager
+    def releasing_faults(path, **kwargs):
+        try:
+            with real_file_lock(path, **kwargs):
+                yield
+        finally:
+            raise OSError(9, "Bad file descriptor")  # the release, body done or not
+
+    monkeypatch.setattr(deferredwork, "file_lock", releasing_faults)
+
+    with pytest.raises(OSError) as exc:
+        mark_done_many(p, ["DW-1"], "2026-07-24", "note")
+    assert isinstance(exc.value, deferredwork.LedgerLockReleaseError)
+    assert isinstance(exc.value.__cause__, OSError) and exc.value.__cause__.errno == 9
+    assert "Bad file descriptor" in str(exc.value)
+    entries = {e.id: e for e in parse_ledger(p.read_text(encoding="utf-8"))}
+    assert not entries["DW-1"].open  # the publish landed
+
+    # a body fault under a faulting release: the with-statement's verdict, not this type
+    p.write_bytes(b"### DW-1: bad \xff byte\n\nstatus: open\n")
+    with pytest.raises(OSError) as exc2:
+        mark_done_many(p, ["DW-1"], "2026-07-24", "note")
+    assert type(exc2.value) is OSError and exc2.value.errno == 9
+    assert isinstance(exc2.value.__context__, deferredwork.LedgerReadError)
+
+
 def test_mark_done_many_skips_an_already_done_entry(tmp_path):
     """Idempotent for a resume that re-drives a close that already landed: no
     second resolution line, and the id is not reported as newly marked."""

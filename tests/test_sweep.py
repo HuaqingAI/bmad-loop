@@ -9504,6 +9504,43 @@ def test_a_failed_ledger_publish_ends_the_resolved_close_loudly(project, monkeyp
     assert ledger_entries(project)["DW-1"].open  # the atomic writer left the ledger alone
 
 
+def test_a_lock_release_fault_after_a_landed_close_ends_the_sweep_loudly(project, monkeypatch):
+    """The far side of the publish. `mark_done_many` wrote the closure and the
+    ledger lock's RELEASE then faulted — Windows' `LK_UNLCK`, `os.close` anywhere.
+    As a bare `OSError` that took the DW-166 degrade arm, which journaled a close
+    that HAPPENED as one that did not and skipped the commit of bytes already on
+    disk. `ledger_lock` types it `LedgerLockReleaseError` and `_close_resolved`
+    re-raises it with `LedgerWriteError`: the ledger on disk says DW-1 is done, and
+    the sweep does not get to say otherwise.
+
+    Ablation: drop `LedgerLockReleaseError` from the re-raise tuple and this reds on
+    a `sweep-resolved-close-unavailable` row for an entry the ledger shows closed."""
+    import contextlib
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}),
+        already_resolved=(ResolvedEntry("DW-1", "fixed by a1b2c3d"),),
+    )
+    real_file_lock = deferredwork.file_lock
+
+    @contextlib.contextmanager
+    def releasing_faults(path, **kwargs):
+        with real_file_lock(path, **kwargs):
+            yield
+        raise OSError(9, "Bad file descriptor")
+
+    monkeypatch.setattr(deferredwork, "file_lock", releasing_faults)
+
+    with pytest.raises(deferredwork.LedgerLockReleaseError, match="Bad file descriptor"):
+        engine._close_resolved(plan)
+
+    assert not (engine.run_dir / "journal.jsonl").exists()  # no degrade row, no false claim
+    assert not ledger_entries(project)["DW-1"].open  # ...because the close DID land
+
+
 def test_a_failed_ledger_publish_ends_the_decision_walk_loudly(project, monkeypatch):
     """`_decisions_phase`'s arm, where the stakes are the ones DW-166 was about:
     the human's answer is already in `<run>/decisions.json` when the effect runs.
