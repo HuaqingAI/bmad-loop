@@ -1854,11 +1854,13 @@ def test_a_release_fault_after_a_landed_publish_is_typed_and_the_bytes_stay(tmp_
     as `LedgerLockReleaseError` (an `OSError`, so degrade callers are unchanged),
     with the release fault chained, and the ledger carries the closure.
 
-    The second half pins what the type is NOT: a release fault on top of a body
-    fault is not a landed publish, so it never wears this type. It surfaces the
-    way a `with` statement decides it — the release's bare `OSError`, with the
-    body's fault chained as `__context__` — which is the behavior the spelled-out
-    form preserves rather than a new one.
+    The second half pins what the type is NOT, and what a double fault does: a
+    release fault on top of a body fault is not a landed publish, so it never
+    wears this type — and it does not get to REPLACE the body's fault either, the
+    way a `with` statement would. For a body that raised `LedgerWriteError` that
+    replacement would be a bare `OSError`, the very type the sweep's degrade arms
+    read as a lock never acquired. The body's fault leaves, with the release fault
+    chained as `__context__` and added as a note.
 
     Ablation: restore `with file_lock(lock_path): yield` in `ledger_lock` and the
     `isinstance(..., LedgerLockReleaseError)` assertion reds while `OSError` still
@@ -1887,12 +1889,22 @@ def test_a_release_fault_after_a_landed_publish_is_typed_and_the_bytes_stay(tmp_
     entries = {e.id: e for e in parse_ledger(p.read_text(encoding="utf-8"))}
     assert not entries["DW-1"].open  # the publish landed
 
-    # a body fault under a faulting release: the with-statement's verdict, not this type
-    p.write_bytes(b"### DW-1: bad \xff byte\n\nstatus: open\n")
-    with pytest.raises(OSError) as exc2:
+    # a body fault under a faulting release: the body's fault leaves, not this type
+    # and not the bare release OSError — graded on the typed WRITE fault, since that
+    # is the one a downgrade would hand to a degrade arm
+    p.write_text(LEDGER, encoding="utf-8")
+    monkeypatch.setattr(
+        deferredwork,
+        "atomic_write_text",
+        lambda path, text: (_ for _ in ()).throw(OSError(28, "No space left on device")),
+    )
+    with pytest.raises(deferredwork.LedgerWriteError) as exc2:
         mark_done_many(p, ["DW-1"], "2026-07-24", "note")
-    assert type(exc2.value) is OSError and exc2.value.errno == 9
-    assert isinstance(exc2.value.__context__, deferredwork.LedgerReadError)
+    assert not isinstance(exc2.value, deferredwork.LedgerLockReleaseError)
+    assert isinstance(exc2.value.__cause__, OSError) and exc2.value.__cause__.errno == 28
+    assert isinstance(exc2.value.__context__, OSError) and exc2.value.__context__.errno == 9
+    assert any("release faulted" in note for note in exc2.value.__notes__)
+    assert p.read_text(encoding="utf-8") == LEDGER  # nothing published
 
 
 def test_mark_done_many_skips_an_already_done_entry(tmp_path):

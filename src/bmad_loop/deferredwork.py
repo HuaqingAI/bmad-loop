@@ -176,8 +176,10 @@ class LedgerLockReleaseError(OSError):
     a landed close or decision as one that never happened. An ``OSError`` subclass
     for the same reason :class:`LedgerWriteError` is: every ``except OSError``
     caller is unchanged, and the one that must fail loud can name it. Raised only
-    when the BODY completed — a body that raised keeps its own exception, with
-    ``with``-statement semantics for a release fault on top of it.
+    when the BODY completed — a body that raised keeps its own exception even
+    when the release faults on top of it (the release fault is chained as
+    ``__context__`` and added as a note), so a :class:`LedgerWriteError` is never
+    downgraded to a bare ``OSError`` by the cleanup that followed it.
     """
 
 
@@ -1013,13 +1015,28 @@ def ledger_lock(path: Path) -> Iterator[None]:
         # faulted", which is the case `LedgerLockReleaseError` names. Acquisition
         # faults leave `__enter__` untouched (`LockUnavailableError`, or a bare
         # `OSError` from the sidecar's `mkdir`/`open`), and a body that raised
-        # gets the statement's own semantics from `__exit__`.
+        # keeps its own fault ahead of any release fault — see the except arm.
         lock = file_lock(lock_path)
         lock.__enter__()
         try:
             yield
-        except BaseException:
-            if not lock.__exit__(*sys.exc_info()):
+        except BaseException as body_fault:
+            # The body's fault is the news, and it stays the exception that leaves.
+            # A `with` statement would let a release fault on top of it REPLACE it,
+            # and for a body that raised `LedgerWriteError` that replacement is a
+            # bare `OSError` — exactly the type the sweep's degrade arms read as a
+            # lock never acquired, so a failed repair write would be degraded
+            # after all. The release fault rides along as `__context__` and as a
+            # note; it is not lost, it just does not get to speak first.
+            try:
+                suppressed = lock.__exit__(*sys.exc_info())
+            except OSError as release_fault:
+                body_fault.add_note(
+                    "and then the ledger lock's release faulted: "
+                    f"{type(release_fault).__name__}: {release_fault}"
+                )
+                raise body_fault  # noqa: B904 — `__context__` IS the release fault
+            if not suppressed:
                 raise
         else:
             try:
