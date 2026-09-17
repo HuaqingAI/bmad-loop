@@ -361,7 +361,10 @@ breaking changes may land in a minor release.
   offered again and fresh sweeps stop repeating stale-answer notifications. Journal
   the removal and preserve run-local answers and ledger history. A read-only project
   store raises `PermissionError` after the drop is announced and quarantined; a fresh
-  run retries once the store is writable.
+  run retries once the store is writable. The retirement removes the entry only while
+  it still holds the value that was dropped: a paused run's stale run-local copy wins
+  over the store on resume, so a replacement a human recorded out of band meanwhile
+  is left in place for the next run instead of being deleted and committed away.
 
 - **Skip an unreadable cached triage instead of failing the read** (DW-145). Widen
   `decisions.pending_missed_decisions`' except tuple to include `UnicodeDecodeError` —

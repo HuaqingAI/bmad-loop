@@ -1156,9 +1156,13 @@ class SweepEngine(Engine):
             self.journal.append("decision-preanswers-pruned", dw_ids=dropped)
             self._commit_ledger("chore(sweep): drop consumed deferred-work pre-answers")
 
-    def _prune_dropped_pre_answer(self, dw_id: str, drop_cause: str) -> None:
+    def _prune_dropped_pre_answer(
+        self, dw_id: str, drop_cause: str, answer: dict[str, Any]
+    ) -> None:
         """Retire the PROJECT-level pre-answer a just-dropped stale answer came
-        from (DW-143). Part of the drop itself, not a later cleanup.
+        from (DW-143). Part of the drop itself, not a later cleanup. `answer` is
+        the value this run just dropped, and the store entry goes ONLY while it
+        still equals it — see the provenance guard below.
 
         Why it exists: DW-124's quarantine is RUN-scoped by design, so it bounds
         the drop to one announcement per run and a NEW run re-evaluates from
@@ -1186,20 +1190,44 @@ class SweepEngine(Engine):
         Reaches the project store ONLY. `<run>/decisions.json` keeps the answer
         (the run-local audit trail is untouched by design) and so does the ledger
         `decision:` line `_apply_decision_effect` wrote. The journal row carries the
-        id and the drop cause alone — no answer prose, no store path."""
+        id and the drop cause alone — no answer prose, no store path.
+
+        Retires the entry ONLY while it still holds the value that was dropped.
+        The dropped `answer` is this run's RUN-LOCAL copy, and `_decisions_phase`
+        lets that copy win over the project store for the rest of the run — so a
+        human who re-answers the id out of band while the run is paused
+        (`pending_missed_decisions` screens against the store alone, never against
+        a run's `decisions.json`) leaves a NEWER store entry this run has never
+        evaluated. Keyed on the id alone, the removal deleted that replacement, and
+        committed the deletion, on the strength of a stale copy the human had
+        already superseded. `drop_pre_answer` compares before it deletes: a seeded
+        copy round-trips through JSON unchanged and so equals the entry it came
+        from, while a re-answer differs in at least `answered_at`, and an
+        interactive in-run answer never equals a store entry at all. The surviving
+        replacement is left for the NEXT run to evaluate from scratch, exactly as
+        a fresh answer would be; this run stays on its own record."""
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
         # `_project_of_run_dir`, never `self.workspace.root`: under the `repo_root`
         # override the two diverge and only the run dir stays anchored to the
         # project that owns the store (see `_decisions_phase` and
         # `_prune_pre_answers`, which resolve it the same way).
-        if not decisions_store.drop_pre_answer(_project_of_run_dir(self.run_dir), dw_id):
-            return  # run-local-only answer: no store entry, so no write and no row
+        if not decisions_store.drop_pre_answer(
+            _project_of_run_dir(self.run_dir), dw_id, answer=answer
+        ):
+            # Either no store entry (a run-local-only answer) or an entry that is
+            # no longer the value dropped (a human's later replacement): no write,
+            # no row — the store's bytes are untouched either way.
+            return
         self.journal.append(
             "sweep-decision-preanswer-pruned", decision=dw_id, drop_cause=drop_cause
         )
         # Committed like `_prune_pre_answers`': `_materialize_bundles` runs ahead of
-        # this cycle's bundles, and bundles need a clean baseline.
+        # this cycle's bundles, and bundles need a clean baseline. Same reach as
+        # every other `_commit_ledger` caller, and the same limit: it commits
+        # `workspace.root`, so under a `repo_root` override whose project dir is
+        # NOT inside the code repo this edit — like the ledger's own — stays on
+        # disk uncommitted (DW-335; the store write above is the durable part).
         self._commit_ledger("chore(sweep): drop stale deferred-work pre-answer")
 
     def _drive_story(self, task: StoryTask) -> None:
@@ -2103,7 +2131,15 @@ class SweepEngine(Engine):
 
     def _commit_ledger(self, message: str) -> None:
         """Commit pending orchestrator ledger edits; bundles need a clean
-        baseline. No-op when the tree is already clean."""
+        baseline. No-op when the tree is already clean.
+
+        Reaches `workspace.root` — the CODE repo — while every edit it is asked
+        to commit (the ledger, the project pre-answer store) is project-rooted.
+        The two coincide by default and in the monorepo shape the `repo_root`
+        override targets (project inside the code repo, where `add -A` reaches
+        it); with the project dir OUTSIDE the code repo the edits stay on disk
+        uncommitted and this is a no-op or commits unrelated code-repo residue.
+        DW-335 owns that gap for the whole family of callers."""
         if verify.worktree_clean(self.workspace.root):
             return
         sha = verify.commit_story(self.workspace.root, message)
@@ -2475,8 +2511,10 @@ class SweepEngine(Engine):
             # open only: the build lanes' `no-intent`/`name-collision` drops leave
             # their stored answer alone, since it still carries a payload to re-ask
             # against. `<run>/decisions.json` and the ledger are untouched either
-            # way — only the PROJECT store entry goes.
-            self._prune_dropped_pre_answer(dw_id, "stale-option")
+            # way — only the PROJECT store entry goes, and only while it is still
+            # THIS answer: a replacement a human recorded out of band since this
+            # run last read the store is not the value being dropped, and survives.
+            self._prune_dropped_pre_answer(dw_id, "stale-option", answer)
             answer_dropped = True
         kept = []
         for b in bundles:

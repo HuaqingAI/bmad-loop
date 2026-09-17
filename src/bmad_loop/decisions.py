@@ -127,21 +127,36 @@ def prune_pre_answers(project: Path, open_ids: set[str]) -> list[str]:
     return dropped
 
 
-def drop_pre_answer(project: Path, dw_id: str) -> bool:
-    """Remove ONE id's entry, returning whether an entry was actually there. The
-    single-id sibling of `prune_pre_answers` above, and public for the same reason
-    that one is: a sweep that has just dropped a stored answer as stale (DW-143)
-    must be able to retire the entry that fed it without reaching into
-    `_write_store`, which is this module's private writer.
+def drop_pre_answer(project: Path, dw_id: str, *, answer: object) -> bool:
+    """Remove ONE id's entry — but only while it still IS `answer` — returning
+    whether an entry was removed. The single-id sibling of `prune_pre_answers`
+    above, and public for the same reason that one is: a sweep that has just
+    dropped a stored answer as stale (DW-143) must be able to retire the entry that
+    fed it without reaching into `_write_store`, which is this module's private
+    writer.
+
+    `answer` is the value the caller is retiring, and the entry goes only when the
+    store still holds exactly that value. The caller's copy is what a sweep READ:
+    `_decisions_phase` seeds a project pre-answer into `<run>/decisions.json` and
+    from then on the run-local copy wins, so a human who re-answers the id out of
+    band while that run is paused (`pending_missed_decisions` screens against this
+    store alone, never against a run's file) leaves a NEWER entry here that the
+    resumed run has never evaluated. An unconditional removal keyed on the id
+    deleted that replacement — and committed the deletion — on the strength of a
+    stale copy it had superseded. Equality is the whole provenance test: a seeded
+    copy round-trips through JSON unchanged, so it compares equal to the entry it
+    came from and unequal to anything a human wrote afterwards, and an interactive
+    in-run answer never equals a store entry at all (different shape), so an id a
+    run answered itself never reaches this store through the drop.
 
     Same read-modify-write shape, same no-op-when-nothing-changes discipline: an
-    absent id writes nothing at all, so a drop whose answer only ever lived in
-    `<run>/decisions.json` leaves the project store's bytes (and mtime) untouched.
-    A removal goes through `_write_store`, so an operator-locked store still raises
-    `PermissionError` rather than silently skipping — deleting a human-authored
-    answer is a store write, never a repair."""
+    absent id, or one holding a different value, writes nothing at all, so a drop
+    whose answer only ever lived in `<run>/decisions.json` leaves the project
+    store's bytes (and mtime) untouched. A removal goes through `_write_store`, so
+    an operator-locked store still raises `PermissionError` rather than silently
+    skipping — deleting a human-authored answer is a store write, never a repair."""
     data = load_pre_answers(project)
-    if dw_id not in data:
+    if dw_id not in data or data[dw_id] != answer:
         return False
     del data[dw_id]
     _write_store(project, data)

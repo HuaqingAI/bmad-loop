@@ -69,17 +69,21 @@ def test_drop_pre_answer_removes_one_entry_and_leaves_the_rest(project):
     `SweepEngine._materialize_bundles`, which cannot see the returned bool at all
     and pins the no-op branch only indirectly.
 
-    Three claims: the bool reports whether an entry was actually there (both
+    Four claims: the bool reports whether an entry was actually removed (all
     branches), an absent id writes NOTHING — the file's bytes are untouched, so the
     keep-open drop of an answer that only ever lived in `<run>/decisions.json`
-    cannot re-serialize a store it has no business rewriting — and a real removal
-    carries every sibling through, the unusable one included, since
-    `load_pre_answers` validates only the top level and an unrelated write must not
-    delete a human's corrupt entry.
+    cannot re-serialize a store it has no business rewriting — an id whose entry is
+    no longer the `answer` being retired is left alone the same way (the caller's
+    copy is a stale read; what the store holds now is a human's LATER answer, and
+    deleting it on the strength of the stale copy is exactly the loss the keyword
+    exists to refuse), and a real removal carries every sibling through, the
+    unusable one included, since `load_pre_answers` validates only the top level
+    and an unrelated write must not delete a human's corrupt entry.
 
-    Ablation: drop the `if dw_id not in data: return False` early return and the
-    bool and the byte-equality both redden; write `_write_store(project, {})` and
-    the siblings redden."""
+    Ablation: drop the `dw_id not in data` half of the early return and the bool
+    and the byte-equality both redden; drop the `data[dw_id] != answer` half and
+    the replaced-entry branch reddens; write `_write_store(project, {})` and the
+    siblings redden."""
     opt = DecisionOption(key="1", label="Build it", effect="build", intent="do it")
     decisions.record_pre_answer(project.project, "DW-7", opt, date="2026-06-13")
     decisions.record_pre_answer(project.project, "DW-8", opt, date="2026-06-13")
@@ -89,18 +93,25 @@ def test_drop_pre_answer_removes_one_entry_and_leaves_the_rest(project):
     data["DW-9"] = ["not a decision answer at all"]
     store.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
     before = store.read_bytes()
+    dw7 = decisions.load_pre_answers(project.project)["DW-7"]
 
     # an id the store never held: False, and not one byte written
-    assert decisions.drop_pre_answer(project.project, "DW-404") is False
+    assert decisions.drop_pre_answer(project.project, "DW-404", answer=dw7) is False
     assert store.read_bytes() == before
 
-    assert decisions.drop_pre_answer(project.project, "DW-7") is True
+    # an id the store holds under a DIFFERENT value than the one being retired — a
+    # human re-answered it since the caller read its copy: False, not one byte written
+    superseded = {**dw7, "answered_at": "2026-06-01"}
+    assert decisions.drop_pre_answer(project.project, "DW-7", answer=superseded) is False
+    assert store.read_bytes() == before
+
+    assert decisions.drop_pre_answer(project.project, "DW-7", answer=dw7) is True
     remaining = decisions.load_pre_answers(project.project)
     assert set(remaining) == {"DW-8", "DW-9"}
     assert remaining["DW-8"]["intent"] == "do it"
     assert remaining["DW-9"] == ["not a decision answer at all"]
     # and removing the same id twice is False the second time
-    assert decisions.drop_pre_answer(project.project, "DW-7") is False
+    assert decisions.drop_pre_answer(project.project, "DW-7", answer=dw7) is False
 
 
 def test_load_pre_answers_tolerates_garbage(project):
