@@ -24,7 +24,9 @@ from conftest import (
     nested_repo_root_paths,
     plant_root_markers,
     refuse_to_resolve,
+    seed_outer_decoy_ledger,
     spec_path,
+    write_ledger,
     write_spec,
     write_sprint,
 )
@@ -710,6 +712,58 @@ def test_verify_dev_missing_spec_file_claim(project):
     task = make_task(project)
     out = verify.verify_dev(task, project, {})
     assert not out.ok and out.retryable and "missing spec_file" in out.reason
+
+
+_NON_MAPPING_DOCUMENTS = [["nope"], "escalations", 7]
+
+
+@pytest.mark.parametrize("document", _NON_MAPPING_DOCUMENTS)
+def test_verify_dev_refuses_a_non_mapping_document_as_a_missing_claim(project, document):
+    """DW-206. These three gates are where the CHANGELOG locates the legible
+    refusal for a non-mapping result document, and they are reachable WITHOUT
+    passing `_run_session`'s guard: `Engine._resumable_session` rebuilds a
+    `SessionResult` straight from `record.result_json` behind an `is not None`
+    check alone, so a document rehydrated by `SessionRecord.from_dict` (which
+    does no shape check) arrives here directly on the resume path.
+
+    A non-mapping claims no `spec_file`, so it refuses exactly as an empty
+    document does — retryable, not an escalation and not a raise.
+
+    ABLATION: revert this gate to `(result_json or {}).get(...)` and every row
+    raises `AttributeError` instead of reddening."""
+    task = make_task(project)
+    out = verify.verify_dev(task, project, document)
+    assert not out.ok and out.retryable and "missing spec_file" in out.reason
+
+
+@pytest.mark.parametrize("document", _NON_MAPPING_DOCUMENTS)
+def test_verify_dev_bundle_refuses_a_non_mapping_document_as_a_missing_claim(project, document):
+    """The bundle twin of the row above — same gate, same refusal, and the lane a
+    sweep bundle's dev leg actually verifies through."""
+    task = make_bundle_task(project)
+    out = verify.verify_dev_bundle(task, project, document)
+    assert not out.ok and out.retryable and "missing spec_file" in out.reason
+
+
+@pytest.mark.parametrize("document", _NON_MAPPING_DOCUMENTS)
+def test_verify_dev_stories_refuses_a_non_mapping_document_at_the_plan_halt_marker(
+    project, document
+):
+    """The stories twin, which refuses on a DIFFERENT gate and so is worth its own
+    row: `verify_dev_stories` resolves the spec deterministically by id rather
+    than trusting a claimed `spec_file`, so its only read of the document is the
+    `plan_halt` marker cross-check. A non-mapping carries no marker, so a
+    plan-halt leg refuses there — the same channel a died-mid-flight
+    `ready-for-dev` takes, which is exactly what that gate exists to catch."""
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = make_stories_task(project, "1")
+    write_story(spec_folder, "1", "user-auth", "ready-for-dev", task.baseline_commit)
+
+    out = verify.verify_dev_stories(
+        task, project, document, spec_folder=spec_folder, review_enabled=False, plan_halt=True
+    )
+
+    assert not out.ok and out.retryable and "no plan_halt marker" in out.reason
 
 
 def test_verify_dev_spec_does_not_exist(project):
@@ -3819,6 +3873,29 @@ def test_verify_review_bundle_ledger_oserror_degrades_to_retry(project, monkeypa
     assert "DW-1" not in out.reason  # not the "entries not marked done" verdict
 
 
+def test_verify_review_bundle_ledger_undecodable_degrades_to_retry(project):
+    """The sibling the `PermissionError` row above could never cover (DW-146): this
+    site caught `except OSError` alone, and `UnicodeDecodeError` is a `ValueError`,
+    so undecodable bytes flew straight past a degrade arm sitting right there and
+    aborted the verify instead of retrying it. The outcome must be the SAME shape as
+    the OSError row — retryable, not fixable — and name the fault so an operator
+    knows the ledger is unreadable rather than incomplete.
+    Ablation: revert the except tuple to `OSError` alone and this reddens with
+    `UnicodeDecodeError` escaping rather than a retryable outcome."""
+    task = make_bundle_task(project)
+    sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "done", task.baseline_commit)
+    task.spec_file = str(sp)
+    bundle_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
+    project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+
+    out = verify.verify_review_bundle(task, project, Policy())
+    assert not out.ok and out.retryable and not out.fixable
+    assert "deferred-work ledger unreadable" in out.reason
+    assert "UnicodeDecodeError" in out.reason
+    assert "DW-1" not in out.reason  # not the "entries not marked done" verdict
+
+
 def test_safe_rollback_reverts_tracked_and_removes_run_created(project):
     repo = project.project
     baseline = verify.rev_parse_head(repo)
@@ -5305,7 +5382,7 @@ def test_path_ignored_raises_on_git_failure(project):
 
 def test_worktree_clean_ignores_stderr_chatter_on_success(project, monkeypatch):
     """A pristine tree must not read DIRTY because git wrote to stderr while
-    exiting 0. Seven callers gate on this and `cli.py`'s three refuse the command
+    exiting 0. Six callers gate on this and `cli.py`'s three refuse the command
     outright, so the merged-stream read made a noisy git config unable to start a
     run — with no file named in the message."""
     real = verify._run_git
@@ -5320,6 +5397,66 @@ def test_worktree_clean_ignores_stderr_chatter_on_success(project, monkeypatch):
     assert verify.worktree_clean(project.project)
     (project.project / "stray.txt").write_text("real change\n")
     assert not verify.worktree_clean(project.project)  # a genuine change still shows
+
+
+def test_path_clean_reports_untracked_files_when_git_hides_them(project):
+    """A publication check must see a new file regardless of display preferences.
+
+    Ablation: remove --untracked-files=all and the dirty assertion fails.
+    """
+    repo = project.project
+    git(repo, "config", "status.showUntrackedFiles", "no")
+    target = repo / "new-ledger.md"
+    target.write_text("published\n", encoding="utf-8")
+    assert git(repo, "status", "--porcelain", "--", target.name) == ""
+    assert not verify.path_clean(repo, target.name)
+
+
+def test_path_clean_treats_a_glob_basename_literally(project):
+    """A dirty neighbor cannot make a clean published file require staging.
+
+    Ablation: remove literal pathspec escaping and the clean assertion fails.
+    """
+    repo = project.project
+    target = repo / "ledger[1].md"
+    neighbor = repo / "ledger1.md"
+    target.write_text("published\n", encoding="utf-8")
+    neighbor.write_text("before\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "seed ledger names")
+    neighbor.write_text("operator edit\n", encoding="utf-8")
+    assert git(repo, "status", "--porcelain", "--", target.name)
+    assert verify.path_clean(repo, target.name)
+
+
+def test_path_clean_ignores_stderr_chatter_on_success(project):
+    """`path_clean`'s narrow sibling of the row above, and it inherits the hazard for
+    the same reason: `status --porcelain` exits 0 while warning on stderr, so against
+    a merged stream an UNCHANGED pathspec reads non-empty and the function answers
+    DIRTY about a file that matches HEAD.
+
+    That direction is not benign. `sweep._commit_ledger` takes this as the decision
+    to publish, so on a host whose git config warns, every already-clean publish
+    would stage and re-interrogate a file it had nothing to say about — reaching git
+    and the index for a non-event, on the ordinary idempotent-replay path (a resumed
+    cycle re-closing ids already `done`).
+
+    REAL-GIT axis (#442), like the `commit_paths` no-op row below: `make_git_noisy`
+    sets an unknown VALUE for a known KEY, which is a warning at rc 0 and the normal
+    shape on a host the orchestrator does not control — not a synthetic stderr.
+
+    The second assertion is the other half: a read that always answered True would
+    satisfy the first alone.
+
+    Ablation target: return `(proc.stdout + proc.stderr).strip() == ""` and this
+    fails alone, answering DIRTY for the unchanged pathspec."""
+    repo = project.project
+    make_git_noisy(repo)
+
+    assert verify.path_clean(repo, "src.txt")  # unchanged, despite the warning
+
+    (repo / "src.txt").write_text("real change\n", encoding="utf-8")
+    assert not verify.path_clean(repo, "src.txt")  # ...and a genuine change still shows
 
 
 # ------------------------------------------ probes that return git's text (#442)
@@ -5765,6 +5902,141 @@ def test_commit_paths_raises_when_no_operand_survives_resolution(project, monkey
     assert isinstance(caught.value.__cause__, error_type)
     assert not any(args[:1] == ("add",) for args in git_calls)
     assert uncertain.read_text() == "uncommitted exact write\n"
+
+
+# ------------------------------------------- unpublishable_target (DW-199/203/205, DW-209/213)
+
+_UNDECODABLE_LEDGER = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
+
+
+def test_unpublishable_target_refuses_an_absent_ledger(project):
+    """The `target-absent` half of the ledger family: `read_for_write` answers `None`
+    for a file that is not there, and that is the whole probe.
+
+    This is the shape the guard exists for — `verify.commit_paths` deliberately
+    keeps a missing-but-TRACKED path as a DELETION to stage, so an absent ledger
+    reaching git publishes its own removal.
+
+    Ablation: return `None` unconditionally from the ledger arm and this reds."""
+    write_ledger(project, {"DW-1": "open"})
+    ledger = project.deferred_work
+    ledger.unlink()
+
+    assert verify.unpublishable_target(ledger, "ledger") == ("target-absent", None)
+
+
+def test_unpublishable_target_refuses_an_undecodable_ledger_with_the_fault(project):
+    """`target-unreadable`, carrying the decode fault as the second element. The
+    ledger's own read contract (DW-146) raises `LedgerReadError` for bytes nobody
+    can decode, and that is what this arm folds into a refusal.
+
+    Ablation: drop `deferredwork.LedgerReadError` from the `except` tuple and the
+    call raises instead of answering, reddening the assertion below."""
+    write_ledger(project, {"DW-1": "open"})
+    project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
+
+    cause, error = verify.unpublishable_target(project.deferred_work, "ledger")
+
+    assert cause == "target-unreadable"
+    assert "not valid UTF-8" in error
+
+
+def test_unpublishable_target_folds_a_ledger_oserror_into_the_refusal(project, monkeypatch):
+    """The arm that has to be said out loud: `read_for_write`'s contract lets
+    `OSError` PROPAGATE, and here it deliberately does not. Both callers are
+    best-effort bookkeeping whose degrade discipline exists so a publication fault
+    never aborts the work that wrote the file, so an unreadable target joins the
+    undecodable cause rather than escaping into a caller with no handler for it.
+
+    Ablation: drop `OSError` from the `except` tuple and this reds with the
+    `PermissionError` escaping instead of the tuple coming back."""
+    write_ledger(project, {"DW-1": "open"})
+    fault_read_text(monkeypatch, project.deferred_work)
+
+    cause, error = verify.unpublishable_target(project.deferred_work, "ledger")
+
+    assert cause == "target-unreadable"
+    assert "Permission denied" in error
+
+
+def test_unpublishable_target_refuses_an_absent_store(project):
+    """The store family, whose whole probe is existence.
+
+    Ablation: return `None` unconditionally from the store arm and this reds."""
+    store = project.project / ".bmad-loop" / "decisions.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+
+    assert verify.unpublishable_target(store, "store") == ("target-absent", None)
+
+
+def test_unpublishable_target_publishes_a_present_store_that_is_not_decodable(project):
+    """EXISTENCE ONLY for the store, and that boundary is exactly why the family is
+    DECLARED by the caller rather than derived from the path: the store's writer
+    emits valid UTF-8 JSON, so bytes that will not decode represent a replacement
+    after that write, and publication deliberately preserves the existing
+    content policy rather than newly refusing them.
+
+    Ablation: route the store family through the ledger validator and this reds
+    with `target-unreadable` where `None` is expected."""
+    store = project.project / ".bmad-loop" / "decisions.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_bytes(b'{"DW-1": "\xff"}')  # present, and not UTF-8
+
+    assert verify.unpublishable_target(store, "store") is None
+
+
+def test_unpublishable_target_reads_a_present_empty_ledger_as_publishable(project):
+    """An empty ledger is present, readable bookkeeping and stays publishable — the
+    absence probe is `is None`, not falsiness.
+
+    Ablation: change the ledger arm's `is None` to a falsiness check and this
+    reds: empty text would be refused as absent."""
+    write_ledger(project, {"DW-1": "open"})
+    project.deferred_work.write_text("", encoding="utf-8")
+
+    assert verify.unpublishable_target(project.deferred_work, "ledger") is None
+
+
+def test_a_dangling_link_resolves_to_an_absence_before_the_probes_run(project):
+    """The probes are taken on the RESOLVED argument, and that is what decides what
+    the `is_symlink()` disjunct actually buys — not the spelling. A DANGLING link
+    does not survive the resolve as a link: non-strict `Path.resolve` collapses it
+    to the plain non-existent path it points at, so both probes answer False and
+    the store is refused `target-absent`. That is the right answer for it —
+    `atomic_write_text_confined` REFUSES to write through a link at the store's
+    own name, so a dangling one holds no write of ours to publish — but it is the
+    opposite of what "keeps a dangling link publishable" would mean.
+
+    On Python 3.13+ the disjunct keeps a symlink LOOP publishable: it resolves to
+    the link ITSELF (`exists()` False, `is_symlink()` True). Python 3.11-3.12
+    raise during resolve, which each caller handles on its own.
+
+    Ablation: on Python 3.13+, drop `or target.is_symlink()` and the loop case
+    starts refusing too. Reverse the arm to `if target.exists():` and the dangling
+    case stops being refused on every version."""
+    store = project.project / ".bmad-loop" / "decisions.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        store.symlink_to(store.parent / "gone.json")
+    except OSError as exc:  # pragma: no cover - win32 without developer mode
+        pytest.skip(f"symlinks unavailable on this host: {exc}")
+    # premise: the link is real, and the RESOLVE is what erases it
+    assert store.is_symlink()
+    resolved = store.resolve()
+    assert not resolved.exists() and not resolved.is_symlink()
+
+    assert verify.unpublishable_target(resolved, "store") == ("target-absent", None)
+
+    # Path.resolve changed its non-strict loop behavior in Python 3.13.
+    loop = store.parent / "loop.json"
+    loop.symlink_to("loop.json")
+    if sys.version_info < (3, 13):
+        with pytest.raises(RuntimeError):
+            loop.resolve()
+    else:
+        resolved_loop = loop.resolve()
+        assert not resolved_loop.exists() and resolved_loop.is_symlink()
+        assert verify.unpublishable_target(resolved_loop, "store") is None
 
 
 def test_commit_paths_noop_when_unchanged(project):
@@ -6416,6 +6688,16 @@ def test_verify_dev_park_zero_diff_excludes_engine_writes_under_the_monorepo_sha
     gains ``app/`` while the plausible wrong spelling names a real outer ledger,
     so the two spellings produce opposite ``park_zero_diff`` observations.
 
+    The outer decoy comes from the shared ``seed_outer_decoy_ledger`` seeder (DW-208)
+    rather than being re-spelled here: the seeder DERIVES the decoy's location from
+    ``paths.deferred_work``, so this row and the rule under test move together if the
+    artifact layout changes, and its exists-guard makes a template that grew an outer
+    ``deferred-work.md`` fail loudly instead of degrading this row's premise into a
+    setup accident. Staging and committing stay here — the seeder only writes, and
+    whether the decoy ends up TRACKED is this row's own premise, graded by value with
+    ``ls-files --error-unmatch`` exactly as the inner ledger's mirror-image UNTRACKED
+    premise is graded below.
+
     Ablation performed: drop ``+ mode_exclude`` from ``proof_of_work_probe``'s
     exclusion composition and this row reddens on the correct spelling's
     ``park_zero_diff is True`` assertion; restoring the composition makes it green.
@@ -6424,14 +6706,14 @@ def test_verify_dev_park_zero_diff_excludes_engine_writes_under_the_monorepo_sha
     assert paths.project != paths.repo_root
     assert paths.project.parent == paths.repo_root
 
-    outer_ledger = project.implementation_artifacts / "deferred-work.md"
-    outer_ledger.write_text("- DW-132 outer decoy\n", encoding="utf-8")
-    git(
-        paths.repo_root,
-        "add",
-        outer_ledger.relative_to(paths.repo_root).as_posix(),
-    )
+    decoy, decoy_bytes = seed_outer_decoy_ledger(paths)
+    from_repo_root = decoy.relative_to(paths.repo_root).as_posix()
+    git(paths.repo_root, "add", from_repo_root)
     git(paths.repo_root, "commit", "-q", "-m", "seed outer deferred-work decoy")
+    # TRACKED, by value: `--error-unmatch` exits non-zero (and `git` raises) on a path
+    # git does not have in the index, so the premise the misrooted spelling's
+    # `park_zero_diff is False` rests on is asserted rather than merely commented.
+    git(paths.repo_root, "ls-files", "--error-unmatch", "--", from_repo_root)
 
     task, sp = _residue_free(
         paths, status=verify.AWAITING_OPERATOR, sprint=verify.AWAITING_OPERATOR
@@ -6480,6 +6762,14 @@ def test_verify_dev_park_zero_diff_excludes_engine_writes_under_the_monorepo_sha
     assert misrooted.ok
     assert misrooted.park_proof_skipped is True
     assert misrooted.park_zero_diff is False
+
+    # Graded HERE, after both verifications, rather than beside the seed call: the seeder
+    # writes and returns these exact bytes, so a check placed there grades nothing. What
+    # is worth grading is that the file the misrooted spelling names IS the seeded decoy
+    # and that nothing in `verify_dev` disturbed it — so the `False` above is about the
+    # pathspec landing on a real, unrelated, unchanged file rather than on residue.
+    assert paths.repo_root / from_project == decoy
+    assert decoy.is_file() and decoy.read_bytes() == decoy_bytes
 
 
 def test_verify_dev_refuses_a_bare_spec_flip_under_the_monorepo_shape(project):
@@ -7067,17 +7357,15 @@ def test_spec_within_roots(project, tmp_path):
 
 
 def _refuse_resolution_as(monkeypatch, target: Path, error_type: type[Exception]) -> None:
-    if error_type is OSError:
-        refuse_to_resolve(monkeypatch, target)
-        return
-    real_resolve = Path.resolve
+    """Make `target` fail to resolve in the named class, through the shared seam.
 
-    def stub(self, strict: bool = False):
-        if str(self) == str(target):
-            raise error_type("injected resolution uncertainty")
-        return real_resolve(self, strict=strict)
-
-    monkeypatch.setattr(Path, "resolve", stub)
+    Every class goes through `refuse_to_resolve`'s `error=` keyword. The `OSError` branch
+    used to take that seam while every other class got a local `Path.resolve` stub beside
+    it, which left the parametrized rows below differing by FAULT SEAM as well as by
+    class — only the seam clears `platform_util._LEXICAL_FALLBACK_NOTED`, so the two rows
+    were not the controlled comparison their parametrization claims.
+    """
+    refuse_to_resolve(monkeypatch, target, error=error_type("injected resolution uncertainty"))
 
 
 @pytest.mark.parametrize("error_type", [OSError, RuntimeError])

@@ -570,7 +570,19 @@ from — press `d`. The Deferred Work pane title shows the outstanding count
 (question, context, and each option with its effect and the triage
 recommendation). Each answer is durable: a `close` is applied immediately, and
 a `build`/`keep-open` is saved to `.bmad-loop/decisions.json`, so the next sweep
-acts on it (build → bundle, keep-open → recorded) without asking again. Skip a
+acts on it (build → bundle, keep-open → recorded) without asking again. The
+ledger can take no `decision:` line, though — the entry retired by another
+writer while the modal was open, or the ledger file gone (DW-198). The modal
+says so in a `warning` toast (naming the id, and the store answer where one was
+still saved), the walk carries on to the next decision, and that answer is not
+counted in the `recorded N decision(s)` summary. A publication refusal is appended
+to that warning, or shown in its own `warning` toast when a ledger line landed.
+It says an answer that DID land on disk could not be published to git
+(DW-209/213): the modal's writer commits only the files that call actually
+wrote, and a file that vanished or went unreadable between the write and the
+staging is dropped from the commit and named here with its cause. That one does
+not change the count, which still depends only on whether a ledger line landed,
+and the walk carries on the same way. Skip a
 modal to leave that one for later. The same set is available on the CLI via
 `bmad-loop decisions` (`--list` to just view).
 

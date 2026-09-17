@@ -128,6 +128,45 @@ def test_pending_missed_decisions_survives_an_undecodable_triage(project):
     assert [d.id for d in data.pending_missed_decisions(project.project)] == ["DW-1"]
 
 
+def test_pending_missed_decisions_survives_a_nested_null_triage(project):
+    """DW-155/DW-158 at the same uncaught surface, one fault class over. A cached
+    triage can decode and parse cleanly and still hold a `null` where a list
+    member belongs; `validate_triage` called `.get` on it unscreened, so an
+    `AttributeError` -- not an `OSError`, so this reader's
+    `(BmadConfigError, OSError)` catch does not see it either -- escaped
+    `decisions.pending_missed_decisions` and reached the dashboard's render, the
+    same path DW-145's `UnicodeDecodeError` took. The validator is total over
+    shapes now, so the bad cache is refused and skipped and the good run's DW-1
+    still lists: degradation is per FILE, not a blanked panel.
+    Ablation: drop the `_plan_mapping` call in `validate_triage`'s `bundles` loop
+    and this reddens with `AttributeError` rather than returning ["DW-1"]."""
+    import json
+
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _write_triage_decision(make_run(project.project, "20260101-000000-aaaa"))
+    bad = make_run(project.project, "20260102-000000-bbbb")
+    (bad / "triage.json").write_text(
+        json.dumps(
+            {
+                "workflow": "deferred-sweep-triage",
+                "open_ids": [],
+                "already_resolved": [],
+                "bundles": [None],
+                "blocked": [],
+                "skip": [],
+                "decisions": [],
+                "escalations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert [d.id for d in data.pending_missed_decisions(project.project)] == ["DW-1"]
+
+
 def test_pending_missed_decisions_empty_for_uninitialized(tmp_path):
     assert data.pending_missed_decisions(tmp_path) == []
 
@@ -1092,6 +1131,20 @@ def test_deferred_entries(project):
 def test_deferred_entries_unavailable(tmp_path, project):
     assert data.deferred_entries(tmp_path) is None  # no _bmad config at all
     install_bmad_config(project)  # config but no ledger file
+    assert data.deferred_entries(project.project) is None
+
+
+def test_deferred_entries_undecodable_ledger_is_unavailable(project):
+    """The pane already had an "unavailable" degrade (`items = None`), but reached it
+    only for `OSError` — and `UnicodeDecodeError` is a `ValueError` (DW-146), so
+    undecodable bytes escaped the whole refresh instead of rendering the pane
+    unavailable. Same answer as a missing ledger: the dashboard cannot show entries
+    it could not read.
+    Ablation: revert the except tuple to `OSError` alone and this reddens with
+    `UnicodeDecodeError` escaping rather than `None`."""
+    install_bmad_config(project)
+    project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+
     assert data.deferred_entries(project.project) is None
 
 

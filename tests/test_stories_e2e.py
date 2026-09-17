@@ -48,7 +48,9 @@ temporary directory, the orchestrator reaped that exact child, and the worktree
 teardown remained clean despite the missing normal identity record.
 
 Alongside those scenarios the file also holds local-process `/proc`+pidfd harness
-rows covering the reap-identity helpers the three teardown E2Es depend on. Those rows
+rows covering the reap-identity helpers the three teardown E2Es depend on, plus the
+DW-159 rows that drive the detached fakes' bash session-readiness gate directly
+rather than any helper. Those rows
 spawn and reap their own short-lived children, but run no tmux or orchestrator session.
 """
 
@@ -286,6 +288,41 @@ idfile="$rd/tasks/$tid/fake-child.pid"
 """
 )
 
+# DW-159: publication must not precede the session transition. `$!` names the child
+# the instant fork(2) returns, but `setsid(2)` runs in that child AFTERWARDS, so an
+# identity published straight off `$!` merely ASSUMES the escape it is supposed to
+# prove — under a scheduler delay the consumer can harvest and grade a straggler still
+# inside the pane's session, and the row silently covers the weaker same-pgid case
+# (#183/#139) it was written to exclude. This gate turns detachment into an established
+# fact: bounded-poll the child's OBSERVED session id until it differs from this shell's
+# own, then let publication proceed; a child that never detaches fails loudly instead.
+#
+# Expects `$child` and `$detach_ack_ceiling_s` to be set already, and mirrors the
+# recorder's `") "`-strip parse convention: after `${stat##*) }`, index 3 is the session
+# id (index 19 is the start time the recorder reads). Deliberately NOT folded into
+# RECORD_CHILD_IDENTITY_SH: that snippet is shared verbatim with TIMEOUT_FAKE_CLI, whose
+# child is intentionally same-session, where a session-differs gate would never return.
+# On refusal, kill the owned child before exiting: it could otherwise detach later
+# without an identity record for the E2E cleanup sweep. The fake can wait on its child;
+# a direct harness shell cannot, so only that wait status is ignored under `set -e`.
+AWAIT_DETACHED_SESSION_SH = r"""sstat=$(<"/proc/$$/stat")
+read -r -a sfields <<< "${sstat##*) }"
+own_session="${sfields[3]}"
+detach_deadline=$(( SECONDS + detach_ack_ceiling_s ))
+while :; do
+    cstat=$(<"/proc/$child/stat")
+    read -r -a cfields <<< "${cstat##*) }"
+    if [[ ${cfields[3]} != "$own_session" ]]; then break; fi
+    if (( SECONDS >= detach_deadline )); then
+        printf 'child %s never left session %s\n' "$child" "$own_session" >&2
+        kill -KILL "$child"
+        wait "$child" 2>/dev/null || :
+        exit 1
+    fi
+    sleep 0.05
+done
+"""
+
 # A fake CLI that ends CLEANLY (writes a `done` spec + Stop, then idles like a real
 # interactive session) but first `setsid`-detaches a straggler into its OWN session.
 # Unlike the :185-204 same-pgid child (which tmux's SIGHUP reaps), a setsid child
@@ -308,7 +345,13 @@ baseline=$(git rev-parse HEAD)
 # fork) — it now leads its own session and survives the pane pgid's SIGHUP.
 setsid sleep 100000 &
 child=$!
-idfile="$rd/tasks/$tid/fake-child.pid"
+"""
+    # The fake pins the shared hang ceiling (int for bash arithmetic) rather than a bare
+    # literal, per DW-95/DW-108; the assert below is what holds that spelling. It is
+    # `_run_detach_gate`, not this line, that varies the budget for the direct rows.
+    + f"detach_ack_ceiling_s={int(REAL_MUX_HANG_CEILING_S)}\n"
+    + AWAIT_DETACHED_SESSION_SH
+    + r"""idfile="$rd/tasks/$tid/fake-child.pid"
 """
     + RECORD_CHILD_IDENTITY_SH
     + r"""
@@ -364,6 +407,27 @@ PUBLICATION_FAULT_FAKE_CLI = DETACHED_WRITER_FAKE_CLI.replace(
     RECORD_CHILD_IDENTITY_SH, _PUBLICATION_FAULT_FRAGMENT, 1
 )
 assert PUBLICATION_FAULT_FAKE_CLI.count(RECORD_CHILD_IDENTITY_SH) == 2
+# The gate sits ahead of the substituted `idfile=` line, so the publication-fault fake
+# inherits it for free — correct, since it detaches the same way. ORDER is the whole
+# property, not presence: a gate spliced AFTER the recorder would publish the identity
+# first and re-establish exactly the race DW-159 closes, so pin the index too. The
+# ceiling assignment is respelled rather than shared, so swapping the splice for a bare
+# SHORT literal fails here.
+#
+# These asserts compare rendered TEXT, which on its own cannot tell the splice apart from
+# a hardcoded `90` — the two render byte-identically. That is graded elsewhere (DW-174):
+# `_scan_detach_ceiling_splices` in `tests/test_conftest.py` reads THIS module's own AST
+# and requires the module-level `detach_ack_ceiling_s=` fragment to be followed by
+# `int(<conftest REAL_MUX_HANG_CEILING_S>)`, under either import form, against a named
+# expected-site inventory. Keep both halves: that scan observes only the EXPRESSION, while
+# the splice ORDER pinned below and the derived `PUBLICATION_FAULT_FAKE_CLI` inheritance
+# (a `str.replace` result, which holds no fragment of its own) are text properties no AST
+# scan of this module sees.
+for _fake in (DETACHED_WRITER_FAKE_CLI, PUBLICATION_FAULT_FAKE_CLI):
+    assert _fake.count(AWAIT_DETACHED_SESSION_SH) == 1
+    assert _fake.count(f"detach_ack_ceiling_s={int(REAL_MUX_HANG_CEILING_S)}\n") == 1
+    assert _fake.index(AWAIT_DETACHED_SESSION_SH) < _fake.index(RECORD_CHILD_IDENTITY_SH)
+del _fake
 
 
 def _git(root: Path, *args: str) -> None:
@@ -946,6 +1010,129 @@ def test_recorded_identity_bash_and_python_agree(tmp_path):
         )
         assert not pid_file.is_symlink(), "the recorder must replace, not write through, the name"
         assert recorded_child(pid_file) == (proc.pid, starttime)
+    finally:
+        _reap(proc)
+
+
+def _observed_session(pid: int) -> str:
+    """The session id the detached-fake gate reads: index 3 after the `") "` strip."""
+    stat = Path("/proc", str(pid), "stat").read_text(encoding="utf-8")
+    return stat[stat.rindex(")") + 1 :].split()[3]
+
+
+def _run_detach_gate(
+    child: int, ceiling_s: int, *, head: str = "", tail: str = ""
+) -> subprocess.CompletedProcess:
+    """Drive AWAIT_DETACHED_SESSION_SH itself — the same text the fakes splice in.
+
+    The subprocess wall is derived from the injected ceiling, never fixed: a fixed wall
+    below a caller's budget would report `TimeoutExpired` from the harness instead of
+    the gate's own bounded refusal, inverting which layer the row is grading.
+    """
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"set -e\nchild={child}\ndetach_ack_ceiling_s={ceiling_s}\n"
+            + head
+            + AWAIT_DETACHED_SESSION_SH
+            + tail,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=ceiling_s + 30,
+    )
+
+
+def test_detach_gate_returns_only_once_the_child_left_the_runner_session():
+    """DW-159: the gate is what makes detachment a FACT before the identity is published.
+
+    A `setsid` child spawned the way the fake spawns one (not a process-group leader, so
+    setsid(1) execs rather than forks and the pid is preserved). The gate may return only
+    when the observed session differs from the runner shell's — and for a setsid child
+    that session is the child's own pid, which is what the consumers' escaped-straggler
+    premise rests on.
+    """
+    proc = subprocess.Popen(["setsid", "sleep", "30"])
+    try:
+        done = _run_detach_gate(proc.pid, 10, tail='printf %s "$own_session"\n')
+        assert done.returncode == 0, done.stderr
+        runner_session = done.stdout
+        assert runner_session, done.stderr
+        observed = _observed_session(proc.pid)
+        assert observed != runner_session
+        assert observed == str(proc.pid), f"setsid child {proc.pid} does not lead its session"
+    finally:
+        _reap(proc)
+
+
+def test_detach_gate_retries_until_a_late_child_detaches(tmp_path):
+    """Release the same-session child only when the gate reaches its retry sleep.
+
+    A shell-local sleep function signals the child, then delegates to real sleep.
+    The unmodified gate must observe the original session before it can release the
+    child; parent scheduling cannot consume the delay before observation starts.
+    The child execs setsid, preserving its pid just as the detached fake does.
+    """
+    release_file = tmp_path / "detach-release"
+    release = shlex.quote(str(release_file))
+    proc = subprocess.Popen(
+        ["bash", "-c", f"while [[ ! -e {release} ]]; do sleep 0.05; done; exec setsid sleep 100000"]
+    )
+    try:
+        done = _run_detach_gate(
+            proc.pid,
+            int(REAL_MUX_HANG_CEILING_S),
+            head=f'sleep() {{ : > {release}; command sleep "$@"; }}\n',
+            tail='printf %s "$own_session"\n',
+        )
+        assert done.returncode == 0, done.stderr
+        assert release_file.exists(), "the gate never reached its retry sleep"
+        assert _observed_session(proc.pid) != done.stdout
+        assert _observed_session(proc.pid) == str(proc.pid)
+    finally:
+        _reap(proc)
+
+
+@pytest.mark.parametrize("process_group", [None, 0], ids=["same-pgrp", "new-pgrp"])
+@pytest.mark.parametrize("virtual_clock", [False, True], ids=["real-clock", "virtual-clock"])
+def test_detach_gate_refuses_a_child_that_never_left_the_session(
+    tmp_path, process_group, virtual_clock
+):
+    """Refuse and kill a same-session child, even if it leads a different group.
+
+    Real-clock cases exercise bash's deadline; virtual-clock cases count retries
+    against the injected budget without making a scheduler-sensitive timing claim.
+    Unsetting SECONDS removes its special clock behavior for that shell, so each
+    retry advances an ordinary variable by exactly one second.
+    """
+    proc = subprocess.Popen(["sleep", "100000"], process_group=process_group)
+    try:
+        assert os.getsid(proc.pid) == os.getsid(0)
+        if process_group == 0:
+            assert os.getpgid(proc.pid) == proc.pid
+            assert os.getpgid(proc.pid) != os.getpgrp()
+        pid_file = tmp_path / "fake-child.pid"
+        ticks_file = tmp_path / "ticks"
+        head = ""
+        if virtual_clock:
+            head = (
+                "unset SECONDS\nSECONDS=0\n"
+                f"sleep() {{ printf x >> {shlex.quote(str(ticks_file))}; "
+                "SECONDS=$((SECONDS + 1)); }\n"
+            )
+        done = _run_detach_gate(
+            proc.pid,
+            2,
+            head=head,
+            tail=f"idfile={shlex.quote(str(pid_file))}\n" + RECORD_CHILD_IDENTITY_SH,
+        )
+        assert done.returncode != 0
+        assert f"child {proc.pid} never left session {os.getsid(0)}" in done.stderr
+        assert not pid_file.exists(), "an ungraded identity must never be published"
+        assert proc.wait(timeout=30) == -signal.SIGKILL
+        if virtual_clock:
+            assert ticks_file.read_text() == "xx", "the gate did not honor its two-second budget"
     finally:
         _reap(proc)
 

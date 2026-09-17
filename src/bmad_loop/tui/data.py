@@ -784,9 +784,13 @@ def deferred_entries(project: Path) -> list[DeferredItem] | None:
         return cached[1]
     items: list[DeferredItem] | None = None
     if sig is not None:
+        # OBSERVATION arm of the ledger-read contract (DW-146): the dashboard
+        # writes nothing and already degrades to `items = None` (rendered as
+        # unavailable). `UnicodeDecodeError` is a `ValueError`, so undecodable
+        # bytes escaped this arm and took the whole TUI refresh down instead.
         try:
             text = ledger_path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             items = None
         else:
             merged: list[tuple[int, DeferredItem]] = []

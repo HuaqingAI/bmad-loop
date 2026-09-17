@@ -1298,6 +1298,137 @@ def test_remaining_journal_sanitization_contract_reaches_both_public_renders(pro
         assert canary not in legend_values, f"LEAK via legend: {canary!r}"
 
 
+@pytest.mark.parametrize("render_format", ["markdown", "json"])
+@pytest.mark.parametrize("refuse_cause", ["target-absent", "target-unreadable"])
+@pytest.mark.parametrize(
+    "stop_cause",
+    [
+        "no-open",
+        "no-progress",
+        "max-cycles",
+        "legacy-appeared",
+        "ledger-unreadable",
+        "ledger-inaccessible",
+        "no-selected",
+    ],
+)
+def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
+    project, render_format, stop_cause, refuse_cause
+):
+    """Each public render independently retains all FOUR publication identities,
+    the seven stop slugs, and the dropped fields' presence booleans.
+
+    The refusal row (DW-199/203/205) carries two surviving fields, not one: `file`
+    says WHICH of the two published files went unpublished and `refuse_cause` says
+    WHY, and the two are separate claims — the causes are a closed pair
+    (`target-absent` | `target-unreadable`) whose natural spelling, `reason`, is
+    dropped, so without the minted field a scrubbed dump could not tell a ledger
+    that vanished from one nobody could decode.
+
+    Ablation: remove Markdown's sweep-entry emission, drop
+    `sweep-ledger-commit-refused` from the collected kind set, or add
+    file/stop_cause/refuse_cause to _JOURNAL_DROP_FIELDS, and the corresponding
+    positive assertions fail. Remove message/error/repo/reason from that set and
+    the presence assertions fail.
+    """
+    run_dir = _seed_run(project.project)
+    repo_value = f"{HOME_PATH}/_bmad-output/implementation-artifacts"
+    error_value = "fatal: not a git repository"
+    message_value = "chore(sweep): close resolved deferred-work entries"
+    journal = Journal(run_dir)
+    journal.append(
+        "sweep-ledger-commit-unavailable",
+        message=message_value,
+        repo=repo_value,
+        error=error_value,
+        file="deferred-work.md",
+    )
+    journal.append("sweep-ledger-commit-clean", message=message_value, file="decisions.json")
+    journal.append(
+        "sweep-ledger-commit-refused",
+        message=message_value,
+        file="deferred-work.md",
+        refuse_cause=refuse_cause,
+        **({"error": error_value} if refuse_cause == "target-unreadable" else {}),
+    )
+    journal.append(
+        "sweep-ledger-commit", message=message_value, commit="a" * 40, file="deferred-work.md"
+    )
+    journal.append("sweep-repeat-done", cycles=2, reason=stop_cause, stop_cause=stop_cause)
+
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    markdown = diagnostics.render_markdown(diag, pseudo=pseudo)
+    json_text = diagnostics.render_json(diag, pseudo=pseudo)
+    if render_format == "markdown":
+        # Assert against the Markdown body itself, not JSON rendered beside it.
+        blocks = re.findall(r"```json\n(.*?)\n```", markdown, flags=re.DOTALL)
+        assert len(blocks) == 1
+        entries = json.loads(blocks[0])
+    else:
+        entries = json.loads(json_text)["runs"][0]["journal"]["entries"]
+
+    failed = next(e for e in entries if e["kind"] == "sweep-ledger-commit-unavailable")
+    clean = next(e for e in entries if e["kind"] == "sweep-ledger-commit-clean")
+    refused = next(e for e in entries if e["kind"] == "sweep-ledger-commit-refused")
+    published = next(e for e in entries if e["kind"] == "sweep-ledger-commit")
+    stopped = next(e for e in entries if e["kind"] == "sweep-repeat-done")
+
+    # the whole point: these two survive verbatim, on every row that carries them
+    assert failed["file"] == "deferred-work.md"
+    assert clean["file"] == "decisions.json"
+    assert published["file"] == "deferred-work.md"
+    assert refused["file"] == "deferred-work.md"
+    assert refused["refuse_cause"] == refuse_cause
+    assert stopped["stop_cause"] == stop_cause
+    # ...while every field they were minted to replace still collapses
+    assert failed["repo_present"] is True and "repo" not in failed
+    assert failed["error_present"] is True and "error" not in failed
+    assert failed["message_present"] is True and "message" not in failed
+    assert clean["message_present"] is True and "message" not in clean
+    assert published["message_present"] is True and "message" not in published
+    assert refused["message_present"] is True and "message" not in refused
+    assert "error" not in refused
+    if refuse_cause == "target-unreadable":
+        assert refused["error_present"] is True
+    else:
+        assert "error_present" not in refused
+    assert published["commit"].startswith("commit-")  # aliased, not shipped
+    assert stopped["reason_present"] is True and "reason" not in stopped
+    assert stopped["cycles"] == 2  # the unrelated field is untouched
+
+    for rendered in (markdown, json_text):
+        for canary in (repo_value, error_value, message_value, HOME_PATH, *CANARIES):
+            assert canary not in rendered, f"LEAK: {canary!r}"
+    for canary in (repo_value, error_value, message_value):
+        assert canary not in set(pseudo.legend().values()), "LEAK via legend"
+
+
+def test_a_withheld_bundle_dispatch_keeps_its_count_through_a_dump(project):
+    """Markdown preserves the withheld cycle/count and scrubs the fixed reason.
+
+    Ablation: remove `sweep-bundles-withheld` from the Markdown collected-kind
+    set; the JSON entry block disappears. JSON rendering does not use that set.
+    """
+    run_dir = _seed_run(project.project)
+    journal = Journal(run_dir)
+    journal.append("sweep-bundles-withheld", cycle=3, bundles_not_run=2, reason="ledger-unreadable")
+
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    markdown = diagnostics.render_markdown(diag, pseudo=pseudo)
+    blocks = re.findall(r"```json\n(.*?)\n```", markdown, flags=re.DOTALL)
+    assert len(blocks) == 1
+    entries = json.loads(blocks[0])
+
+    withheld = next(e for e in entries if e["kind"] == "sweep-bundles-withheld")
+    # the point: the identity of the withhold survives, not just its kind
+    assert withheld["bundles_not_run"] == 2
+    assert withheld["cycle"] == 3
+    # ...while the free-text reason collapses exactly as it does on the stop row
+    assert withheld["reason_present"] is True and "reason" not in withheld
+
+
 def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
     """`target` is a BRANCH on the merge kinds and a sprint STATUS on `board-advance-*`.
 
@@ -1901,6 +2032,88 @@ def test_non_ascii_sensitive_value_reaches_the_guard(monkeypatch):
     assert json.loads(rendered)["mystery_ref"] == alias
     assert original not in rendered
     assert json.loads(rendered)["backstop_repairs"] == {f"story:{alias}": 1}
+
+
+def test_markdown_sweep_unknown_key_fails_closed_before_the_backstop(project):
+    """An unknown key on a Markdown sweep kind never reaches the egress backstop
+    with its VALUE: the declared schema collapses it to `<name>_present` in the
+    collector, so an identifier-shaped value — the one shape `scrub_json` ships
+    verbatim — is gone before the block is serialized, and the backstop has nothing
+    to repair. The key NAME still ships, suffixed, as the table's disclosed
+    residual; the suffix also puts it past the backstop's standalone match, which
+    is why the collector, not the backstop, has to be the guard here.
+
+    Driven through the real collector and render, not `_scrub_entry`, because the
+    claim is about what the pasted block contains.
+
+    Ablation: drop `sweep-ledger-commit-clean` from `_JOURNAL_KIND_SCHEMAS` and
+    `AcmeVault` reaches the block byte-identical."""
+    run_dir = _seed_run(project.project)
+    original = "café-user"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    Journal(run_dir).append(
+        "sweep-ledger-commit-clean", file="deferred-work.md", **{original: "AcmeVault"}
+    )
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    [entry] = [e for e in diag.runs[0].journal.entries if e["kind"] == "sweep-ledger-commit-clean"]
+    assert entry[f"{original}_present"] is True
+    assert original not in entry
+    repairs: list[tuple[str, int]] = []
+
+    rendered = diagnostics.render_markdown(diag, pseudo=pseudo, repairs=repairs)
+
+    [block] = re.findall(r"```json\n(.*?)\n```", rendered, flags=re.DOTALL)
+    [published] = json.loads(block)
+    assert published[f"{original}_present"] is True
+    assert "AcmeVault" not in block, "LEAK: off-schema value reached the Markdown block"
+    assert published["file"] == "deferred-work.md"
+    assert repairs == []  # nothing left for the backstop to repair
+    assert "Backstop repairs" not in rendered
+
+
+@pytest.mark.parametrize(
+    "kind, declared",
+    [
+        ("sweep-ledger-commit", {"message": "m", "commit": "a" * 40, "file": "deferred-work.md"}),
+        ("sweep-ledger-commit-clean", {"message": "m", "file": "decisions.json"}),
+        (
+            "sweep-ledger-commit-refused",
+            {"message": "m", "file": "deferred-work.md", "refuse_cause": "target-absent"},
+        ),
+        (
+            "sweep-ledger-commit-unavailable",
+            {"message": "m", "repo": HOME_PATH, "error": "fatal", "file": "deferred-work.md"},
+        ),
+        ("sweep-repeat-done", {"cycles": 2, "reason": "no-open", "stop_cause": "no-open"}),
+    ],
+)
+def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared):
+    """The five kinds `render_markdown` prints as a JSON block carry a declared
+    schema, so a field a future producer adds WITHOUT routing collapses to a
+    presence marker instead of riding `scrub_json` into the pasted dump. Graded
+    both ways, as the `preference-escalation` row is: the off-schema value is GONE
+    and the declared identity fields (`file`, `refuse_cause`, `stop_cause`,
+    `cycles`) are NOT — a schema that flattened the record would pass an
+    absence-only assertion while destroying what the block is rendered for.
+
+    Ablation: drop `kind`'s row from `_JOURNAL_KIND_SCHEMAS` and the `AcmeVault`
+    absence assertion reds — `scrub_json` is the identity on that string."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {"ts": 2.0, "kind": kind, **declared, "customer": "AcmeVault"}, pseudo, {}, 1.0
+    )
+
+    assert "customer" not in scrubbed
+    assert scrubbed["customer_present"] is True
+    assert "AcmeVault" not in json.dumps(scrubbed), "LEAK: off-schema sweep value"
+    for name in ("file", "refuse_cause", "stop_cause", "cycles"):
+        if name in declared:
+            assert scrubbed[name] == declared[name]
+    for name in ("message", "repo", "error", "reason"):
+        if name in declared:
+            assert name not in scrubbed and scrubbed[f"{name}_present"] is True
+    if "commit" in declared:
+        assert scrubbed["commit"].startswith("commit-")
 
 
 def test_env_tmux_version_folds_a_multi_line_probe(monkeypatch):

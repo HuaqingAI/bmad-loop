@@ -174,6 +174,30 @@ class SessionRecord:
         )
 
 
+def result_mapping(result_json: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the original result dictionary, or an empty dictionary otherwise.
+
+    SessionRecord.from_dict rehydrates result_json unchecked, and third-party
+    adapters may return non-dictionaries despite the declared contract. The
+    first-party generic adapter already rejects such documents at its reader.
+    Keep the narrow annotation to catch incorrect arguments statically; the
+    runtime guard covers those untrusted producers (DW-206/DW-207).
+
+    Consumers use the existing empty-document channel for these reads, without
+    adding an error or event. This replaces falsiness-only `result_json or {}`
+    reads, which raised on truthy non-dictionaries. The raw session document
+    remains available to validators with their own shape-refusal channels.
+
+    Preserve dictionary identity so downstream reconciliation can mutate the
+    same document, including the review loop's normalized local value. Empty
+    dictionaries also retain identity; their field reads answer just as the old
+    empty substitute did. No caller's document is copied or rewritten here.
+    """
+    if isinstance(result_json, dict):
+        return result_json
+    return {}
+
+
 def _rebased_on(path: str | None, root: Path) -> str | None:
     """One persisted spec path, re-anchored on `root`; absolute values pass through.
 
@@ -799,6 +823,28 @@ class RunState:
     # run reached about it lives here.
     sweep_skipped_decisions: list[str] = field(default_factory=list)
     sweep_dropped_decisions: list[str] = field(default_factory=list)
+    # sweep runs only, and a VERDICT rather than a disposition (DW-200): ids whose
+    # `build` answer this run recorded while `record_decision` reported writing no
+    # `decision:` line. It answers a different question from the two lists above —
+    # "this answer's ledger line never landed", not "this disposition was already
+    # announced" — and neither replaces the other. Persisted because the verdict is
+    # observed in `_decisions_phase` and consumed in `_materialize_bundles`: an
+    # interruption anywhere between them must not resume into a materialized bundle
+    # for an id the ledger holds no entry for. Cleared by the drop that announces
+    # it, in the same `_save()` that quarantines the id in
+    # `sweep_dropped_decisions`. An id no later drop announces remains until the
+    # run ends; this list never doubles as a second announcement gate.
+    sweep_unlanded_decisions: list[str] = field(default_factory=list)
+    # sweep runs only: a ledger write this run published whose commit has not yet
+    # landed. Latched BEFORE the already-resolved close and each decision effect
+    # write, cleared by the ledger-family `_commit_ledger` once git says the file
+    # is at HEAD, and settled at the top of a resume. The two sites gate their own
+    # commit on THIS invocation's write result (DW-183/DW-185), and a process that
+    # dies between the publish and the commit replays as an invocation that wrote
+    # nothing — so without the debt on disk the closure the journal already claims
+    # stays dirty ahead of the cycle's bundles. A pre-latch `state.json` loads
+    # False and resumes exactly as before.
+    sweep_ledger_commit_owed: bool = False
     # auto-sweep triggers already fired this run (e.g. "epic-1", "run-end");
     # guards re-fire on resume
     sweeps_triggered: list[str] = field(default_factory=list)
@@ -892,6 +938,8 @@ class RunState:
             "sweep_cycle": self.sweep_cycle,
             "sweep_skipped_decisions": self.sweep_skipped_decisions,
             "sweep_dropped_decisions": self.sweep_dropped_decisions,
+            "sweep_unlanded_decisions": self.sweep_unlanded_decisions,
+            "sweep_ledger_commit_owed": self.sweep_ledger_commit_owed,
             "sweeps_triggered": self.sweeps_triggered,
             "sweeps_refused": self.sweeps_refused,
             "target_branch": self.target_branch,
@@ -928,6 +976,8 @@ class RunState:
             sweep_cycle=int(d.get("sweep_cycle", 1)),
             sweep_skipped_decisions=[str(s) for s in d.get("sweep_skipped_decisions", [])],
             sweep_dropped_decisions=[str(s) for s in d.get("sweep_dropped_decisions", [])],
+            sweep_unlanded_decisions=[str(s) for s in d.get("sweep_unlanded_decisions", [])],
+            sweep_ledger_commit_owed=bool(d.get("sweep_ledger_commit_owed", False)),
             sweeps_triggered=[str(s) for s in d.get("sweeps_triggered", [])],
             sweeps_refused={str(k): str(v) for k, v in d.get("sweeps_refused", {}).items()},
             target_branch=str(d.get("target_branch", "")),

@@ -49,7 +49,42 @@ class Decision:
 
 
 def _escalation_list(result_json: dict[str, Any] | None) -> list[Any]:
-    if not result_json:
+    """The `escalations` list a result document contributes, or `[]`.
+
+    Total on any input (DW-181): a non-mapping document -- a list, a string, a
+    number -- answers `[]` instead of raising `AttributeError` out of `.get`.
+    Like the DW-155/DW-170 guards in `sweep.validate_triage` /
+    `validate_migration`, what that buys is totality over parseable JSON for
+    this predicate's callers. When DW-181 wrote this guard that totality was
+    unreachable in production: `Engine._run_session` dereferenced
+    `result.result_json.get(...)` behind an `is not None` check alone and raised
+    THERE, upstream of every caller here. DW-206 routed that frame through
+    `model.result_mapping`, so a non-mapping document now survives to reach the
+    callers that still pass one RAW -- the `critical_escalations` sites reading
+    `result.result_json` directly (`sweep.py`'s triage and migration lanes,
+    `engine.py`'s review leg, and the two in this module) -- and this guard is
+    what answers it. Refused through the existing return channel -- no
+    escalation contributes, no new raise or escalation path.
+
+    Scope that reachability claim to those callers only. `preference_escalations`
+    has a single call site (`engine.py`'s review leg) and it is now handed the
+    already-normalized `rj`, so a non-mapping cannot reach this guard along that
+    path. `resolve.py` likewise pre-checks: it raises
+    `ValueError("artifact is not a JSON object")` on a non-dict artifact before
+    it ever calls `critical_escalations`.
+
+    Kept as its own `isinstance` rather than delegated to `result_mapping`, so
+    the ablation still proves this predicate total on its own -- routing it
+    through the shared helper would make that ablation vacuous.
+
+    Kept as the single shared predicate so `critical_escalations` and
+    `preference_escalations` cannot drift on what a non-list `escalations`
+    VALUE contributes -- the question `resolve.py:273-284` relies on this
+    owning.
+    """
+    if not isinstance(result_json, dict):
+        # Subsumes the old `if not result_json`: `None` refuses here, and `{}`
+        # falls through to `.get`, which returns `[]`.
         return []
     escalations = result_json.get("escalations", [])
     return escalations if isinstance(escalations, list) else []

@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import warnings
@@ -93,11 +94,13 @@ REAL_MUX_XDIST_GROUP = "real_mux_e2e"
 # tests/test_conftest.py asserts that declaration alongside the marks.
 real_mux_e2e = pytest.mark.xdist_group(REAL_MUX_XDIST_GROUP)
 
-# Hang ceiling for a real-tmux wait. Three consumer classes ride it: the hook-completion
+# Hang ceiling for a real-tmux wait. Four consumer classes ride it: the hook-completion
 # waits; the window-death wait in `test_tmux_crash_detected`, which reaches its verdict
-# through a dead window rather than a hook event; and the descendant-reap poll deadlines
+# through a dead window rather than a hook event; the descendant-reap poll deadlines
 # in `tests/test_stories_e2e.py` (DW-108), which wait on a killed child disappearing
-# rather than on any session event.
+# rather than on any session event; and the detached-fake readiness gate (DW-159) that
+# both `setsid` fakes in that module splice between `child=$!` and publication, which
+# waits inside bash on the child's own setsid(2) transition completing.
 #
 # This is a HANG DETECTOR, not a performance budget: it answers "is this session
 # wedged?" and nothing else. It is deliberately NOT tuned to observed runtimes — never
@@ -110,10 +113,15 @@ real_mux_e2e = pytest.mark.xdist_group(REAL_MUX_XDIST_GROUP)
 # Ceiling: `--dist loadgroup` now serializes every one of these onto ONE worker, so a
 # SYSTEMIC regression pays the wait once per test rather than in parallel, and the
 # Linux test job is capped at `timeout-minutes: 15` — 900s (.github/workflows/ci.yml).
-# Nine collected uses (five hook-completion cases, one crash case, and the three stories
-# reap polls) can consume up to 810s for these waits alone. The stories subprocess
-# budgets (`_run(..., timeout=90/120)`) and other overhead sit OUTSIDE this constant and
-# are additional, so this ceiling does not guarantee the whole job fits within its cap.
+# Eleven sites (five hook-completion cases, one crash case, the three stories reap polls,
+# and the readiness gate in each of the two detached fakes) nominally total 990s for
+# these waits alone — sites, not collected instances: several sit in parametrized rows.
+# The two gate sites cannot actually add their 180s on top: each is bounded from OUTSIDE
+# by the `_run(..., timeout=120)` wall its row runs under. The gate usually fires first;
+# the outer wall wins only when earlier work has used enough of that shared budget. The
+# stories subprocess budgets (`_run(..., timeout=90/120)`) and other overhead sit
+# OUTSIDE this constant and are additional, so this ceiling does not guarantee the whole
+# job fits within its cap.
 REAL_MUX_HANG_CEILING_S = 90.0
 
 
@@ -565,6 +573,28 @@ def git(repo: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
+def remove_tree(path: Path) -> None:
+    """``shutil.rmtree`` that also removes a tree holding READ-ONLY files.
+
+    Git writes every loose object ``0444``, and on Windows ``DeleteFile`` refuses a
+    file carrying the READONLY attribute (``WinError 5``), so a bare
+    ``shutil.rmtree(repo / ".git")`` — the way a test turns a sandbox into "not a git
+    repository" — dies on the first object it reaches there. POSIX never takes that
+    arm: unlink consults the parent directory's mode, never the entry's own. The bit
+    is cleared file by file up front rather than through ``rmtree``'s ``onerror``,
+    which 3.12 deprecates in favour of an ``onexc`` that 3.11 does not have.
+
+    Symlinks are not followed: ``os.walk`` lists a linked directory under ``dirs``
+    without descending (``followlinks=False``), and a linked file is skipped, so a
+    link out of the tree never passes the write bit through to its target."""
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            entry = os.path.join(root, name)
+            if not os.path.islink(entry):
+                os.chmod(entry, stat.S_IREAD | stat.S_IWRITE)
+    shutil.rmtree(path)
+
+
 NOISY_GIT_KEY = "core.fsyncMethod"
 NOISY_GIT_VALUE = "bmad-loop-not-a-method"
 
@@ -991,14 +1021,95 @@ def nested_repo_root_paths(paths: ProjectPaths) -> ProjectPaths:
     return load_paths(project)
 
 
+OUTER_DECOY_LEDGER = b"# outer ledger\n"
+
+
+def seed_outer_decoy_ledger(paths: ProjectPaths) -> tuple[Path, bytes]:
+    """Seed the OUTER project's decoy ledger under `nested_repo_root_paths`' shape.
+
+    The companion half of `nested_repo_root_paths`. Under the nested shape the
+    ledger's project-relative tail (``_bmad-output/implementation-artifacts/
+    deferred-work.md``) re-rooted at `repo_root` is *precisely* the real file a
+    `project`-rooted pathspec silently names once git resolves it in the code tree
+    — the "not merely wrong, it is SILENTLY wrong" failure the consumer rows grade.
+    So the decoy is DERIVED from `paths.deferred_work`, never re-spelled: the
+    helper's derivation and `engine._harvest_gate_exclude`'s rule move together if
+    the artifact layout ever changes.
+
+    Returns ``(path, bytes)`` rather than bare bytes because every consumer needs
+    the path too — for `is_file`/`resolve` claims and for its own `git add` seed
+    list — and a bytes-only return would leave each row re-deriving the identity by
+    hand, which is the duplication this helper exists to remove.
+
+    SEEDS ONLY: it writes the file and stops — it never stages, commits, or touches
+    the decoy again. The consumer rows turn on the decoy being left ALONE afterwards,
+    and whether it ends up tracked is each row's own premise to establish and to
+    pin, not something this helper may decide on their behalf.
+
+    The content is fixed and the path always derives from `paths`; neither is an
+    additional helper argument. Consumers share that seed while the decoy's location
+    follows the artifact layout.
+
+    Refuses input it cannot honor, and BOTH refused shapes fail silently rather than
+    loudly — which is why they are asserted rather than left to fall over on their
+    own. On COLLAPSED paths (``project == repo_root``, the plain `project` fixture)
+    the "decoy" would BE `paths.deferred_work`, so the helper would overwrite the
+    very ledger the consumer rows exclude. On DISJOINT paths (`repo_root` not an
+    ancestor of `project`, the sibling shape) nothing raises either: both operands of
+    ``paths.deferred_work.relative_to(paths.project)`` are independent of `repo_root`,
+    so the tail still resolves and the helper would happily seed a file into a tree
+    that has no outer project at all — a decoy no pathspec spelling can name, making
+    the consumer's claim vacuous instead of false. A decoy already on disk is refused
+    rather than overwritten: the consumer rows create it deliberately so the claim is
+    graded by value, and silently absorbing an inherited one would turn that premise
+    into a setup accident. All three guards fail before anything is written.
+    """
+    assert paths.project != paths.repo_root and paths.project.is_relative_to(paths.repo_root), (
+        "seed_outer_decoy_ledger needs the NESTED shape from `nested_repo_root_paths`: "
+        "`repo_root` a strict ancestor of `project`. Collapsed roots would make the "
+        "'decoy' the ledger itself, and disjoint roots have no outer ledger at all."
+    )
+    decoy = paths.repo_root / paths.deferred_work.relative_to(paths.project)
+    decoy.parent.mkdir(parents=True, exist_ok=True)
+    assert not decoy.exists(), (
+        "this row creates the outer ledger deliberately so the 'silently wrong' "
+        "claim is graded by value; inheriting one from the sandbox template would "
+        "make that premise a setup accident"
+    )
+    decoy.write_bytes(OUTER_DECOY_LEDGER)
+    return decoy, OUTER_DECOY_LEDGER
+
+
 UNRESOLVABLE = "stubbed: the provider is registered but not serving"
 
 
-def refuse_to_resolve(monkeypatch, *targets: Path) -> None:
-    """Make ``Path.resolve()`` raise WinError 64 for exactly ``targets`` — the answer
-    a registered-but-not-serving WSL UNC provider gives (#529/#536), and one CPython's
-    non-strict ``ntpath`` allow-list does not absorb, so ``resolve()`` fails outright
-    instead of degrading to its own lexical walk. That is the #552 condition.
+def refuse_to_resolve(monkeypatch, *targets: Path, error: Exception | None = None) -> None:
+    """Make ``Path.resolve()`` fail for exactly ``targets``.
+
+    By DEFAULT it raises WinError 64 — the answer a registered-but-not-serving WSL UNC
+    provider gives (#529/#536), and one CPython's non-strict ``ntpath`` allow-list does
+    not absorb, so ``resolve()`` fails outright instead of degrading to its own lexical
+    walk. That is the #552 condition, and it is what every call site written before
+    DW-195 means; the keyword is optional precisely so none of them had to be edited.
+
+    ``error`` supplies a DIFFERENT resolve fault instead. A resolve can fail in more than
+    one exception class — POSIX ``Path.resolve()`` raises ``RuntimeError`` on a symlink
+    loop, not ``OSError`` — and a caller grading a handler that catches several classes
+    needs to drive each class separately. Passing the exception here rather than
+    hand-rolling a second local ``Path.resolve`` stub keeps one shared fault seam: a
+    private stub beside this helper is the hand-rolled duplicate these conversions remove.
+
+    ``Exception``, not ``BaseException``: no production handler catches
+    ``KeyboardInterrupt``/``SystemExit``/``GeneratorExit``, so a per-class ablation driven
+    with one of those would be vacuous by construction — the arm under test could be
+    deleted and the row would still red.
+
+    The exception is RE-CONSTRUCTED from its class and args on every matching resolve
+    rather than re-raised as one object. With ~43 call sites this is a shared seam, and a
+    consumer that resolves the same target twice would otherwise accumulate
+    ``__traceback__`` frames and ``__context__`` chaining on a single instance, so the
+    second fault would carry the first one's frames. The class must therefore accept its
+    own ``args`` back, which every plain ``Exception(message)`` does.
 
     Scoped to named paths on purpose: a blanket stub would break every unrelated
     resolve in the process, and a row asserting "the command survived" would then pass
@@ -1010,7 +1121,9 @@ def refuse_to_resolve(monkeypatch, *targets: Path) -> None:
 
     def stub(self, strict: bool = False):
         if str(self) in wanted:
-            raise OSError(0, UNRESOLVABLE, None, 64)
+            if error is None:
+                raise OSError(0, UNRESOLVABLE, None, 64)
+            raise type(error)(*error.args)  # fresh per raise — see the docstring
         return real(self, strict=strict)
 
     monkeypatch.setattr(Path, "resolve", stub)

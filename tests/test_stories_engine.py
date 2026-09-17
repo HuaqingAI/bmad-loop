@@ -13,7 +13,10 @@ from conftest import (
     attach_profile,
     git,
     install_build_auto_skill,
+    nested_repo_root_paths,
+    seed_outer_decoy_ledger,
     write_gated_ledger,
+    write_ledger,
     write_spec,
 )
 
@@ -1030,6 +1033,42 @@ def test_refused_plan_halt_does_not_journal_a_proof_waiver(project, result_json)
     assert not _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
 
 
+@pytest.mark.parametrize("document", [["nope"], "escalations", 7])
+def test_non_mapping_document_selects_not_a_plan_halt_on_both_reads(project, document):
+    """DW-206: stories mode's two `plan_halt` reads, which a non-mapping document
+    now reaches for the first time.
+
+    `_run_session` guards its own reads but returns the document untouched, so
+    these two frames sit downstream of it and were previously unreachable with
+    this shape — a truthy non-mapping raised `AttributeError` upstream. Both
+    reads must be TOTAL and must agree: a document that carries no readable
+    `plan_halt` marker is not a plan-halt leg.
+
+    That answer is the safe one on both sides. `_verify_dev_artifacts` leaves
+    `plan_checkpoint_pending` False, so the run does not pause for a plan review
+    it has no plan for; and `_run_verify_commands_after_dev` returns True, so the
+    project's build/test gate still RUNS rather than being skipped as it is for a
+    real plan leg. A non-mapping must never buy a session past the gate.
+
+    ABLATION: revert either read to `(result_json or {}).get("plan_halt")` and
+    that row raises `AttributeError` instead of answering."""
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    engine, _adapter = make_engine(project, [])
+    baseline = rev_parse_head(project.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline)
+    write_spec(story_spec(project, "1"), "ready-for-dev", baseline)
+
+    outcome = engine._verify_dev_artifacts(task, document)
+
+    # not a plan halt: the checkpoint never arms, and the leg is verified as an
+    # ordinary implementation (which a ready-for-dev spec does not satisfy)
+    assert task.plan_checkpoint_pending is False
+    assert not outcome.ok
+    assert not _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    # the twin read agrees: the build/test gate is not waived
+    assert engine._run_verify_commands_after_dev(task, document) is True
+
+
 @pytest.mark.parametrize("zero_diff", [False, None], ids=["residue", "unknown"])
 def test_accepted_plan_halt_journals_the_non_clean_proof_observation(
     project, monkeypatch, zero_diff
@@ -1086,6 +1125,88 @@ def test_accepted_plan_halt_journal_excludes_engine_written(project, monkeypatch
     assert outcome.ok
     (record,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
     assert record["zero_diff"] is True
+
+
+def test_accepted_plan_halt_observation_excludes_the_nested_ledger_under_the_monorepo_shape(
+    project,
+):
+    """Grade the real producer's stories plan-halt join (DW-153).
+
+    ``StoriesEngine._verify_dev_artifacts`` passes ``_harvest_gate_exclude`` into
+    ``verify_dev_stories`` as ``engine_written`` for ``observe_skipped_proof``.
+    The nested shape makes a project-rooted spelling name a REAL outer ledger,
+    so it cannot agree with the correct root through a pathspec matching nothing.
+
+    Seed the absolute outer stories folder, whose path the engine keeps verbatim:
+    stories exclusions stay unprefixed while the ledger exclusion needs ``app/``.
+    Commit every seeded file, including the draft story, before the attempt. This
+    prevents decoy residue and forces git's exclude-pathspec branch for the append.
+    Leave the decoy alone: touching it would make even the correct root see residue.
+
+    Assert the observation before the spelling pin so the ablation fails on
+    behavior. The stand-down control proves the append is countable; an additional
+    verifier exclusion hiding it would fail that control. Check the journal first
+    because the second verification deduplicates the same attempt/generation.
+
+    Ablation, measured: set ``root = paths.project`` in ``_harvest_gate_exclude``
+    and this fails with ``plan_halt_zero_diff is False``. The unprefixed spelling
+    excludes the untouched outer decoy and counts the engine's nested append.
+    """
+    paths = nested_repo_root_paths(project)
+    assert paths.project != paths.repo_root
+    assert paths.project.parent == paths.repo_root
+
+    decoy, decoy_bytes = seed_outer_decoy_ledger(paths)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+
+    outer_spec_folder = paths.repo_root / SPEC_FOLDER
+    sp = outer_spec_folder / "stories" / "1-slug.md"
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(sp, "draft", rev_parse_head(paths.repo_root))
+    setup_stories(paths, [entry("1", spec_checkpoint=True)], spec_folder=str(outer_spec_folder))
+    # setup_stories stages repo-wide even from app/: pin every tracked seed.
+    git(
+        paths.repo_root,
+        "ls-files",
+        "--error-unmatch",
+        decoy.as_posix(),
+        paths.deferred_work.as_posix(),
+        sp.as_posix(),
+        (outer_spec_folder / "SPEC.md").as_posix(),
+        (outer_spec_folder / "stories.yaml").as_posix(),
+    )
+
+    engine, _adapter = make_engine(paths, [], spec_folder=str(outer_spec_folder))
+    assert Path(engine._spec_folder_rel).is_absolute()
+    assert engine._stories_folder() == outer_spec_folder
+    baseline = rev_parse_head(paths.repo_root)
+    task = StoryTask("1", 0, baseline_commit=baseline)
+    task.harvest_wrote_ledger = True
+
+    # The entire attempt: update the tracked plan and append the nested ledger.
+    write_spec(sp, "ready-for-dev", baseline)
+    with paths.deferred_work.open("a", encoding="utf-8") as fh:
+        fh.write("\n### DW-2: harvested from the spec\n\nstatus: open\n")
+    result_json = {"workflow": "auto-dev", "plan_halt": True}
+    outcome = engine._verify_dev_artifacts(task, result_json)
+
+    assert outcome.ok
+    assert outcome.plan_halt_zero_diff is True
+    (record,) = _kinds(engine.journal, "plan-halt-proof-of-work-skipped")
+    assert record["zero_diff"] is True
+
+    task.ledger_changed_before_harvest = True
+    control = engine._verify_dev_artifacts(task, result_json)
+    assert control.ok
+    assert control.plan_halt_zero_diff is False
+    assert engine._harvest_gate_exclude(task) == ()
+    task.ledger_changed_before_harvest = False
+    assert _kinds(engine.journal, "plan-halt-proof-of-work-skipped") == [record]
+
+    assert engine._harvest_gate_exclude(task) == (
+        "app/_bmad-output/implementation-artifacts/deferred-work.md",
+    )
+    assert decoy.is_file() and decoy.read_bytes() == decoy_bytes
 
 
 def test_replayed_plan_halt_does_not_duplicate_proof_waiver(project):
@@ -2070,6 +2191,39 @@ STORY_FINDING = {
     "location": "src/bmad_loop/stories.py:120",
     "severity": "low",
 }
+
+
+def test_stories_non_mapping_dev_result_skips_harvest_and_retries(project):
+    """A malformed result cannot select an id-keyed spec for harvesting.
+
+    Ablation: restore `_harvest_spec_path`'s `(result_json or {}).get(...)`
+    read and the first attempt crashes instead of reaching the successful retry.
+    """
+    write_ledger(project, {})
+    setup_stories(project, [entry("1")])
+    before = project.deferred_work.read_bytes()
+    malformed_effect = stories_dev_effect(deferred=[STORY_FINDING])
+    valid_effect = stories_dev_effect()
+
+    def malformed(spec):
+        malformed_effect(spec)
+        return SessionResult(status="completed", result_json=["nope"])
+
+    def retry(spec):
+        assert project.deferred_work.read_bytes() == before
+        assert not _kinds(engine.journal, "spec-deferrals-harvested")
+        return valid_effect(spec)
+
+    engine, adapter = make_engine(project, [malformed, retry])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert engine.state.tasks["1"].phase == Phase.DONE
+    assert engine.state.tasks["1"].attempt == 2
+    assert len(adapter.sessions) == 2
+    assert project.deferred_work.read_bytes() == before
+    assert not _kinds(engine.journal, "spec-deferrals-harvested")
 
 
 def test_stories_mode_harvests_spec_deferrals_into_the_ledger(project):

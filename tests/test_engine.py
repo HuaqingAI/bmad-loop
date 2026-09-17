@@ -35,6 +35,7 @@ from conftest import (
     refuse_to_resolve,
     review_effect,
     scripted_verify_runner,
+    seed_outer_decoy_ledger,
     set_sprint,
     spec_path,
     write_gated_ledger,
@@ -1850,11 +1851,16 @@ def test_resume_final_review_cycle_replays_clean_result(project):
     assert "resume-restart" not in kinds
 
 
-def test_resume_final_review_cycle_dirty_replay_defers_without_extra_budget(project):
+@pytest.mark.parametrize("malformed", [False, True])
+def test_resume_final_review_cycle_dirty_replay_defers_without_extra_budget(project, malformed):
     """The same final-cycle replay for a non-convergent review consumes the
     recorded pass, then the loop exits on the normal budget guard — no fresh
     session, no extra cycle — and the story defers. Proves the relaxed guard
-    burns no extra budget once the replayed result is consumed."""
+    burns no extra budget once the replayed result is consumed.
+
+    The malformed row rehydrates a non-mapping review document from state.json.
+    Ablation: restore `_review_and_commit`'s `rj = result.result_json or {}`
+    and that row crashes at the status read instead of deferring."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
         project,
@@ -1877,6 +1883,11 @@ def test_resume_final_review_cycle_dirty_replay_defers_without_extra_budget(proj
     engine._emit = crashing_emit
     assert engine.run().crashed
     assert load_state(engine.run_dir).tasks["1-1-a"].review_cycle == 1
+
+    if malformed:
+        engine.state.tasks["1-1-a"].sessions[-1].result_json = ["nope"]
+        engine._save()
+        assert load_state(engine.run_dir).tasks["1-1-a"].sessions[-1].result_json == ["nope"]
 
     resumed, adapter = resume_engine(project, engine, [])
     summary = resumed.run()
@@ -2198,6 +2209,118 @@ def test_run_session_record_result_json_isolated_from_later_mutation(project):
     assert task.sessions[-1].result_json == {"workflow": "auto-dev"}  # in-memory record
     saved = load_state(engine.run_dir).tasks["1-1-a"]
     assert saved.sessions[-1].result_json == {"workflow": "auto-dev"}  # on-disk snapshot
+
+
+@pytest.mark.parametrize("role", ["dev", "review"])
+@pytest.mark.parametrize(
+    "document", [["nope"], "escalations", 7, 3.5, [["a", 1]], False, 0, "", []]
+)
+def test_run_session_is_total_on_a_non_mapping_result_document(project, document, role):
+    """DW-206: `_run_session` read the raw document behind an `is not None` check
+    alone, so a non-mapping — even a falsy list, string, or number — raised
+    `AttributeError` out of `.get` at the very top of the frame, and could fail again
+    out of `dict(...)` at the record snapshot. That is one frame UPSTREAM of
+    DW-181's guards in `escalation._escalation_list` /
+    `sweep._normalize_bundle_names`, which made them unreachable on the
+    production path.
+
+    `adapters/generic.py _read_result` rejects a non-dict top level, so the
+    exposure is third-party adapters and `SessionRecord.from_dict`'s unchecked
+    rehydration — both reach the engine exactly as this mock does.
+
+    The document is refused through the existing empty-document channel: no new
+    raise, no escalation, no extra journal event. The session still completes,
+    its `session-start` is still paired with a `session-end`, and the persisted
+    snapshot is `{}` — not `None`, which would claim the session recorded no
+    payload at all.
+
+    The `[["a", 1]]` row is the reason this is parametrized rather than a single
+    case. The two old failures were NOT uniform: `.get` raised `AttributeError`
+    on every shape, but the `dict(...)` snapshot was shape-dependent —
+    `ValueError` for a list or string, `TypeError` for a number, and for a
+    pair-list it SUCCEEDED, silently persisting a fabricated `{"a": 1}` into
+    state.json as if the session had returned it. That shape corrupted rather
+    than crashed, so it is the one the crash-shaped rows would never have caught.
+
+    ABLATION: restore `result.result_json.get("post_kill_reconciled")` behind
+    `result.result_json is not None` and every row raises `AttributeError` out of
+    `_run_session`. Restore the `dict(result.result_json)` snapshot instead and
+    the truthy rows fail in three different ways — `ValueError`, `TypeError`,
+    and the pair-list row reddening on a fabricated `{"a": 1}` record. Empty
+    strings and lists already convert to `{}` and do not pin the snapshot."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [SessionResult(status="completed", result_json=document)])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    engine.state.tasks[task.story_key] = task
+    engine._save()
+
+    result = engine._run_session(task, role=role, prompt="/bmad-dev-auto 1-1-a", seq=1)
+
+    # the raw document reaches the caller untouched — the predicate reads it, it
+    # does not rewrite what the adapter returned
+    assert result.result_json == document
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.count("session-start") == 1 and kinds.count("session-end") == 1
+    # neither forensic breadcrumb fires: an unreadable document claims nothing
+    assert "session-rescued-post-kill" not in kinds
+    assert "session-synthesized-from-frontmatter" not in kinds
+    # `{}`, not `None`: both roles are resumable, so the record must say "a payload was
+    # returned and it carried nothing usable", not "no payload was persisted".
+    assert task.sessions[-1].result_json == {}
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.sessions[-1].result_json == {}
+
+
+def test_resume_from_a_rehydrated_non_mapping_dev_result_retries_instead_of_crashing(project):
+    """DW-206's OTHER entry point: the dev lane, reached without passing
+    `_run_session`'s guard at all.
+
+    `_run_session` guards its own reads but returns the document untouched, so
+    the twelve engine/stories/sweep conversions are downstream of it and need
+    their own arrival path. `SessionRecord.from_dict` rehydrates `result_json`
+    from state.json with no shape check, and `Engine._resumable_session`
+    rebuilds a `SessionResult` straight from `record.result_json` behind an
+    `is not None` check alone — so a corrupted or hand-edited run state delivers
+    a non-mapping directly into `_dev_phase`, which never re-enters
+    `_run_session` on the replay path.
+
+    It must degrade, not crash: the document claims no `spec_file`, so
+    `verify_dev` refuses it retryably and the dev leg retries into a real
+    session that succeeds.
+
+    ABLATION: revert `_dev_phase`'s `rj = result.result_json or {}` (or
+    `_harvest_spec_path` / `_post_dev_state_sync`'s reads) and the resumed run
+    comes back `crashed=True` with an `AttributeError` instead of done."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [dev_effect(project, "1-1-a")])
+
+    def crashing_emit(stage, *args, **kwargs):
+        if stage == "post_session":
+            raise RuntimeError("host died in the post-session window")
+        return original_emit(stage, *args, **kwargs)
+
+    original_emit = engine._emit
+    engine._emit = crashing_emit
+    assert engine.run().crashed
+    assert load_state(engine.run_dir).tasks["1-1-a"].phase == Phase.DEV_RUNNING
+
+    # Corrupt the durable record the way `from_dict` would happily rehydrate it.
+    engine.state.tasks["1-1-a"].sessions[0].result_json = ["nope"]
+    engine._save()
+    assert load_state(engine.run_dir).tasks["1-1-a"].sessions[0].result_json == ["nope"]
+
+    resumed, _ = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = resumed.run()
+
+    assert not summary.crashed and summary.crash_error is None
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.DONE
+    # the replayed non-mapping was refused retryably, so the leg ran again
+    assert final.attempt == 2
 
 
 def test_run_session_persists_result_json_only_for_resumable_roles(project):
@@ -2602,14 +2725,7 @@ def test_harvest_gate_exclude_names_the_prefixed_path_under_the_monorepo_shape(p
 
     # the OUTER project's ledger — the file a `project`-rooted pathspec silently
     # names when git resolves it in the code tree
-    decoy = paths.repo_root / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
-    decoy.parent.mkdir(parents=True, exist_ok=True)
-    assert not decoy.exists(), (
-        "this row creates the outer ledger deliberately so the 'silently wrong' "
-        "claim is graded by value; inheriting one from the sandbox template would "
-        "make that premise a setup accident"
-    )
-    decoy.write_text("# outer ledger\n", encoding="utf-8")
+    decoy, _ = seed_outer_decoy_ledger(paths)
 
     engine, _ = make_engine(paths, [])
     task = StoryTask(story_key="1-1-a", epic=1)
@@ -2687,15 +2803,7 @@ def test_harvest_gate_exclude_gates_the_nested_ledger_under_the_monorepo_shape(p
 
     # the OUTER project's ledger: the real file a `project`-rooted pathspec names
     # once git resolves it in the code tree
-    decoy = paths.repo_root / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
-    decoy.parent.mkdir(parents=True, exist_ok=True)
-    assert not decoy.exists(), (
-        "this row creates the outer ledger deliberately so the 'silently wrong' "
-        "claim is graded by value; inheriting one from the sandbox template would "
-        "make that premise a setup accident"
-    )
-    decoy_text = "# outer ledger\n"
-    decoy.write_text(decoy_text, encoding="utf-8")
+    decoy, decoy_bytes = seed_outer_decoy_ledger(paths)
 
     # every file the attempt below touches is seeded as TRACKED content first
     initial_baseline = verify.rev_parse_head(paths.repo_root)
@@ -2745,7 +2853,7 @@ def test_harvest_gate_exclude_gates_the_nested_ledger_under_the_monorepo_shape(p
     # the wrong spelling would have named a REAL file, and the decoy contributed no
     # residue of its own — so the refusal above is about the nested ledger being
     # excluded, not about the outer one being absent
-    assert decoy.is_file() and decoy.read_text(encoding="utf-8") == decoy_text
+    assert decoy.is_file() and decoy.read_bytes() == decoy_bytes
 
     # the same attempt with one real source edit passes, so the refusal is about the
     # missing work and not about the fixture being unusable
@@ -2807,15 +2915,7 @@ def test_accepted_park_observation_excludes_the_nested_ledger_under_the_monorepo
 
     # the OUTER project's ledger: the real file a `project`-rooted pathspec names
     # once git resolves it in the code tree
-    decoy = paths.repo_root / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
-    decoy.parent.mkdir(parents=True, exist_ok=True)
-    assert not decoy.exists(), (
-        "this row creates the outer ledger deliberately so the 'silently wrong' "
-        "claim is graded by value; inheriting one from the sandbox template would "
-        "make that premise a setup accident"
-    )
-    decoy_text = "# outer ledger\n"
-    decoy.write_text(decoy_text, encoding="utf-8")
+    decoy, decoy_bytes = seed_outer_decoy_ledger(paths)
 
     # every file the attempt below touches is seeded as TRACKED content first, at
     # PRE-park values: the flip INTO `awaiting-operator` with `operator_actions` has to
@@ -2886,7 +2986,7 @@ def test_accepted_park_observation_excludes_the_nested_ledger_under_the_monorepo
     # the wrong spelling would have named a REAL file, and the decoy contributed no
     # residue of its own — so the `True` above is about the nested ledger being
     # excluded, not about the outer one being absent
-    assert decoy.is_file() and decoy.read_text(encoding="utf-8") == decoy_text
+    assert decoy.is_file() and decoy.read_bytes() == decoy_bytes
 
 
 # ------------------- `[verify] commands` run where the SESSION ran (#695, DW-3)
@@ -7212,6 +7312,41 @@ def test_budget_exhausted_finalized_work_commits(project):
         e.open and "origin: review-budget-followup" in e.body
         for e in deferredwork.parse_ledger(ledger)
     )
+
+
+def test_review_budget_journal_survives_an_undecodable_ledger(project):
+    """DW-146's OBSERVATION row inside the engine. `_journal_review_budget_spent`
+    reads the ledger for ONE purpose — the `re_review_capped` flag on the row it is
+    about to write — and writes nothing to the ledger itself. Raising a
+    `UnicodeDecodeError` out of a journaling helper is the wrong failure: the story
+    is already committed and verify-green by the time this runs, so the fault would
+    abort a run over a flag. It degrades to the flag's own default (`False`: no
+    evidence this story came from a follow-up entry) and journals the attributed
+    fault, so the missing evidence is visible rather than indistinguishable from a
+    genuine `False`.
+    Ablation: revert the read to
+    `deferredwork.parse_ledger(ledger.read_text(encoding="utf-8"))` under an
+    `is_file()` guard and this reddens with `UnicodeDecodeError` escaping."""
+    engine, _ = make_engine(
+        project, [], policy=Policy(gates=GatesPolicy(mode="none"), notify=QUIET)
+    )
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.dw_ids = ["DW-1"]
+    ledger = engine.workspace.paths.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n")
+
+    engine._journal_review_budget_spent(task)
+
+    entries = engine.journal.entries()
+    faults = [e for e in entries if e["kind"] == "review-budget-ledger-unreadable"]
+    assert len(faults) == 1
+    assert faults[0]["ledger"] == str(ledger) and faults[0]["dw_ids"] == ["DW-1"]
+    assert faults[0]["error"].startswith("UnicodeDecodeError: ")
+    committed = [e for e in entries if e["kind"] == "review-budget-committed"]
+    assert len(committed) == 1 and committed[0]["re_review_capped"] is False
+    # nothing was written to the ledger by a journaling helper
+    assert ledger.read_bytes().endswith(b"status: open\n")
 
 
 def test_budget_exhausted_unfinalized_defers(project):
@@ -11760,6 +11895,103 @@ def test_auto_sweep_that_started_then_failed_keeps_the_trigger_spent(project):
 
     _re_ask(project, engine, policy, started_then_failed)._maybe_auto_sweep("run-end", "run-end")
     assert calls == ["run-end"]  # refused by the persisted latch
+
+
+def test_auto_sweep_records_a_child_stopped_by_a_ledger_fault_as_finished(project, monkeypatch):
+    """What the PARENT records when its child sweep cannot read the ledger — a
+    record DW-197 changed, and which no row pinned in either direction.
+
+    Before it, the child's own top-of-cycle `read_for_write` raised, `_run_inner`'s
+    nested arm re-raised, and the raise landed in `_maybe_auto_sweep`'s
+    `except (Exception, SystemExit)` arm: the parent recorded `SWEEP_REFUSED_FAILED`,
+    journaled `sweep-auto-failed` and notified. The child now STOPS instead, so the
+    factory returns plainly and the parent takes the `else` arm — trigger spent,
+    `sweep-auto-finished`, no refusal and no notification.
+
+    That is the truthful record, which is why the row asserts it rather than trying
+    to restore the old one: the child finalized its run dir and reported its own stop, with its own
+    repair notice naming the ledger. Repair is followed by a fresh sweep. The cost, named in
+    `docs/FEATURES.md` beside the other auto-sweep residuals, is that the PARENT's
+    journal no longer says anything about the ledger — the stop token lives in the
+    child's run dir. This row is where that trade is written down.
+
+    The child is driven through the real `sweep_factory` seam with a real
+    `SweepEngine`, because a factory that merely returned would be
+    indistinguishable from `..._latches_a_factory_that_never_signalled` above and
+    would grade nothing about DW-197. The fault is armed INSIDE the factory and
+    undone as it returns, so the parent's own run never meets it.
+
+    Ablation: restore the raise at `_loop`'s read (narrow `_read_cycle_ledger` to
+    `except deferredwork.LedgerReadError` alone). The parent goes back to recording
+    a failed child — `sweeps_refused == {"run-end": "failed"}`, `sweep-auto-failed`
+    journaled and `sweep-auto-finished` gone, all three verified under the mutation
+    — but the row reds first on the absent child journal. The real nested lifecycle
+    re-raises the fault before it can journal the refusal or finalize the child."""
+    from bmad_loop.sweep import SweepEngine
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-1": "open"})
+    policy = Policy(gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(auto="run-end"))
+    child_dir = project.project / ".bmad-loop" / "runs" / "child-sweep"
+
+    def faulted_child(trigger, *, started):
+        started()  # the child owns a published run dir before it reads anything
+        child_dir.mkdir(parents=True, exist_ok=True)
+        child = SweepEngine(
+            paths=project,
+            policy=Policy(
+                gates=GatesPolicy(mode="none"), notify=QUIET, sweep=SweepPolicy(repeat=True)
+            ),
+            adapter=MockAdapter([]),
+            run_dir=child_dir,
+            journal=Journal(child_dir),
+            state=RunState(run_id="child-sweep", project=str(project.project), started_at="now"),
+        )
+        fault_read_text(monkeypatch, project.deferred_work)
+        try:
+            child.run()  # exercise nested finalization as well as the loop return
+        finally:
+            monkeypatch.undo()  # the parent's own run must not meet the fault
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+        sweep_factory=faulted_child,
+    )
+    summary = engine.run()
+
+    # premise: the child really did meet the fault and really did stop on it —
+    # without this the parent's clean record below would pass for the wrong reason
+    child_journal = [
+        json.loads(line)
+        for line in (child_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    [refused] = [e for e in child_journal if e["kind"] == "sweep-cycle-ledger-refused"]
+    assert refused["reason"] == "ledger-inaccessible"
+    [done] = [e for e in child_journal if e["kind"] == "sweep-repeat-done"]
+    assert done["stop_cause"] == "ledger-inaccessible" and done["cycles"] == 0
+    child_state = load_state(child_dir)
+    assert child_state.finished and not child_state.crashed and not child_state.stopped
+    assert any(e["kind"] == "run-complete" for e in child_journal)
+
+    assert summary.done == 1 and engine.state.finished  # parent unaffected, as always
+    saved = load_state(engine.run_dir)
+    assert saved.sweeps_triggered == ["run-end"]  # a child that RAN
+    assert saved.sweeps_refused == {}  # ...and not one that failed
+    journal = (engine.run_dir / "journal.jsonl").read_text(encoding="utf-8")
+    assert "sweep-auto-finished" in journal
+    assert "sweep-auto-failed" not in journal
+    assert "sweep-auto-not-started" not in journal
+    # the parent notifies nothing: the child's own ATTENTION carries the repair
+    parent_attention = engine.run_dir / "ATTENTION"
+    assert "auto sweep failed" not in (
+        parent_attention.read_text(encoding="utf-8") if parent_attention.exists() else ""
+    )
+    assert f"repair {project.deferred_work} by hand" in (
+        (child_dir / "ATTENTION").read_text(encoding="utf-8")
+    )
 
 
 def test_auto_sweep_re_asks_a_trigger_whose_child_never_started(project):

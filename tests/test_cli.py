@@ -201,6 +201,26 @@ def test_sweep_dry_run_warns_when_preflight_would_abort(project, capsys):
     assert "NOT runnable" in capsys.readouterr().err
 
 
+def test_sweep_dry_run_refuses_an_undecodable_ledger(project, capsys):
+    """DW-146 at an operator surface. The listing read was unguarded, so
+    undecodable bytes aborted `sweep --dry-run` with `main`'s anonymous backstop.
+    It is the OBSERVATION arm — nothing is written — but degrading to an empty
+    document would print "0 open, 0 closed" for a ledger nobody could read, which
+    an operator would act on. Name the file, name the fault, and fail instead.
+    Ablation: revert the read to a bare `ledger.read_text(encoding="utf-8")` and
+    this reddens with `UnicodeDecodeError` rather than the attributed error."""
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+
+    assert cli._sweep_dry_run(project, pol) == cli.ExitCode.FAILURE
+    out, err = capsys.readouterr()
+    assert str(project.deferred_work) in err
+    assert "UnicodeDecodeError" in err
+    assert "open," not in out  # never a fabricated listing
+
+
 def test_dry_run_is_silent_when_preflight_would_pass(project, capsys):
     """The banner must be evidence, not decoration: a complete install prints
     nothing to stderr. Without this the warning could be unconditional and every
@@ -729,6 +749,94 @@ def test_decisions_json_survives_an_undecodable_triage_cache(project, capsys):
     assert [d["id"] for d in doc["decisions"]] == ["DW-1"]
 
 
+@pytest.mark.parametrize("non_object", [False, True], ids=["nested-null", "non-object"])
+def test_decisions_json_survives_a_wrong_shape_triage_cache(project, capsys, non_object):
+    """DW-155/DW-158 at the surface a caller actually sees. A cached triage that
+    decodes and parses cleanly could still hold a `null` list member, which
+    `validate_triage` iterated unscreened: `AttributeError` out of
+    `pending_missed_decisions`, past `cmd_decisions` (which catches
+    `BmadConfigError` alone) and into `main`'s broad backstop -- exit 1, NOTHING
+    on stdout, so one malformed member in one run's cache took the whole listing
+    down. `machine_json` parses the WHOLE stream, so it asserts both halves: exit
+    0 and exactly one complete document.
+
+    The good run's DW-1 still lists, so the totality degrades per FILE rather
+    than emptying the document -- the DW-145 shape, one fault class over.
+    Ablation: drop the `_plan_mapping` call in `validate_triage`'s `bundles` loop
+    and the nested-null row reddens with `AttributeError` (exit 1, empty stdout).
+    For the non-object row, remove both the reader's boundary guard and the
+    validator's top-level refusal: it then fails with exit 1 and empty stdout."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    bad = project.project / ".bmad-loop" / "runs" / "20260102-000000-bbbb"
+    bad.mkdir(parents=True, exist_ok=True)
+    (bad / "state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "20260102-000000-bbbb",
+                "project": str(project.project),
+                "started_at": "now",
+                "run_type": "sweep",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (bad / "triage.json").write_text(
+        json.dumps(
+            ["nope"]
+            if non_object
+            else {
+                "workflow": "deferred-sweep-triage",
+                "open_ids": [],
+                "already_resolved": [],
+                "bundles": [None],
+                "blocked": [],
+                "skip": [],
+                "decisions": [],
+                "escalations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    doc = _decisions_json(project, capsys, "--list")
+    assert [d["id"] for d in doc["decisions"]] == ["DW-1"]
+
+
+def test_decisions_json_survives_an_undecodable_ledger(project, capsys):
+    """DW-146's observation row at the surface a caller actually sees, mirroring
+    DW-145's. `cmd_decisions` catches `BmadConfigError` alone, so the unguarded
+    ledger read in `pending_missed_decisions` reached `main`'s broad backstop:
+    exit 1 and NO document at all. The command now still emits exactly one JSON
+    document and exits 0, listing nothing pending — an unreadable ledger has no
+    open ids to reconcile a triage against.
+
+    ...but degrading SILENTLY would be its own bug: an empty listing is
+    indistinguishable from "nothing is pending", when the truth is "nothing could
+    be read". `pending_missed_decisions` cannot say so (no journal is reachable
+    from it), so `cmd_decisions` re-probes and puts the attributed note on STDERR
+    — which is also the assertion that it stays off stdout, since `machine_json`
+    parses the whole of stdout as one document.
+    Ablation: revert that read to
+    `ledger.read_text(encoding="utf-8") if ledger.is_file() else ""` and this
+    reddens — exit 1, empty stdout; drop the `cmd_decisions` probe and it reddens
+    on the missing note instead."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_decision(project, run_id="20260101-000000-aaaa")
+    project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+
+    doc = _decisions_json(
+        project, capsys, "--list", err_contains=f"note: {project.deferred_work} cannot be read"
+    )
+    assert doc["decisions"] == []
+
+
 def test_decisions_answer_records_and_carries_forward(project, capsys, monkeypatch):
     from conftest import write_ledger
 
@@ -750,6 +858,304 @@ def test_decisions_answer_records_and_carries_forward(project, capsys, monkeypat
     assert stored["DW-1"]["effect"] == "build"
     # and it no longer shows as pending
     assert decisions.pending_missed_decisions(project.project) == []
+
+
+def _make_run_with_two_decisions(project, run_id="20260101-000000-aaaa"):
+    """`_make_run_with_decision`'s two-decision sibling (options `1`=build,
+    `2`=keep-open), so a walk has somewhere to continue to after the first."""
+    run_dir = project.project / ".bmad-loop" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "project": str(project.project),
+                "started_at": "now",
+                "run_type": "sweep",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "triage.json").write_text(
+        json.dumps(
+            {
+                "workflow": "deferred-sweep-triage",
+                "open_ids": ["DW-1", "DW-2"],
+                "already_resolved": [],
+                "bundles": [],
+                "blocked": [],
+                "skip": [],
+                "decisions": [
+                    {
+                        "id": dw_id,
+                        "question": f"build the widening for {dw_id}?",
+                        "context": "ctx",
+                        "options": [
+                            {"key": "1", "label": "Widen", "effect": "build", "intent": "widen it"},
+                            {"key": "2", "label": "Keep", "effect": "keep-open"},
+                        ],
+                        "recommendation": "1",
+                    }
+                    for dw_id in ("DW-1", "DW-2")
+                ],
+                "escalations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_decisions_reports_a_close_the_ledger_never_took(project, capsys, monkeypatch):
+    """The lie DW-198 removes: `apply_pre_answer` discarded `record_decision`'s
+    False, so this loop read every non-exception as a success and printed
+    `closed now` for an entry the ledger holds no `decision:` line for.
+
+    Reproduced with a rival writer rather than a hand-made pending decision:
+    `pending_missed_decisions` only offers ids the ledger currently has open, so
+    the entry has to vanish AFTER the listing and BEFORE the record — from inside
+    `ask`, which is exactly where the real prompt blocks on the human.
+
+    Exit 0 is asserted deliberately: a non-write is a degrade, not a failure, and
+    the command's exit codes are a compatibility contract.
+
+    Ablation: hardcode `recorded=True` on `apply_pre_answer`'s `PreAnswerResult`,
+    or drop the `if not result.recorded` arm here, and this reddens on `closed now`."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    _make_run_with_rich_decision(project)
+
+    class _StubPrompter:
+        def ask(self, decision):
+            # a rival writer retired the entry while this prompt blocked
+            write_ledger(project, {"DW-2": "open"})
+            return decision.option("2")  # choose close
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert "closed now" not in out
+    # Ablation: append the saved-answer suffix for close; this assertion fails.
+    assert "saved to the pre-answer store" not in out
+    assert "DW-1: no decision line was written: the ledger holds no entry for this id" in out
+
+
+def test_decisions_names_an_absent_ledger_rather_than_a_missing_entry(project, capsys, monkeypatch):
+    """The other of `record_decision`'s two False states, and why the outcome line
+    re-probes `is_file()` to say which fired: a retired id is one entry, where a
+    ledger that is gone took every `decision:` line the walk already wrote with it.
+
+    Ablation: collapse the two-state probe to the single "holds no entry" sentence
+    and this reddens while the sibling above still passes."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_rich_decision(project)
+
+    class _StubPrompter:
+        def ask(self, decision):
+            project.deferred_work.unlink()  # the whole ledger went, mid-prompt
+            return decision.option("2")  # choose close
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert "closed now" not in out
+    # Ablation: append the saved-answer suffix for close; this assertion fails.
+    assert "saved to the pre-answer store" not in out
+    assert "DW-1: no decision line was written: the ledger file is gone" in out
+
+
+def test_decisions_names_a_written_answer_it_could_not_publish(project, capsys, monkeypatch):
+    """DW-209/213 on this surface. The commit's operand list is already gated on
+    what the call WROTE, so a publishable-target refusal means an answer that
+    really landed on disk is missing from git history — worth telling the human
+    about, unlike the swallowed `GitError` beside it.
+
+    Reported ON TOP of the ordinary outcome rather than replacing it: the record
+    succeeded, so `queued — the next sweep will build it` still stands, exit 0 is
+    unchanged (a refusal is a degrade, not a failure), and the walk still advances
+    to DW-2.
+
+    Ablation: drop the `result.publish_note()` append in `cmd_decisions` and this
+    reddens on the `not committed to git` assertion while every other one here
+    still passes."""
+    from conftest import write_ledger
+
+    from bmad_loop import verify
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    _make_run_with_two_decisions(project)
+    asked = []
+
+    class _StubPrompter:
+        def ask(self, decision):
+            asked.append(decision.id)
+            return decision.option("1")  # build
+
+    # The race the guard exists for: both written operands go unpublishable
+    # between the write and the staging.
+    monkeypatch.setattr(verify, "unpublishable_target", lambda _t, _f: ("target-absent", None))
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+
+    assert asked == ["DW-1", "DW-2"]
+    out = capsys.readouterr().out
+    assert (
+        "DW-1: queued — the next sweep will build it; "
+        "not committed to git: deferred-work.md (target-absent), "
+        "decisions.json (target-absent)" in out
+    )
+    assert "DW-2: queued" in out
+
+
+def test_decisions_continues_when_the_non_write_diagnostic_probe_fails(
+    project, capsys, monkeypatch
+):
+    """A later observation failure must not abort a completed non-write.
+
+    Ablation: remove the diagnostic probe's OSError handler and the command
+    returns failure before asking DW-2.
+    """
+    from conftest import write_ledger
+
+    from bmad_loop import decisions
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    _make_run_with_two_decisions(project)
+    asked = []
+
+    class _StubPrompter:
+        def ask(self, decision):
+            asked.append(decision.id)
+            if decision.id == "DW-1":
+                write_ledger(project, {"DW-2": "open"})
+            return decision.option("1")
+
+    apply = decisions.apply_pre_answer
+    is_file = Path.is_file
+    probe_faults = []
+
+    def failing_probe(path):
+        if path == project.deferred_work:
+            # Only the diagnostic fails; later decisions see the recovered FS.
+            monkeypatch.setattr(Path, "is_file", is_file)
+            probe_faults.append(path)
+            raise PermissionError("ledger observation denied")
+        return is_file(path)
+
+    def record_then_fail_probe(*args, **kwargs):
+        result = apply(*args, **kwargs)
+        if not result.recorded:
+            monkeypatch.setattr(Path, "is_file", failing_probe)
+        return result
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+    monkeypatch.setattr(decisions, "apply_pre_answer", record_then_fail_probe)
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+    assert probe_faults == [project.deferred_work]
+    assert asked == ["DW-1", "DW-2"]
+    out = capsys.readouterr().out
+    assert (
+        "DW-1: no decision line was written; ledger state unavailable; "
+        "your answer was saved to the pre-answer store" in out
+    )
+    assert "DW-2: queued — the next sweep will build it" in out
+    assert decisions.load_pre_answers(project.project)["DW-1"]["effect"] == "build"
+
+
+def test_decisions_build_non_write_still_reports_the_saved_answer(project, capsys, monkeypatch):
+    """A non-write must not deny what DID land, and must not promise what will not.
+    The pre-answer store write runs regardless of the ledger, so the answer really
+    was saved and the line says exactly that — but NOT that the next sweep will
+    build it, which is false: a sweep's triage is derived from the ledger's open
+    ids, so a retired id is never surfaced again, nothing materializes, and
+    `_prune_pre_answers` drops the stored answer as no longer open. Annotating the
+    old outcome (`queued — the next sweep will build it, but ...`) would keep that
+    promise alive, so the outcome is replaced outright for every effect.
+
+    The walk continuing is asserted through DW-2's own outcome line: a loop that
+    returned or raised on the non-write would never print it."""
+    from conftest import write_ledger
+
+    from bmad_loop import decisions
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    _make_run_with_two_decisions(project)
+
+    class _StubPrompter:
+        def ask(self, decision):
+            if decision.id == "DW-1":
+                write_ledger(project, {"DW-2": "open"})  # DW-1 retired mid-prompt
+            return decision.option("1")  # choose build
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert (
+        "DW-1: no decision line was written: the ledger holds no entry for this id; "
+        "your answer was saved to the pre-answer store" in out
+    )
+    # the promise the annotated wording used to carry, on the line that cannot keep it
+    assert "DW-1: queued" not in out
+    # the walk carried on, and the entry the ledger still had got the plain outcome
+    assert "DW-2: queued — the next sweep will build it\n" in out
+    # ...and the answer really is saved, which is all the line above claims
+    stored = decisions.load_pre_answers(project.project)
+    assert stored["DW-1"]["effect"] == "build"
+    assert decisions.pending_missed_decisions(project.project) == []
+
+
+def test_decisions_keep_open_non_write_drops_the_recorded_claim(project, capsys, monkeypatch):
+    """The third effect's lane, and the one whose old wording was self-contradictory:
+    `kept open (recorded)` annotated with a non-write reads "recorded ... but nothing
+    was written", where `(recorded)` is the exact claim the annotation retracts. Every
+    effect's outcome is replaced outright for that reason, not annotated.
+
+    Like the `build` sibling, the line still states what DID land — the pre-answer
+    store write ran — and promises nothing about a later sweep.
+
+    Ablation: annotate rather than replace (`outcome = f"{outcome}, but {miss}"`) and
+    this reddens on the `(recorded)` assertion."""
+    from conftest import write_ledger
+
+    from bmad_loop import decisions
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    _make_run_with_two_decisions(project)
+
+    class _StubPrompter:
+        def ask(self, decision):
+            if decision.id == "DW-1":
+                write_ledger(project, {"DW-2": "open"})  # DW-1 retired mid-prompt
+            return decision.option("2")  # choose keep-open
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert (
+        "DW-1: no decision line was written: the ledger holds no entry for this id; "
+        "your answer was saved to the pre-answer store" in out
+    )
+    assert "(recorded)" not in out.split("DW-2")[0]  # not on DW-1's line
+    # the answer really was saved, which is the only thing that line claims
+    assert decisions.load_pre_answers(project.project)["DW-1"]["effect"] == "keep-open"
 
 
 def test_decisions_names_the_decision_a_bad_date_failed(project, capsys, monkeypatch):
@@ -782,6 +1188,53 @@ def test_decisions_names_the_decision_a_bad_date_failed(project, capsys, monkeyp
     assert "could not record DW-1" in captured.err
     assert "date must be YYYY-MM-DD" in captured.err
     assert decisions.load_pre_answers(project.project) == {}  # nothing recorded
+
+
+def test_decisions_names_the_decision_an_undecodable_ledger_failed(project, capsys, monkeypatch):
+    """The third reachable member of the same tuple, and the one DW-146 created.
+
+    `record_decision`'s locked read is a REPAIR/WRITE site, so an undecodable ledger
+    raises `deferredwork.LedgerReadError` instead of writing a ledger rebuilt from
+    `""`. That fault used to reach this handler as a `ValueError` (a
+    `UnicodeDecodeError` is one); retyping it to a plain `Exception` — deliberately,
+    so no `except OSError` can swallow it — dropped it out of the tuple, and with it
+    the `DW-1` attribution this arm exists for.
+
+    Reproduced the way the broken-config row is, by corrupting the file from inside
+    `ask` rather than by patching `apply_pre_answer` to raise: `prompter.ask` blocks
+    on the human, so the ledger really can go bad after this command's own read
+    succeeded, and the live locked read is what fails.
+
+    Ablation: drop `deferredwork.LedgerReadError` from the tuple and this reddens on
+    the `could not record DW-1` prefix — `main`'s bare tail still exits 1 and still
+    prints the codec text, just with nothing saying which decision did not land.
+    Byte-preservation ablation: rewrite the heading before raising LedgerReadError;
+    the exact-byte assertion fails even though the status line remains open."""
+    from conftest import write_ledger
+
+    from bmad_loop import decisions
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_decision(project)
+    corrupted = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
+
+    class _StubPrompter:
+        def ask(self, decision):
+            # the ledger went bad while this prompt was blocking on the human
+            project.deferred_work.write_bytes(corrupted)
+            return decision.option("1")
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 1
+
+    captured = capsys.readouterr()
+    assert "could not record DW-1" in captured.err
+    assert "not valid UTF-8" in captured.err
+    assert decisions.load_pre_answers(project.project) == {}  # nothing recorded
+    # ...and nothing was written to the ledger nobody could read.
+    assert project.deferred_work.read_bytes() == corrupted
 
 
 def test_decisions_names_the_decision_a_broken_config_failed(project, capsys, monkeypatch):
@@ -832,6 +1285,56 @@ def test_status_surfaces_missed_decision_count(project, capsys):
     # status needs a run to report; the decision run dir doubles as one
     assert cli.main(["status", "--project", str(project.project)]) == 0
     assert "decisions awaiting an answer: 1" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("fault", ["undecodable", "metadata"])
+def test_status_drops_the_decision_line_for_an_unreadable_ledger(
+    project, capsys, monkeypatch, fault
+):
+    """The sibling above's negative, and the surface where the OBSERVATION arm's
+    silence lands. `cmd_status` wraps `pending_missed_decisions` in `except
+    BmadConfigError` alone, so every other fault the helper degrades reaches it as an
+    empty list: the decision line simply does not print, and status still exits 0
+    with the rest of its report intact. That is the intended shape — a ledger this
+    command was not asked to repair must not take the whole status report down — but
+    nothing pinned it in either direction.
+
+    Both legs of the guard are graded. `undecodable` was already degraded by DW-146's
+    `read_for_observation` conversion. `metadata` is the leg moving `is_file()` inside
+    that helper's try created: an `EACCES`-class fault on the probe used to escape the
+    helper entirely and reach `main`'s backstop as exit 1, so this row is the only
+    thing that would notice it silently becoming exit 0.
+
+    Ablation: hoisting `read_for_observation`'s `is_file()` back above its `try`
+    reddens the `metadata` row alone, on the exit code (1, from `main`'s backstop) —
+    the leg isolated to this build. Reverting
+    `decisions.pending_missed_decisions`' read to
+    `ledger.read_text(encoding="utf-8") if ledger.is_file() else ""` reddens BOTH
+    rows, since that bare read re-exposes the codec error and the bare `is_file()`
+    beside it re-exposes the metadata fault; verified in both directions."""
+    from conftest import write_ledger, write_sprint
+
+    install_bmad_config(project)
+    write_sprint(project, {})
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_decision(project, run_id="20260102-000000-bbbb")
+    if fault == "undecodable":
+        project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+    else:
+        ledger, real = project.deferred_work, Path.is_file
+
+        def boom(self, *a, **kw):
+            if self == ledger:
+                raise PermissionError(13, "Permission denied")
+            return real(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "is_file", boom)
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert "decisions awaiting an answer" not in out
+    assert "sprint backlog remaining" in out  # the rest of the report still landed
 
 
 def _make_run_with_tokens(project, tasks, *, weight, run_id="20260101-000000-aaaa"):

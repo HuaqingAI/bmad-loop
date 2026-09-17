@@ -1596,6 +1596,10 @@ def _validate_deferred_ledger(
     here, and swapping the two lines changes no severity and no exit code.
     """
     ledger = paths.deferred_work
+    # OBSERVATION arm of the ledger-read contract (DW-146), kept inline rather than
+    # routed through `read_for_observation`: `validate` writes nothing, but it has
+    # to REPORT the fault as a graded problem rather than degrade quietly to an
+    # empty ledger — see the reasoning below. Same classification, richer response.
     try:
         text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
     except (OSError, UnicodeDecodeError) as e:
@@ -2597,7 +2601,14 @@ def _sweep_dry_run(
                 return ExitCode.FAILURE
         print(f"no deferred-work ledger at {ledger}")
         return 0
-    text = ledger.read_text(encoding="utf-8")
+    # OBSERVATION arm of the ledger-read contract (DW-146): this listing writes
+    # nothing, but it is an OPERATOR SURFACE, so degrading to an empty document
+    # would report "0 open" for a ledger nobody could read — a fabricated listing
+    # is worse than no listing. Say which file and which fault, and fail.
+    text, fault = deferredwork.read_for_observation(ledger)
+    if fault is not None:
+        print(f"error: {ledger} cannot be read ({fault})", file=sys.stderr)
+        return ExitCode.FAILURE
     entries = deferredwork.parse_ledger(text)
     open_entries = [e for e in entries if e.open]
     legacy = deferredwork.parse_legacy(text)
@@ -4007,10 +4018,36 @@ def cmd_decisions(args: argparse.Namespace) -> int:
 
     project = _project(args)
     try:
+        paths = bmadconfig.load_paths(project)
         pending = decisions.pending_missed_decisions(project)
     except bmadconfig.BmadConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    # The OBSERVATION arm's evidence, surfaced HERE because it cannot be surfaced
+    # where the degrade happens (DW-146). `pending_missed_decisions` reads the
+    # ledger through `read_for_observation` and discards the fault, because no
+    # journal is reachable from a module-level function handed only a project path
+    # — so an unreadable ledger yields no open ids and this command would print
+    # "no unanswered decisions from past sweeps" and exit 0. That is indisputably
+    # the WRONG silence: the answer is not "nothing is pending", it is "nothing
+    # could be read". The contract says an observation site degrades with an
+    # attributed fault, and for this one the operator's own terminal is the only
+    # place the attribution can land. Same probe the helper runs, so the two
+    # cannot disagree about whether the file is readable.
+    #
+    # stderr, never stdout: `--json` promises exactly one document on stdout, and
+    # a note there would corrupt the contract for every machine consumer. Exit
+    # stays 0 for the same reason `_sweep_dry_run` does NOT — nothing here is
+    # fabricated, the empty listing is honest once the note explains it, and an
+    # operator answering an unrelated decision must not be blocked by a ledger
+    # this command was not asked to repair.
+    _, ledger_fault = deferredwork.read_for_observation(paths.deferred_work)
+    if ledger_fault is not None:
+        print(
+            f"note: {paths.deferred_work} cannot be read ({ledger_fault}) — "
+            "no pending decisions could be resolved from it",
+            file=sys.stderr,
+        )
     if args.json:
         # Before the empty-set early return (nothing pending is a valid empty
         # document, not the text line), and regardless of --list: --json *is*
@@ -4037,8 +4074,14 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     for decision in pending:
         option = prompter.ask(decision)
         try:
-            decisions.apply_pre_answer(project, decision, option, date=today)
-        except (OSError, bmadconfig.BmadConfigError, ValueError, runs.StateRootError) as e:
+            result = decisions.apply_pre_answer(project, decision, option, date=today)
+        except (
+            OSError,
+            bmadconfig.BmadConfigError,
+            ValueError,
+            runs.StateRootError,
+            deferredwork.LedgerReadError,
+        ) as e:
             # What this buys is the `{decision.id}` in the message, and only
             # that: `main`'s tail catches BmadConfigError by name and everything
             # else through a bare `except Exception`, so none of these ever
@@ -4061,6 +4104,16 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             # or broken mid-prompt raises here even though the read at the top of
             # this command succeeded. Leaving it out gave the likelier failure the
             # worse message.
+            #
+            # LedgerReadError is the SAME reachable shape as BmadConfigError, and it
+            # is here for the same reason (DW-146). `prompter.ask` blocks on the
+            # human, so a ledger that goes undecodable while the prompt is open
+            # raises out of `record_decision`'s locked `read_for_write` — the exact
+            # failure this tuple used to catch as a bare `ValueError`, back when the
+            # codec error escaped untyped. Retyping it to a plain `Exception` is what
+            # dropped it out of this handler; naming it puts it back, so the
+            # attribution this arm exists for is not lost to the contract that made
+            # the fault attributable.
             print(f"error: could not record {decision.id}: {e}", file=sys.stderr)
             return 1
         if option.effect == "close":
@@ -4069,6 +4122,33 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             outcome = "queued — the next sweep will build it"
         else:
             outcome = "kept open (recorded)"
+        if not result.recorded:
+            # Replace success claims with what apply_pre_answer actually persisted.
+            # This later probe is only diagnostic: paths predates the prompt and
+            # may differ from the writer's reloaded config. A probe fault must not
+            # turn a completed non-write into a failed walk.
+            outcome = "no decision line was written"
+            try:
+                why = (
+                    "the ledger file is gone"
+                    if not paths.deferred_work.is_file()
+                    else "the ledger holds no entry for this id"
+                )
+            except OSError:
+                outcome += "; ledger state unavailable"
+            else:
+                outcome += f": {why}"
+            if option.effect != "close":
+                outcome += "; your answer was saved to the pre-answer store"
+        # A written operand that could not be published (DW-209/213). Separate from
+        # the non-write above and reportable on TOP of a successful record: the
+        # operand list is already gated on what the call wrote, so a refusal means
+        # an answer that really landed on disk is missing from git history. It is
+        # not an error — the exit code, the walk and the outcome wording above are
+        # all unchanged by it.
+        note = result.publish_note()
+        if note is not None:
+            outcome += f"; {note}"
         print(f"  {decision.id}: {outcome}")
     print("\nrun `bmad-loop sweep` to act on any builds.")
     return 0

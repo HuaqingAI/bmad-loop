@@ -18,19 +18,47 @@ the entry simply leaves the open set.
 
 Layering note: this module sits above sweep.py (it reuses Decision/validate_triage
 and the deterministic ledger helpers). sweep.py imports it lazily to avoid a cycle.
+
+Concurrency (#286/#469, DW-161): the store is a second orchestrator-written file
+with the ledger's exact exposure — a `bmad-loop decisions` answer, the TUI
+decision modal and a sweep can all reach it at once, and each writer here is a
+read->edit->write of the WHOLE file, so unserialized they trade last-write-wins
+and a human's answer vanishes. All three writers (`record_pre_answer`,
+`prune_pre_answers`, `drop_pre_answer`) therefore run their whole cycle under
+:func:`deferredwork.ledger_lock` keyed on the STORE path.
+
+Reused rather than twinned, and precisely one thing is shared. NOT the OS lock:
+`runs.lock_path_for` keys each sidecar on `sha256(resolved path)[:16]`, so the
+ledger and the store take DIFFERENT locks and exclude nobody from each other —
+correctly, since they are different files with different writers. What is shared
+is `ledger_lock`'s thread-local NESTING guard, which is path-agnostic, and its
+consequence is the whole point: no caller may hold both at once, in either
+order. A second helper would mean two independent guards, and a caller could
+then hold the ledger and the store simultaneously with neither noticing — the
+lock-ordering hazard this avoids by construction rather than by convention. The
+hold covers file I/O only, never a subprocess: `apply_pre_answer`'s commit stays
+outside it, and it takes the two locks in sequence, never nested.
+
+Readers stay lock-free on purpose (`load_pre_answers`, `pending_missed_decisions`,
+`_decisions_phase`'s seeding read): every write replaces the file atomically, so
+a reader already sees one whole version or another. And a conditional writer
+handed nothing to do answers from ONE advisory read taken above the lock (#736)
+— it publishes no bytes, so it linearizes at that read and there is nothing for a
+rival to interleave with. That is what keeps `drop_pre_answer` for an id the
+store never held — the common case — from newly failing on an acquisition it did
+not need.
 """
 
 from __future__ import annotations
 
 import json
 import re
-import threading
-from collections.abc import Iterator
-from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from . import bmadconfig, deferredwork, runs, verify
-from .platform_util import atomic_write_text_confined, file_lock
+from .platform_util import atomic_write_text_confined
 from .sweep import Decision, DecisionOption, unusable_answer_reason, validate_triage
 
 STORE_REL = Path(".bmad-loop") / "decisions.json"
@@ -66,52 +94,6 @@ def load_pre_answers(project: Path) -> dict[str, dict]:
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
-
-
-# Per-thread reentrancy guard for :func:`store_lock`, the same shape as
-# `deferredwork._LOCK_STATE` and for the same reason: `file_lock` is per open fd,
-# so a nested acquisition from the thread that holds it blocks forever on POSIX.
-_LOCK_STATE = threading.local()
-
-
-@contextmanager
-def store_lock(project: Path) -> Iterator[None]:
-    """Cross-process mutual exclusion for one project's pre-answer store — the
-    store's `deferredwork.ledger_lock`.
-
-    The store has two writers that do not share a process: a sweep (`_prune_pre_answers`
-    and the DW-143 prune at a stale drop) and the human's `bmad-loop decisions`
-    (`record_pre_answer`, via `apply_pre_answer`). Every writer is a whole-file
-    read->edit->write, and `_write_store`'s atomic replace protects only the write:
-    two writers that both read, both edit and both publish let the last replace win,
-    and the one it beats is a human's answer. Worse for the DW-143 prune, whose
-    *whole point* is to compare before it deletes — a replacement recorded between
-    its read and its write is exactly the value the compare exists to spare, and an
-    unlocked compare cannot see it. Under the lock the compare and the delete are
-    one step, so a replacement lands either before the read (and compares unequal)
-    or after the write (and is untouched); there is no third interleaving.
-
-    Held only around that one read->edit->write — never across a subprocess, a
-    session or a prompt (`apply_pre_answer` commits OUTSIDE it, the way the ledger
-    lock's holders do), because `file_lock`'s Windows branch gives up after ~10 s and
-    raises. Nesting raises `RuntimeError` rather than self-deadlocking, and a failed
-    acquisition propagates (`OSError`, `runs.StateRootError`): a write that could not
-    be serialized fails loudly, never proceeds unlocked. Distinct from the ledger's
-    lock (a different sidecar for a different file), so a caller holding neither is
-    free to take either; nothing needs both, and nothing should.
-
-    The sidecar lives under the state root, not beside the store, for the reason
-    `runs.lock_path_for` gives: the store is a tracked file the sweep commits with
-    `add -A`, and a lock beside it would ride into those commits."""
-    if getattr(_LOCK_STATE, "held", False):
-        raise RuntimeError("pre-answer store lock is not reentrant")
-    lock_path = runs.lock_path_for(store_path(project))
-    _LOCK_STATE.held = True
-    try:
-        with file_lock(lock_path):
-            yield
-    finally:
-        _LOCK_STATE.held = False
 
 
 def _write_store(project: Path, data: dict) -> None:
@@ -151,8 +133,19 @@ def record_pre_answer(project: Path, dw_id: str, option: DecisionOption, *, date
     """Persist a chosen option so a future sweep applies it without asking. The
     option's full semantics are stored (not just its key): a later triage may
     renumber options, so the sweep reads effect/intent from here directly.
-    One locked read->edit->write (`store_lock`), like every writer here."""
-    with store_lock(project):
+
+    ONE locked read->edit->write (#286/#469, DW-161): unserialized, an answer
+    recorded here between a rival writer's load and its write was overwritten
+    wholesale — the store is read-modify-written in full, so the loser's entry
+    does not survive as a merge, it disappears. No advisory probe: this writer
+    always publishes bytes, so there is no read-provable no-op to answer above
+    the lock. Called as `deferredwork.ledger_lock(...)` — the module attribute,
+    not a `from ... import` binding — which is how this module reaches every
+    `deferredwork` entry point it uses: the lock lives next to the ledger it was
+    written for, and calling it through its home module keeps that ownership
+    legible at the call site instead of aliasing it in here."""
+    path = store_path(project)
+    with deferredwork.ledger_lock(path):
         data = load_pre_answers(project)
         data[dw_id] = {
             "key": option.key,
@@ -166,18 +159,62 @@ def record_pre_answer(project: Path, dw_id: str, option: DecisionOption, *, date
         _write_store(project, data)
 
 
+def _prunable_ids(data: dict[str, dict], open_ids: set[str]) -> list[str]:
+    """The store ids `prune_pre_answers` drops: those no longer in the open set.
+
+    Pure, and module-level rather than inlined at each arm, for the reason
+    `deferredwork`'s Concurrency note requires of every #736 probe — the advisory
+    read and the authoritative locked read must run "the same pure decision
+    helper ... so the two cannot drift". Two identical comprehensions satisfy
+    that only by textual coincidence: edit one and the probe starts answering a
+    question the hold does not ask, which is a silent lost update in the one
+    direction the probe is allowed to skip the lock."""
+    return [k for k in data if k not in open_ids]
+
+
+def _droppable(data: dict[str, dict], dw_id: str, answer: object) -> bool:
+    """Whether `drop_pre_answer` removes `dw_id`: present, and still `answer`.
+    Pure and shared by its probe and its hold, for `_prunable_ids`'s reason."""
+    return dw_id in data and data[dw_id] == answer
+
+
 def prune_pre_answers(project: Path, open_ids: set[str]) -> list[str]:
     """Drop store entries whose DW id is no longer open (built or closed). No-op
-    write when nothing is dropped. Returns the dropped ids. One locked
-    read->edit->write (`store_lock`), like every writer here."""
-    with store_lock(project):
+    write when nothing is dropped. Returns the dropped ids.
+
+    ONE locked read->edit->write (#286/#469, DW-161), like every writer here: the
+    read that decides WHICH ids survive and the write that publishes them sit
+    inside one hold, so a `bmad-loop decisions` answer recorded in that window is
+    read by this prune rather than erased by it.
+
+    The pre-lock read is an ADVISORY probe (#736) running :func:`_prunable_ids`,
+    the same pure selection the locked pass runs, and only its "nothing to drop"
+    answer is acted on — the overwhelmingly common outcome, since most cycles
+    consume no pre-answer. Such a call publishes no bytes and linearizes at the
+    probe read. Any other answer falls through to the hold, which re-reads and
+    re-decides authoritatively.
+
+    No `try:` around the probe, and that is a DIFFERENT arrangement from
+    `record_decision`'s, not a shorter spelling of it. That probe wraps its raw
+    `read_text` in `except Exception` so a read fault falls THROUGH to the hold,
+    which re-reads and decides. Here `load_pre_answers` is total — a missing,
+    unreadable, unparseable, non-UTF-8 or non-dict store all degrade to `{}` — so
+    a read fault does not fall through at all: it becomes a decisive "nothing to
+    prune" and the hold is skipped. That is exactly what an unreadable store did
+    before DW-161, when this function was unlocked and read through the same
+    total helper, so it is PRESERVED behavior rather than a new degradation — and
+    it is the tolerant reader this module refuses to turn into a repair site."""
+    path = store_path(project)
+    if not _prunable_ids(load_pre_answers(project), open_ids):
+        return []  # ADVISORY probe (#736): nothing to write, so nothing to serialize
+    with deferredwork.ledger_lock(path):
         data = load_pre_answers(project)
-        dropped = [k for k in data if k not in open_ids]
+        dropped = _prunable_ids(data, open_ids)
         if dropped:
             for k in dropped:
                 del data[k]
             _write_store(project, data)
-    return dropped
+        return dropped
 
 
 def drop_pre_answer(project: Path, dw_id: str, *, answer: object) -> bool:
@@ -202,7 +239,7 @@ def drop_pre_answer(project: Path, dw_id: str, *, answer: object) -> bool:
     in-run answer never equals a store entry at all (different shape), so an id a
     run answered itself never reaches this store through the drop.
 
-    The compare and the delete are ONE step under `store_lock`: without it a
+    The compare and the delete are ONE step under the hold: without it a
     replacement recorded between the read and the write — by `bmad-loop decisions`
     in another process — is precisely the value the compare exists to spare, and
     the stale snapshot would overwrite it. Under the lock a replacement lands
@@ -220,14 +257,40 @@ def drop_pre_answer(project: Path, dw_id: str, *, answer: object) -> bool:
     whose answer only ever lived in `<run>/decisions.json` leaves the project
     store's bytes (and mtime) untouched. A removal goes through `_write_store`, so
     an operator-locked store still raises `PermissionError` rather than silently
-    skipping — deleting a human-authored answer is a store write, never a repair."""
-    with store_lock(project):
+    skipping — deleting a human-authored answer is a store write, never a repair.
+    The `PermissionError` is raised under the hold and propagates through it; the
+    lock is released on the way out.
+
+    ONE locked read->edit->write (#286/#469, DW-161) with an ADVISORY pre-lock
+    probe (#736): an absent or replaced id is answered from the probe read, so the
+    no-op keeps taking no lock at all. That is load-bearing rather than an
+    optimization — the absent-id case is the ordinary one (a stale answer that
+    only ever lived in `<run>/decisions.json` has no store entry),
+    `_prune_dropped_pre_answer` swallows nothing, and without the probe those
+    calls would newly raise `runs.StateRootError` where no state root is
+    derivable, or a Windows acquisition timeout, on a call that used to return
+    `False` in silence. Probe and hold both decide through :func:`_droppable`,
+    for the reason `_prunable_ids` gives: the probe may only skip the lock on the
+    exact question the hold would ask.
+
+    The probe needs no `try:`, and for a different reason than
+    `record_decision`'s has one. That probe guards a raw `read_text` so a fault
+    falls THROUGH to the hold; `load_pre_answers` is total, so a fault here is
+    already an answer — an unreadable store reads as `{}`, the id is absent, and
+    the call returns `False` without locking. That is what an unreadable store
+    did before DW-161 too, when this read was unlocked and used the same total
+    helper: PRESERVED behavior, not a new degradation, and consistent with this
+    module's refusal to repair the store on the way past."""
+    path = store_path(project)
+    if not _droppable(load_pre_answers(project), dw_id, answer):
+        return False  # ADVISORY probe (#736): nothing to write, so nothing to serialize
+    with deferredwork.ledger_lock(path):
         data = load_pre_answers(project)
-        if dw_id not in data or data[dw_id] != answer:
+        if not _droppable(data, dw_id, answer):
             return False
         del data[dw_id]
         _write_store(project, data)
-    return True
+        return True
 
 
 # ------------------------------------------------------- discovery + apply
@@ -242,7 +305,17 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
     number."""
     paths = bmadconfig.load_paths(project)
     ledger = paths.deferred_work
-    text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+    # OBSERVATION arm of the ledger-read contract (DW-146). This helper writes
+    # nothing: every caller is a read-only surface (`cmd_decisions`, `cmd_status`,
+    # the TUI), so an undecodable ledger must not take the whole listing down —
+    # `UnicodeDecodeError` is a `ValueError` and escaped every `except OSError`
+    # above it, exactly as it did for the triage-cache read below (DW-145).
+    # The degradation is SILENT here, unlike the engine's observation sites: no
+    # journal is reachable from a module-level function handed only a project
+    # path, and the same is true of the triage read below. An empty ledger means
+    # no open ids, which returns [] — the honest answer for a file nobody could
+    # read, and the one the surfaces above already render.
+    text, _fault = deferredwork.read_for_observation(ledger)
     open_now = deferredwork.open_ids(text)
     if not open_now:
         return []
@@ -259,8 +332,19 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
     # out was an id no reader ever surfaced: a missing or unrecognized `effect` and
     # a non-string `key`/`label`/`intent`/`bundle_name` are unusable here for
     # exactly the reason they are unusable there.
+    #
+    # The STORE, not the reader, selects the predicate's configuration (DW-147):
+    # both readers of THIS store — here and `_decisions_phase`'s pre-answer
+    # seeding loop — pass the identical `allow_close=False`, which is what keeps
+    # DW-142's same-store agreement intact while the run-local store, whose
+    # interactive writer legitimately records a `close`, passes True. A `close`
+    # here is hand-seeded or corrupt (`apply_pre_answer` sends a close to the
+    # ledger and never records one), and it matches no bundling lane, so it must
+    # be re-offered rather than counted answered.
     answered = {
-        k for k, v in load_pre_answers(project).items() if unusable_answer_reason(v) is None
+        k
+        for k, v in load_pre_answers(project).items()
+        if unusable_answer_reason(v, allow_close=False) is None
     }
 
     # (run-id, cycle) descending == most recent first; run ids sort chronologically
@@ -287,6 +371,17 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
         # (`_ensure_triage`, `_decisions_phase`).
         except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             continue
+        # Boundary guard (DW-155/DW-158): `json.loads` returns `Any`, and the
+        # parameter below is `dict[str, Any] | None`, so this call was handing an
+        # unchecked shape across a typed boundary — a non-object document made
+        # `validate_triage` raise `AttributeError` past every caller listed in the
+        # comment above. `validate_triage` is total over shapes now, so removing
+        # this alone reproduces nothing; it stands as the parity these two
+        # siblings already have — `load_pre_answers` (`isinstance(data, dict)`)
+        # and `_ensure_triage`'s cache-reload branch — keeping this reader's
+        # per-file degradation independent of the validator's internals.
+        if not isinstance(rj, dict):
+            continue
         plan, _errors = validate_triage(rj, None)
         if plan is None:
             continue
@@ -297,15 +392,125 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
     return sorted(pending, key=lambda d: int(d.id.split("-")[1]))
 
 
+@dataclass(frozen=True)
+class PublishRefusal:
+    """One operand `apply_pre_answer` WROTE but could not publish.
+
+    `file` is the LEXICAL basename of the operand — `deferred-work.md`
+    (`ProjectPaths.deferred_work`) or `decisions.json` (`STORE_REL`), a code
+    constant at both operands and never operator-controlled prose, which is what
+    makes it safe for both surfaces to print verbatim. `cause` is
+    `verify.unpublishable_target`'s closed two-token enum; `error` carries the
+    decode or OS fault where the refusal has one to attribute, and is `None` for a
+    plain absence (an empty string would read as a fault)."""
+
+    file: str
+    cause: Literal["target-absent", "target-unreadable"]
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class PreAnswerResult:
+    """What `apply_pre_answer` persisted: whether a ledger `decision:` line landed,
+    and which written operands went unpublished.
+
+    `recorded` is `record_decision`'s own boolean with DW-198's exact meaning —
+    a line landed, False is not an error, it withholds nothing, and it says
+    nothing about whether the ledger was readable. `refusals` is a separate axis
+    and usually empty: the operand list is already gated on what this call wrote,
+    so a refusal means an answer that really WAS written could not be published,
+    which is why both surfaces report it rather than treating it as noise."""
+
+    recorded: bool
+    refusals: tuple[PublishRefusal, ...] = ()
+
+    def publish_note(self) -> str | None:
+        """One shared wording for both out-of-band surfaces, or `None` when no
+        target was refused. Publication remains best effort. The caller supplies
+        its own separator: `cli` appends it to the outcome line it already prints,
+        and the TUI either
+        appends it to the existing non-write toast or raises one of its own.
+
+        The fault rides WITH the cause where the refusal has one, the way the
+        sweep's `error` field rides beside its `refuse_cause`. Without it the two
+        causes read alike at both surfaces, and `target-unreadable` is the one that
+        names something a human can act on — a decode fault, an `EACCES`, a symlink
+        loop. `target-absent` has no exception text and takes the bare wording; an
+        empty parenthetical would read as a fault."""
+        if not self.refusals:
+            return None
+        named = ", ".join(
+            f"{r.file} ({r.cause})" if r.error is None else f"{r.file} ({r.cause}: {r.error})"
+            for r in self.refusals
+        )
+        return f"not committed to git: {named}"
+
+
 def apply_pre_answer(
     project: Path, decision: Decision, option: DecisionOption, *, date: str, commit: bool = True
-) -> None:
-    """Record a human's out-of-band answer durably. Always writes a ledger
-    `decision:` audit line; `close` also flips the entry to done (so it leaves
-    the open set now), while `build`/`keep-open` are saved to the pre-answer
-    store for the next sweep to consume. When `commit`, the ledger and store are
-    committed on their own (only those paths) — best effort, so a non-git or
-    dirty tree never blocks the on-disk record.
+) -> PreAnswerResult:
+    """Record a human's out-of-band answer durably, answering whether a ledger
+    `decision:` audit line actually landed. `close` also flips the entry to done
+    (so it leaves the open set now), while `build`/`keep-open` are saved to the
+    pre-answer store for the next sweep to consume. When `commit`, the files THIS
+    call wrote are committed on their own (only those paths) — best effort, so a
+    non-git or dirty tree never blocks the on-disk record.
+
+    `PreAnswerResult.recorded` is `record_decision`'s own boolean, and it is the
+    CALLER's non-write signal, not decoration — the same discipline
+    `sweep._apply_decision_effect` applies inside the sweep (DW-186), carried to
+    the two out-of-band surfaces (DW-198). `record_decision` answers False in
+    exactly the two states that mean no line was written — no ledger file at all,
+    and no entry carrying this id, a rival writer being free to retire one while
+    the prompt blocks on the human — and True only when it wrote one. Discarded,
+    those two states were indistinguishable from a write at both call sites, which
+    then announced closures the ledger never took: `cli.cmd_decisions` printed
+    `closed now` and `tui.app._record_decision` counted the decision into
+    `recorded N decision(s)`.
+
+    What False does NOT say is that the ledger was readable: the missing-file arm
+    answers before any read. So a caller may report a non-write and nothing more;
+    it may not infer a read fault from it.
+
+    False is not an error and withholds nothing. The pre-answer store write still
+    runs on it, unchanged by the boolean. So for `build`/`keep-open` the human's
+    answer really was saved to the store, and a caller's report must not deny that
+    — but it must not promise a later sweep will consume it either: a sweep's
+    triage is derived from the ledger's open ids, so an id the ledger no longer
+    carries is never surfaced again and `prune_pre_answers` drops the stored
+    answer as no longer open.
+
+    THE COMMIT IS GATED TWICE, and the two gates answer different questions
+    (DW-209/213).
+
+    "Did this call write it?" is DW-185's rule — a phase that wrote nothing runs
+    no git — and it is what decides the operand list: the ledger is an operand
+    only when `recorded` is True, and the store only when the effect is not
+    `close` (a `close` writes no store entry). An empty list spawns no git at all.
+    Unconditional, the block reached `verify.commit_paths` with `[ledger, store]`
+    whatever had happened, and against a TRACKED ledger that has gone absent
+    `commit_paths` deliberately keeps the missing path as a DELETION to stage — so
+    a `close` whose ledger file had vanished published that ledger's own REMOVAL
+    under a `chore(decisions): pre-answer <id>` message, taking every `decision:`
+    line and open entry out of HEAD. The `recorded` gate is what closes that: the
+    absent-ledger state never puts the ledger in front of `git add`.
+
+    "Is the target still publishable?" is DW-199/203/205's guard, shared verbatim
+    with the sweep's nine publishers as `verify.unpublishable_target`, and it
+    narrows the residual race between the write above and the staging below. The
+    FAMILY is declared here, never derived from the path. Because the first gate
+    is upstream of the second, this one fires only on a race or a resolve fault,
+    which is exactly why a refusal is worth reporting: it means an answer that
+    really was written could not be published. A resolve fault (`OSError` on a
+    broken chain, `RuntimeError` on a symlink loop under 3.11–3.12) takes the same
+    refusal arm with cause `target-unreadable` — a target whose path cannot be
+    resolved cannot be read well enough to publish — because this module has no
+    journal to route it to and the cause enum is closed by contract.
+
+    A refusal drops only ITS operand; the survivors still publish, and a refusal
+    never raises. The swallowed `verify.GitError` below is a different, older
+    degrade and stays silent and unreported: the files are written, and git
+    history is best effort. The commit stays OUTSIDE every lock (#286).
 
     Precondition: `date` is ISO `YYYY-MM-DD`. The ledger writers raise
     `ValueError` on anything else (it would otherwise land a `status:` line that
@@ -326,17 +531,46 @@ def apply_pre_answer(
     # "close it" over a status that still says open. The bytes are identical to
     # the pair's. The commit below stays OUTSIDE any lock — locks are held only
     # around file I/O, never across a subprocess (#286).
-    deferredwork.record_decision(
+    recorded = deferredwork.record_decision(
         ledger, decision.id, date, option.label, detail, close_note=close_note
     )
     if option.effect != "close":
         record_pre_answer(project, decision.id, option, date=date)
-    if commit:
+    if not commit:
+        return PreAnswerResult(recorded=recorded)
+    # GATE ONE — only what THIS call wrote, each paired with the family it
+    # declares for the guard. Never derived from the path (see the docstring).
+    wrote: list[tuple[Path, Literal["ledger", "store"]]] = []
+    if recorded:
+        wrote.append((ledger, "ledger"))
+    if option.effect != "close":
+        wrote.append((store_path(project), "store"))
+    # GATE TWO — the shared publishable-target guard, on the RESOLVED operand
+    # because that is the file git would publish, and before any git runs because
+    # a refused publish must spawn none.
+    operands: list[Path] = []
+    refusals: list[PublishRefusal] = []
+    for path, family in wrote:
         try:
-            verify.commit_paths(
-                project,
-                f"chore(decisions): pre-answer {decision.id}",
-                [ledger, store_path(project)],
-            )
+            target = path.resolve()
+        except (OSError, RuntimeError) as e:
+            refusals.append(PublishRefusal(file=path.name, cause="target-unreadable", error=str(e)))
+            continue
+        refusal = verify.unpublishable_target(target, family)
+        if refusal is None:
+            operands.append(target)
+            continue
+        cause, error = refusal
+        # `path.name`, never `target.name`, and here is where that is a CHOICE: a
+        # resolved target is reached through a symlink an OPERATOR named, so its
+        # tail is arbitrary operator text, while the lexical tail is a code
+        # constant at both operands (`deferred-work.md`, `decisions.json`). That is
+        # what lets both surfaces print it verbatim — the same rule
+        # `sweep._commit_ledger`'s `file` journal field is held to.
+        refusals.append(PublishRefusal(file=path.name, cause=cause, error=error))
+    if operands:
+        try:
+            verify.commit_paths(project, f"chore(decisions): pre-answer {decision.id}", operands)
         except verify.GitError:
             pass  # files are written; git history is best effort
+    return PreAnswerResult(recorded=recorded, refusals=tuple(refusals))

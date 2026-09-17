@@ -56,6 +56,7 @@ from .model import (
     SessionRecord,
     StoryTask,
     VerifyOutcome,
+    result_mapping,
 )
 from .platform_util import (
     atomic_replace,
@@ -1302,6 +1303,10 @@ class Engine:
         with no session at all. The arm's own unwinding is the stronger guarantee.
         """
         ledger = self.paths.deferred_work
+        # OBSERVATION arm of the ledger-read contract (DW-146), kept inline rather
+        # than routed through `read_for_observation`: this site carries behavior
+        # the helper cannot — it notifies the human and REFUSES the story instead
+        # of degrading to an empty ledger. Same classification, richer response.
         try:
             text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
         except (OSError, UnicodeDecodeError) as e:
@@ -2458,7 +2463,7 @@ class Engine:
                 # pre-reconcile snapshot whose re-fold may have been dropped by a
                 # spec read fault — re-derive from the spec instead of defaulting
                 # a recommended review away.
-                rj = result.result_json or {}
+                rj = result_mapping(result.result_json)
                 if "followup_review_recommended" in rj:
                     task.followup_review_recommended = bool(rj["followup_review_recommended"])
                 else:
@@ -2637,7 +2642,7 @@ class Engine:
         real spec goes unread."""
         if task.spec_file:
             return
-        spec_file = (result_json or {}).get("spec_file")
+        spec_file = result_mapping(result_json).get("spec_file")
         if not spec_file:
             return
         spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
@@ -2771,7 +2776,7 @@ class Engine:
                 )
                 continue
 
-            rj = result.result_json or {}
+            rj = result_mapping(result.result_json)
             for pref in preference_escalations(rj):
                 # `pref` is LLM-authored — it comes straight out of the session's own
                 # result.json — so its keys become journal field NAMES, and three of
@@ -3658,7 +3663,7 @@ class Engine:
         all read the reconciled spec."""
         if not self._generic_dev():
             return
-        spec_file = (result_json or {}).get("spec_file")
+        spec_file = result_mapping(result_json).get("spec_file")
         if not spec_file:
             return
         spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
@@ -3784,9 +3789,11 @@ class Engine:
         `_salvage_review_timeout` reads the frontmatter fresh and stays disjoint.
         The append is engine-side ONLY — an adapter-side write would perturb the
         adapter's own mtime/hash observation state (#276 M1/M2)."""
+        # Normalize once for both the spec path and the later status read.
+        rj = result_mapping(rj)
         if not self._generic_dev():
             return
-        spec_file = (rj or {}).get("spec_file")
+        spec_file = rj.get("spec_file")
         if not spec_file:
             return
         spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
@@ -3896,7 +3903,7 @@ class Engine:
         path to a merge persists the task before reaching it."""
         if not self._generic_dev():
             return
-        spec_file = (result_json or {}).get("spec_file")
+        spec_file = result_mapping(result_json).get("spec_file")
         if not spec_file:
             return
         spec_path = verify.resolve_spec_path(str(spec_file), self.workspace.paths)
@@ -3981,7 +3988,7 @@ class Engine:
 
     def _harvest_spec_path(self, task: StoryTask, result_json: dict | None) -> Path | None:
         """Resolve the spec whose frontmatter this mode may harvest."""
-        spec_file = (result_json or {}).get("spec_file")
+        spec_file = result_mapping(result_json).get("spec_file")
         if not spec_file:
             return None
         return verify.resolve_spec_path(str(spec_file), self.workspace.paths)
@@ -4174,7 +4181,7 @@ class Engine:
             # remain in the spec until the post-checkpoint implementation pass.
             if (
                 status == devcontract.PLAN_HALT_STATUS
-                and (result_json or {}).get("plan_halt") is True
+                and result_mapping(result_json).get("plan_halt") is True
             ):
                 return
             if status not in devcontract.RECONCILABLE_FROM:
@@ -4201,7 +4208,9 @@ class Engine:
         # before any ledger write) is preserved by the reorder — both writes,
         # the seen-again marks and the appends, still run after the record save.
         ledger = self.workspace.paths.deferred_work
-        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        # REPAIR/WRITE (DW-146): the seen-again match derived here decides which
+        # findings are appended, and both writes run off this text.
+        text = deferredwork.read_for_write(ledger) or ""
         seen = deferredwork.parse_ledger(text)
 
         # Cross-spec dedupe (DW-88 vs DW-65). A real finding that is not this
@@ -4544,6 +4553,23 @@ class Engine:
         if not ids:
             return
         ledger = self.workspace.paths.deferred_work
+        # OBSERVATION arm of the ledger-read contract (DW-146), kept inline rather
+        # than routed through `read_for_observation`: the helper collapses absence
+        # and fault, and this site has to split them — a MISSING ledger classifies
+        # every id unmatched, while a dangling symlink is an outage that must be
+        # journaled and written nothing from. Either way this site writes nothing.
+        #
+        # OBSERVATION *by the discriminator*, not as an exception to it, because
+        # this is the site that looks most like a counterexample: the text below is
+        # classified and the result arms `_ArmedClose`, and a write does follow. But
+        # the arm is decided by whose text THIS site edits and publishes, never by
+        # whether a write happens downstream — and this site publishes nothing. The
+        # close is `deferredwork.mark_done_many_reopenable`, whose own locked
+        # `read_for_write` is the repair/write read for it and which never re-uses
+        # the snapshot taken here. So the documented "Advisory by contract" stands:
+        # a degraded read journals `deferred-close-ledger-unavailable`, writes
+        # nothing, and leaves the entries `open`. It must NOT raise
+        # `LedgerReadError` — nothing here was about to be published.
         try:
             text = ledger.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -5009,9 +5035,15 @@ class Engine:
         return
 
     def _ledger_text(self) -> str | None:
-        """Return the active workspace ledger text, preserving absence."""
+        """Return the active workspace ledger text, preserving absence.
+
+        REPAIR/WRITE arm (DW-146): this feeds proof-of-work attribution, so reads
+        stay fail-loud — guessing either equality answer misjudges the session's
+        work. Absence is preserved because an absent and an empty ledger are a
+        real distinction to the caller.
+        """
         ledger = self.workspace.paths.deferred_work
-        return ledger.read_text(encoding="utf-8") if ledger.is_file() else None
+        return deferredwork.read_for_write(ledger)
 
     def _ledger_digest(self) -> str:
         """Digest the current ledger text for proof-of-work attribution.
@@ -5367,10 +5399,30 @@ class Engine:
 
         The relpath is derived against ``paths.repo_root``, the tree the gate
         invokes git in, NOT ``paths.project`` (#716). The two are the same object
-        in every configuration but the `repo_root` override, and under that
-        override the ledger sits outside the code tree — where it cannot satisfy
-        proof-of-work, so ``()`` is the right answer rather than a pathspec git
-        would silently match nothing against.
+        in every configuration but the `repo_root` override, and that override has
+        TWO shapes whose wrong-root symptoms differ (DW-169):
+
+        - DISJOINT (any root that is NOT an ancestor of `project` — a sibling
+          checkout beside it is the example the fixtures build, but a descendant
+          of `project`, or a root unrelated to it, lands here too): the ledger
+          sits OUTSIDE the probed tree, where it cannot satisfy proof-of-work at
+          all, so the ``ValueError`` arm's ``()`` is the right answer rather than
+          a pathspec git would silently match nothing against.
+        - NESTED / ANCESTOR (`repo_root` an ancestor of `project`, the monorepo
+          shape): the ledger sits INSIDE the probed tree and the correct relpath
+          keeps the project prefix (``app/_bmad-output/...``). Here ``()`` would be
+          wrong and a ``paths.project`` spelling is not empty either — it drops the
+          prefix and names a DIFFERENT, REAL file, the outer project's own ledger.
+          That is the silently-wrong case: git matches something, just not this
+          attempt's append, so the engine's own ledger write is left counting as
+          session proof of work.
+
+        Graded by these consumer-JOIN rows, which drive the tuple through a gate;
+        the tuple's own value rows live alongside them in ``tests/test_engine.py``:
+        ``tests/test_engine.py::test_harvest_gate_exclude_gates_the_nested_ledger_under_the_monorepo_shape``,
+        ``tests/test_engine.py::test_accepted_park_observation_excludes_the_nested_ledger_under_the_monorepo_shape``,
+        ``tests/test_stories_engine.py::test_accepted_plan_halt_observation_excludes_the_nested_ledger_under_the_monorepo_shape``,
+        and ``tests/test_sweep.py::test_bundle_gate_excludes_the_nested_ledger_under_the_monorepo_shape``.
         """
         if not task.harvest_wrote_ledger or task.ledger_changed_before_harvest:
             return ()
@@ -5951,15 +6003,20 @@ class Engine:
         ended = False
         try:
             result = adapter.run(spec)
+            # One shape read for the whole frame (DW-206): `result_json` is
+            # parsed JSON off an adapter, so a non-mapping top level reached the
+            # `.get`s below behind an `is not None` test alone and raised
+            # `AttributeError` here — upstream of every guarded consumer,
+            # including the sweep triage lane's own validator. It now refuses
+            # through the empty-document channel each read already has.
+            rj = result_mapping(result.result_json)
             # A post-kill rescue (#61) is otherwise indistinguishable from a normal
             # completion in the journal; leave a breadcrumb for forensics.
-            if result.result_json is not None and result.result_json.get("post_kill_reconciled"):
+            if rj.get("post_kill_reconciled"):
                 self.journal.append("session-rescued-post-kill", task_id=task_id, role=role)
             # Same forensics need for a missing-marker synthesis (#224): the
             # result is real, but the marker-append the skill owes was skipped.
-            if result.result_json is not None and result.result_json.get(
-                "synthesized_from_frontmatter"
-            ):
+            if rj.get("synthesized_from_frontmatter"):
                 self.journal.append(
                     "session-synthesized-from-frontmatter", task_id=task_id, role=role
                 )
@@ -5967,7 +6024,7 @@ class Engine:
                 # on-disk spec (best-effort) so the next re-read is harvested on the
                 # normal marker path. Covers live-Stop, crash-path, and post-kill
                 # dead-window synthesis — every path that sets this flag.
-                self._repair_spec_marker(task, result.result_json)
+                self._repair_spec_marker(task, rj)
             # Only dev/review sessions are resumable — `_resumable_session` matches
             # exactly those task ids under DEV_RUNNING/REVIEW_RUNNING. For everything
             # else (triage/sweep, labeled plugin-workflow sessions) the payload is
@@ -6018,7 +6075,13 @@ class Engine:
                     session_id=result.session_id,
                     transcript_path=result.transcript_path,
                     result_json=(
-                        dict(result.result_json)
+                        # `dict(rj)`, not `dict(result.result_json)`: a non-mapping
+                        # document raised out of `dict(...)` here too, one line
+                        # past the reads above. The `is not None` arm stays — it
+                        # is what keeps an empty document persisting as `{}`
+                        # rather than collapsing to `None`, which a truthiness
+                        # test on `rj` would silently do (DW-206).
+                        dict(rj)
                         if resumable and result.result_json is not None
                         else None
                     ),
@@ -6762,10 +6825,24 @@ class Engine:
                 f"is filed."
             )
         re_review = False
-        if task.dw_ids and ledger.is_file():
-            entries = {
-                e.id: e for e in deferredwork.parse_ledger(ledger.read_text(encoding="utf-8"))
-            }
+        if task.dw_ids:
+            # OBSERVATION arm (DW-146): this read decides only the
+            # `re_review_capped` flag on the journal row below — nothing is
+            # written to the ledger here, and the story is already committed and
+            # verify-green, so an unreadable ledger must not raise out of a
+            # journaling helper. Degrade to `re_review = False` (the flag's own
+            # default: no evidence this story came from a follow-up entry) and
+            # record the attributed fault so the missing evidence is visible.
+            text, fault = deferredwork.read_for_observation(ledger)
+            if fault is not None:
+                self.journal.append(
+                    "review-budget-ledger-unreadable",
+                    story_key=task.story_key,
+                    dw_ids=list(task.dw_ids),
+                    ledger=str(ledger),
+                    error=fault,
+                )
+            entries = {e.id: e for e in deferredwork.parse_ledger(text)}
             re_review = any(
                 i in entries
                 and deferredwork.field_line_present(
@@ -6922,9 +6999,10 @@ class Engine:
         if task.baseline_commit:
             self._stash_deferred_artifacts(task)
             deferred_work = self.workspace.paths.deferred_work
-            snapshot = (
-                deferred_work.read_text(encoding="utf-8") if deferred_work.is_file() else None
-            )
+            # REPAIR/WRITE (DW-146), absence preserved: this snapshot is the input
+            # to `_restore_defer_ledger`, so a snapshot taken from bytes nobody
+            # could read would be republished over the real ledger.
+            snapshot = deferredwork.read_for_write(deferred_work)
             try:
                 self._rollback_or_pause(task)
             except RunPaused:
@@ -7188,7 +7266,9 @@ class Engine:
         if not task.harvested_deferrals:
             return
         ledger = self.paths.deferred_work
-        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
+        # REPAIR/WRITE (DW-146): this one fresh read is the whole on-disk guard
+        # for the `append_entries` write below it.
+        text = deferredwork.read_for_write(ledger) or ""
         seen = deferredwork.parse_ledger(text)
         specs: list[deferredwork.EntrySpec] = []
         for item in task.harvested_deferrals:

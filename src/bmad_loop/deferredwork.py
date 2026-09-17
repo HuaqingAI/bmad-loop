@@ -40,12 +40,94 @@ never needed — an `OSError` from acquisition, or a
 :class:`~bmad_loop.runs.StateRootError` from deriving the sidecar path where no
 state root exists — which a replayed rollback, a re-run sweep and
 ``sweep --archive`` all reach routinely.
+
+Ledger-read contract (DW-146). Every deferred-work ledger read in
+``src/bmad_loop`` belongs to one of exactly three cases, and the reader's NAME is
+the classification recorded at the site:
+
+* REPAIR/WRITE — :func:`read_for_write`. The text decides published bytes: it is
+  edited and written back, or it becomes an artifact a session is dispatched on.
+  Absence answers ``None``; ``OSError`` propagates; undecodable bytes raise
+  :class:`LedgerReadError` with the ``UnicodeDecodeError`` chained as
+  ``__cause__``. A repair write must never proceed from bytes nobody could read.
+* OBSERVATION — :func:`read_for_observation`. The text informs a report, a hint,
+  or a flag, and nothing is written from it. Absence answers ``("", None)``; both
+  ``OSError`` and ``UnicodeDecodeError`` degrade to ``("", "<Class>: <msg>")`` so
+  the caller can journal the attributed fault and carry on. It never raises.
+  The helper never raising does not oblige its CALLER to stay quiet: the arm is
+  about who WRITES, not about how loud the response is. An observation caller may
+  legitimately answer louder than a silent degrade — ``cli._sweep_dry_run`` fails
+  the command rather than print a fabricated listing,
+  ``cli._validate_deferred_ledger`` grades a problem, and
+  ``Engine._refuse_gated_story`` notifies the human and refuses the story — and
+  three such sites keep their read inline for exactly that reason.
+* ADVISORY — the pre-lock probes above, which keep their ``except Exception`` and
+  decide nothing. Neither arm: the locked read below each one is the repair/write
+  site, and a fault in a probe simply falls through to it.
+
+THE DISCRIMINATOR, for a read that is not obviously one or the other: the arm is
+decided by whose text THIS site edits and publishes — never by whether a write
+happens downstream of it. A read whose bytes this site mutates and writes back
+(or hands to a session as an artifact) is REPAIR/WRITE. A read that only
+classifies, reports, or NARROWS a later write performed by a locked mutator that
+re-reads the ledger for itself is OBSERVATION. That is the only property a site
+can be held to locally: a data-flow rule ("a write follows, therefore
+repair/write") would reclassify every read that feeds any mutator, including the
+reads the mutator's own locked :func:`read_for_write` already covers, and would
+leave no read anywhere in the tree on the observation arm.
+
+The worked example, because it is the one that looks like a counterexample:
+``Engine._close_declared_deferred`` reads the ledger, runs :func:`classify` over
+it, and arms the commit's rollback set from the result — and it is OBSERVATION.
+It never edits or publishes that text. The close itself is
+:func:`mark_done_many_reopenable`, whose own locked :func:`read_for_write` is the
+repair/write read for it, and which deliberately never re-uses the caller's
+snapshot. So a degraded read there journals ``deferred-close-ledger-unavailable``,
+writes nothing, and leaves the entries ``open`` — it must NOT raise
+:class:`LedgerReadError`, because nothing at that site was about to be published.
+
+Only the undecodable-bytes case is retyped, and deliberately so.
+``UnicodeDecodeError`` is a ``ValueError``, so a handler spelled ``except
+OSError`` never caught it. Two sites were spelled that way — ``verify``'s
+``verify_review_bundle`` and ``tui.data.deferred_entries`` — and both had a
+degrade arm sitting right there (a retryable outcome, an unavailable pane) that
+undecodable bytes flew straight past; each now catches both. The other two
+inline observation sites, ``Engine._refuse_gated_story`` and
+``cli._validate_deferred_ledger``, already caught the pair and are unchanged.
+No repair/write site's ``OSError`` behavior changes anywhere: ``read_for_write``
+lets it propagate untouched. :class:`LedgerReadError` derives from ``Exception``
+rather than ``OSError`` or ``ValueError`` so that neither those two widened
+handlers nor any future ``except OSError`` silently swallows the one fault this
+contract exists to attribute.
+
+The WRITE half of every mutator is typed too. Each locked read->edit->write ends in
+:func:`_publish`, and an ``OSError`` raised there — ``ENOSPC``, ``EROFS``, a failed
+fsync or rename, a permission the atomic writer's temp file lacks — leaves as
+:class:`LedgerWriteError`. It IS an ``OSError`` (a subclass), so every caller that
+already degrades on ``OSError`` is unchanged: the CLI and the TUI decision modal
+keep answering the human rather than dying. What the subclass buys is the split a
+caller that WANTS to fail loud on a lost publish needs, and cannot make from the
+outside: before it, a failed lock (``EDEADLK``, a contended sidecar) and a failed
+write reached a handler as the same bare ``OSError``, and ``sweep._close_resolved``
+/ ``sweep._decisions_phase`` — which degrade the lock and read faults DW-166 named
+so a bookkeeping phase cannot crash a sweep — swallowed the write fault with them,
+reporting a phase that closed nothing where a repair write had failed. Both now
+re-raise this type ahead of that arm. The rule they follow is the one in
+``AGENTS.md``: observation may degrade, repair writes must raise.
+
+Its sibling is :class:`LedgerLockReleaseError`, for the fault on the far side of
+the publish: the body of :func:`ledger_lock` completed and the lock's release
+then raised. The bytes ARE on disk there, so a degrade arm that read the bare
+``OSError`` as "nothing was written" reported a landed close or decision as one
+that never happened. Same ``OSError``-subclass reasoning, same two re-raise
+sites.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
+import sys
 import threading
 from bisect import bisect_right
 from collections.abc import Iterator, Sequence
@@ -57,6 +139,107 @@ from pathlib import Path
 from . import sprintstatus
 from .fences import fenced_spans
 from .platform_util import atomic_write_text, file_lock, neutralize_surrogates
+
+
+class LedgerReadError(Exception):
+    """A repair/write site could not decode the deferred-work ledger.
+
+    A plain ``Exception`` on purpose (DW-146): an ``OSError`` or ``ValueError``
+    subclass would be swallowed by the very ``except`` arms this fault escaped.
+    """
+
+
+class LedgerWriteError(OSError):
+    """A mutator's atomic publish of the deferred-work ledger failed.
+
+    An ``OSError`` SUBCLASS on purpose, the opposite choice from
+    :class:`LedgerReadError`: the read fault had to escape the ``except OSError``
+    arms it kept flying past, where this one must keep being CAUGHT by every
+    caller that already degrades a ledger ``OSError`` (``cli.cmd_decisions``,
+    ``tui.app._record_decision``, ``decisions.apply_pre_answer``'s callers). The
+    subclass exists for the callers that must NOT — a sweep phase whose degrade
+    arm was written for lock and decode faults, and which a lost publish reached
+    looking exactly like a lost lock. Raised only by :func:`_publish`, with the
+    original ``OSError`` chained as ``__cause__``.
+    """
+
+
+class LedgerLockReleaseError(OSError):
+    """:func:`ledger_lock` published its body and then could not RELEASE the lock.
+
+    The publish landed — that is the whole point of the type. Acquisition faults
+    are already typed (:class:`~bmad_loop.platform_util.LockUnavailableError`),
+    and a fault on the way OUT — Windows' ``msvcrt.locking(LK_UNLCK)`` or the
+    ``lseek`` ahead of it, ``os.close`` on any platform — reached callers as the
+    same bare ``OSError`` a failed ``os.open`` does, with the bytes already on
+    disk. A sweep degrade arm reading that as "nothing was written" then reported
+    a landed close or decision as one that never happened. An ``OSError`` subclass
+    for the same reason :class:`LedgerWriteError` is: every ``except OSError``
+    caller is unchanged, and the one that must fail loud can name it. Raised only
+    when the BODY completed — a body that raised keeps its own exception even
+    when the release faults on top of it (the release fault is chained as
+    ``__context__`` and added as a note), so a :class:`LedgerWriteError` is never
+    downgraded to a bare ``OSError`` by the cleanup that followed it.
+    """
+
+
+def _publish(path: Path, text: str) -> None:
+    """The one write every ledger mutator ends in: :func:`atomic_write_text`,
+    retyped. The atomic writer's failure modes — the temp file, its fsync, the
+    replace — all surface as ``OSError``; each leaves here as
+    :class:`LedgerWriteError` so a caller can tell a publish that failed from a
+    lock it never got. Anything that is not an ``OSError`` (the strict encoder's
+    ``UnicodeEncodeError``, a ``ValueError`` precondition) is not a publish fault
+    and passes through untouched.
+    """
+    try:
+        atomic_write_text(path, text)
+    except OSError as e:
+        raise LedgerWriteError(f"could not publish {path}: {type(e).__name__}: {e}") from e
+
+
+def read_for_write(path: Path) -> str | None:
+    """REPAIR/WRITE arm of the ledger-read contract (DW-146).
+
+    Absence answers ``None`` — callers that treat an absent ledger like an empty
+    one spell that ``or ""`` at the site, which is exact because ``open_ids("")``
+    and ``parse_ledger("")`` already answer identically for both. ``OSError``
+    propagates unchanged. Undecodable bytes become :class:`LedgerReadError`, so a
+    site about to publish bytes escalates instead of writing from a text nobody
+    could read.
+    """
+    if not path.is_file():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        raise LedgerReadError(f"{path} is not valid UTF-8: {e}") from e
+
+
+def read_for_observation(path: Path) -> tuple[str, str | None]:
+    """OBSERVATION arm of the ledger-read contract (DW-146).
+
+    Returns ``(text, fault)``. Absence is not a fault: it answers ``("", None)``,
+    the empty text every observation site already read for a missing ledger. Both
+    ``OSError`` and ``UnicodeDecodeError`` degrade to ``("", "<Class>: <msg>")``
+    — attributed, so a caller holding a journal can record WHICH fault it
+    degraded on rather than reporting an empty ledger. Never raises.
+
+    The ``is_file()`` probe is INSIDE the guard, unlike the repair/write arm's.
+    Metadata errors that escape ``is_file()`` are attributed here too. On Python
+    3.11–3.13, that includes ``EACCES``; Python 3.14 suppresses all OS errors in
+    ``is_file()``. Both readers preserve the runtime's existing false-probe
+    meaning as absence, including directories and ignored metadata errors. This
+    guard attributes exceptions the probe raises; it cannot recover errors the
+    probe suppresses. See Python's pathlib "Querying file type and status" docs.
+    """
+    try:
+        if not path.is_file():
+            return "", None
+        return path.read_text(encoding="utf-8"), None
+    except (OSError, UnicodeDecodeError) as e:
+        return "", f"{e.__class__.__name__}: {e}"
+
 
 HEADING_RE = re.compile(r"^### (DW-\d+): (.+?)\s*$", re.MULTILINE)
 # Where a canonical entry ENDS, in every shape CommonMark spells an ATX heading:
@@ -664,19 +847,22 @@ def _one_line(value: str) -> str:
     observable is the line structure.
 
     Sanitizes; never raises, and nothing upstream rejects on a break either. The
-    close paths call these writers bare (`sweep._close_resolved`,
-    `decisions.apply_pre_answer`), so a `ValueError` would end the sweep as
-    crashed; refusing the same text back at `validate_triage` only moved the
-    stoppage to a pause. Collapsing is lossless enough — the ledger wants one
-    line anyway — so this is the fix, and the skill docs are guidance that
-    reduces occurrences without gating on them.
+    close paths do not want a `ValueError` out of these writers: it used to end
+    the sweep as crashed from `sweep._close_resolved`, which since DW-166 catches
+    it and degrades instead — losing the batch's closures for the cycle, which is
+    better than the crash but still a lost cycle of bookkeeping, and
+    `decisions.apply_pre_answer` still calls them bare (its `cli` and TUI callers
+    hold the handler). Refusing the same text back at `validate_triage` only
+    moved the stoppage to a pause. Collapsing is lossless enough — the ledger
+    wants one line anyway — so this is the fix, and the skill docs are guidance
+    that reduces occurrences without gating on them.
 
     That contract covers one hazard more than the break collapse alone, which is
     what the `neutralize_surrogates` pass in front of it buys (#329). A lone
     surrogate is not a line break, so it sailed through untouched — but it has
     no UTF-8 encoding, and `atomic_write_text`'s strict encode raises
     `UnicodeEncodeError` (a `ValueError` subclass) on it, from inside those same
-    bare close-path calls. It arrives the way the break did: a triage
+    close-path calls. It arrives the way the break did: a triage
     `result.json` is cached with `json.dumps`, whose `ensure_ascii` keeps the
     code point a harmless `\\ud800` escape, and the reload's `json.loads` revives
     the real thing into `ResolvedEntry.evidence` and on into the `mark_done`
@@ -790,15 +976,25 @@ def ledger_lock(path: Path) -> Iterator[None]:
     engine's rollback/restore windows, which span git spawns, get compare-and-set
     semantics instead of a lock around the window.
 
-    Acquired in exactly two strata: the leaf mutators in this module, and the
-    engine's CAS restores, which do pure in-memory text work under the hold.
-    Never call a mutator while holding it — every mutator takes this lock itself,
-    and the nested acquisition would deadlock.
+    Acquired in exactly three strata: the leaf mutators in this module, the
+    engine's CAS restores, which do pure in-memory text work under the hold, and
+    — keyed on a different file entirely — the pre-answer store's three writers
+    in :mod:`~bmad_loop.decisions` (DW-161). Never call a mutator while holding
+    it — every mutator takes this lock itself, and the nested acquisition would
+    deadlock.
 
     Nesting raises :class:`RuntimeError` rather than deadlocking. The guard is
     deliberately path-agnostic: two *different* ledgers would not self-deadlock
     on the OS lock, but nesting is still a lock-ordering hazard, and no caller
-    has a reason to hold two ledgers at once. The lock file itself lives out of
+    has a reason to hold two ledgers at once. That path-agnosticism is also why
+    the store reuses this helper rather than minting a twin. What the two files
+    share is ONLY this nesting guard — never an OS lock:
+    :func:`~bmad_loop.runs.lock_path_for` keys each sidecar on
+    ``sha256(resolved path)[:16]``, so the ledger and the store take different
+    locks and exclude nobody from each other. The guard's consequence is the
+    benefit: no caller may hold both at once, in either order. Two independent
+    guards would let a caller hold the ledger and the store simultaneously with
+    neither one noticing. The lock file itself lives out of
     the repository — see :func:`~bmad_loop.runs.lock_path_for` for why a sidecar
     beside the tracked ledger would be committed by the engine's own `git add
     -A`. Propagates `OSError` from acquisition and
@@ -814,8 +1010,42 @@ def ledger_lock(path: Path) -> Iterator[None]:
     lock_path = runs.lock_path_for(path)
     _LOCK_STATE.held = True
     try:
-        with file_lock(lock_path):
+        # Spelled out rather than `with file_lock(...)`: the one thing the
+        # statement cannot express is "the body completed, and THEN the release
+        # faulted", which is the case `LedgerLockReleaseError` names. Acquisition
+        # faults leave `__enter__` untouched (`LockUnavailableError`, or a bare
+        # `OSError` from the sidecar's `mkdir`/`open`), and a body that raised
+        # keeps its own fault ahead of any release fault — see the except arm.
+        lock = file_lock(lock_path)
+        lock.__enter__()
+        try:
             yield
+        except BaseException as body_fault:
+            # The body's fault is the news, and it stays the exception that leaves.
+            # A `with` statement would let a release fault on top of it REPLACE it,
+            # and for a body that raised `LedgerWriteError` that replacement is a
+            # bare `OSError` — exactly the type the sweep's degrade arms read as a
+            # lock never acquired, so a failed repair write would be degraded
+            # after all. The release fault rides along as `__context__` and as a
+            # note; it is not lost, it just does not get to speak first.
+            try:
+                suppressed = lock.__exit__(*sys.exc_info())
+            except OSError as release_fault:
+                body_fault.add_note(
+                    "and then the ledger lock's release faulted: "
+                    f"{type(release_fault).__name__}: {release_fault}"
+                )
+                raise body_fault  # noqa: B904 — `__context__` IS the release fault
+            if not suppressed:
+                raise
+        else:
+            try:
+                lock.__exit__(None, None, None)
+            except OSError as e:
+                raise LedgerLockReleaseError(
+                    f"published, then could not release the ledger lock: "
+                    f"{type(e).__name__}: {e}"
+                ) from e
     finally:
         _LOCK_STATE.held = False
 
@@ -950,15 +1180,19 @@ def _mark_done_many(
         if not _apply_done_many(probe, dw_ids, date, note, notes, undo_owner)[1]:
             return []
     except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        # Neither arm of the DW-146 ledger-read contract, and deliberately
+        # broader than both: this probe decides nothing on a fault, and the
+        # locked read below is the REPAIR/WRITE site that does.
         pass
     with ledger_lock(path):
         if not path.is_file():
             return []
-        text = path.read_text(encoding="utf-8")
+        # REPAIR/WRITE (DW-146): this text is edited and published below.
+        text = read_for_write(path) or ""
         text, marked = _apply_done_many(text, dw_ids, date, note, notes, undo_owner)
         if not marked:
             return []
-        atomic_write_text(path, text)
+        _publish(path, text)
         return marked
 
 
@@ -1080,7 +1314,8 @@ def mark_seen_again_many(
     with ledger_lock(path):
         if not path.is_file():
             return [False for _ in dw_ids], None, list(dw_ids), None
-        preimage = path.read_text(encoding="utf-8")
+        # REPAIR/WRITE (DW-146): the preimage this call anchors its write on.
+        preimage = read_for_write(path) or ""
         text = preimage
         applied: list[bool] = []
         stale: list[str] = []
@@ -1097,7 +1332,7 @@ def mark_seen_again_many(
             applied.append(True)
         if not any(applied):
             return applied, None, stale, preimage
-        atomic_write_text(path, text)
+        _publish(path, text)
         # Both returned from INSIDE the hold: the published text by
         # construction, and the preimage it replaced — neither a read-back that a
         # rival could have moved.
@@ -1262,15 +1497,19 @@ def mark_open_many(path: Path, dw_ids: Sequence[str], note: str, operation_id: s
         if not _apply_open_many(probe, dw_ids, note, undo_owner)[1]:
             return []
     except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        # Neither arm of the DW-146 ledger-read contract, and deliberately
+        # broader than both: this probe decides nothing on a fault, and the
+        # locked read below is the REPAIR/WRITE site that does.
         pass
     with ledger_lock(path):
         if not path.is_file():
             return []
-        text = path.read_text(encoding="utf-8")
+        # REPAIR/WRITE (DW-146): this text is edited and published below.
+        text = read_for_write(path) or ""
         text, reopened = _apply_open_many(text, dw_ids, note, undo_owner)
         if not reopened:
             return []
-        atomic_write_text(path, text)
+        _publish(path, text)
         return reopened
 
 
@@ -1283,6 +1522,19 @@ def mark_open(path: Path, dw_id: str, note: str, operation_id: str) -> bool:
     wrapper that took the lock itself and then called the batch would nest, and
     `ledger_lock` raises on that rather than deadlocking."""
     return bool(mark_open_many(path, [dw_id], note, operation_id))
+
+
+def _entry_is_open(text: str, dw_id: str) -> bool:
+    """Whether `text` carries `dw_id` with a status :attr:`DWEntry.open` accepts.
+
+    Pure, and locating the entry with :func:`_find_entry` — the same first-wins
+    locator :func:`_apply_decision` and :func:`_apply_done` edit through — so
+    :func:`record_decision`'s `require_open` check and its write cannot disagree
+    about which entry they mean. False for a missing entry and for a status the
+    format does not understand — `.open` is deliberately not ``not done``, and a
+    caller that asked for an open entry gets a refusal for both."""
+    entry = _find_entry(text, dw_id)
+    return entry is not None and entry.open
 
 
 def _apply_decision(text: str, dw_id: str, date: str, label: str, detail: str) -> str | None:
@@ -1318,11 +1570,12 @@ def record_decision(
     detail: str,
     *,
     close_note: str | None = None,
+    require_open: bool = False,
 ) -> bool:
     """Record a human decision on one entry and, when `close_note` is given, act
     on it by flipping the entry to `status: done <date>` — both in ONE read and
-    ONE atomic write. Returns True when the entry was found (and therefore
-    carries a decision line), False when it was not.
+    ONE atomic write. Returns True when a decision line was written, False when
+    the ledger or entry is absent, or `require_open` refuses a non-open entry.
 
     ONE locked read->edit->write: the whole cycle runs under the cross-process
     ledger lock (#286/#469), so concurrent mutators — a second run, a sweep, the
@@ -1346,6 +1599,28 @@ def record_decision(
     else already closed is still what the human chose. `close_note` is the
     resolution note for the flip, distinct from `detail`, which is the decision's
     own rationale.
+
+    `require_open` is the ONE exception to that rule, and it defaults to False so
+    every existing caller — ``cli.cmd_decisions``, the TUI decision modal,
+    :func:`~bmad_loop.decisions.apply_pre_answer`, the sweep's interactive
+    decision arm — keeps exactly the behaviour above: a decision recorded on an
+    entry someone else already closed still lands. Passed True by one caller,
+    the sweep's DW-167 replay walk, which re-applies a `close` the run that
+    answered it never got onto the ledger. That walk's premise is that the entry
+    is STILL OPEN — a done entry means the effect already landed — and it takes
+    an open-set snapshot before it writes; but a snapshot read outside this lock
+    cannot enforce a promise the lock exists to hold, so a rival writer closing
+    the entry in between produced a second `decision:` line on an entry whose
+    close had already been recorded. With `require_open` the predicate and the
+    mutation are ONE critical section: a third refusal state joins the two
+    documented above — the entry is present but no longer open — and it returns
+    False having written nothing, exactly as the other two do. The caller
+    distinguishes the three for its journal row; nothing here reports which. That
+    third state is the one non-write that always PAYS a lock acquisition: the
+    advisory probe below knows nothing about `require_open` (it asks only what
+    :func:`_apply_decision` would do), so it cannot short-circuit a still-open
+    refusal the way it does a missing entry — which is correct, since the answer
+    it would be short-circuiting on is exactly the one a rival writer can change.
 
     Precondition: `date` is ISO `YYYY-MM-DD` — one check for both halves, since
     the decision line and the close share it; anything else raises `ValueError`,
@@ -1378,11 +1653,22 @@ def record_decision(
         if _apply_decision(probe, dw_id, date, label, detail) is None:
             return False
     except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        # Neither arm of the DW-146 ledger-read contract, and deliberately
+        # broader than both: this probe decides nothing on a fault, and the
+        # locked read below is the REPAIR/WRITE site that does.
         pass
     with ledger_lock(path):
         if not path.is_file():
             return False
-        text = path.read_text(encoding="utf-8")
+        # REPAIR/WRITE (DW-146): this text is edited and published below.
+        text = read_for_write(path) or ""
+        if require_open and not _entry_is_open(text, dw_id):
+            # UNDER the lock, deliberately: this is the caller's still-open
+            # premise being enforced at the mutation boundary rather than by its
+            # own earlier read. Refuse the way the other two states do — return
+            # False, write nothing — so the caller's existing non-write arm
+            # covers it without a new return shape.
+            return False
         updated = _apply_decision(text, dw_id, date, label, detail)
         if updated is None:
             return False
@@ -1391,7 +1677,7 @@ def record_decision(
             closed = _apply_done(text, dw_id, date, close_note)
             if closed is not None:
                 text = closed
-        atomic_write_text(path, text)
+        _publish(path, text)
         return True
 
 
@@ -1648,14 +1934,19 @@ def append_entries_published(
             # from — and nothing was written for an anchor to claim either.
             return minted, None, None
     except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        # Neither arm of the DW-146 ledger-read contract, and deliberately
+        # broader than both: this probe decides nothing on a fault, and the
+        # locked read below is the REPAIR/WRITE site that does.
         pass
     with ledger_lock(path):
-        preimage = path.read_text(encoding="utf-8") if path.is_file() else None
+        # REPAIR/WRITE (DW-146), absence preserved: `None` still means "no
+        # ledger", which the returned preimage carries to the caller's anchor.
+        preimage = read_for_write(path)
         text, minted = _apply_appends(preimage or "", specs)
         if all(dw_id is None for dw_id in minted):
             return minted, None, preimage
         path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(path, text)
+        _publish(path, text)
         # Both returned from INSIDE the hold: the published text by
         # construction, and the preimage it replaced — neither a read-back that a
         # rival could have moved.
@@ -1975,11 +2266,15 @@ def archive_closed(
         if not _eligible_for_archive(probe, before):
             return []
     except Exception:  # nosec B110 - ADVISORY probe: a fault here must decide nothing
+        # Neither arm of the DW-146 ledger-read contract, and deliberately
+        # broader than both: this probe decides nothing on a fault, and the
+        # locked read below is the REPAIR/WRITE site that does.
         pass
     with ledger_lock(path):
         if not path.is_file():
             return []
-        text = path.read_text(encoding="utf-8")
+        # REPAIR/WRITE (DW-146): this text is stubbed and published below.
+        text = read_for_write(path) or ""
         to_archive = _eligible_for_archive(text, before)
         if not to_archive:
             return []
@@ -1988,7 +2283,16 @@ def archive_closed(
             return archived_ids
         stamp = archive_date or calendar_date.today().isoformat()
         archive_path = path.parent / ARCHIVE_REL
-        existing = archive_path.read_text(encoding="utf-8") if archive_path.is_file() else ""
+        # REPAIR/WRITE (DW-146): the archive sidecar is republished with these
+        # entries appended, so undecodable bytes here must escalate rather than
+        # publish an archive rebuilt from "" — the same class as the ledger read
+        # above, applied to the other file this mutator writes. The contract is
+        # otherwise ledger-only; this sidecar is IN scope by name because it is the
+        # second half of ONE locked repair/write cycle over ledger contents (the
+        # entries appended here are the entries the read above found), so leaving it
+        # bare would park an unattributed `UnicodeDecodeError` inside a converted
+        # region. Nothing else outside the ledger is in scope.
+        existing = read_for_write(archive_path) or ""
         # Append an `archived:` line after each entry's status line. The status
         # span is body-relative, so the insertion works within the body slice —
         # same offset math as `_insert_after_status`, applied to the body.
@@ -2069,8 +2373,8 @@ def archive_closed(
         # the ledger unchanged (safe — the bodies are still in the live file).
         # Writing the ledger first would leave stubs in the ledger with no bodies
         # in the archive — content lost.
-        atomic_write_text(archive_path, archive_content)
-        atomic_write_text(path, text)
+        _publish(archive_path, archive_content)
+        _publish(path, text)
         return archived_ids
 
 

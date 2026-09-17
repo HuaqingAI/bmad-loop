@@ -17,6 +17,7 @@ from bmad_loop.model import (
     StoryTask,
     TokenUsage,
     VerifyOutcome,
+    result_mapping,
 )
 
 
@@ -130,29 +131,46 @@ def test_sweep_decision_quarantines_round_trip():
     not `set[str]` because `save_state` serializes through `json.dumps`, which
     cannot encode a set; `sweeps_triggered` beside them already has that shape.
 
+    `sweep_unlanded_decisions` (DW-200) rides the same way for a different reason,
+    and is deliberately not folded into either: it records a VERDICT — this `build`
+    answer's `decision:` line never landed — observed in the decision phase and
+    consumed in materialization, so an interruption between those two phases must
+    not lose it. The drop that announces it clears it, so the two lists never both
+    hold an id.
+
     The dumps/loads here is the point: a set would raise on the way out."""
     state = _state()
     assert state.sweep_skipped_decisions == [] and state.sweep_dropped_decisions == []
+    assert state.sweep_unlanded_decisions == []
     state.sweep_skipped_decisions.append("DW-1")
     state.sweep_dropped_decisions.extend(["DW-2", "DW-3"])
+    state.sweep_unlanded_decisions.append("DW-4")
     back = RunState.from_dict(json.loads(json.dumps(state.to_dict())))
     assert back.sweep_skipped_decisions == ["DW-1"]
     assert back.sweep_dropped_decisions == ["DW-2", "DW-3"]
+    assert back.sweep_unlanded_decisions == ["DW-4"]
 
 
 def test_sweep_decision_quarantines_default_when_absent_from_dict():
     """A `state.json` written before DW-124 carries neither key, and must resume
     exactly as it does today: both quarantines empty, every decision re-evaluated.
 
+    A `state.json` written before DW-200 is the same case for the third list, and
+    the default matters more there than for a quarantine: reading it absent as
+    empty means an old paused run resumes with no unlanded verdicts, which is
+    exactly what it had.
+
     Ablation: change from_dict's `d.get("sweep_dropped_decisions", [])` to
-    `d["sweep_dropped_decisions"]` and this fails with KeyError while the
-    round-trip above stays green — to_dict always writes both keys, so the two
-    tests cover disjoint halves."""
+    `d["sweep_dropped_decisions"]` (or the same for `sweep_unlanded_decisions`)
+    and this fails with KeyError while the round-trip above stays green — to_dict
+    always writes all three keys, so the two tests cover disjoint halves."""
     d = _state().to_dict()
     del d["sweep_skipped_decisions"]
     del d["sweep_dropped_decisions"]
+    del d["sweep_unlanded_decisions"]
     back = RunState.from_dict(d)
     assert back.sweep_skipped_decisions == [] and back.sweep_dropped_decisions == []
+    assert back.sweep_unlanded_decisions == []
 
 
 def test_sweep_decision_quarantines_coerce_their_elements():
@@ -160,12 +178,14 @@ def test_sweep_decision_quarantines_coerce_their_elements():
     foreign state file is reachable, and every consumer membership-tests these
     lists against a DW id string.
 
-    Ablation: drop either `str()` in from_dict and the matching half fails."""
+    Ablation: drop any `str()` in from_dict and the matching half fails."""
     d = _state().to_dict()
     d["sweep_skipped_decisions"] = [1]
     d["sweep_dropped_decisions"] = [2]
+    d["sweep_unlanded_decisions"] = [3]
     back = RunState.from_dict(d)
     assert back.sweep_skipped_decisions == ["1"] and back.sweep_dropped_decisions == ["2"]
+    assert back.sweep_unlanded_decisions == ["3"]
 
 
 def test_sweeps_refused_coerces_both_halves():
@@ -983,3 +1003,85 @@ def test_release_spec_paths_from_mount_keeps_an_out_of_mount_spec_verbatim():
     task.release_spec_paths_from_mount()
 
     assert task.spec_file == "/shared-artifacts/spec.md"
+
+
+# ------------------------------------------------------- result_mapping
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        None,
+        # truthy non-mappings: the shapes that RAISED out of `.get` before
+        # DW-206, because `(doc or {})` substituted only on a falsy value
+        ["nope"],
+        "escalations",
+        7,
+        3.5,
+        ("nope",),
+        {"a", "b"},
+        object(),
+        # falsy non-mappings: the shapes the old idiom already absorbed
+        [],
+        "",
+        0,
+        False,
+        (),
+    ],
+)
+def test_result_mapping_answers_empty_for_every_non_mapping(document):
+    """The one shape predicate every read of a session result document goes
+    through. A result document is parsed JSON, so its top level can be any JSON
+    value, while every consumer reads it with `.get` — so each truthy row here
+    raised `AttributeError` at whichever frame touched it first (DW-206:
+    `Engine._run_session`, one frame upstream of DW-181's own guards). All of
+    them now refuse through the empty-document channel the absent-document row
+    already takes.
+
+    Ablation: replace the body with `result_json or {}` and every truthy
+    non-mapping row reddens (it is returned as itself), while `None` and the
+    falsy rows stay green — which is exactly why the falsy rows are here."""
+    assert result_mapping(document) == {}
+
+
+def test_result_mapping_returns_a_mapping_by_identity_never_a_copy():
+    """Returning the caller's OWN object is load-bearing, not incidental:
+    `Engine._reconcile_generic_terminal_status` mutates the document in place
+    under its own `isinstance` guard, and `_dev_phase` / the review loop bind
+    the result and pass it on. A copy would silently strand every such write.
+
+    Ablation: return `dict(result_json)` instead and the `is` assertions redden
+    while an `==` -only test would not notice."""
+    document = {"spec_file": "x.md"}
+
+    assert result_mapping(document) is document
+
+    empty: dict = {}
+    assert result_mapping(empty) is empty
+
+
+def test_result_mapping_falsy_mapping_answers_identically_to_the_old_substitute():
+    """`{}` is the one input the replaced `(doc or {})` idiom substituted for
+    while the input was already the right shape. `isinstance` lets it fall
+    through to `.get`, which answers the same thing the substitute would have —
+    the equivalence that preserves field-read behavior at the converted sites."""
+    assert result_mapping({}).get("spec_file") is None
+    assert result_mapping(None).get("spec_file") is None
+
+
+def test_result_mapping_absorbs_the_unchecked_session_record_rehydration():
+    """`SessionRecord.from_dict` takes `result_json` off state.json with no shape
+    check, so a hand-edited or corrupted run state is one of the two named
+    producers of a non-mapping document. Reading that record through the
+    predicate is total; reading it with `.get` is not."""
+    record = SessionRecord.from_dict(
+        {
+            "task_id": "1-1-a-dev-1",
+            "role": "dev",
+            "status": "completed",
+            "result_json": ["nope"],
+        }
+    )
+
+    assert record.result_json == ["nope"]  # rehydrated verbatim, unchecked
+    assert result_mapping(record.result_json) == {}

@@ -24,7 +24,17 @@ from textual.app import App, SuspendNotSupported
 from textual.binding import Binding
 from tomlkit.exceptions import ParseError
 
-from .. import bmadconfig, decisions, devcontract, policy, resolve, runs, stories, verify
+from .. import (
+    bmadconfig,
+    decisions,
+    deferredwork,
+    devcontract,
+    policy,
+    resolve,
+    runs,
+    stories,
+    verify,
+)
 from ..adapters.multiplexer import MultiplexerError, mux_usable
 from ..journal import load_state, state_lock
 from ..model import (
@@ -389,18 +399,45 @@ class BmadLoopApp(App[None]):
         self.push_screen(DecisionModal(decision), on_choice)
 
     def _record_decision(self, decision: object, option: object) -> bool:
+        """Record one answered decision, answering whether `_walk_decisions` may
+        count it into `recorded N decision(s)`.
+
+        False means either a caught fault (which may follow a partial write) or
+        a ledger non-write. The toasts distinguish these by wording and severity;
+        the caller excludes both from its count and continues the walk.
+
+        A publish REFUSAL (DW-209/213) is a third, orthogonal thing and does not
+        touch the boolean: the operand list `apply_pre_answer` commits is already
+        gated on what that call wrote, so a refusal means an answer that really
+        landed on disk is missing from git history — news worth a `warning` toast,
+        but not a reason to stop counting the answer as answered. It rides on the
+        non-write toast where there is one and raises its own otherwise.
+        """
         # decision/option cross the widget boundary as `object`; their runtime types
         # are the Decision/DecisionOption that apply_pre_answer and `.id` expect.
         try:
-            decisions.apply_pre_answer(
+            result = decisions.apply_pre_answer(
                 self.project,
                 decision,  # pyright: ignore[reportArgumentType]
                 option,  # pyright: ignore[reportArgumentType]
                 date=time.strftime("%Y-%m-%d"),
             )
-        except (OSError, bmadconfig.BmadConfigError, ValueError, runs.StateRootError) as e:
+        except (
+            OSError,
+            bmadconfig.BmadConfigError,
+            ValueError,
+            runs.StateRootError,
+            deferredwork.LedgerReadError,
+        ) as e:
             # ValueError is the ledger writers' date precondition; it cannot fire
-            # from the strftime above. StateRootError is reachable: the ledger
+            # from the strftime above. LedgerReadError is the one that IS reachable
+            # from the ledger read itself (DW-146): the modal blocks on the human,
+            # so a ledger that goes undecodable while it is open raises out of
+            # `record_decision`'s locked `read_for_write`. That fault used to arrive
+            # as a `ValueError` (a `UnicodeDecodeError` is one) and was caught here;
+            # retyping it to a plain `Exception` — deliberately, so no `except
+            # OSError` can swallow it — dropped it out of this tuple, and naming it
+            # puts it back. StateRootError is reachable too: the ledger
             # write now takes a cross-process lock whose sidecar lives under the
             # state root (#286/#469), and an environment that names no usable root
             # raises it — it is NOT an OSError, so the tuple has to say so.
@@ -414,6 +451,31 @@ class BmadLoopApp(App[None]):
                 severity="error",
             )
             return False
+        note = result.publish_note()
+        if not result.recorded:
+            # Report the persistence contract from apply_pre_answer, excluding
+            # the non-write from the walk's count. Path resolution can itself fail,
+            # so this toast does not distinguish missing files from retired ids.
+            saved = (
+                ""
+                if option.effect == "close"  # pyright: ignore[reportAttributeAccessIssue]
+                else "; your answer was saved to the pre-answer store"
+            )
+            unpublished = "" if note is None else f"; {note}"
+            self.notify(
+                f"{decision.id}: no decision line was written to the ledger{saved}{unpublished}",  # pyright: ignore[reportAttributeAccessIssue]
+                severity="warning",
+                markup=False,
+            )
+            return False
+        if note is not None:
+            # An otherwise-successful record whose written operand went
+            # unpublished. Its own toast, and the answer still counts.
+            self.notify(
+                f"{decision.id}: {note}",  # pyright: ignore[reportAttributeAccessIssue]
+                severity="warning",
+                markup=False,
+            )
         return True
 
     def action_resume_run(self) -> None:
