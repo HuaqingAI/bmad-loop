@@ -364,7 +364,10 @@ breaking changes may land in a minor release.
   run retries once the store is writable. The retirement removes the entry only while
   it still holds the value that was dropped: a paused run's stale run-local copy wins
   over the store on resume, so a replacement a human recorded out of band meanwhile
-  is left in place for the next run instead of being deleted and committed away.
+  is left in place for the next run instead of being deleted and committed away. The
+  store's three writers now serialize on a state-root sidecar lock (`decisions.store_lock`,
+  the store's `ledger_lock`), so that compare-and-delete and a concurrent `bmad-loop
+decisions` re-answer cannot interleave.
 
 - **Skip an unreadable cached triage instead of failing the read** (DW-145). Widen
   `decisions.pending_missed_decisions`' except tuple to include `UnicodeDecodeError` —

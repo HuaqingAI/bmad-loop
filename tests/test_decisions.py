@@ -1,12 +1,13 @@
 """Pre-answer store, discovery of missed decisions, and out-of-band apply."""
 
+import contextlib
 import json
 import sys
 
 import pytest
 from conftest import fault_read_text, install_bmad_config, write_ledger
 
-from bmad_loop import decisions, deferredwork, platform_util
+from bmad_loop import decisions, deferredwork, platform_util, runs
 from bmad_loop.sweep import DecisionOption
 
 
@@ -61,6 +62,115 @@ def test_store_round_trip_and_prune(project):
     dropped = decisions.prune_pre_answers(project.project, {"DW-9"})
     assert dropped == ["DW-7"]
     assert decisions.load_pre_answers(project.project) == {}
+
+
+# The pre-answer store's cross-process writers. Same doctrine as the ledger-lock
+# section of tests/test_deferredwork.py, whose comment says why exclusion is
+# probed with `blocking=False` only: `file_lock` is per open fd, so a blocking
+# probe from this process would wait forever on POSIX against a lock this very
+# thread holds. Every row is seeded to WRITE — a no-op row would grade nothing.
+_OPT = DecisionOption(key="1", label="Build it", effect="build", intent="do it")
+STORE_WRITERS = {
+    "record_pre_answer": lambda root: decisions.record_pre_answer(
+        root, "DW-2", _OPT, date="2026-06-13"
+    ),
+    "prune_pre_answers": lambda root: decisions.prune_pre_answers(root, set()),
+    "drop_pre_answer": lambda root: decisions.drop_pre_answer(
+        root, "DW-1", answer=decisions.load_pre_answers(root)["DW-1"]
+    ),
+}
+
+
+def _store_lock_is_held(root) -> bool:
+    """True when the store's sidecar lock cannot be taken right now."""
+    try:
+        with platform_util.file_lock(
+            runs.lock_path_for(decisions.store_path(root)), blocking=False
+        ):
+            return False
+    except OSError:
+        return True
+
+
+@pytest.mark.parametrize("name", sorted(STORE_WRITERS))
+def test_every_store_writer_holds_the_store_lock_once(project, monkeypatch, name):
+    """Each store writer takes `store_lock` exactly once, at depth zero, and the
+    hold really excludes.
+
+    The store has two writers in different processes — a sweep's prunes and the
+    human's `bmad-loop decisions` — and each is a whole-file read->edit->write that
+    `_write_store`'s atomic replace protects only the last step of. For the DW-143
+    prune the unlocked interval was the whole defect: a replacement recorded
+    between its read and its write is exactly the value its compare exists to
+    spare, and it would overwrite it with the stale snapshot. That the spy fired
+    says the writer routes through the lock; ONCE says the read, the edit and the
+    write sit inside one acquisition rather than a per-step hold another writer
+    can slip between; the probe inside says it is a real OS lock and not a no-op.
+
+    Ablation: dedent any one writer's body out of its `with store_lock(project):`
+    — that row's spy never fires and it reds. Wrap only `drop_pre_answer` and the
+    other two rows red, which is the point: a lock one writer takes excludes
+    nobody."""
+    decisions.record_pre_answer(project.project, "DW-1", _OPT, date="2026-06-13")
+    real_lock = decisions.store_lock
+    probed = []
+    depth = 0
+
+    @contextlib.contextmanager
+    def spy_lock(root):
+        nonlocal depth
+        assert depth == 0, f"{name} nested a store_lock acquisition"
+        depth += 1
+        try:
+            with real_lock(root):
+                probed.append(_store_lock_is_held(root))
+                yield
+        finally:
+            depth -= 1
+
+    monkeypatch.setattr(decisions, "store_lock", spy_lock)
+
+    STORE_WRITERS[name](project.project)
+
+    assert probed == [True]
+
+
+def test_store_lock_refuses_to_nest(project):
+    """A nested acquisition raises rather than self-deadlocking on POSIX `flock`
+    (per open fd, no timeout, no traceback) — the same guard `ledger_lock` has.
+
+    Ablation: delete the `_LOCK_STATE.held` check and this row hangs instead of
+    raising, which is why it is the one row here that MUST stay a raise."""
+    with decisions.store_lock(project.project):
+        with pytest.raises(RuntimeError, match="not reentrant"):
+            with decisions.store_lock(project.project):
+                pass  # pragma: no cover — never entered
+    # and the guard is released on exit, so a later acquisition is fine
+    with decisions.store_lock(project.project):
+        pass
+
+
+def test_a_store_writer_that_cannot_lock_writes_nothing(project, monkeypatch):
+    """A failed acquisition propagates without touching the store: a write that
+    could not be serialized fails loudly rather than proceeding unlocked. The
+    error shape is the one `msvcrt.locking` raises when its ~10 s retry runs out
+    — a routine outcome on the Windows legs, not a contrived one."""
+    decisions.record_pre_answer(project.project, "DW-1", _OPT, date="2026-06-13")
+    store = decisions.store_path(project.project)
+    before = store.read_bytes()
+
+    @contextlib.contextmanager
+    def unavailable(path, **kwargs):
+        raise OSError(11, "Resource deadlock avoided")
+        yield  # pragma: no cover — unreachable
+
+    monkeypatch.setattr(decisions, "file_lock", unavailable)
+
+    with pytest.raises(OSError):
+        decisions.record_pre_answer(project.project, "DW-2", _OPT, date="2026-06-13")
+    with pytest.raises(OSError):
+        decisions.drop_pre_answer(project.project, "DW-1", answer=json.loads(before)["DW-1"])
+    assert store.read_bytes() == before
 
 
 def test_drop_pre_answer_removes_one_entry_and_leaves_the_rest(project):
@@ -626,7 +736,6 @@ def test_apply_pre_answer_is_one_ledger_transaction(
     It is kept for the claim it does decide — that the no-close path still writes
     the pair's bytes and leaves the entry open — not as a second count oracle.
     """
-    import contextlib
 
     from bmad_loop.sweep import Decision
 

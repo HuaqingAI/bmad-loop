@@ -24,10 +24,13 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from . import bmadconfig, deferredwork, runs, verify
-from .platform_util import atomic_write_text_confined
+from .platform_util import atomic_write_text_confined, file_lock
 from .sweep import Decision, DecisionOption, unusable_answer_reason, validate_triage
 
 STORE_REL = Path(".bmad-loop") / "decisions.json"
@@ -63,6 +66,52 @@ def load_pre_answers(project: Path) -> dict[str, dict]:
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+# Per-thread reentrancy guard for :func:`store_lock`, the same shape as
+# `deferredwork._LOCK_STATE` and for the same reason: `file_lock` is per open fd,
+# so a nested acquisition from the thread that holds it blocks forever on POSIX.
+_LOCK_STATE = threading.local()
+
+
+@contextmanager
+def store_lock(project: Path) -> Iterator[None]:
+    """Cross-process mutual exclusion for one project's pre-answer store — the
+    store's `deferredwork.ledger_lock`.
+
+    The store has two writers that do not share a process: a sweep (`_prune_pre_answers`
+    and the DW-143 prune at a stale drop) and the human's `bmad-loop decisions`
+    (`record_pre_answer`, via `apply_pre_answer`). Every writer is a whole-file
+    read->edit->write, and `_write_store`'s atomic replace protects only the write:
+    two writers that both read, both edit and both publish let the last replace win,
+    and the one it beats is a human's answer. Worse for the DW-143 prune, whose
+    *whole point* is to compare before it deletes — a replacement recorded between
+    its read and its write is exactly the value the compare exists to spare, and an
+    unlocked compare cannot see it. Under the lock the compare and the delete are
+    one step, so a replacement lands either before the read (and compares unequal)
+    or after the write (and is untouched); there is no third interleaving.
+
+    Held only around that one read->edit->write — never across a subprocess, a
+    session or a prompt (`apply_pre_answer` commits OUTSIDE it, the way the ledger
+    lock's holders do), because `file_lock`'s Windows branch gives up after ~10 s and
+    raises. Nesting raises `RuntimeError` rather than self-deadlocking, and a failed
+    acquisition propagates (`OSError`, `runs.StateRootError`): a write that could not
+    be serialized fails loudly, never proceeds unlocked. Distinct from the ledger's
+    lock (a different sidecar for a different file), so a caller holding neither is
+    free to take either; nothing needs both, and nothing should.
+
+    The sidecar lives under the state root, not beside the store, for the reason
+    `runs.lock_path_for` gives: the store is a tracked file the sweep commits with
+    `add -A`, and a lock beside it would ride into those commits."""
+    if getattr(_LOCK_STATE, "held", False):
+        raise RuntimeError("pre-answer store lock is not reentrant")
+    lock_path = runs.lock_path_for(store_path(project))
+    _LOCK_STATE.held = True
+    try:
+        with file_lock(lock_path):
+            yield
+    finally:
+        _LOCK_STATE.held = False
 
 
 def _write_store(project: Path, data: dict) -> None:
@@ -101,29 +150,33 @@ def _write_store(project: Path, data: dict) -> None:
 def record_pre_answer(project: Path, dw_id: str, option: DecisionOption, *, date: str) -> None:
     """Persist a chosen option so a future sweep applies it without asking. The
     option's full semantics are stored (not just its key): a later triage may
-    renumber options, so the sweep reads effect/intent from here directly."""
-    data = load_pre_answers(project)
-    data[dw_id] = {
-        "key": option.key,
-        "label": option.label,
-        "effect": option.effect,
-        "intent": option.intent,
-        "resolution": option.resolution,
-        "bundle_name": option.bundle_name,
-        "answered_at": date,
-    }
-    _write_store(project, data)
+    renumber options, so the sweep reads effect/intent from here directly.
+    One locked read->edit->write (`store_lock`), like every writer here."""
+    with store_lock(project):
+        data = load_pre_answers(project)
+        data[dw_id] = {
+            "key": option.key,
+            "label": option.label,
+            "effect": option.effect,
+            "intent": option.intent,
+            "resolution": option.resolution,
+            "bundle_name": option.bundle_name,
+            "answered_at": date,
+        }
+        _write_store(project, data)
 
 
 def prune_pre_answers(project: Path, open_ids: set[str]) -> list[str]:
     """Drop store entries whose DW id is no longer open (built or closed). No-op
-    write when nothing is dropped. Returns the dropped ids."""
-    data = load_pre_answers(project)
-    dropped = [k for k in data if k not in open_ids]
-    if dropped:
-        for k in dropped:
-            del data[k]
-        _write_store(project, data)
+    write when nothing is dropped. Returns the dropped ids. One locked
+    read->edit->write (`store_lock`), like every writer here."""
+    with store_lock(project):
+        data = load_pre_answers(project)
+        dropped = [k for k in data if k not in open_ids]
+        if dropped:
+            for k in dropped:
+                del data[k]
+            _write_store(project, data)
     return dropped
 
 
@@ -149,17 +202,31 @@ def drop_pre_answer(project: Path, dw_id: str, *, answer: object) -> bool:
     in-run answer never equals a store entry at all (different shape), so an id a
     run answered itself never reaches this store through the drop.
 
+    The compare and the delete are ONE step under `store_lock`: without it a
+    replacement recorded between the read and the write — by `bmad-loop decisions`
+    in another process — is precisely the value the compare exists to spare, and
+    the stale snapshot would overwrite it. Under the lock a replacement lands
+    either before the read (compares unequal, spared) or after the write
+    (untouched). Equality then IS the provenance test, with one deliberate
+    consequence: a re-answer that is byte-for-byte the stale entry (same option,
+    same day — `answered_at` is day-precise) is the same answer, stale by the same
+    evidence, and the next run would seed, drop and prune it anyway; retiring it
+    now costs the human one drop-and-notify cycle they were owed nothing by, not
+    an answer. A store revision would refuse that removal at the price of a store
+    schema change, for an entry whose fate is identical either way.
+
     Same read-modify-write shape, same no-op-when-nothing-changes discipline: an
     absent id, or one holding a different value, writes nothing at all, so a drop
     whose answer only ever lived in `<run>/decisions.json` leaves the project
     store's bytes (and mtime) untouched. A removal goes through `_write_store`, so
     an operator-locked store still raises `PermissionError` rather than silently
     skipping — deleting a human-authored answer is a store write, never a repair."""
-    data = load_pre_answers(project)
-    if dw_id not in data or data[dw_id] != answer:
-        return False
-    del data[dw_id]
-    _write_store(project, data)
+    with store_lock(project):
+        data = load_pre_answers(project)
+        if dw_id not in data or data[dw_id] != answer:
+            return False
+        del data[dw_id]
+        _write_store(project, data)
     return True
 
 
