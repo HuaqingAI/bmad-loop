@@ -508,7 +508,11 @@ breaking changes may land in a minor release.
   human's answer had already been saved and journaled. Both now journal the fault
   (`sweep-resolved-close-unavailable`, `sweep-decision-effect-unavailable`) and carry
   on: the answers stay in the run's `decisions.json` and the entries stay open for the
-  next cycle.
+  next cycle. The PUBLISH is the exception: a ledger mutator whose atomic write fails
+  (`ENOSPC`, `EROFS`, a failed rename) now raises `deferredwork.LedgerWriteError` — an
+  `OSError` subclass, so the CLI and TUI degrade arms are unchanged — and both sweep
+  sites re-raise it ahead of the degrade, since a repair write that failed is not a
+  phase that closed nothing.
 
 - Commit the deferred-work ledger in the tree that owns it (DW-175). `implementation_artifacts`
   is configurable to any absolute path, so the ledger may sit under the project, inside

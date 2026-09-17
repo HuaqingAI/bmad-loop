@@ -9464,6 +9464,82 @@ def test_decision_effect_degrades_on_lock_and_state_root_failures(project, monke
     assert all(entry.open for entry in ledger_entries(project).values())
 
 
+def test_a_failed_ledger_publish_ends_the_resolved_close_loudly(project, monkeypatch):
+    """The DW-166 degrade is for the faults it named — a lock we never got, bytes
+    we could not read — and NOT for the publish itself. `mark_done_many` ends in an
+    atomic write, and its `ENOSPC` reached the same `except OSError` arm the
+    lock's `EDEADLK` does, so a repair write that FAILED was journaled as a phase
+    that closed nothing and the sweep carried on with its books unkept. That
+    fault leaves `deferredwork` as `LedgerWriteError` and `_close_resolved`
+    re-raises it ahead of the degrade: observation may degrade, repair writes
+    must raise (AGENTS.md).
+
+    The real `mark_done_many` runs here — only the writer beneath it is faulted —
+    so the row grades the whole path from the atomic write to the caller, and the
+    sibling degrade row above (a lock-shaped bare `OSError` injected at the
+    mutator) still passes: the two faults are now different types.
+
+    Ablation: delete the `except deferredwork.LedgerWriteError: raise` arm and
+    this reds on the degrade returning 0 with a `sweep-resolved-close-unavailable`
+    row instead of raising."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}),
+        already_resolved=(ResolvedEntry("DW-1", "fixed by a1b2c3d"),),
+    )
+
+    def boom(path, text):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(deferredwork, "atomic_write_text", boom)
+
+    with pytest.raises(deferredwork.LedgerWriteError, match="No space left on device"):
+        engine._close_resolved(plan)
+
+    # not degraded and nothing claimed closed: the raise left the run with no
+    # journal at all — the phase writes its first row only after the mutator returns
+    assert not (engine.run_dir / "journal.jsonl").exists()
+    assert ledger_entries(project)["DW-1"].open  # the atomic writer left the ledger alone
+
+
+def test_a_failed_ledger_publish_ends_the_decision_walk_loudly(project, monkeypatch):
+    """`_decisions_phase`'s arm, where the stakes are the ones DW-166 was about:
+    the human's answer is already in `<run>/decisions.json` when the effect runs.
+    That ordering is what makes the raise SAFE rather than a regression — the
+    answer survives the crash exactly as it would any other — while degrading
+    here let a `build` answer's bundle be dispatched off an authorization the
+    ledger could not record, and reported the sweep as having kept its books.
+
+    Ablation: delete the `except deferredwork.LedgerWriteError: raise` arm in
+    `_decisions_phase` and this reds on the walk continuing to DW-2 with a
+    `sweep-decision-effect-unavailable` row for DW-1 instead of raising."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    engine, _ = make_sweep(project, [], answers=["1", "1"], prompting=True)
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}),
+        decisions=(_close_or_keep_decision("DW-1"), _close_or_keep_decision("DW-2")),
+    )
+
+    def boom(path, text):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(deferredwork, "atomic_write_text", boom)
+
+    with pytest.raises(deferredwork.LedgerWriteError, match="No space left on device"):
+        engine._decisions_phase(plan)
+
+    # the answer outlived the raise — the ordering the degrade was written around
+    saved = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
+    assert set(saved) == {"DW-1"}  # DW-1 answered and persisted; DW-2 never reached
+    assert [r["dw_id"] for r in _records(engine, "decision-answered")] == ["DW-1"]
+    assert _records(engine, "sweep-decision-effect-unavailable") == []  # not degraded
+    assert _records(engine, "post_decision") == []
+    assert all(entry.open for entry in ledger_entries(project).values())
+
+
 @pytest.mark.parametrize(
     "first_effect_lands", [False, True], ids=["all-fault", "success-then-fault"]
 )

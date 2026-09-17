@@ -99,6 +99,21 @@ lets it propagate untouched. :class:`LedgerReadError` derives from ``Exception``
 rather than ``OSError`` or ``ValueError`` so that neither those two widened
 handlers nor any future ``except OSError`` silently swallows the one fault this
 contract exists to attribute.
+
+The WRITE half of every mutator is typed too. Each locked read->edit->write ends in
+:func:`_publish`, and an ``OSError`` raised there — ``ENOSPC``, ``EROFS``, a failed
+fsync or rename, a permission the atomic writer's temp file lacks — leaves as
+:class:`LedgerWriteError`. It IS an ``OSError`` (a subclass), so every caller that
+already degrades on ``OSError`` is unchanged: the CLI and the TUI decision modal
+keep answering the human rather than dying. What the subclass buys is the split a
+caller that WANTS to fail loud on a lost publish needs, and cannot make from the
+outside: before it, a failed lock (``EDEADLK``, a contended sidecar) and a failed
+write reached a handler as the same bare ``OSError``, and ``sweep._close_resolved``
+/ ``sweep._decisions_phase`` — which degrade the lock and read faults DW-166 named
+so a bookkeeping phase cannot crash a sweep — swallowed the write fault with them,
+reporting a phase that closed nothing where a repair write had failed. Both now
+re-raise this type ahead of that arm. The rule they follow is the one in
+``AGENTS.md``: observation may degrade, repair writes must raise.
 """
 
 from __future__ import annotations
@@ -124,6 +139,36 @@ class LedgerReadError(Exception):
     A plain ``Exception`` on purpose (DW-146): an ``OSError`` or ``ValueError``
     subclass would be swallowed by the very ``except`` arms this fault escaped.
     """
+
+
+class LedgerWriteError(OSError):
+    """A mutator's atomic publish of the deferred-work ledger failed.
+
+    An ``OSError`` SUBCLASS on purpose, the opposite choice from
+    :class:`LedgerReadError`: the read fault had to escape the ``except OSError``
+    arms it kept flying past, where this one must keep being CAUGHT by every
+    caller that already degrades a ledger ``OSError`` (``cli.cmd_decisions``,
+    ``tui.app._record_decision``, ``decisions.apply_pre_answer``'s callers). The
+    subclass exists for the callers that must NOT — a sweep phase whose degrade
+    arm was written for lock and decode faults, and which a lost publish reached
+    looking exactly like a lost lock. Raised only by :func:`_publish`, with the
+    original ``OSError`` chained as ``__cause__``.
+    """
+
+
+def _publish(path: Path, text: str) -> None:
+    """The one write every ledger mutator ends in: :func:`atomic_write_text`,
+    retyped. The atomic writer's failure modes — the temp file, its fsync, the
+    replace — all surface as ``OSError``; each leaves here as
+    :class:`LedgerWriteError` so a caller can tell a publish that failed from a
+    lock it never got. Anything that is not an ``OSError`` (the strict encoder's
+    ``UnicodeEncodeError``, a ``ValueError`` precondition) is not a publish fault
+    and passes through untouched.
+    """
+    try:
+        atomic_write_text(path, text)
+    except OSError as e:
+        raise LedgerWriteError(f"could not publish {path}: {type(e).__name__}: {e}") from e
 
 
 def read_for_write(path: Path) -> str | None:
@@ -1086,7 +1131,7 @@ def _mark_done_many(
         text, marked = _apply_done_many(text, dw_ids, date, note, notes, undo_owner)
         if not marked:
             return []
-        atomic_write_text(path, text)
+        _publish(path, text)
         return marked
 
 
@@ -1226,7 +1271,7 @@ def mark_seen_again_many(
             applied.append(True)
         if not any(applied):
             return applied, None, stale, preimage
-        atomic_write_text(path, text)
+        _publish(path, text)
         # Both returned from INSIDE the hold: the published text by
         # construction, and the preimage it replaced — neither a read-back that a
         # rival could have moved.
@@ -1403,7 +1448,7 @@ def mark_open_many(path: Path, dw_ids: Sequence[str], note: str, operation_id: s
         text, reopened = _apply_open_many(text, dw_ids, note, undo_owner)
         if not reopened:
             return []
-        atomic_write_text(path, text)
+        _publish(path, text)
         return reopened
 
 
@@ -1528,7 +1573,7 @@ def record_decision(
             closed = _apply_done(text, dw_id, date, close_note)
             if closed is not None:
                 text = closed
-        atomic_write_text(path, text)
+        _publish(path, text)
         return True
 
 
@@ -1797,7 +1842,7 @@ def append_entries_published(
         if all(dw_id is None for dw_id in minted):
             return minted, None, preimage
         path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(path, text)
+        _publish(path, text)
         # Both returned from INSIDE the hold: the published text by
         # construction, and the preimage it replaced — neither a read-back that a
         # rival could have moved.
@@ -2224,8 +2269,8 @@ def archive_closed(
         # the ledger unchanged (safe — the bodies are still in the live file).
         # Writing the ledger first would leave stubs in the ledger with no bodies
         # in the archive — content lost.
-        atomic_write_text(archive_path, archive_content)
-        atomic_write_text(path, text)
+        _publish(archive_path, archive_content)
+        _publish(path, text)
         return archived_ids
 
 

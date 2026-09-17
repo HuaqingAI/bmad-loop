@@ -2627,6 +2627,16 @@ class SweepEngine(Engine):
         # unreachable from `_today()` and named for the same reason the DW-146
         # sibling handlers name it. `LedgerReadError` is a plain `Exception` and
         # `StateRootError` is not an `OSError`, so both must be spelled out.
+        #
+        # What does NOT degrade is the publish itself. `mark_done_many` ends in an
+        # atomic write, and its `ENOSPC`/`EROFS`/failed-rename `OSError` reached
+        # this tuple looking exactly like the lock's — the fault DW-166 never
+        # named, swallowed along with the ones it did. `deferredwork._publish`
+        # retypes it as `LedgerWriteError` (an `OSError` subclass, so the CLI and
+        # TUI degrade arms are untouched) and this site re-raises it first: a
+        # repair write that failed is not a phase that closed nothing, it is a
+        # sweep that cannot keep its books, and the rule is AGENTS.md's —
+        # observation may degrade, repair writes must raise.
         try:
             closed = deferredwork.mark_done_many(
                 ledger,
@@ -2635,6 +2645,8 @@ class SweepEngine(Engine):
                 "already resolved",
                 notes=[f"already resolved: {entry.evidence}" for entry in plan.already_resolved],
             )
+        except deferredwork.LedgerWriteError:
+            raise
         except (deferredwork.LedgerReadError, OSError, ValueError, StateRootError) as e:
             self.journal.append("sweep-resolved-close-unavailable", dw_ids=ids, error=str(e))
             # `post_close_resolved` still fires and 0 is still returned: the phase
@@ -2908,8 +2920,19 @@ class SweepEngine(Engine):
                 # and then crashed. (That ordering is deliberate and stays: the
                 # human's answer must survive a crash. It is the reason this
                 # degrade matters, not a thing to fix by reordering.)
+                #
+                # The publish is the exception to the degrade, as in
+                # `_close_resolved`: a `LedgerWriteError` out of `record_decision`
+                # means the human's answer is in `<run>/decisions.json` and the
+                # ledger's atomic write FAILED — not a lock we never got, not bytes
+                # we could not read — and that raises. The ordering above is what
+                # makes the raise safe: the answer already survives the crash, and
+                # a `build` bundle must not be dispatched off an authorization the
+                # ledger could not record.
                 try:
                     recorded = self._apply_decision_effect(decision, option)
+                except deferredwork.LedgerWriteError:
+                    raise
                 except (
                     deferredwork.LedgerReadError,
                     OSError,

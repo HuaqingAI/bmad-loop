@@ -1805,6 +1805,47 @@ def test_mark_done_many_is_all_or_nothing_on_a_write_failure(tmp_path, monkeypat
     assert p.read_bytes() == before  # nothing partially applied
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda p: mark_done_many(p, ["DW-1"], "2026-07-24", "note"), id="mark_done_many"
+        ),
+        pytest.param(
+            lambda p: record_decision(p, "DW-1", "2026-07-24", "Keep", "why"),
+            id="record_decision",
+        ),
+    ],
+)
+def test_a_failed_publish_leaves_as_a_typed_ledger_write_error(tmp_path, monkeypatch, mutate):
+    """The mutators' atomic write fails as `LedgerWriteError`: an `OSError` — so
+    every `except OSError` caller keeps its degrade — that a caller which must fail
+    loud on a lost publish can name AHEAD of that arm, where a bare `OSError` was
+    indistinguishable from the lock's. The original fault stays chained as
+    `__cause__` and named in the message, and nothing partial reaches disk.
+
+    Ablation: make `_publish` a bare `atomic_write_text` call and the
+    `isinstance(..., LedgerWriteError)` assertion reds while `OSError` still
+    passes — which is exactly the split the type exists to make."""
+    p = tmp_path / "deferred-work.md"
+    p.write_text(LEDGER, encoding="utf-8")
+    before = p.read_bytes()
+
+    def boom(path, text):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(deferredwork, "atomic_write_text", boom)
+
+    with pytest.raises(OSError) as exc:
+        mutate(p)
+
+    assert isinstance(exc.value, deferredwork.LedgerWriteError)
+    assert isinstance(exc.value.__cause__, OSError)
+    assert exc.value.__cause__.errno == 28
+    assert "No space left on device" in str(exc.value)
+    assert p.read_bytes() == before
+
+
 def test_mark_done_many_skips_an_already_done_entry(tmp_path):
     """Idempotent for a resume that re-drives a close that already landed: no
     second resolution line, and the id is not reported as newly marked."""
