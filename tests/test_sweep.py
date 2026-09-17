@@ -7666,6 +7666,89 @@ def test_a_run_local_only_stale_answer_writes_nothing_to_the_project_store(proje
     assert len(_records(engine, "sweep-decision-answer-dropped")) == 1
 
 
+def test_the_stale_drop_spares_a_project_pre_answer_a_human_replaced_while_the_run_was_paused(
+    project,
+):
+    """The prune retires the entry that FED the dropped answer — never an entry a
+    human wrote after it. `_decisions_phase` seeds a project pre-answer into
+    `<run>/decisions.json` once and lets the run-local copy win from then on, and
+    `pending_missed_decisions` screens against the project store alone, so a human
+    can re-answer the id out of band while that run is paused: the store then
+    holds a NEWER answer the resumed run has never evaluated. Keyed on the id
+    alone, the prune deleted that replacement — and committed the deletion — on
+    the strength of the stale run-local copy it had superseded. `drop_pre_answer`
+    now compares the value it is retiring against what the store holds.
+
+    Run 1 holds the stale keep-open answer run-locally (a paused run's file, hand-
+    written the way the DW-124 rows write it); the project store holds the human's
+    later `build` replacement. The drop's own surfaces are unchanged — row,
+    quarantine, `answer_dropped` — while the store keeps its exact bytes and no
+    prune row or ledger commit is written. Run 2 is a genuinely separate run and
+    seeds the replacement: it is the next evaluation the surviving answer was kept
+    for, and it materializes into a bundle instead of being re-asked.
+
+    Ablation: restore `drop_pre_answer`'s unconditional `del data[dw_id]` (drop
+    the `data[dw_id] != answer` half of its early return) and this reddens — the
+    store is emptied, a prune row and a ledger commit land, and run 2 seeds
+    nothing."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open"})
+    install_bmad_config(project)
+    plan = _stale_keep_open_plan()
+    # the human's replacement, recorded out of band AFTER run 1 stored its answer:
+    # the plan's current build option, so run 2 can consume it as-is
+    decisions_store.record_pre_answer(
+        project.project, "DW-1", plan.decisions[0].options[0], date="2026-09-16"
+    )
+    store = decisions_store.store_path(project.project)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "out-of-band re-answer")
+    replacement = decisions_store.load_pre_answers(project.project)["DW-1"]
+    assert replacement != _STALE_KEEP_OPEN_ANSWER  # PRECONDITION: the two really differ
+    before = store.read_bytes()
+
+    first, _ = make_sweep(project, [])
+    first.run_dir.mkdir(parents=True, exist_ok=True)
+    (first.run_dir / "decisions.json").write_text(
+        json.dumps({"DW-1": _STALE_KEEP_OPEN_ANSWER}, indent=2), encoding="utf-8"
+    )
+    first_answers, _closed = first._decisions_phase(plan)
+    # PRECONDITION: the run-local copy won — the replacement was not seeded, so
+    # the phase had nothing to journal at all
+    assert first_answers == {"DW-1": _STALE_KEEP_OPEN_ANSWER}
+    assert not (first.run_dir / "journal.jsonl").exists()
+
+    _, dropped = first._materialize_bundles(plan, first_answers)
+
+    # the drop itself is exactly what it was
+    assert dropped is True
+    [drop] = _records(first, "sweep-decision-answer-dropped")
+    assert drop["decision"] == "DW-1" and drop["drop_cause"] == "stale-option"
+    assert first.state.sweep_dropped_decisions == ["DW-1"]
+    # but the human's replacement is not the answer that was dropped, and survives
+    # byte-for-byte: no removal, no prune row, nothing to commit
+    assert store.read_bytes() == before
+    assert decisions_store.load_pre_answers(project.project) == {"DW-1": replacement}
+    assert _records(first, "sweep-decision-preanswer-pruned") == []
+    assert _records(first, "sweep-ledger-commit") == []
+    assert worktree_clean(project.project)
+    # the store still answers the id, so it is not re-offered out of band either
+    assert decisions_store.pending_missed_decisions(project.project) == []
+
+    # run 2 evaluates the replacement from scratch and builds from it
+    second, _ = make_sweep(project, [], run_id="sweep-run-2")
+    second.run_dir.mkdir(parents=True, exist_ok=True)
+    assert second.run_dir != first.run_dir
+    second_answers, _closed = second._decisions_phase(plan)
+    assert second_answers == {"DW-1": replacement}
+    assert [r["dw_id"] for r in _records(second, "decision-preanswered")] == ["DW-1"]
+    bundles, dropped_second = second._materialize_bundles(plan, second_answers)
+    assert not dropped_second
+    assert _records(second, "sweep-decision-answer-dropped") == []
+    assert [tuple(b.dw_ids) for b in bundles] == [("DW-1",)]
+
+
 @pytest.mark.parametrize("drop_cause", ["no-intent", "name-collision"])
 def test_a_build_answer_drop_leaves_the_project_pre_answer_in_place(project, drop_cause):
     """The prune is scoped to the keep-open lane. A dropped BUILD answer leaves its
