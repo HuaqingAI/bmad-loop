@@ -8993,6 +8993,110 @@ def test_a_phase_that_wrote_nothing_spawns_no_git(project, monkeypatch, phase):
     assert git(project.project, "status", "--porcelain") == dirty_before  # ...and it stays theirs
 
 
+class _Killed(BaseException):
+    """The process dying between a phase's ledger PUBLISH and its commit — a
+    `BaseException` so it passes every `except Exception` arm the way a real
+    SIGKILL, power loss or `KeyboardInterrupt` would."""
+
+
+def _close_resolved_then_die(engine):
+    """`_close_resolved` over a plan that closes DW-1: `mark_done_many` publishes
+    the closure, then the process dies before `_commit_ledger` runs."""
+    engine._close_resolved(
+        TriagePlan(
+            open_ids=frozenset({"DW-1", "DW-2"}),
+            already_resolved=(ResolvedEntry("DW-1", "fixed by a1b2c3d"),),
+        )
+    )
+
+
+def _decisions_phase_then_die(engine):
+    """`_decisions_phase` attended, the human closing DW-1: `record_decision`
+    publishes the `decision:` line and the close, then the process dies before
+    `_commit_ledger` runs. The answer is already in `<run>/decisions.json`, so
+    a replay finds nothing pending and applies no effect."""
+    engine.prompting = True
+    engine.prompter = DecisionPrompter(input_fn=lambda _p: "1", print_fn=lambda _l: None)
+    engine._decisions_phase(
+        TriagePlan(
+            open_ids=frozenset({"DW-1", "DW-2"}),
+            decisions=(_close_or_keep_decision("DW-1"),),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [_close_resolved_then_die, _decisions_phase_then_die],
+    ids=["close-resolved", "decisions-phase"],
+)
+def test_a_publish_an_interrupted_phase_left_uncommitted_is_committed_on_resume(project, phase):
+    """The non-empty-pass guards above (DW-183/DW-185) grade THIS invocation's
+    write, and a resume is a different invocation. A process that dies after
+    `mark_done_many` (or `record_decision`) published but before `_commit_ledger`
+    ran leaves the ledger dirty with a closure the journal already claims; the
+    replay then closes nothing — the ids are already `done`, the answer is already
+    saved — so the guard that was unconditional before DW-183 now skips the commit,
+    and the cycle's bundles run against the dirt: absorbed by `commit_story`'s
+    `add -A`, or discarded by a failed bundle's rollback, or simply left dirty at
+    run end. Neither `closed` nor `any_effect_landed` can see it, and git cannot
+    tell the sweep's own unpublished write from an operator's edit.
+
+    The sweep can: it persists the debt. Each of the two sites latches
+    `state.sweep_ledger_commit_owed` BEFORE its publish, every ledger-family
+    `_commit_ledger` clears it once git says the file is at HEAD, and `_loop`
+    settles an owed commit at the top of a resume — beside the post-recovery
+    publisher, before the ledger is read by triage or a bundle baseline.
+
+    Graded at HEAD, with the replay stubbed out: `_cycle` is not under grade, and
+    a real replay would re-run the phase against a ledger this settle has already
+    cleaned. The persisted latch is asserted on both sides so the shape on disk is
+    pinned, not just its effect.
+
+    Ablation: drop the `or self.state.sweep_ledger_commit_owed` from `_loop`'s
+    post-recovery condition, or the `_owe_ledger_commit()` call at either site, and
+    the matching row reds on the HEAD assertion — the closure stays dirty across the
+    resume, exactly the pre-fix shape."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    head = git(project.project, "rev-parse", "HEAD")
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+
+    def die(*_args, **_kwargs):
+        raise _Killed
+
+    engine._commit_ledger = die  # the interruption sits exactly here
+    with pytest.raises(_Killed):
+        phase(engine)
+
+    # premise: the publish LANDED and nothing committed it
+    assert ledger_entries(project)["DW-1"].status.startswith("done ")
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert git(project.project, "status", "--porcelain") != ""
+    assert load_state(engine.run_dir).sweep_ledger_commit_owed is True  # the debt is on disk
+
+    resumed, _ = resume_sweep(project, engine, [])
+    resumed._finish_inflight_bundles = lambda: 0  # nothing in flight: the debt alone
+    resumed._cycle = lambda *_a, **_k: False  # the replay itself is not under grade
+    resumed._loop()
+
+    # THE claim: the resume published the closure before anything read the ledger
+    [commit] = _records(resumed, "sweep-ledger-commit")
+    assert commit["commit"] == git(project.project, "rev-parse", "HEAD") != head
+    assert commit["message"] == (
+        "chore(sweep): commit a ledger write an interrupted phase left unpublished"
+    )
+    assert git(project.project, "status", "--porcelain") == ""
+    ledger_rel = str(project.deferred_work.relative_to(project.project)).replace("\\", "/")
+    committed = {
+        e.id: e
+        for e in deferredwork.parse_ledger(git(project.project, "show", f"HEAD:{ledger_rel}"))
+    }
+    assert committed["DW-1"].status.startswith("done ")
+    assert committed["DW-2"].open
+    assert load_state(resumed.run_dir).sweep_ledger_commit_owed is False  # ...and settled
+
+
 # The sanctioned `path=` spellings, by family. Compared as `ast.unparse` text,
 # which is exact for these and stable across formatting. The ledger family is ONE
 # fully-qualified spelling on purpose: a bare `ledger` is name-scoped, and

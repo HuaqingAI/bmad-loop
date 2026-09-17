@@ -1313,6 +1313,30 @@ class SweepEngine(Engine):
             ids.append(dw_id)
         self._save()
 
+    def _owe_ledger_commit(self) -> None:
+        """Latch `state.sweep_ledger_commit_owed` and persist it, BEFORE a ledger
+        publish whose commit is gated on that publish's own result.
+
+        The two write-result-gated publishers (`_close_resolved` on `closed`,
+        `_decisions_phase` on `any_effect_landed`) grade the write THIS invocation
+        made, and a resume is a different invocation: a process that dies after
+        `mark_done_many` or `record_decision` published but before `_commit_ledger`
+        ran replays as a phase that closed nothing — the ids are already `done`,
+        the answer already saved — so the guard that was unconditional before
+        DW-183 skips the commit, and the closure the journal already claims stays
+        dirty ahead of the cycle's bundles, where `commit_story`'s `add -A` absorbs
+        it or a failed bundle's rollback discards it. Git cannot tell that dirt
+        from an operator's edit; the sweep can, by persisting the debt. Same
+        mutate-then-`_save()` latch as `_quarantine`, and for the same reason: the
+        whole point is that a resume of this run sees it. Set before the write so
+        every crash window is covered — a debt latched for a publish that then
+        never happened settles as a `path_clean` no-op. Cleared only by the
+        ledger-family `_commit_ledger` once git says the file is at HEAD;
+        `_loop` settles an outstanding one at the top of a resume."""
+        if not self.state.sweep_ledger_commit_owed:
+            self.state.sweep_ledger_commit_owed = True
+            self._save()
+
     def _remaining_estimate(self) -> int | None:
         """Sweep override of the graceful-stop hint: how many deferred-work
         entries are still open in the ledger — the work a resume would pick up.
@@ -1363,14 +1387,22 @@ class SweepEngine(Engine):
     def _loop(self) -> None:
         ledger = self.workspace.paths.deferred_work
         cycle = max(1, self.state.sweep_cycle)
-        if self._finish_inflight_bundles():
+        recovered = self._finish_inflight_bundles()
+        if recovered or self.state.sweep_ledger_commit_owed:
             # a recovered bundle's ledger restore can leave the LEDGER dirty, and
             # triage plus the first bundle baseline read it, so it is published
             # here. Only it: unrelated dirt in the same repository is left for
             # whoever owns it, so this no longer ends on a clean TREE and nothing
             # downstream may assume one. Guarded on a non-empty recovery pass, so
             # a fresh sweep spawns no git at all (see `_close_resolved` for the
-            # guard inventory across all seven sites).
+            # guard inventory across all seven sites) — OR on a persisted debt: a
+            # publish the already-resolved close or the decision phase landed and
+            # then died before committing (`_owe_ledger_commit`). Both sites gate
+            # their own commit on this invocation's write, which a replay of an
+            # already-landed publish cannot show, so the debt is settled HERE,
+            # before triage or a bundle baseline reads the ledger. One call, two
+            # messages: the recovery one when a recovery pass ran (it covers the
+            # debt too), the debt's own otherwise.
             # The LEDGER FILE (`_commit_ledger`): this publisher wrote the ledger,
             # so it names the file it published and the commit is narrowed to it.
             # Spelled off `self.workspace.paths` rather than a `ledger` local, at
@@ -1378,7 +1410,11 @@ class SweepEngine(Engine):
             # DIFFERENT file under worktree isolation, and only the workspace's
             # copy is the one a publisher just wrote.
             self._commit_ledger(
-                "chore(sweep): commit ledger after recovering in-flight bundles",
+                (
+                    "chore(sweep): commit ledger after recovering in-flight bundles"
+                    if recovered
+                    else "chore(sweep): commit a ledger write an interrupted phase left unpublished"
+                ),
                 path=self.workspace.paths.deferred_work,
                 family="ledger",
             )
@@ -2637,6 +2673,16 @@ class SweepEngine(Engine):
         # repair write that failed is not a phase that closed nothing, it is a
         # sweep that cannot keep its books, and the rule is AGENTS.md's —
         # observation may degrade, repair writes must raise.
+        #
+        # The commit below is gated on `closed`, THIS invocation's write — and a
+        # process that dies between the publish and that commit replays with the
+        # ids already `done`, so `closed` comes back empty and the guard skips the
+        # commit of bytes the journal already claims. The debt is persisted ahead
+        # of the write instead (`_owe_ledger_commit`), and `_loop` settles it at
+        # the top of the resume. Only when there is something to write: an empty
+        # plan spawns no git and owes nothing (DW-183/DW-185).
+        if ids:
+            self._owe_ledger_commit()
         try:
             closed = deferredwork.mark_done_many(
                 ledger,
@@ -2686,7 +2732,11 @@ class SweepEngine(Engine):
             #   * `_commit_ledger`'s `path_clean`, which makes any of them a no-op
             #     when the published file already matches HEAD.
             # The per-site guards are the early-outs that keep a phase which wrote
-            # nothing from reaching git at all.
+            # nothing from reaching git at all. What the two write-result guards
+            # cannot see is a publish a PREVIOUS invocation landed and never
+            # committed — a replay closes nothing — so those two sites persist
+            # the debt ahead of the write (`_owe_ledger_commit`) and `_loop`
+            # settles it at the top of a resume.
             #
             # the ledger file: `mark_done_many` above wrote the ledger
             self._commit_ledger(
@@ -2932,6 +2982,14 @@ class SweepEngine(Engine):
                 # makes the raise safe: the answer already survives the crash, and
                 # a `build` bundle must not be dispatched off an authorization the
                 # ledger could not record.
+                #
+                # And the debt is persisted ahead of it (`_owe_ledger_commit`):
+                # the commit below is gated on `any_effect_landed`, this walk's
+                # own write, and a process that dies between this effect and that
+                # commit replays with the answer already saved — nothing pending,
+                # no effect applied, the `decision:` line dirty and unpublished.
+                # Idempotent, so one `_save()` per walk however many decisions.
+                self._owe_ledger_commit()
                 try:
                     recorded = self._apply_decision_effect(decision, option)
                 except (deferredwork.LedgerWriteError, deferredwork.LedgerLockReleaseError):
@@ -3366,6 +3424,7 @@ class SweepEngine(Engine):
         # refusal short-circuits past the two git calls, and `sha`'s `None` is the
         # same "nothing was published" the clean arm reads.
         sha: str | None = None
+        clean = False
         refusal: tuple[str, str | None] | None = None
         # Flipped the moment `commit_paths` is entered: a `GitError` after that
         # point comes from a commit git was asked to make, not from a tree it could
@@ -3416,6 +3475,23 @@ class SweepEngine(Engine):
                 **extra,
             )
             return
+        # Git has now answered for the LEDGER: it is at HEAD, either because this
+        # commit put it there or because it already was. That settles any debt a
+        # publisher latched (`_owe_ledger_commit`) — and only that answer does:
+        # the degrade and refusal arms above return with the latch untouched,
+        # since a tree git cannot interrogate, or a target that is absent or
+        # undecodable, says nothing about whether the write reached HEAD, and
+        # neither does the `commit_paths` race below (dirty, then gone untracked
+        # before `git add`), which is why `clean or sha` and not `not refusal`.
+        # A debt that survives to run end costs the next resume one `path_clean`.
+        # The STORE family never latches and never clears.
+        if (
+            family == "ledger"
+            and (clean or sha is not None)
+            and self.state.sweep_ledger_commit_owed
+        ):
+            self.state.sweep_ledger_commit_owed = False
+            self._save()
         if sha is None:
             # Already clean/ignored, or raced clean between the two calls. Absence
             # reaches here only as that RACE — a target removed after the guard
