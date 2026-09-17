@@ -530,7 +530,11 @@ breaking changes may land in a minor release.
   git resolve the enclosing repository; pre-answer-store commits keep naming the
   project, which is the tree that store is a bare join off. Where no repository encloses
   the file, the commit is skipped and journaled (`sweep-ledger-commit-unavailable`,
-  naming the directory and git's error) rather than ending the sweep.
+  naming the directory and git's error) rather than ending the sweep. That degrade is
+  for a tree git cannot interrogate only: a ledger commit git was asked to make and
+  refused (a hook, the index, a full disk) still raises, as the publishers did before
+  re-rooting — the cycle's bundles would otherwise run against the dirty baseline the
+  commit was meant to clean. The store's commits keep degrading on both.
 
 - Stop a sweep wiping every recorded pre-answer when the ledger vanishes mid-cycle
   (DW-176). An absent ledger read as "nothing is open" and dropped the whole store,

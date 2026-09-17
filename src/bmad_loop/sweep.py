@@ -3238,23 +3238,46 @@ class SweepEngine(Engine):
         replays make that the ordinary case, not the rare one: a resumed cycle
         re-closing ids already `done` reproduces the committed bytes exactly.
 
-        A `verify.GitError` degrades to a journal row naming the resolved
-        directory and the error instead of propagating, and under this rule the
-        degrade is REQUIRED rather than a kindness. `cli`'s sweep precondition only
-        requires `paths.repo_root` to be a git repository, so neither the project
-        nor a freestanding artifacts directory need be one, and `git status` there
-        answers `fatal: not a git repository`. Letting the raise through would
-        abort the whole sweep over bookkeeping that was always best effort —
-        strictly worse than the missed commit it replaces.
-        `decisions.apply_pre_answer` already degrades on `GitError` for this very
-        file ("best effort, so a non-git or dirty tree never blocks the on-disk
-        record") and this keeps them agreeing. The RESOLVE degrades to the same row
-        for the same reason: `path.resolve()` can raise `OSError` (a broken link
-        chain, a permission-denied component) or `RuntimeError` (a symlink loop),
-        so both are caught alongside Git failures. `verify.commit_paths` and
-        `verify.last_commit_for` guard their own resolves against the same pair.
-        Best effort applies to Git publication and resolution only: journal I/O
-        failures propagate, as they do for other journal writes.
+        A `verify.GitError` from a tree git cannot INTERROGATE degrades to a
+        journal row naming the resolved directory and the error, and under this
+        rule that degrade is REQUIRED rather than a kindness. `cli`'s sweep
+        precondition only requires `paths.repo_root` to be a git repository, so
+        neither the project nor a freestanding artifacts directory need be one,
+        and `git status` there answers `fatal: not a git repository`. Letting
+        that raise through would abort the whole sweep over a destination that
+        will answer the same way on every cycle — strictly worse than the missed
+        commit it replaces. `decisions.apply_pre_answer` degrades on `GitError`
+        for the store ("best effort, so a non-git or dirty tree never blocks the
+        on-disk record") and this keeps them agreeing.
+
+        A `GitError` from a commit that was ATTEMPTED is a different fault, and
+        for the LEDGER family it propagates. `path_clean` runs first, so by the
+        time `commit_paths` raises, git has already answered for this tree: the
+        destination is a repository, the ledger is dirty in it, and the commit
+        itself failed — a hook refused it, the index could not be written, the
+        disk filled. That is not a destination that cannot be published to; it is
+        a publication that failed, and the five ledger publishers raised on it
+        before they were re-rooted (DW-175) — "their raise is the pre-existing
+        contract, and nothing here should quiet a commit failure nobody asked to
+        re-root", which the re-rooting then quieted by accident of sharing one
+        handler with the store. Restored, because the degrade had a hazard behind
+        it and not just a doctrine: the cycle's bundles run next, against a
+        baseline this commit was meant to clean, and a dirty ledger there is
+        swept into a story commit by `commit_story`'s `add -A` or discarded by a
+        failed bundle's rollback — closures and `decision:` lines already
+        journalled as landed. The STORE family keeps degrading on an attempted
+        commit too, as it did before this PR (DW-160): its two prunes are the
+        cycle's last call and a materialize-time drop, the on-disk record is what
+        matters for a pre-answer, and re-dropping later is cheap. Observation may
+        degrade, repair writes must raise (AGENTS.md); the ledger commit is the
+        publication step of a repair, and the store commit is bookkeeping.
+
+        The RESOLVE degrades to the same row for the not-a-repository reason:
+        `path.resolve()` can raise `OSError` (a broken link chain, a
+        permission-denied component) or `RuntimeError` (a symlink loop), and
+        nothing was published from a path that could not be named. Best effort
+        applies to Git interrogation and resolution: journal I/O failures
+        propagate, as they do for other journal writes.
 
         `path` is a REQUIRED keyword argument with no default, replacing the old
         `root=None` arm and its runtime raise. That is strictly louder, not
@@ -3344,6 +3367,10 @@ class SweepEngine(Engine):
         # same "nothing was published" the clean arm reads.
         sha: str | None = None
         refusal: tuple[str, str | None] | None = None
+        # Flipped the moment `commit_paths` is entered: a `GitError` after that
+        # point comes from a commit git was asked to make, not from a tree it could
+        # not read (see the docstring — `path_clean` has already answered).
+        attempted = False
         try:
             target = path.resolve()
             root = target.parent
@@ -3354,8 +3381,12 @@ class SweepEngine(Engine):
             if refusal is None:
                 # Preserve the clean short-circuit without catching journal write faults.
                 clean = verify.path_clean(root, target.name)
-                sha = None if clean else verify.commit_paths(root, message, [target])
+                if not clean:
+                    attempted = True
+                    sha = verify.commit_paths(root, message, [target])
         except (verify.GitError, OSError, RuntimeError) as e:
+            if attempted and family == "ledger":
+                raise  # a ledger commit git was asked to make failed: publication failed
             # `repo` (not `root`): an absolute host path naming a git tree,
             # already routed out of diagnostics dumps, exactly as
             # `rearm-baseline-advance-failed` spells the same value. The RESOLVED

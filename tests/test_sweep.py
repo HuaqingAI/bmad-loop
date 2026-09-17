@@ -7950,6 +7950,74 @@ def test_a_prune_in_a_non_git_project_keeps_the_store_write_and_journals(project
     assert "not a git repository" in failed["error"]
 
 
+def test_a_ledger_commit_git_attempted_and_refused_ends_the_sweep_loudly(project, monkeypatch):
+    """The `GitError` degrade in `_commit_ledger` is for a tree git cannot
+    INTERROGATE — the not-a-repository destination the two rows above grade — and
+    not for a commit git was asked to make and refused. `path_clean` runs first, so
+    a raise out of `commit_paths` means the destination IS a repository, the ledger
+    IS dirty in it, and the commit itself failed: a hook, the index, the disk.
+
+    Before the re-rooting (DW-175) the five ledger publishers raised on exactly
+    that — "their raise is the pre-existing contract" — and sharing one handler
+    with the store quieted them. Restored here for the LEDGER family, because the
+    degrade had a hazard behind it: the cycle's bundles run next against a baseline
+    this commit was meant to clean, and a dirty ledger there is swept into a story
+    commit by `add -A` or discarded by a failed bundle's rollback — closures the
+    journal already announced as landed.
+
+    The STORE family keeps its DW-160 degrade on the same fault, and the second
+    half pins that: the split is by family, not a blanket re-raise.
+
+    Ablation: drop the `if attempted and family == "ledger": raise` arm and the
+    first half reds with a `sweep-ledger-commit-unavailable` row for a repository
+    that answered `git status` a moment earlier."""
+    from bmad_loop import decisions as decisions_store
+
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    decisions_store.record_pre_answer(
+        project.project,
+        "DW-2",
+        DecisionOption(key="2", label="Keep", effect="keep-open"),
+        date="2026-06-12",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "store")
+    engine, _ = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    plan = TriagePlan(
+        open_ids=frozenset({"DW-1", "DW-2"}),
+        already_resolved=(ResolvedEntry("DW-1", "fixed by a1b2c3d"),),
+    )
+    real_path_clean = verify.path_clean
+    interrogated: list[str] = []
+
+    def spy_clean(root, name):
+        interrogated.append(name)
+        return real_path_clean(root, name)
+
+    def hook_refused(*_args, **_kwargs):
+        raise verify.GitError("git commit failed: pre-commit hook refused the ledger")
+
+    monkeypatch.setattr(verify, "path_clean", spy_clean)
+    monkeypatch.setattr(verify, "commit_paths", hook_refused)
+
+    # LEDGER family: the closure landed on disk, git answered for the tree, the
+    # commit was refused — and the sweep does not carry on as if it had published
+    with pytest.raises(verify.GitError, match="pre-commit hook refused"):
+        engine._close_resolved(plan)
+    assert interrogated == ["deferred-work.md"]  # premise: git DID answer before the attempt
+    assert not ledger_entries(project)["DW-1"].open  # the repair write is on disk
+    assert _records(engine, "sweep-ledger-commit-unavailable") == []  # not a degrade
+
+    # STORE family, same injected fault: the DW-160 degrade is unchanged
+    stale = decisions_store.load_pre_answers(project.project)["DW-2"]
+    engine._prune_dropped_pre_answer("DW-2", "stale-option", stale)  # must not raise
+    assert "DW-2" not in decisions_store.load_pre_answers(project.project)  # write survived
+    [failed] = _records(engine, "sweep-ledger-commit-unavailable")
+    assert failed["file"] == "decisions.json"
+    assert "pre-commit hook refused" in failed["error"]
+
+
 def test_commit_ledger_requires_the_published_path():
     """`path` and `family` are REQUIRED keyword-only parameters. `path` is what
     replaced the old `root=None` default and its runtime raise; `family` is the
