@@ -602,6 +602,65 @@ def test_byte_identical_accepted_spec_delivery_journals_no_warning(project):
     assert _superseded_records(engine) == []
 
 
+def test_accepted_spec_differing_only_in_line_endings_journals_no_warning(project):
+    """CRLF in the mount against LF in the main checkout is not a lost correction.
+
+    The mount is a git CHECKOUT: under Git-for-Windows' system `core.autocrlf=true`
+    an LF-authored spec comes back CRLF there while the main checkout keeps the LF
+    bytes the spec writer laid down. Git folds that difference away on the next
+    commit, so the record must not report it. Provoked here without autocrlf by
+    COMMITTING the spec as CRLF — a checkout delivers the committed bytes verbatim —
+    and leaving the LF spelling of the same text uncommitted in the main checkout;
+    under autocrlf the commit normalizes and the checkout re-expands, which lands
+    the same two spellings on the two sides.
+
+    Ablation: compare raw bytes in `_warn_accepted_spec_superseded` and this
+    journals a `compared: true` record for a spec nobody corrected.
+    """
+    rel = "_bmad-output/implementation-artifacts/accepted-crlf.md"
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted text\r\nsecond line\r\n")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted.write_bytes(b"accepted text\nsecond line\n")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    seen: list[bytes] = []
+
+    engine._run_isolated(task, _defer_reading_mount(engine, rel, seen))
+
+    # premise: the two sides really do differ as bytes, and only in line endings
+    assert seen == [b"accepted text\r\nsecond line\r\n"]
+    assert accepted.read_bytes() == b"accepted text\nsecond line\n"
+    assert _superseded_records(engine) == []
+
+
+def test_a_lone_cr_in_the_accepted_spec_still_counts_as_a_correction(project):
+    """Only CRLF folds. A bare CR is a byte git would commit, so it is reported —
+    the normalization must not widen into "ignore all carriage returns"."""
+    rel = "_bmad-output/implementation-artifacts/accepted-lone-cr.md"
+    accepted = project.project / rel
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_bytes(b"accepted text")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    accepted.write_bytes(b"accepted\rtext")
+
+    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
+    engine.state.target_branch = "main"
+    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
+    engine.state.tasks[task.story_key] = task
+    seen: list[bytes] = []
+
+    engine._run_isolated(task, _defer_reading_mount(engine, rel, seen))
+
+    assert seen == [b"accepted text"]
+    (record,) = _superseded_records(engine)
+    assert record["compared"] is True
+
+
 def test_seeded_accepted_spec_journals_no_supersede_warning(project):
     """The seed's own case: a gitignored spec the checkout cannot carry.
 

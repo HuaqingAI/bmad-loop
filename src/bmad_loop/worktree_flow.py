@@ -93,6 +93,12 @@ def _setup_mcp_agent_id(profile_name: str) -> str:
     return _SETUP_MCP_AGENT_IDS.get(profile_name, profile_name)
 
 
+def _crlf_normalized(data: bytes) -> bytes:
+    """``data`` with every CRLF read as LF — the one translation a git checkout
+    under ``core.autocrlf`` applies on its own (see `_warn_accepted_spec_superseded`)."""
+    return data.replace(b"\r\n", b"\n")
+
+
 def _worktree_skill_copy_candidates(repo_root: Path, tree: str) -> tuple[str, ...]:
     """Every upstream skill worth best-effort copying into ``tree``."""
     resolved = resolve_review_layers(repo_root, tree)
@@ -1620,6 +1626,14 @@ class WorktreeFlow:
         reads the operator's bytes, and an unprovable delivery is exactly what this
         record is for. Nothing here may raise out: the locator swallows its own
         faults, ``_is_file`` is total over them, and the comparison is wrapped.
+
+        "Identical" is read with line endings normalized (CRLF ≡ LF). The mount is
+        a git CHECKOUT, so under Git-for-Windows' system ``core.autocrlf=true`` an
+        LF-authored spec comes back CRLF there while the main checkout keeps the
+        LF bytes the spec writer laid down — a difference git itself folds away on
+        the next commit, and one this record must not report as a lost correction.
+        Only that translation is folded: a lone CR, a missing final newline, or any
+        other byte still counts, since git would carry those into the commit.
         """
         pair = self._accepted_spec_pair(task, worktree, project_relative_only=project_relative_only)
         if pair is None:
@@ -1628,7 +1642,9 @@ class WorktreeFlow:
         if not _is_file(source) or not _is_file(destination):
             return
         try:
-            identical = source.read_bytes() == destination.read_bytes()
+            identical = _crlf_normalized(source.read_bytes()) == _crlf_normalized(
+                destination.read_bytes()
+            )
         except (OSError, RuntimeError, ValueError):
             compared = False
         else:
