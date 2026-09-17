@@ -1768,9 +1768,13 @@ class SweepEngine(Engine):
                 family="store",
             )
 
-    def _prune_dropped_pre_answer(self, dw_id: str, drop_cause: str) -> None:
+    def _prune_dropped_pre_answer(
+        self, dw_id: str, drop_cause: str, answer: dict[str, Any]
+    ) -> None:
         """Retire the PROJECT-level pre-answer a just-dropped stale answer came
-        from (DW-143). Part of the drop itself, not a later cleanup.
+        from (DW-143). Part of the drop itself, not a later cleanup. `answer` is
+        the value this run just dropped, and the store entry goes ONLY while it
+        still equals it — see the provenance guard below.
 
         Why it exists: DW-124's quarantine is RUN-scoped by design, so it bounds
         the drop to one announcement per run and a NEW run re-evaluates from
@@ -1800,7 +1804,22 @@ class SweepEngine(Engine):
         `decision:` line `_apply_decision_effect` landed — since DW-186 that call
         can report it wrote none, and this drop is unchanged either way. The journal
         row carries the id and the drop cause alone — no answer prose, no store
-        path."""
+        path.
+
+        Retires the entry ONLY while it still holds the value that was dropped.
+        The dropped `answer` is this run's RUN-LOCAL copy, and `_decisions_phase`
+        lets that copy win over the project store for the rest of the run — so a
+        human who re-answers the id out of band while the run is paused
+        (`pending_missed_decisions` screens against the store alone, never against
+        a run's `decisions.json`) leaves a NEWER store entry this run has never
+        evaluated. Keyed on the id alone, the removal deleted that replacement, and
+        committed the deletion, on the strength of a stale copy the human had
+        already superseded. `drop_pre_answer` compares before it deletes: a seeded
+        copy round-trips through JSON unchanged and so equals the entry it came
+        from, while a re-answer differs in at least `answered_at`, and an
+        interactive in-run answer never equals a store entry at all. The surviving
+        replacement is left for the NEXT run to evaluate from scratch, exactly as
+        a fresh answer would be; this run stays on its own record."""
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
         # `_project_of_run_dir`, never `self.workspace.root`: where `repo_root`
@@ -1810,8 +1829,11 @@ class SweepEngine(Engine):
         # way). The nested/monorepo shape is unaffected — `repo_root` is an
         # ancestor there, so the store sits inside it.
         project = _project_of_run_dir(self.run_dir)
-        if not decisions_store.drop_pre_answer(project, dw_id):
-            return  # run-local-only answer: no store entry, so no write and no row
+        if not decisions_store.drop_pre_answer(project, dw_id, answer=answer):
+            # Either no store entry (a run-local-only answer) or an entry that is
+            # no longer the value dropped (a human's later replacement): no write,
+            # no row — the store's bytes are untouched either way.
+            return
         self.journal.append(
             "sweep-decision-preanswer-pruned", decision=dw_id, drop_cause=drop_cause
         )
@@ -3785,8 +3807,10 @@ class SweepEngine(Engine):
             # open only: the build lanes' `no-intent`/`name-collision` drops leave
             # their stored answer alone, since it still carries a payload to re-ask
             # against. `<run>/decisions.json` and the ledger are untouched either
-            # way — only the PROJECT store entry goes.
-            self._prune_dropped_pre_answer(dw_id, "stale-option")
+            # way — only the PROJECT store entry goes, and only while it is still
+            # THIS answer: a replacement a human recorded out of band since this
+            # run last read the store is not the value being dropped, and survives.
+            self._prune_dropped_pre_answer(dw_id, "stale-option", answer)
             answer_dropped = True
         kept = []
         for b in bundles:
