@@ -482,7 +482,9 @@ breaking changes may land in a minor release.
   only the repair-pause arm — so a host lost between that save and the commit
   (notification, a `pre_commit_gate` workflow) replays the salvage with zero sessions
   instead of restart recovery, which erased the published refile under rollback and
-  paused without it.
+  paused without it. A sweep bundle has no replay arm and restarts instead; its
+  restart now clears the latch, which otherwise rode onto the replacement attempt and
+  forced a review the fresh attempt never asked for.
 
 - Notify operators when a ledger snapshot outage leaves story-declared deferred
   closes unapplied, naming the story, every declared ID, and the fault (DW-277).

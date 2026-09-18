@@ -21538,6 +21538,66 @@ def test_resume_committing_bundle_finishes_commit(project):
     assert not mount.exists()
 
 
+@pytest.mark.parametrize("pauses", [False, True], ids=["rollback", "manual-recovery-pause"])
+def test_sweep_restart_clears_a_latched_salvage_before_rollback(project, monkeypatch, pauses):
+    """`_recover_inflight_bundle` has no `_pending_salvage_session` replay (the
+    same deliberate narrowing as its missing `_resumable_session` arm), so a
+    bundle whose review-timeout salvage latched `salvage_refile_pending` — at
+    the handoff save every salvage now takes, or at the refile's repair pause —
+    restarts here. Restarting ABANDONS that product's salvage retry, so the
+    latch must go with it, as the base restart arm clears it (#794 review):
+    left set, it rode onto the replacement attempt and forced
+    `_review_and_commit` down the review path (`review.enabled = false` and the
+    `recommended` trigger both defer to the latch), a review the fresh attempt
+    never asked for. Cleared BEFORE `_rollback_or_pause`, so the manual-recovery
+    pause under `rollback_on_failure = false` persists the task unlatched too:
+    the `manual-recovery-pause` row stubs the pause to raise once it has seen
+    the latch already down.
+
+    Ablation: drop `task.salvage_refile_pending = False` from the restart tail
+    and both rows red — `rollback` on the latch still set at PENDING,
+    `manual-recovery-pause` on the stub seeing it set."""
+    engine, _ = make_sweep(
+        project,
+        [],
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            scm=ScmPolicy(isolation="none", rollback_on_failure=not pauses),
+        ),
+    )
+    task = StoryTask(
+        "dw-fix",
+        0,
+        phase=Phase.REVIEW_VERIFY,
+        baseline_commit=verify.rev_parse_head(project.project),
+        baseline_untracked=[],
+        spec_file="_bmad-output/implementation-artifacts/spec-dw-fix.md",
+        salvage_refile_pending=True,
+    )
+    engine.state.tasks[task.story_key] = task
+    seen_latched: list[bool] = []
+
+    def pause_after_looking(_task, cause):
+        seen_latched.append(_task.salvage_refile_pending)
+        if pauses:
+            raise RunPaused("manual recovery", PAUSE_STORY_GATE, _task.story_key)
+
+    monkeypatch.setattr(engine, "_rollback_or_pause", pause_after_looking)
+
+    if pauses:
+        with pytest.raises(RunPaused):
+            engine._recover_inflight_bundle(task)
+        assert task.phase == Phase.REVIEW_VERIFY  # the reset tail was never reached
+    else:
+        assert engine._recover_inflight_bundle(task) is False
+        assert task.phase == Phase.PENDING
+
+    assert seen_latched == [False]  # already cleared when the rollback/pause ran
+    assert task.salvage_refile_pending is False
+    assert "resume-restart" in [e["kind"] for e in engine.journal.entries()]
+
+
 def test_sweep_isolation_flip_restart_releases_mount_state_without_main_rollback(
     project, monkeypatch
 ):

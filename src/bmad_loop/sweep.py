@@ -3014,7 +3014,16 @@ class SweepEngine(Engine):
         post-session window still restarts rather than replaying its recorded
         result. Lifting that is a resume-fidelity change of its own. The
         COMMITTING window IS recovered, though — same as the base engine's
-        resume-commit arm (#115).
+        resume-commit arm (#115). The base's `_pending_salvage_session` replay
+        (DW-278) is not mirrored either: a bundle whose review-timeout salvage
+        latched `salvage_refile_pending` — at its handoff save, or at the
+        refile's repair pause — restarts here like every other post-session
+        window, so the restart arm below CLEARS the latch as the base restart
+        arm does (#794 review). Left set, the abandoned product's latch would
+        ride onto the replacement attempt and force `_review_and_commit` down
+        the review path it exists to bypass for a latched replay. Mirroring the
+        replay is the same resume-fidelity change as the `_resumable_session`
+        arm and is deferred with it.
 
         The reset tail below deliberately does NOT zero `attempt` or re-arm the
         session-id generation: like the base restart arm it mirrors, a plain
@@ -3077,6 +3086,11 @@ class SweepEngine(Engine):
             # Live in-place policy applies to the replacement attempt, not to an
             # incomplete attempt's mount-owned baselines, paths, and claims.
             self._release_orphaned_mount(task)
+        # Abandoning this product's salvage retry: the replacement attempt owes
+        # its own review decision, not the latched replay's. Cleared BEFORE the
+        # rollback below, as the base restart arm does, so a rollback pause
+        # persists the task unlatched.
+        task.salvage_refile_pending = False
         if not restart_isolated and task.baseline_commit:
             # latch resolved_redrive so the corrected spec + restored diff stay
             # protected through every reset of this re-drive, not just this
