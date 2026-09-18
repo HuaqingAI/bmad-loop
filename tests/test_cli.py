@@ -17,6 +17,7 @@ import yaml
 from conftest import (
     _OK,
     MISSING_TOOL_CMD,
+    NUL_PATH_RESOLVE_FAULTS,
     PROJECT_MARKER_CMD,
     READABLE_LEDGER,
     REPO_ROOT_MARKER_CMD,
@@ -8827,6 +8828,44 @@ def test_validate_fails_when_the_ledger_itself_is_unreadable(project, capsys, mo
     # refusal had run and found nothing
     assert "gate:" in findings[0]["message"] and "hard gates" in findings[0]["message"]
     # and the declaration checks it could not run stay quiet rather than guessing
+    assert not [f for f in doc["findings"] if f["check"] == "deferred.closes-unknown"]
+    assert not [f for f in doc["findings"] if f["check"].startswith("deferred.hard-gate")]
+
+
+@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
+def test_validate_fails_when_the_ledger_path_cannot_be_encoded(project, capsys, monkeypatch, fault):
+    """The `ValueError` class of `_validate_deferred_ledger`'s `except`, driven on its
+    own. `Path.stat` raises a plain `ValueError` for an embedded NUL in the
+    configured `deferred_work` path and a `UnicodeEncodeError` (a `ValueError`
+    subclass) for a lone surrogate — neither an `OSError`, and both a path
+    `is_file()` had answered False for. Before DW-267 that False read as an empty
+    ledger and `validate` reported a clean deferred check; after it the probe raised
+    past a tuple spelled `(OSError, UnicodeDecodeError)` and `validate` CRASHED
+    (#794 review). An observation arm attributes a non-encodable path as a fault,
+    never as absence, so the verdict is the same `deferred.ledger-unreadable`
+    problem a refused `stat` earns, naming the fault, and `Engine._refuse_gated_story`
+    pauses on the same fault — the two surfaces keep agreeing about the same file.
+    Injected through `fault_metadata_probe(..., "stat", error=)` from
+    `NUL_PATH_RESOLVE_FAULTS` so both classes are driven on every platform.
+    Ablation: narrow the tuple back to `(OSError, UnicodeDecodeError)` and both rows
+    red with the injected fault escaping `cmd_validate`; the `PermissionError` rows
+    above stay green."""
+    install_bmad_config(project)
+    _write_policy(project.project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    write_spec(spec_path(project, "1-1-a"), "ready-for-dev", "abc123", closes_deferred=["DW-1"])
+    fault_metadata_probe(monkeypatch, project.deferred_work, "stat", error=fault)
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    doc = json.loads(capsys.readouterr().out)
+    findings = [f for f in doc["findings"] if f["check"] == "deferred.ledger-unreadable"]
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "problem"
+    assert findings[0]["detail"] == {"ledger": str(project.deferred_work), "error": str(fault)}
+    assert "gate:" in findings[0]["message"] and "hard gates" in findings[0]["message"]
     assert not [f for f in doc["findings"] if f["check"] == "deferred.closes-unknown"]
     assert not [f for f in doc["findings"] if f["check"].startswith("deferred.hard-gate")]
 

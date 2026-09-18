@@ -13,20 +13,13 @@ breaking changes may land in a minor release.
   (DW-273). A bundle whose only deliverable lives under a gitignored
   `implementation_artifacts` (a spec-only erratum) burned every attempt on
   `no changes in worktree since baseline commit`. The bundle dev session may assert
-  `Artifact only: true` in its `## Auto Run Result` marker; `devcontract` mints the strict
-  `artifact_only` boolean from the current session's genuine marker (the shape and
-  authorship proof `park_asserted` uses), and `verify_dev_bundle` — the bundle path
-  alone — accepts ignored (`!!`) entries in a `git status --ignored` listing scoped to the artifacts dir
-  once the ordinary probe found nothing, journaling `bundle-artifact-only-accepted`
-  with the `count`. Only entries THIS attempt created or changed count: the sweep
-  engine fingerprints (`lstat` mtime and size) the dir's ignored entries at each
-  genuinely new attempt's start (`StoryTask.baseline_artifacts`, persisted in
-  state.json; `-z` listing, so a non-ASCII name is a path the gate can measure),
-  and residue that all predates the attempt, a task with no snapshot, or an entry
-  unmeasurable at either end refuses the receipt rather than letting a session
-  that wrote nothing clear the gate on last week's erratum. A git fault taking the
-  snapshot degrades to `bundle-artifact-baseline-unavailable` (the attempt is
-  still driven). The review gate's every-id-`done` check is unchanged.
+  `Artifact only: true` in its `## Auto Run Result` marker, and `verify_dev_bundle` —
+  the bundle path alone — then accepts ignored entries under the artifacts dir once
+  the ordinary probe found nothing, journaling `bundle-artifact-only-accepted`. Only
+  artifacts this attempt created or changed count; residue that predates the attempt
+  or cannot be measured refuses the receipt, and a fault taking the attempt's
+  snapshot degrades to `bundle-artifact-baseline-unavailable` with the attempt still
+  driven. The review gate's every-id-`done` check is unchanged.
 
 - Announce a ledger publish that publishes nothing (`sweep-ledger-commit-clean`), for every
   outcome that publishes nothing. An ignored path reads clean, so a project
@@ -686,11 +679,16 @@ breaking changes may land in a minor release.
   where `is_file()` suppressed the refusal and the `gate:` hard gate failed OPEN — the story
   dispatched and `story-gate-unreadable` was unreachable; `ENOENT`/`ENOTDIR` and a
   non-regular file stay the empty ledger, and a symlink loop at the ledger's name now
-  pauses at the gate instead of passing it (DW-266; also closes DW-276).
+  pauses at the gate instead of passing it (DW-266; also closes DW-276). The arm catches
+  `ValueError` too: `stat()` raises it for a configured ledger path the OS cannot encode
+  (an embedded NUL, a lone surrogate), which `is_file()` had answered False for and which
+  now takes the same pause instead of crashing the run.
 - Same probe inside `validate`'s deferred-ledger read and `verify_review_bundle`'s, so on
   Python 3.14 a refused ledger is the `deferred.ledger-unreadable` problem rather than a
   clean deferred check, and the non-fixable "deferred-work ledger unreadable" retry rather
-  than the fixable "entries not marked done" one (DW-267).
+  than the fixable "entries not marked done" one (DW-267). Both arms catch `ValueError`
+  too, so a configured ledger path the OS cannot encode is that problem and that retry
+  rather than a crash.
 - Take ledger absence from the observation reader's own answer in `sweep --dry-run` and
   `SweepEngine._non_write_state`, and probe the archive's post-report presence inside its
   `try`, so a refused ledger is the attributed `error: ... cannot be read` failure, the

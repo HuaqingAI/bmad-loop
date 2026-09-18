@@ -19,6 +19,7 @@ from conftest import (
     _OK,
     MARKER_IN_PROJECT,
     MARKER_IN_REPO_ROOT,
+    NUL_PATH_RESOLVE_FAULTS,
     PROJECT_MARKER_CMD,
     REPO_ROOT_MARKER_CMD,
     _disarm_check_script,
@@ -11070,6 +11071,39 @@ def test_dispatch_pauses_when_the_ledger_cannot_be_read(project, monkeypatch, fa
     assert adapter.sessions == []
     assert "cannot be read" in saved.paused_reason
     assert [e["kind"] for e in engine.journal.entries()].count("story-gate-unreadable") == 1
+
+
+@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
+def test_dispatch_pauses_when_the_ledger_path_cannot_be_encoded(project, monkeypatch, fault):
+    """The `ValueError` class of the gate's `except`, driven on its own. `Path.stat`
+    raises a plain `ValueError` for an embedded NUL in the configured
+    `deferred_work` path and a `UnicodeEncodeError` (a `ValueError` subclass) for
+    a lone surrogate — neither an `OSError`, and both a path `is_file()` had
+    answered False for. Before DW-266 that False read as an empty ledger and the
+    gate failed OPEN; after it the probe raised past a tuple spelled
+    `(OSError, UnicodeDecodeError)` and the run CRASHED at dispatch (#794 review).
+    An observation arm attributes a non-encodable path as a fault, never as
+    absence (`deferredwork.probe_absence`'s contract), so the verdict is the
+    same `PAUSE_STORY_GATE` pause a refused `stat` takes, with the fault's text
+    in the reason. Injected through `fault_metadata_probe(..., "stat", error=)`
+    from `NUL_PATH_RESOLVE_FAULTS` so both classes are driven on every platform.
+    Ablation: narrow the gate's tuple back to `(OSError, UnicodeDecodeError)` and
+    both rows red with the injected fault escaping `engine.run()`; the
+    `PermissionError` rows above stay green."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 9-9"])})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+    fault_metadata_probe(monkeypatch, project.deferred_work, "stat", error=fault)
+
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert saved.paused_stage == PAUSE_STORY_GATE
+    assert adapter.sessions == []
+    assert "cannot be read" in saved.paused_reason and str(fault) in saved.paused_reason
+    unreadable = [e for e in engine.journal.entries() if e["kind"] == "story-gate-unreadable"]
+    assert len(unreadable) == 1 and unreadable[0]["error"] == str(fault)
 
 
 def test_dispatch_pauses_on_a_symlink_loop_at_the_ledgers_name(project):

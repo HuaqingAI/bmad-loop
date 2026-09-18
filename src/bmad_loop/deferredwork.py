@@ -102,7 +102,12 @@ inline observation sites, ``Engine._refuse_gated_story`` and
 DW-146; since DW-266/267 their presence probe is ``stat`` + ``S_ISREG`` inside
 that same ``try`` (as is ``verify_review_bundle``'s), so on Python 3.14 the pair
 is reached for a refused probe too, where ``is_file()`` had answered False and
-read the refusal as an empty ledger.
+read the refusal as an empty ledger. All three now spell the tuple ``(OSError,
+ValueError)``: ``Path.stat`` raises a plain ``ValueError`` for an embedded NUL
+in the configured path and a ``UnicodeEncodeError`` for a lone surrogate — the
+faults :func:`probe_absence` classifies as absence for the WRITE arm — and an
+observation arm attributes them as a fault instead, which is where
+``UnicodeDecodeError`` alone had let them escape the ``try`` uncaught.
 DW-146 left repair/write ``OSError`` propagation untouched; DW-279 now wraps
 metadata and text-read faults as :class:`LedgerReadFault`, so existing locked
 read-refusal handlers can distinguish them from lock and write failures. (DW-221 later made that

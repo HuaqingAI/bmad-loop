@@ -5159,9 +5159,14 @@ def verify_review_bundle(
     # Same TOCTOU class as the spec read above: the ledger is rewritten by the
     # orchestrator's own mark_done between the dev and review gates.
     # OBSERVATION arm of the ledger-read contract (DW-146): this check writes
-    # nothing and already degrades into the `retry` it returns. `UnicodeDecodeError`
-    # joins the tuple because it is a `ValueError`, not an `OSError` — undecodable
-    # bytes escaped this arm entirely and aborted the verify instead of retrying it.
+    # nothing and already degrades into the `retry` it returns. `ValueError` is in
+    # the tuple because neither of its two arrivals is an `OSError`: DW-146 added
+    # `UnicodeDecodeError` (a `ValueError` subclass) when undecodable bytes escaped
+    # this arm entirely and aborted the verify instead of retrying it, and the
+    # `stat` probe below raises a plain `ValueError` for an embedded NUL in the
+    # configured path and a `UnicodeEncodeError` for a lone surrogate, which
+    # `is_file()` had answered False for — an observation arm attributes those as
+    # a fault, never as absence, so they take the same retry.
     # The presence probe is `stat` + `S_ISREG` INSIDE the `try` (DW-267), so a
     # refused probe is the "unreadable" retry below and not the "entries not
     # marked done" one: the `is_file()` it replaced suppresses every OS error on
@@ -5172,7 +5177,7 @@ def verify_review_bundle(
             text = ledger.read_text(encoding="utf-8") if S_ISREG(ledger.stat().st_mode) else ""
         except (FileNotFoundError, NotADirectoryError):
             text = ""
-    except (OSError, UnicodeDecodeError) as exc:
+    except (OSError, ValueError) as exc:
         return VerifyOutcome.retry(
             f"deferred-work ledger unreadable ({exc.__class__.__name__}: {exc}): {ledger}"
         )

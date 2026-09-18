@@ -1606,13 +1606,18 @@ def _validate_deferred_ledger(
     # False, so a refused ledger read as an empty one and `validate` reported a
     # clean deferred check with the finding below unreachable. Only absence
     # (`ENOENT`/`ENOTDIR`, a present non-regular file) is the empty text; a
-    # refused probe takes the same arm a refused `read_text` does.
+    # refused probe takes the same arm a refused `read_text` does. `ValueError`,
+    # not `UnicodeDecodeError` (its subclass): `Path.stat` raises a plain
+    # `ValueError` for an embedded NUL in the configured path and a
+    # `UnicodeEncodeError` for a lone surrogate, neither an `OSError`, which
+    # `is_file()` had answered False for — an observation arm attributes those
+    # as a fault, never as absence, so they are the same graded problem.
     try:
         try:
             text = ledger.read_text(encoding="utf-8") if S_ISREG(ledger.stat().st_mode) else ""
         except (FileNotFoundError, NotADirectoryError):
             text = ""
-    except (OSError, UnicodeDecodeError) as e:
+    except (OSError, ValueError) as e:
         # Split from the manifest read in the checks below, which is silent for a
         # good reason that does not apply here: nothing else in `validate` reads
         # the ledger, so returning quietly reported success for preflights that

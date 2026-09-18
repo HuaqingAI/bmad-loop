@@ -14,6 +14,7 @@ from conftest import (
     _FAIL,
     _OK,
     MISSING_TOOL_CMD,
+    NUL_PATH_RESOLVE_FAULTS,
     OMIT,
     PROJECT_MARKER_CMD,
     REPO_ROOT_MARKER_CMD,
@@ -4396,6 +4397,39 @@ def test_verify_review_bundle_ledger_undecodable_degrades_to_retry(project):
     assert not out.ok and out.retryable and not out.fixable
     assert "deferred-work ledger unreadable" in out.reason
     assert "UnicodeDecodeError" in out.reason
+    assert "DW-1" not in out.reason  # not the "entries not marked done" verdict
+
+
+@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
+def test_verify_review_bundle_non_encodable_ledger_path_degrades_to_retry(
+    project, monkeypatch, fault
+):
+    """The `ValueError` class of this arm's `except`, driven at the PROBE rather
+    than the read. `Path.stat` raises a plain `ValueError` for an embedded NUL in
+    the configured `deferred_work` path and a `UnicodeEncodeError` (a `ValueError`
+    subclass) for a lone surrogate — neither an `OSError`, and both a path
+    `is_file()` had answered False for. Before DW-267 that False read as an empty
+    ledger and the verify retried, fixable, naming every id; after it the probe
+    raised past a tuple spelled `(OSError, UnicodeDecodeError)` and the verify
+    ABORTED (#794 review). An observation arm attributes a non-encodable path as a
+    fault, never as absence, so the outcome is the SAME shape as the two rows
+    above — retryable, not fixable, naming the fault's class. Injected through
+    `fault_metadata_probe(..., "stat", error=)` from `NUL_PATH_RESOLVE_FAULTS` so
+    both classes are driven on every platform.
+    Ablation: narrow the tuple back to `(OSError, UnicodeDecodeError)` and both
+    rows red with the injected fault escaping `verify_review_bundle`; the
+    `UnicodeDecodeError` row above stays green."""
+    task = make_bundle_task(project)
+    sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "done", task.baseline_commit)
+    task.spec_file = str(sp)
+    bundle_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
+    fault_metadata_probe(monkeypatch, project.deferred_work, "stat", error=fault)
+
+    out = verify.verify_review_bundle(task, project, Policy())
+    assert not out.ok and out.retryable and not out.fixable
+    assert "deferred-work ledger unreadable" in out.reason
+    assert type(fault).__name__ in out.reason and str(fault) in out.reason
     assert "DW-1" not in out.reason  # not the "entries not marked done" verdict
 
 
