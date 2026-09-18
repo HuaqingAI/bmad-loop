@@ -476,6 +476,11 @@ breaking changes may land in a minor release.
   (a concurrent writer) no longer reads as "nothing to commit" with the accepted chain
   orphaned and baseline recorded as the bundle's commit — the committed-tree validator
   runs against baseline, the original chain and index are restored, and the run pauses.
+  The integrated target tree is validated ahead of `unit-merged` as well: a target-side
+  `pre-commit` hook rewriting a tracked deliverable in the squash leg's own commit no
+  longer lands it under the bundle's name — the target is returned to its pre-merge
+  revision (`reset --keep`, never flattening a local edit), the refusal is journaled and
+  the unit is kept and escalated, so a resume replays the merge.
 
 - Sample destination pathname identity after streamed artifact probes, refusing observed
   detachment while retaining checked-fallback races (DW-301).

@@ -3141,6 +3141,21 @@ def _reset_hard_head(repo: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def reset_keep(repo: Path, revision: str) -> tuple[bool, str]:
+    """`reset --keep <revision>`: move HEAD and undo exactly the tracked paths that
+    differ between HEAD and `revision`, while a local modification on any such
+    path ABORTS the reset instead of being flattened, and modifications elsewhere
+    are left alone. The rollback shape for a merge commit that LANDED but must
+    not stand (the integrated-tree check in `worktree_flow.merge_local`): unlike
+    `_reset_hard_head` it never flattens an operator edit, at the price of
+    declining when one sits on a merged path. Returns `(restored, note)`; the
+    note is git's own text when the reset declined."""
+    rc, out = _git(repo, "reset", "--keep", revision)
+    if rc != 0:
+        return False, out.strip()
+    return True, ""
+
+
 def _index_unmerged(repo: Path) -> tuple[bool, GitError | None]:
     """`(the index carries unmerged stages — i.e. a merge really ran and left a
     content conflict to resolve, the probe failure when the reading itself

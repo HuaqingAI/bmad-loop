@@ -2453,6 +2453,11 @@ class WorktreeFlow:
                 strategy=merge_strategy,
                 source=source,
             )
+        # The integrated-tree check below rolls a drifted merge back to THIS
+        # revision; read it only for a bundle carrying a Git deliverable binding,
+        # the one case the check runs for.
+        integrated_check = bool(task.dw_ids) and task.artifact_tracked_source_oids is not None
+        pre_merge_head = verify.rev_parse_head(repo) if integrated_check else None
         try:
             verify.merge_branch(
                 repo,
@@ -2671,6 +2676,16 @@ class WorktreeFlow:
             )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
+        if integrated_check and pre_merge_head is not None:
+            # The unit-side validators proved the unit's commit; the target's own
+            # commit (`--no-ff`'s merge commit, the squash leg's `git commit`) runs
+            # the TARGET's hooks, which can rewrite and re-add a tracked
+            # deliverable after everything the run validated (#795 review). Read
+            # the integrated tree BEFORE `unit-merged` latches the merge as proof:
+            # a drifted merge is rolled back to the pre-merge revision and
+            # escalated with the unit kept, so a resume replays the merge rather
+            # than publishing over it.
+            self.validate_integrated_publication(task, unit, pre_merge_head)
         self.journal.append(
             "unit-merged",
             story_key=task.story_key,
@@ -2681,6 +2696,47 @@ class WorktreeFlow:
         )
         self._emit("post_merge", task)
         self.finish_publication(task, unit)
+
+    def validate_integrated_publication(
+        self, task: StoryTask, unit: UnitWorkspace, pre_merge_head: str
+    ) -> None:
+        """Refuse a target integration whose tree drifted from the accepted deliverables.
+
+        On drift the target is returned to ``pre_merge_head`` with ``reset --keep``
+        — it undoes exactly the paths the merge changed and ABORTS rather than
+        flatten a local edit on one of them, so an operator's uncommitted work
+        outside the merge survives as `clean_incoming_collisions` promised — and
+        the unit is kept and escalated through the merge-failure route. A rollback
+        git declines is reported in the reason, never retried: the merge commit
+        is then still on the target and the operator's first step is to clear it.
+        """
+        try:
+            artifact_publication.validate_integrated(task, self.paths, "HEAD")
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            target = self.state.target_branch
+            restored, restore_out = verify.reset_keep(self.paths.repo_root, pre_merge_head)
+            if restored:
+                state = (
+                    f"{target} has been returned to {pre_merge_head[:12]}, so the drifted "
+                    f"merge commit is gone and the checkout needs nothing from you"
+                )
+            else:
+                state = (
+                    f"the drifted merge commit is STILL on {target} because the rollback "
+                    f"to {pre_merge_head[:12]} was declined ({restore_out}); "
+                    f"return {target} to that revision by hand first"
+                )
+            reason = (
+                f"integration of {unit.branch} into {target} was rolled back: the "
+                f"target's own commit did not carry the accepted Git deliverables — a "
+                f"target-side hook (`pre-merge-commit`, `pre-commit`) or a concurrent "
+                f"writer rewrote them after verification. {state}. Fix what rewrote "
+                f"the deliverables, then `bmad-loop resume {self.state.run_id}`. {exc}"
+            )
+            self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
 
     def prepare_publication(self, task: StoryTask, source: ProjectPaths) -> None:
         """Persist accepted bytes before merge can consume the unit."""

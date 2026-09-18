@@ -695,6 +695,41 @@ def validate_committed(
         )
 
 
+def validate_integrated(task: StoryTask, paths: ProjectPaths, revision: str) -> None:
+    """Require the integrated target ``revision`` to carry the accepted Git deliverables.
+
+    The unit-side validators prove the unit's own commit; this one proves what the
+    target integration landed. ``merge_branch``'s ``--no-ff`` and squash legs each
+    seal the result with a commit of the TARGET's own, where its hooks run and can
+    rewrite and re-add a tracked deliverable (#795 review) — the same drift the
+    committed-tree validator refuses on the unit side. Tracked and pending-tracked
+    rels must sit in ``revision`` at their accepted blob identity, and an ignored
+    rel must not have been force-added: the same predicate as the staged and
+    committed checks, read off the target's tree.
+    """
+    ignored, tracked = _validated_source_maps(task)
+    rels = tuple(ignored) + tuple(tracked)
+    if rels:
+        _root(paths)
+    repo_rels = {
+        rel: (paths.implementation_artifacts / _relative(rel))
+        .relative_to(paths.repo_root)
+        .as_posix()
+        for rel in rels
+    }
+    try:
+        integrated = verify.revision_blob_oids(paths.repo_root, revision, repo_rels.values())
+    except verify.GitError as exc:
+        raise PublicationError(
+            "Git artifact deliverables have unavailable integration evidence: "
+            + ", ".join(sorted(repo_rels))
+        ) from exc
+    observed = {
+        rel: integrated[repo_rel] for rel, repo_rel in repo_rels.items() if repo_rel in integrated
+    }
+    _validate_git_snapshot(ignored, tracked, observed)
+
+
 def prepare(
     task: StoryTask,
     paths: ProjectPaths,

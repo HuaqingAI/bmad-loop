@@ -25922,6 +25922,138 @@ def test_commit_hook_git_deliverable_drift_refuses_and_retains_source(project):
     assert refusal["error"].endswith("report.bin")
 
 
+@pytest.mark.parametrize("strategy", ["squash", "merge", "ff"])
+@pytest.mark.parametrize("kind", ["tracked", "pending-tracked"])
+def test_target_hook_git_deliverable_drift_rolls_the_merge_back_and_escalates(
+    project, strategy, kind
+):
+    """The unit-side validators (DW-300) prove the unit's commit; the TARGET's
+    own commit runs the target's hooks after everything the run validated. On
+    the squash leg that commit is a plain `git commit`, which re-reads the index
+    after `pre-commit` — so a hook that rewrites and re-adds a tracked
+    deliverable landed it under the bundle's name (#795 review): `unit-merged`
+    latched, publication finished, the unit was torn down and the ids read
+    `done` over bytes the run never accepted.
+
+    `validate_integrated` now reads the target's tree ahead of `unit-merged`:
+    on drift the target is returned to its pre-merge revision (`reset --keep`,
+    which never flattens a local edit), the refusal is journaled, and the unit
+    is kept and escalated through the merge-failure route — so `unit-merged`
+    never lands and a later resume replays the merge instead of publishing over
+    the drift.
+
+    The `merge` and `ff` rows pin the check's other half — no false positive.
+    `--no-ff` writes its merge commit from the tree git already resolved, so a
+    `pre-merge-commit` hook's `git add` never reaches the commit (measured: HEAD
+    keeps the accepted bytes and the hook's edit is merely left staged), and
+    `ff` creates no commit and runs no hook. Both land with the accepted bytes
+    at the target's HEAD. The hook is the leg's own — `pre-commit` for the
+    squash commit, `pre-merge-commit` for the others — gated to the target
+    branch so the unit's own commits stay clean. A target-gated `pre-commit` on
+    the merge/ff rows would instead ride the run's LATER pathspec'd ledger-carry
+    commit (its temporary index takes the hook's `git add`): a hazard of every
+    orchestrator commit on the target, not of the integration this check reads.
+
+    Ablation: drop the `validate_integrated_publication` call from
+    `merge_local` and the squash rows red on `summary.paused` with the hook's
+    bytes at the target's HEAD."""
+    effect, destination, accepted = _git_bound_publication_bundle(project, kind)
+    target_head = verify.rev_parse_head(project.repo_root)
+    before = destination.read_bytes() if destination.exists() else None
+    hook_name = "pre-commit" if strategy == "squash" else "pre-merge-commit"
+    hook = project.project / ".git" / "hooks" / hook_name
+    hook.write_text(
+        "#!/bin/sh\n"
+        'case "$(git symbolic-ref --short HEAD)" in\n'
+        "  bmad-loop/*|bmad_loop/*) ;;\n"
+        "  *) printf 'hook mutation' > _bmad-output/implementation-artifacts/report.bin; "
+        "git add -- _bmad-output/implementation-artifacts/report.bin ;;\n"
+        "esac\n"
+    )
+    hook.chmod(0o755)
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    task = engine.state.tasks["dw-fix"]
+    assert task.commit_sha not in (None, task.baseline_commit)  # the unit's commit stood
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+    kinds = journal_kinds(engine)
+    shown = verify.git_bytes(
+        project.project, "show", "HEAD:_bmad-output/implementation-artifacts/report.bin"
+    )
+    if strategy != "squash":
+        assert not summary.paused and not summary.crashed
+        assert task.phase == Phase.DONE and task.artifact_publication_complete
+        assert "unit-merged" in kinds and _records(engine, "artifact-publication-refused") == []
+        assert shown.returncode == 0 and shown.stdout == accepted
+        assert not Path(task.worktree_path).exists()
+        return
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    assert task.phase == Phase.ESCALATED
+    reason = engine.state.paused_reason or ""
+    assert "rolled back" in reason and "returned to" in reason and "report.bin" in reason
+    # the drifted merge commit is gone: target back where it was, tracked tree clean
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert git(project.project, "status", "--porcelain", "--untracked-files=no") == ""
+    assert (destination.read_bytes() if destination.exists() else None) == before
+    assert shown.stdout != b"hook mutation"
+    # nothing latched the merge as proof, so a resume replays it rather than publishing
+    assert "unit-merge-started" in kinds and "unit-merged" not in kinds
+    assert "story-escalated" in kinds
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert refusal["error"].endswith("report.bin")
+    assert not task.artifact_publication_complete
+    # the unit is kept for manual recovery with its accepted bytes intact
+    assert Path(task.worktree_path).is_dir()
+    assert verify.branch_exists(project.project, task.branch)
+    unit_paths = project.rebased(Path(task.worktree_path))
+    assert (unit_paths.implementation_artifacts / "report.bin").read_bytes() == accepted
+
+
+def test_target_hook_drift_rollback_declined_names_the_landed_merge_first(project, monkeypatch):
+    """`reset --keep` declines when a local edit sits on a path the merge
+    changed — the one shape where undoing the merge would flatten operator
+    work. Then the drifted merge commit is STILL on the target, and the reason
+    says so as the operator's first step, instead of claiming a rollback that
+    did not happen (the same `restored` split the commit-refused arm makes).
+    The refusal, the escalation and the kept unit are unchanged."""
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    target_head = verify.rev_parse_head(project.repo_root)
+    hook = project.project / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        'case "$(git symbolic-ref --short HEAD)" in\n'
+        "  bmad-loop/*|bmad_loop/*) ;;\n"
+        "  *) printf 'hook mutation' > _bmad-output/implementation-artifacts/report.bin; "
+        "git add -- _bmad-output/implementation-artifacts/report.bin ;;\n"
+        "esac\n"
+    )
+    hook.chmod(0o755)
+    monkeypatch.setattr(verify, "reset_keep", lambda repo, revision: (False, "declined by test"))
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="squash"),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and not summary.crashed
+    task = engine.state.tasks["dw-fix"]
+    reason = engine.state.paused_reason or ""
+    assert "STILL on" in reason and "declined by test" in reason and "report.bin" in reason
+    assert "returned to" not in reason
+    assert verify.rev_parse_head(project.repo_root) != target_head  # the merge commit stands
+    assert "unit-merged" not in journal_kinds(engine)
+    assert len(_records(engine, "artifact-publication-refused")) == 1
+    assert Path(task.worktree_path).is_dir()
+
+
 def test_commit_hook_force_added_ignored_deliverable_rolls_back_and_resumes_without_session(
     project,
 ):
