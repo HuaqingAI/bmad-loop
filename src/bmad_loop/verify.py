@@ -719,8 +719,9 @@ def path_clean(repo: Path, rel: str) -> bool:
 
 
 def _artifact_dir_entries(repo: Path, artifact_dir: Path) -> list[str] | None:
-    """The IGNORED porcelain records (`!!`) git lists under `artifact_dir` — the
-    probe behind the bundle path's artifact-only receipt (DW-273).
+    """The IGNORED entries (`!!` porcelain records) git lists under `artifact_dir`,
+    as repo-relative posix paths — the listing behind the bundle path's
+    artifact-only receipt (DW-273) and its attempt-start snapshot.
 
     `None` when the receipt cannot be consulted at all: `artifact_dir` resolves
     outside `repo` (an artifacts dir configured beside the checkout holds nothing
@@ -745,17 +746,22 @@ def _artifact_dir_entries(repo: Path, artifact_dir: Path) -> list[str] | None:
     Why `status --ignored` and not a baseline diff: ignored paths never enter the
     index, so there is no commit to diff them against. The listing answers only
     "the artifacts dir holds ignored content under the code tree" — it cannot say
-    which entry a session wrote, and no caller may read it as if it could.
+    which entry a session wrote, which is why :func:`artifact_dir_snapshot` and
+    :func:`_artifact_dir_owned_entries` exist: the ATTEMPT's own start-of-attempt
+    fingerprint of this listing is the baseline ignored paths otherwise lack.
     `--untracked-files=all` makes git enumerate the individual files inside an
     ignored directory rather than collapsing the directory to one record, so the
-    count carried to the journal is a count of files, not of prefixes.
+    entries are files that can be fingerprinted, not prefixes.
 
-    Reads `stdout` ALONE, for the reason :func:`path_clean` spells out: `status`
-    exits 0 while still writing advisories to stderr, and against a merged stream
-    that chatter would be one phantom entry — enough, on its own, to accept a
-    receipt over an empty directory. Literal pathspec, like every other
-    directory-scoped operand here (`_exclude_specs`): a configured artifacts dir
-    may carry glob magic in a segment."""
+    `-z` bytes, decoded with `os.fsdecode`, for the reason `dirty_paths` and
+    `commit_paths` read them so: ordinary porcelain C-quotes a non-ASCII name
+    under `core.quotePath`, and a quoted record is not a path this module can
+    `stat`. Reads `stdout` ALONE, for the reason :func:`path_clean` spells out:
+    `status` exits 0 while still writing advisories to stderr, and against a
+    merged stream that chatter would be one phantom entry — enough, on its own,
+    to accept a receipt over an empty directory. Literal pathspec, like every
+    other directory-scoped operand here (`_exclude_specs`): a configured
+    artifacts dir may carry glob magic in a segment."""
     try:
         rel = artifact_dir.resolve().relative_to(repo.resolve())
     except ValueError:
@@ -767,23 +773,93 @@ def _artifact_dir_entries(repo: Path, artifact_dir: Path) -> list[str] | None:
             return None
     if rel == Path("."):
         return None
-    proc = _run_git(
-        [
-            "git",
-            "-C",
-            str(repo),
-            "status",
-            "--porcelain",
-            "--ignored",
-            "--untracked-files=all",
-            "--",
-            *_literal_specs([rel.as_posix()]),
-        ],
+    proc = git_bytes(
         repo,
+        "status",
+        "--porcelain",
+        "-z",
+        "--ignored",
+        "--untracked-files=all",
+        "--",
+        *_literal_specs([rel.as_posix()]),
     )
     if proc.returncode != 0:
         return None
-    return [line for line in proc.stdout.splitlines() if line.startswith("!! ")]
+    # `-z` records are `XY<space>path\0`; a rename carries a second `\0`-terminated
+    # operand, but only tracked records rename, and this reads `!!` alone.
+    return [
+        os.fsdecode(record[3:]) for record in proc.stdout.split(b"\0") if record.startswith(b"!! ")
+    ]
+
+
+# One ignored entry's fingerprint in an attempt-start snapshot: `[st_mtime_ns,
+# st_size]`, or `None` when the entry was listed but could not be measured
+# (`lstat` refused, or it vanished between the listing and the probe). JSON-shaped
+# on purpose — it persists on `StoryTask.baseline_artifacts` through state.json.
+ArtifactFingerprint = list[int] | None
+
+
+def _artifact_fingerprint(repo: Path, rel: str) -> ArtifactFingerprint:
+    """`[st_mtime_ns, st_size]` of `repo/rel` via `lstat`, or `None` on any
+    `OSError` — the entry stays in the snapshot as "present, unmeasurable", which
+    :func:`_artifact_dir_owned_entries` never credits."""
+    try:
+        st = (repo / rel).lstat()
+    except OSError:
+        return None
+    return [st.st_mtime_ns, st.st_size]
+
+
+def artifact_dir_snapshot(repo: Path, artifact_dir: Path) -> dict[str, ArtifactFingerprint] | None:
+    """The attempt-start fingerprint of every ignored entry under `artifact_dir`,
+    keyed by repo-relative posix path — the baseline the artifact-only receipt
+    (DW-273) measures ownership against, stamped by `Engine._dev_phase` beside
+    `baseline_commit` and `baseline_untracked` at every genuinely new attempt.
+
+    `None` on exactly :func:`_artifact_dir_entries`' "cannot be consulted" answer
+    (outside the tree, IS the tree, git refused), and a `GitError` propagates for
+    the caller to degrade. An empty dict is a real answer: nothing was there, so
+    everything the attempt leaves is its own."""
+    entries = _artifact_dir_entries(repo, artifact_dir)
+    if entries is None:
+        return None
+    return {rel: _artifact_fingerprint(repo, rel) for rel in entries}
+
+
+def _artifact_dir_owned_entries(
+    repo: Path, artifact_dir: Path, baseline: dict[str, ArtifactFingerprint]
+) -> list[str] | None:
+    """The ignored entries under `artifact_dir` this ATTEMPT created or changed:
+    listed now and either absent from `baseline` or carrying a different
+    fingerprint than the one :func:`artifact_dir_snapshot` recorded there.
+
+    The attempt-ownership half of the receipt. Without it any pre-existing
+    ignored residue — a spec from an earlier bundle, an erratum note from last
+    week — satisfied the listing, and a session that asserted `artifact_only`
+    and wrote nothing cleared the proof-of-work gate on it. Uncertainty keeps the
+    gate strict in both directions: an entry whose baseline fingerprint is `None`
+    (unmeasurable at attempt start) is never credited even if it measures now,
+    and an entry unmeasurable NOW is not credited either — a fingerprint that
+    cannot be taken proves no change. Deleted entries are not deliverables and
+    are not counted. `None` and `[]` are :func:`_artifact_dir_entries`' two
+    answers, unchanged in meaning: no listing at all, and a listing with nothing
+    this attempt owns (which the caller distinguishes from an empty directory by
+    the listing's own size)."""
+    entries = _artifact_dir_entries(repo, artifact_dir)
+    if entries is None:
+        return None
+    owned: list[str] = []
+    for rel in entries:
+        current = _artifact_fingerprint(repo, rel)
+        if current is None:
+            continue
+        if rel not in baseline:
+            owned.append(rel)
+            continue
+        before = baseline[rel]
+        if before is not None and before != current:
+            owned.append(rel)
+    return owned
 
 
 def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
@@ -3827,15 +3903,18 @@ def _verify_shared_gates(
     ``artifact_only_dir`` is the bundle leg's artifact-only RECEIPT (DW-273), and
     it composes onto the gate arm only: when the ordinary probe positively answers
     "nothing changed" (``is False`` — a refusal or a fault never reaches it) and
-    the caller passed a directory, :func:`_artifact_dir_entries` lists that
+    the caller passed a directory, :func:`_artifact_dir_owned_entries` lists that
     directory's IGNORED entries (`!!` records only — tracked and untracked ones
-    are what the ordinary probe already measured), and a positive listing is
+    are what the ordinary probe already measured) and keeps those the ATTEMPT
+    created or changed against ``task.baseline_artifacts``, the fingerprint
+    snapshot ``Engine._dev_phase`` stamped at its start; a positive owned set is
     accepted as proof of work with its count on
-    ``_SharedGateResult.artifact_only_residue``. An empty listing, a directory
-    outside ``paths.repo_root`` (or equal to it) or a git refusal
-    keep the ordinary retry, with the receipt's refusal appended to the verbatim
-    reason; a ``GitError`` escalates through the same ``except`` as the ordinary
-    probe's. Only :func:`verify_dev_bundle` passes it — ``verify_dev`` and
+    ``_SharedGateResult.artifact_only_residue``. No owned entry (an empty
+    directory, or one holding only residue that predates the attempt), no
+    snapshot on the task, a directory outside ``paths.repo_root`` (or equal to
+    it) or a git refusal keep the ordinary retry, with the receipt's refusal
+    appended to the verbatim reason; a ``GitError`` escalates through the same
+    ``except`` as the ordinary probe's. Only :func:`verify_dev_bundle` passes it — ``verify_dev`` and
     ``verify_dev_stories`` never do, so a story result asserting
     ``artifact_only`` still owes the ordinary diff — and the caller passes it only
     when the session's synthesized result carries the strict ``artifact_only:
@@ -4000,16 +4079,44 @@ def _verify_shared_gates(
                 # listed no ignored entry) both refuse it — the retry keeps its
                 # verbatim prefix so existing readers still match, and names the
                 # cause.
-                entries = _artifact_dir_entries(paths.repo_root, artifact_only_dir)
-                if entries:
-                    return _SharedGateResult(artifact_only_residue=len(entries))
-                cause = (
-                    "artifact-only receipt refused: implementation_artifacts is "
-                    "outside the code tree or git refused to list it"
-                    if entries is None
-                    else "artifact-only receipt refused: implementation_artifacts "
-                    "lists no ignored entries"
+                # Ownership, not presence: only entries this attempt created or
+                # changed since its start-of-attempt snapshot count, so residue
+                # left by an earlier bundle (or by last week) proves nothing. No
+                # snapshot at all — a pre-upgrade task, or a capture that degraded
+                # at dispatch — refuses too: uncertainty keeps the gate strict.
+                baseline = task.baseline_artifacts
+                owned = (
+                    None
+                    if baseline is None
+                    else _artifact_dir_owned_entries(paths.repo_root, artifact_only_dir, baseline)
                 )
+                if owned:
+                    return _SharedGateResult(artifact_only_residue=len(owned))
+                if owned is None:
+                    # Two refusals share this arm; the listing's own answer names
+                    # which, and spawns git only on the way to a refusal a dir
+                    # outside the tree never reaches (it answers `None` first).
+                    listable = (
+                        baseline is None
+                        and _artifact_dir_entries(paths.repo_root, artifact_only_dir) is not None
+                    )
+                    cause = (
+                        "artifact-only receipt refused: no attempt-start snapshot "
+                        "of implementation_artifacts to measure ownership against"
+                        if listable
+                        else "artifact-only receipt refused: implementation_artifacts "
+                        "is outside the code tree or git refused to list it"
+                    )
+                else:
+                    listed = _artifact_dir_entries(paths.repo_root, artifact_only_dir) or []
+                    cause = (
+                        "artifact-only receipt refused: implementation_artifacts "
+                        "lists no ignored entries"
+                        if not listed
+                        else "artifact-only receipt refused: implementation_artifacts "
+                        f"lists {len(listed)} ignored entries, none created or "
+                        "changed by this attempt"
+                    )
                 return _SharedGateResult(VerifyOutcome.retry(f"{reason} ({cause})"))
         except GitError as e:
             return _SharedGateResult(VerifyOutcome.escalate(str(e)))
@@ -4288,19 +4395,23 @@ def verify_dev_bundle(
     strict ``artifact_only: True`` boolean — minted by ``devcontract`` from the
     current session's genuine marker, never from frontmatter, exactly as
     ``park_asserted`` is — and the ordinary probe positively found nothing, the
-    gate accepts a positive ``git status --ignored`` listing scoped to
-    ``paths.implementation_artifacts`` in its place, and the acceptance rides out
-    as ``artifact_only_accepted`` / ``artifact_only_residue`` for the sweep
-    engine to journal. A bundle with a real change passes the ordinary arm and
+    gate accepts, in its place, the ignored entries of a ``git status --ignored``
+    listing scoped to ``paths.implementation_artifacts`` that THIS attempt
+    created or changed — measured against the fingerprint snapshot
+    ``Engine._dev_phase`` stamped on ``task.baseline_artifacts`` at the attempt's
+    start — and the acceptance rides out as ``artifact_only_accepted`` /
+    ``artifact_only_residue`` (the owned count) for the sweep engine to journal. A bundle with a real change passes the ordinary arm and
     records no receipt; a loose truthy value (``"true"``, ``1``) is no assertion.
 
     What the receipt does NOT relax: the workflow tag, the expected status, the
     baseline match, the dw_ids cross-check below, the configured ``[verify]``
     commands, and the review gate — ``verify_review_bundle`` still requires every
-    bundle id ``status: done``. And what it cannot prove: ignored paths carry no
-    baseline, so the listing shows that the artifacts dir holds content under the
-    code tree, not which entry this session wrote. The assertion is the
-    load-bearing half."""
+    bundle id ``status: done``. And what the receipt's ownership check does not
+    reach: ignored paths carry no git baseline, so "created or changed" is read
+    off ``lstat`` fingerprints (mtime and size) rather than content — a rewrite
+    that lands byte-identical with a preserved mtime is invisible to it, as it
+    is to the ordinary probe. The assertion selects the receipt; the snapshot is
+    what makes it proof."""
     rj = result_mapping(result_json)
     spec_file = rj.get("spec_file")
     if not spec_file:
@@ -5146,9 +5257,14 @@ def verify_review_bundle(
     # Same TOCTOU class as the spec read above: the ledger is rewritten by the
     # orchestrator's own mark_done between the dev and review gates.
     # OBSERVATION arm of the ledger-read contract (DW-146): this check writes
-    # nothing and already degrades into the `retry` it returns. `UnicodeDecodeError`
-    # joins the tuple because it is a `ValueError`, not an `OSError` — undecodable
-    # bytes escaped this arm entirely and aborted the verify instead of retrying it.
+    # nothing and already degrades into the `retry` it returns. `ValueError` is in
+    # the tuple because neither of its two arrivals is an `OSError`: DW-146 added
+    # `UnicodeDecodeError` (a `ValueError` subclass) when undecodable bytes escaped
+    # this arm entirely and aborted the verify instead of retrying it, and the
+    # `stat` probe below raises a plain `ValueError` for an embedded NUL in the
+    # configured path and a `UnicodeEncodeError` for a lone surrogate, which
+    # `is_file()` had answered False for — an observation arm attributes those as
+    # a fault, never as absence, so they take the same retry.
     # The presence probe is `stat` + `S_ISREG` INSIDE the `try` (DW-267), so a
     # refused probe is the "unreadable" retry below and not the "entries not
     # marked done" one: the `is_file()` it replaced suppresses every OS error on
@@ -5159,7 +5275,7 @@ def verify_review_bundle(
             text = ledger.read_text(encoding="utf-8") if S_ISREG(ledger.stat().st_mode) else ""
         except (FileNotFoundError, NotADirectoryError):
             text = ""
-    except (OSError, UnicodeDecodeError) as exc:
+    except (OSError, ValueError) as exc:
         return VerifyOutcome.retry(
             f"deferred-work ledger unreadable ({exc.__class__.__name__}: {exc}): {ledger}"
         )

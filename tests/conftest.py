@@ -1091,7 +1091,11 @@ UNRESOLVABLE = "stubbed: the provider is registered but not serving"
 # raises `UnicodeEncodeError`, a `ValueError` subclass, which `refuse_to_resolve`
 # reconstructs faithfully from its five args. INJECTED rather than driven with a
 # real path because `ntpath.realpath` tolerates a NUL, so a real NUL path is not a
-# cross-platform driver at the publisher.
+# cross-platform driver at the publisher. `Path.stat()` bottoms out in the same
+# `os.stat` and raises the same two, so the observation-arm rows that grade the
+# `stat` + `S_ISREG` presence probe (DW-266/267) drive them through
+# `fault_metadata_probe(..., "stat", error=)`; a real lone surrogate is not a
+# cross-platform driver there either (the Windows W-API accepts it).
 NUL_PATH_RESOLVE_FAULTS = [
     pytest.param(ValueError("lstat: embedded null character in path"), id="nul"),
     pytest.param(
@@ -1351,10 +1355,20 @@ def fault_locked_ledger_read(
     return before
 
 
-def fault_metadata_probe(monkeypatch, target: Path, probe: str) -> None:
+def fault_metadata_probe(
+    monkeypatch, target: Path, probe: str, *, error: Exception | None = None
+) -> None:
     """Make exactly ``target``'s ``probe`` metadata call raise PermissionError; every
     other path still answers normally, and so does every other probe on ``target`` —
     with the ``stat`` family the documented exception, see its own paragraph below.
+
+    ``error`` supplies a DIFFERENT fault instead, on the same terms as
+    ``refuse_to_resolve(..., error=)``: RE-CONSTRUCTED from its class and args on
+    every matching probe rather than re-raised as one object, so a consumer probing
+    the target twice does not see the first raise's frames on the second. Its use
+    is the ``ValueError`` family ``Path.stat`` raises for a path the OS cannot
+    encode (:data:`NUL_PATH_RESOLVE_FAULTS`), which no ``PermissionError`` row can
+    reach and no ``except OSError`` catches.
 
     ``probe`` is one of ``exists`` / ``is_file`` / ``is_symlink`` / ``stat`` /
     ``lstat`` — one probe at a time, which does NOT make one guard-per-probe
@@ -1400,7 +1414,9 @@ def fault_metadata_probe(monkeypatch, target: Path, probe: str) -> None:
 
     def fake(self, *a, **kw):
         if self == target:
-            raise PermissionError(13, "Permission denied")
+            if error is None:
+                raise PermissionError(13, "Permission denied")
+            raise type(error)(*error.args)  # fresh per raise — see the docstring
         return real(self, *a, **kw)
 
     monkeypatch.setattr(Path, probe, fake)

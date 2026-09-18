@@ -65,9 +65,11 @@ STATUS_LINE_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 # The bundle leg's artifact-only assertion (DW-273): an `Artifact only: true` /
-# `artifact_only: true` / `Artifact-only: true` line (a non-empty run of space/
-# underscore/hyphen between the words, case-insensitive) inside the SAME marker.
-# It takes the same bulleted/bolded label and value shapes `STATUS_LINE_RE` tolerates
+# `artifact_only: true` / `Artifact-only: true` line (a run of AT LEAST ONE
+# space/underscore/hyphen between the words — `[ _-]+`, never `*`, so the fused
+# `Artifactonly: true` is no spelling of the contract and cannot relax the
+# bundle gate (#794 review) — case-insensitive) inside the SAME marker. It takes
+# the same bulleted/bolded label and value shapes `STATUS_LINE_RE` tolerates
 # (`**Artifact only:** **true**`, `- **Artifact only: true**`): every `**` is
 # optional and the closing one is consumed before the end-of-line anchor. Only
 # the literal value `true` ALONE on the line asserts — anchored to end of line so

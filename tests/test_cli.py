@@ -1039,6 +1039,39 @@ def test_decisions_names_an_absent_ledger_rather_than_a_missing_entry(project, c
     assert "DW-1: no decision line was written: the ledger file is gone" in out
 
 
+def test_decisions_names_a_missing_entry_for_a_present_empty_ledger(project, capsys, monkeypatch):
+    """The edge between the two siblings above, and the reason the outcome line
+    asks the presence-aware reader (`observe_ledger`) rather than testing the
+    text-only reader's `""` for truth: a ledger truncated to 0 bytes mid-prompt is
+    a file the recorder REACHED and found no entry in — the missing-entry news —
+    where the text-only reader answers the same `""` it answers for absence, and
+    the outcome line then told the operator the file was gone, with every
+    `decision:` line already written (PR #794 review; the edge the DW-281/282
+    CHANGELOG entry recorded as accepted).
+
+    Ablation: switch the site back to `read_for_observation` + `elif not text:`
+    and this reds with "the ledger file is gone" while both siblings still pass."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_rich_decision(project)
+
+    class _StubPrompter:
+        def ask(self, decision):
+            project.deferred_work.write_text("")  # present, 0 bytes: reached, nothing in it
+            return decision.option("2")  # choose close
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert "closed now" not in out
+    assert "the ledger file is gone" not in out
+    assert "DW-1: no decision line was written: the ledger holds no entry for this id" in out
+
+
 @pytest.mark.parametrize(
     "refusals,note",
     [
@@ -8866,6 +8899,44 @@ def test_validate_fails_when_the_ledger_itself_is_unreadable(project, capsys, mo
     # refusal had run and found nothing
     assert "gate:" in findings[0]["message"] and "hard gates" in findings[0]["message"]
     # and the declaration checks it could not run stay quiet rather than guessing
+    assert not [f for f in doc["findings"] if f["check"] == "deferred.closes-unknown"]
+    assert not [f for f in doc["findings"] if f["check"].startswith("deferred.hard-gate")]
+
+
+@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
+def test_validate_fails_when_the_ledger_path_cannot_be_encoded(project, capsys, monkeypatch, fault):
+    """The `ValueError` class of `_validate_deferred_ledger`'s `except`, driven on its
+    own. `Path.stat` raises a plain `ValueError` for an embedded NUL in the
+    configured `deferred_work` path and a `UnicodeEncodeError` (a `ValueError`
+    subclass) for a lone surrogate — neither an `OSError`, and both a path
+    `is_file()` had answered False for. Before DW-267 that False read as an empty
+    ledger and `validate` reported a clean deferred check; after it the probe raised
+    past a tuple spelled `(OSError, UnicodeDecodeError)` and `validate` CRASHED
+    (#794 review). An observation arm attributes a non-encodable path as a fault,
+    never as absence, so the verdict is the same `deferred.ledger-unreadable`
+    problem a refused `stat` earns, naming the fault, and `Engine._refuse_gated_story`
+    pauses on the same fault — the two surfaces keep agreeing about the same file.
+    Injected through `fault_metadata_probe(..., "stat", error=)` from
+    `NUL_PATH_RESOLVE_FAULTS` so both classes are driven on every platform.
+    Ablation: narrow the tuple back to `(OSError, UnicodeDecodeError)` and both rows
+    red with the injected fault escaping `cmd_validate`; the `PermissionError` rows
+    above stay green."""
+    install_bmad_config(project)
+    _write_policy(project.project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    write_spec(spec_path(project, "1-1-a"), "ready-for-dev", "abc123", closes_deferred=["DW-1"])
+    fault_metadata_probe(monkeypatch, project.deferred_work, "stat", error=fault)
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    doc = json.loads(capsys.readouterr().out)
+    findings = [f for f in doc["findings"] if f["check"] == "deferred.ledger-unreadable"]
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "problem"
+    assert findings[0]["detail"] == {"ledger": str(project.deferred_work), "error": str(fault)}
+    assert "gate:" in findings[0]["message"] and "hard gates" in findings[0]["message"]
     assert not [f for f in doc["findings"] if f["check"] == "deferred.closes-unknown"]
     assert not [f for f in doc["findings"] if f["check"].startswith("deferred.hard-gate")]
 

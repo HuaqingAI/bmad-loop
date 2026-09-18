@@ -1435,13 +1435,18 @@ class Engine:
         # gate failed OPEN — the story dispatched, and the pause below was
         # unreachable. Only absence (`ENOENT`/`ENOTDIR`, a present non-regular
         # file) is the empty text; a refused probe takes the pause arm exactly
-        # as a refused `read_text` does.
+        # as a refused `read_text` does. `ValueError`, not `UnicodeDecodeError`
+        # (its subclass): `Path.stat` raises a plain `ValueError` for an embedded
+        # NUL in the configured path and a `UnicodeEncodeError` for a lone
+        # surrogate, neither an `OSError`, which `is_file()` had answered False
+        # for — an observation arm attributes those as a fault, never as absence
+        # (`deferredwork.probe_absence`'s contract), so they take this pause too.
         try:
             try:
                 text = ledger.read_text(encoding="utf-8") if S_ISREG(ledger.stat().st_mode) else ""
             except (FileNotFoundError, NotADirectoryError):
                 text = ""
-        except (OSError, UnicodeDecodeError) as e:
+        except (OSError, ValueError) as e:
             self.journal.append("story-gate-unreadable", story_key=story_key, error=str(e))
             reason = (
                 f"{ledger} cannot be read ({e}), so the `gate:` hard gates protecting "
@@ -2507,6 +2512,16 @@ class Engine:
             or task.dispatched_spec_snapshot is not None
         )
 
+    def _artifact_baseline(self, task: StoryTask) -> dict[str, list[int] | None] | None:
+        """The attempt-start snapshot behind the artifact-only receipt (DW-273).
+
+        The receipt is the bundle leg's alone (`verify.verify_dev_bundle`), so the
+        story engine stamps nothing — `None`, on which the receipt refuses — and
+        spends no git call on it; `SweepEngine` overrides with the real
+        `verify.artifact_dir_snapshot`."""
+        del task
+        return None
+
     def _dev_phase(self, task: StoryTask, resume_result: SessionResult | None = None) -> bool:
         if resume_result is None:
             # A fresh invocation cannot consume a snapshot armed by an earlier,
@@ -2543,6 +2558,13 @@ class Engine:
                 # later isolated carry. Crash replay never enters this branch.
                 if feedback is None:
                     task.harvested_deferrals = []
+                    # The artifact-only receipt's ownership baseline (DW-273) is
+                    # re-stamped on the same rule: a rolled-back attempt's IGNORED
+                    # residue survives the rollback (`git clean -x` never runs), so
+                    # without a fresh snapshot the next attempt would be credited
+                    # with it. A fixable repair keeps the chain's snapshot for the
+                    # same reason it keeps the tree.
+                    task.baseline_artifacts = self._artifact_baseline(task)
                 # A fresh-baseline dispatch replaces stale ownership. A fixable
                 # repair inherits the current working tree, but retains the chain's
                 # first bound snapshot because a later non-fixable retry resets all
@@ -3398,9 +3420,20 @@ class Engine:
                     site="review-timeout-salvage-refile-locked",
                 )
             task.followup_review_recommended = False
-        # Keep recovery authority through notification and commit-gate saves.
-        # The cleared recommendation records successful publication, so replay
-        # re-verifies without appending again. COMMITTING takes over the latch.
+        # Latch the salvage BEFORE the handoff save, on the fault-free path too
+        # — not only from the repair-pause arm above (#794 review). This save is
+        # the last one before `_commit`'s COMMITTING save, and `gates.notify` plus
+        # any `pre_commit_gate` workflow run between them: a host death there
+        # leaves REVIEW_VERIFY over a timeout record, which `_resumable_session`
+        # never matches (the record is not `completed`), so without the latch
+        # resume falls to restart recovery — a rollback erases the refile just
+        # published and re-drives dev and review over finished, verify-green
+        # work, and no rollback pauses for manual recovery. Latched, resume
+        # replays THIS timeout through `_pending_salvage_session`: the preserved
+        # product is verified again, and the cleared recommendation records the
+        # successful publication so the replay appends nothing twice. COMMITTING
+        # takes over the latch (`_commit` clears it with its own save).
+        task.salvage_refile_pending = True
         self._save()
         self.journal.append(
             "review-timeout-salvage",
@@ -7852,7 +7885,7 @@ class Engine:
         self,
         task: StoryTask,
         ledger: Path,
-        error: str,
+        fault: deferredwork.LedgerReadError | OSError,
         *,
         site: str,
         terminal_composite: bool,
@@ -7862,9 +7895,12 @@ class Engine:
         The base route is deliberately invariant across call contexts: ordinary
         story runs pause at escalation. ``SweepEngine`` may use the context bit to
         redirect only the terminal post-merge composite carry; the direct
-        pre-terminal carry from :meth:`_defer` must retain this route.
+        pre-terminal carry from :meth:`_defer` must retain this route. The fault
+        travels as the exception, not its text, so the sweep route can keep the
+        OS-versus-decode classification (DW-279) its own row and notice split on;
+        the base route attributes it here exactly as its other publish sites do.
         """
-        self._pause_for_ledger_repair(task, ledger, error, site=site)
+        self._pause_for_ledger_repair(task, ledger, _ledger_fault_text(ledger, fault), site=site)
 
     def _carry_harvested_deferrals(
         self, task: StoryTask, *, terminal_composite: bool = False
@@ -7892,7 +7928,7 @@ class Engine:
             self._pause_for_harvest_carry_repair(
                 task,
                 ledger,
-                _ledger_fault_text(ledger, e),
+                e,
                 site="harvest-carry",
                 terminal_composite=terminal_composite,
             )
@@ -7949,7 +7985,7 @@ class Engine:
             self._pause_for_harvest_carry_repair(
                 task,
                 ledger,
-                _ledger_fault_text(ledger, e),
+                e,
                 site="harvest-carry-append-locked",
                 terminal_composite=terminal_composite,
             )
