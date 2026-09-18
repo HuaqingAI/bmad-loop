@@ -2076,33 +2076,86 @@ def test_non_ascii_sensitive_value_reaches_the_guard(monkeypatch):
     assert json.loads(rendered)["backstop_repairs"] == {f"story:{alias}": 1}
 
 
-def test_markdown_sweep_unicode_key_reaches_the_backstop(project):
-    """An unknown key survives summarize_journal and needs the egress backstop.
+def test_markdown_sweep_unknown_key_fails_closed_before_the_backstop(project):
+    """An unknown key on a Markdown sweep kind never reaches the egress backstop
+    with its VALUE: the declared schema collapses it to `<name>_present` in the
+    collector, so an identifier-shaped value — the one shape `scrub_json` ships
+    verbatim — is gone before the block is serialized, and the backstop has nothing
+    to repair. The key NAME still ships, suffixed, as the table's disclosed
+    residual; the suffix also puts it past the backstop's standalone match, which
+    is why the collector, not the backstop, has to be the guard here.
 
-    Ablation: remove ensure_ascii=False from the Markdown sweep serialization
-    and the decoded block retains the original key instead of its alias.
-    """
+    Driven through the real collector and render, not `_scrub_entry`, because the
+    claim is about what the pasted block contains.
+
+    Ablation: drop `sweep-ledger-commit-clean` from `_JOURNAL_KIND_SCHEMAS` and
+    `AcmeVault` reaches the block byte-identical."""
     run_dir = _seed_run(project.project)
     original = "café-user"
     pseudo = sanitize.Pseudonymizer(salt=b"fixed")
-    alias = pseudo.alias(original, ns="story", epic=1)
     Journal(run_dir).append(
-        "sweep-ledger-commit-clean", file="deferred-work.md", **{original: True}
+        "sweep-ledger-commit-clean", file="deferred-work.md", **{original: "AcmeVault"}
     )
     diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
     [entry] = [e for e in diag.runs[0].journal.entries if e["kind"] == "sweep-ledger-commit-clean"]
-    assert entry[original] is True  # the real collector leaves this key for the guard
+    assert entry[f"{original}_present"] is True
+    assert original not in entry
     repairs: list[tuple[str, int]] = []
 
     rendered = diagnostics.render_markdown(diag, pseudo=pseudo, repairs=repairs)
 
     [block] = re.findall(r"```json\n(.*?)\n```", rendered, flags=re.DOTALL)
     [published] = json.loads(block)
-    assert published[alias] is True
-    assert original not in published
+    assert published[f"{original}_present"] is True
+    assert "AcmeVault" not in block, "LEAK: off-schema value reached the Markdown block"
     assert published["file"] == "deferred-work.md"
-    assert repairs == [(f"story:{alias}", 1)]
-    assert "Backstop repairs" in rendered
+    assert repairs == []  # nothing left for the backstop to repair
+    assert "Backstop repairs" not in rendered
+
+
+@pytest.mark.parametrize(
+    "kind, declared",
+    [
+        ("sweep-ledger-commit", {"message": "m", "commit": "a" * 40, "file": "deferred-work.md"}),
+        ("sweep-ledger-commit-clean", {"message": "m", "file": "decisions.json"}),
+        (
+            "sweep-ledger-commit-refused",
+            {"message": "m", "file": "deferred-work.md", "refuse_cause": "target-absent"},
+        ),
+        (
+            "sweep-ledger-commit-unavailable",
+            {"message": "m", "repo": HOME_PATH, "error": "fatal", "file": "deferred-work.md"},
+        ),
+        ("sweep-repeat-done", {"cycles": 2, "reason": "no-open", "stop_cause": "no-open"}),
+    ],
+)
+def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared):
+    """The five kinds `render_markdown` prints as a JSON block carry a declared
+    schema, so a field a future producer adds WITHOUT routing collapses to a
+    presence marker instead of riding `scrub_json` into the pasted dump. Graded
+    both ways, as the `preference-escalation` row is: the off-schema value is GONE
+    and the declared identity fields (`file`, `refuse_cause`, `stop_cause`,
+    `cycles`) are NOT — a schema that flattened the record would pass an
+    absence-only assertion while destroying what the block is rendered for.
+
+    Ablation: drop `kind`'s row from `_JOURNAL_KIND_SCHEMAS` and the `AcmeVault`
+    absence assertion reds — `scrub_json` is the identity on that string."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {"ts": 2.0, "kind": kind, **declared, "customer": "AcmeVault"}, pseudo, {}, 1.0
+    )
+
+    assert "customer" not in scrubbed
+    assert scrubbed["customer_present"] is True
+    assert "AcmeVault" not in json.dumps(scrubbed), "LEAK: off-schema sweep value"
+    for name in ("file", "refuse_cause", "stop_cause", "cycles"):
+        if name in declared:
+            assert scrubbed[name] == declared[name]
+    for name in ("message", "repo", "error", "reason"):
+        if name in declared:
+            assert name not in scrubbed and scrubbed[f"{name}_present"] is True
+    if "commit" in declared:
+        assert scrubbed["commit"].startswith("commit-")
 
 
 def test_env_tmux_version_folds_a_multi_line_probe(monkeypatch):

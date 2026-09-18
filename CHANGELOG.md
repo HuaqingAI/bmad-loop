@@ -24,6 +24,12 @@ breaking changes may land in a minor release.
   `sweep-repeat-done`'s existing `reason`, so a diagnostics dump tells the five stops
   apart instead of rendering one `reason_present` boolean (DW-201).
 
+- Declare a journal schema for the five sweep kinds `bmad-loop diagnose` prints as a JSON
+  block in the default Markdown dump (`sweep-ledger-commit`, `-clean`, `-refused`,
+  `-unavailable`, `sweep-repeat-done`), so a field a future producer adds without
+  routing collapses to `<name>_present` instead of riding the generic scrub into the
+  pasted block.
+
 - Give each declared journal `**splat` hole a COUNT of the unresolved `**` keyword
   arguments it holds — not write calls, so `append(kind, **a, **b)` counts 2 — and a
   second unresolvable splat inside an already-declared position now reddens instead of
@@ -447,10 +453,12 @@ breaking changes may land in a minor release.
 - Make a resumed sweep honour and announce its own persisted ledger doubt (DW-246,
   DW-244, DW-251). The three ledger publishers that run on a resume ahead of the
   dispatch gate — the already-resolved close's own publish, its stranded-close
-  republish, and the post-recovery publish — now read `_ledger_unfit_to_publish()`
-  and journal `sweep-ledger-commit-withheld` (`message`, `file`,
-  `reason="ledger-in-doubt"`) instead of committing a ledger the run already holds
-  unfit; a ledger-family `sweep-ledger-commit-refused` arms the persisted doubt after
+  republish, and the publisher above the loop body (the post-recovery publish, and
+  the persisted commit-debt settle it shares — the only trigger that still reaches
+  it under doubt, since the recovery pass itself is withheld whole) — now read
+  `_ledger_unfit_to_publish()` and journal `sweep-ledger-commit-withheld`
+  (`message`, `file`, `reason="ledger-in-doubt"`) instead of committing a ledger
+  the run already holds unfit, or silently skipping the settle; a ledger-family `sweep-ledger-commit-refused` arms the persisted doubt after
   its row, so a refusal after a landed decision effect withholds the cycle's bundles
   instead of crashing at the bundle intent's own ledger read (store refusals arm
   nothing; a refusal at the cycle-boundary publisher, which sits below the unfit
@@ -523,8 +531,11 @@ OSError` arm — its own permissions-or-storage attribution on the `bmad-loop sw
   bundle, dropping an id the ledger no longer holds open under a fifth `drop_cause`,
   `entry-not-open`; a ledger read that refuses screens nothing and journals
   `sweep-decision-open-set-refused` (DW-214).
-- Recover stranded decision closes at the sweep's no-open exit, while withholding
-  the new decision recovery path when the run retains ledger doubt (DW-222).
+- Recover stranded decision closes at the sweep's no-open exit, withholding the
+  whole recovery publish — its already-resolved term too, since the commit is of
+  the file — while the run retains ledger doubt; the close phase's own two commit
+  arms read the same verdict, so a resume that inherited a doubt no longer walks a
+  half-landed decision flip into HEAD ahead of the dispatch gate (DW-222).
 - Retry ledger publication before repeating sweeps stop on `no-progress` or
   `max-cycles`; rename the commit message to
   `chore(sweep): commit ledger at the sweep cycle boundary` (DW-223).
@@ -585,7 +596,15 @@ OSError` arm — its own permissions-or-storage attribution on the `bmad-loop sw
   the walk's own verdict — but only for an arm THIS process made: the mirror is
   held while the close phase's latch is armed this cycle, and whenever it was
   inherited across a resume, so in those two states it is deliberately stickier and
-  waits for a human repair plus a fresh sweep (DW-218/219).
+  waits for a human repair plus a fresh sweep. The mirror also outranks the
+  persisted commit debt (`sweep_ledger_commit_owed`): a resume that inherits both
+  skips the top-of-`_loop` settle, since the doubted bytes are the debt. And it
+  withholds the resume's in-flight recovery pass whole: a bundle re-armed out of
+  band by `bmad-loop resolve` is not re-driven while the mirror is on disk — its
+  own commit is a whole-tree `git add -A` — and is journaled as withheld and then
+  stranded rather than dispatched around the gate. Legacy prose met on such a
+  resume is not migrated either: the rewrite session and its commit are refused
+  on the doubt's own `ledger-unreadable` stop and repair notice (DW-218/219).
 
 - Withhold sweep bundles and ledger commits after close, re-apply, or idle decision
   faults; preserve pre-answers while the ledger is in doubt (DW-216/217/220).
@@ -697,6 +716,21 @@ OSError` arm — its own permissions-or-storage attribution on the `bmad-loop sw
   diagnostic probe fails. Report saved store answers only for build/keep-open;
   preserve the existing best-effort commit.
 
+- Commit a ledger write an interrupted sweep phase left unpublished. The
+  already-resolved close and the decision phase gate their commit on the write THIS
+  invocation made (DW-183/DW-185), and a process that died between the publish and
+  the commit replayed as a phase that wrote nothing — the ids already `done`, the
+  answer already saved — leaving the closure dirty ahead of the cycle's bundles, to
+  be absorbed by a story commit, discarded by a rollback, or left at run end. Both
+  sites now persist the debt on `state.json` (`sweep_ledger_commit_owed`) before the
+  write; the ledger-family `_commit_ledger` clears it once git says the file is at
+  HEAD, and a resume settles an outstanding one at the top of `_loop`, before triage
+  or a bundle baseline reads the ledger. An outcome that definitively published
+  nothing — a fault ahead of the write, a failed atomic write, a mutator that flipped
+  no ids — retracts the debt in the same invocation, so a false one never survives to
+  be settled against an operator's edit; a debt inherited from an earlier invocation
+  is never retracted by a replay that closes nothing.
+
 - Handle non-dictionary session result documents through existing empty-document
   paths (DW-206/DW-207). Share read-time normalization across engine, stories,
   sweep, and verification consumers so malformed results reach the existing
@@ -767,7 +801,14 @@ OSError` arm — its own permissions-or-storage attribution on the `bmad-loop sw
   human's answer had already been saved and journaled. Both now journal the fault
   (`sweep-resolved-close-unavailable`, `sweep-decision-effect-unavailable`) and carry
   on: the answers stay in the run's `decisions.json` and the entries stay open for the
-  next cycle.
+  next cycle. The PUBLISH is the exception: a ledger mutator whose atomic write fails
+  (`ENOSPC`, `EROFS`, a failed rename) now raises `deferredwork.LedgerWriteError` — an
+  `OSError` subclass, so the CLI and TUI degrade arms are unchanged — and both sweep
+  sites re-raise it ahead of the degrade, since a repair write that failed is not a
+  phase that closed nothing. Its sibling `LedgerLockReleaseError` covers the far side:
+  the publish landed and the ledger lock's release then faulted (Windows `LK_UNLCK`,
+  `os.close`), which the same arm had read as "nothing was written" while the closure
+  was already on disk.
 
 - Commit the deferred-work ledger in the tree that owns it (DW-175). `implementation_artifacts`
   is configurable to any absolute path, so the ledger may sit under the project, inside
@@ -776,7 +817,11 @@ OSError` arm — its own permissions-or-storage attribution on the `bmad-loop sw
   git resolve the enclosing repository; pre-answer-store commits keep naming the
   project, which is the tree that store is a bare join off. Where no repository encloses
   the file, the commit is skipped and journaled (`sweep-ledger-commit-unavailable`,
-  naming the directory and git's error) rather than ending the sweep.
+  naming the directory and git's error) rather than ending the sweep. That degrade is
+  for a tree git cannot interrogate only: a ledger commit git was asked to make and
+  refused (a hook, the index, a full disk) still raises, as the publishers did before
+  re-rooting — the cycle's bundles would otherwise run against the dirty baseline the
+  commit was meant to clean. The store's commits keep degrading on both.
 
 - Stop a sweep wiping every recorded pre-answer when the ledger vanishes mid-cycle
   (DW-176). An absent ledger read as "nothing is open" and dropped the whole store,
@@ -912,7 +957,12 @@ the ledger` list and the `workflow must be ...` refusal in BOTH validators used 
   offered again and fresh sweeps stop repeating stale-answer notifications. Journal
   the removal and preserve run-local answers and ledger history. A read-only project
   store raises `PermissionError` after the drop is announced and quarantined; a fresh
-  run retries once the store is writable.
+  run retries once the store is writable. The retirement removes the entry only while
+  it still holds the value that was dropped: a paused run's stale run-local copy wins
+  over the store on resume, so a replacement a human recorded out of band meanwhile
+  is left in place for the next run instead of being deleted and committed away. The
+  compare and the delete are one step under the store's lock (DW-161 below), so that
+  compare-and-delete and a concurrent `bmad-loop decisions` re-answer cannot interleave.
 
 - **Skip an unreadable cached triage instead of failing the read** (DW-145). Widen
   `decisions.pending_missed_decisions`' except tuple to include `UnicodeDecodeError` —
