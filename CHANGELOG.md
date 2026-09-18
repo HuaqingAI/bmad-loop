@@ -679,16 +679,13 @@ breaking changes may land in a minor release.
   where `is_file()` suppressed the refusal and the `gate:` hard gate failed OPEN — the story
   dispatched and `story-gate-unreadable` was unreachable; `ENOENT`/`ENOTDIR` and a
   non-regular file stay the empty ledger, and a symlink loop at the ledger's name now
-  pauses at the gate instead of passing it (DW-266; also closes DW-276). The arm catches
-  `ValueError` too: `stat()` raises it for a configured ledger path the OS cannot encode
-  (an embedded NUL, a lone surrogate), which `is_file()` had answered False for and which
-  now takes the same pause instead of crashing the run.
+  pauses at the gate instead of passing it (DW-266; also closes DW-276). A configured
+  ledger path the OS cannot encode takes the same pause instead of crashing the run.
 - Same probe inside `validate`'s deferred-ledger read and `verify_review_bundle`'s, so on
   Python 3.14 a refused ledger is the `deferred.ledger-unreadable` problem rather than a
   clean deferred check, and the non-fixable "deferred-work ledger unreadable" retry rather
-  than the fixable "entries not marked done" one (DW-267). Both arms catch `ValueError`
-  too, so a configured ledger path the OS cannot encode is that problem and that retry
-  rather than a crash.
+  than the fixable "entries not marked done" one (DW-267). A configured ledger path the
+  OS cannot encode is that problem and that retry rather than a crash.
 - Take ledger absence from the observation reader's own answer in `sweep --dry-run` and
   `SweepEngine._non_write_state`, and probe the archive's post-report presence inside its
   `try`, so a refused ledger is the attributed `error: ... cannot be read` failure, the
