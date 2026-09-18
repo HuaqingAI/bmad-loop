@@ -1877,6 +1877,28 @@ class SweepEngine(Engine):
                         "run a fresh `bmad-loop sweep` to migrate them",
                     )
                     return
+                if self._ledger_unfit_to_publish():
+                    # DW-218/219 at the one publisher that sits ABOVE the cycle:
+                    # `_ensure_migration` spends a session rewriting the whole
+                    # ledger and publishes the result through `_commit_ledger`,
+                    # so under an inherited doubt it would normalize and commit
+                    # the very bytes every gate below withholds. Reachable as a
+                    # hand-repair gone sideways — the human the notice sent to
+                    # edit the file pastes legacy prose in and then `resume`s
+                    # instead of starting the fresh sweep it named. The doubt's
+                    # OWN stop and notice, and `cycle - 1` like the arm above:
+                    # this cycle did no work. Literal `reason=`/`stop_cause=`
+                    # pair, as the module-parsing guard requires.
+                    self.journal.append(
+                        "sweep-repeat-done",
+                        cycles=cycle - 1,
+                        reason="ledger-unreadable",
+                        stop_cause="ledger-unreadable",
+                    )
+                    self._notify_ledger_repair(
+                        ledger, "the deferred-work ledger is not fit to publish"
+                    )
+                    return
                 self._ensure_migration(text)
                 # Same cycle, re-read after migration — and degraded on the same
                 # terms as the read above, since the migration's own write is a way

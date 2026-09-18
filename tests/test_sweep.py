@@ -64,6 +64,7 @@ from bmad_loop.policy import (
 )
 from bmad_loop.sweep import (
     BUNDLE_KEY_RE,
+    MIGRATE_KEY,
     Bundle,
     Decision,
     DecisionOption,
@@ -16354,17 +16355,18 @@ def test_a_repeat_stop_journals_a_stop_cause_beside_its_reason(project):
 
 
 def test_every_repeat_stop_pairs_its_reason_with_the_same_stop_cause():
-    """The TOTAL half of DW-201: all eight `sweep-repeat-done` writes in `sweep.py`,
-    graded at the source rather than by eight separate runs.
+    """The TOTAL half of DW-201: all nine `sweep-repeat-done` writes in `sweep.py`,
+    graded at the source rather than by nine separate runs.
 
     Three claims a behavioral row cannot make together: every write passes BOTH
     fields, the two are the SAME literal on each write (a `stop_cause` that drifted
     from its `reason` would be worse than none — a dump would name a stop the raw
-    journal contradicts), and the tokens are exactly the closed seven. Eight writes
-    over seven tokens is not a miscount: `ledger-unreadable` is reached from two
-    places (DW-182's prune carry, and DW-197's degraded `_loop` read), and
-    `_stop_on_ledger_fault` spells its two arms as separate literal writes precisely
-    so this scan keeps seeing constants. `no-selected` is the selector exit: the
+    journal contradicts), and the tokens are exactly the closed seven. Nine writes
+    over seven tokens is not a miscount: `ledger-unreadable` is reached from three
+    places (DW-182's prune carry, DW-197's degraded `_loop` read, and the
+    DW-218/219 refusal ahead of a legacy migration), and `_stop_on_ledger_fault`
+    spells its two arms as separate literal writes precisely so this scan keeps
+    seeing constants. `no-selected` is the selector exit: the
     stop taken when `--only` / `--min-severity` selection leaves nothing to run on
     a cycle after the first (cycle 1 journals `sweep-selection-empty` instead).
     The closed set
@@ -16397,7 +16399,7 @@ def test_every_repeat_stop_pairs_its_reason_with_the_same_stop_cause():
     ]
     # premise: the scan found the producers it is grading, so an AST or spelling
     # change cannot turn this into a guard over an empty set
-    assert len(writes) == 8, f"expected 8 sweep-repeat-done writes, found {len(writes)}"
+    assert len(writes) == 9, f"expected 9 sweep-repeat-done writes, found {len(writes)}"
     tokens = {}
     for node in writes:
         keywords = {
@@ -19952,6 +19954,57 @@ def test_an_inherited_doubt_withholds_the_inflight_redrive_and_its_publish(proje
     assert _records(resumed, "sweep-ledger-commit") == []
     assert git(project.project, "rev-parse", "HEAD") == head
     assert ledger_entries(project)["DW-1"].open
+    assert resumed.state.sweep_ledger_in_doubt is True
+
+
+def test_an_inherited_doubt_withholds_the_legacy_migration(project):
+    """Legacy prose met on a resume with the mirror on disk is not migrated
+    (CodeRabbit on #792).
+
+    `_ensure_migration` sits ABOVE every other gate in `_loop`'s cycle body: it
+    dispatches a rewrite session over the whole ledger and publishes the result
+    through `_commit_ledger`. The shape that reaches it under doubt is the
+    hand-repair gone sideways — the human the doubt's notice sent to edit the
+    file pastes in a flat `- source_spec:` block (the attended `bmad-build`'s own
+    format, which the sweep calls legacy) and then runs `bmad-loop resume`
+    instead of the fresh sweep the notice names. Bare, the resume spent an LLM
+    session normalizing the doubted bytes and committed them under
+    `chore(sweep)`, ahead of the withheld dispatch.
+
+    The refusal takes the doubt's OWN stop — `ledger-unreadable`, with the "not
+    fit to publish" notice — and `cycles=cycle - 1`, like the `legacy-appeared`
+    arm beside it: this cycle did no work. The adapter script is empty, so a
+    migrate session dispatched anywhere here fails loudly.
+
+    Ablation: drop the `_ledger_unfit_to_publish()` arm ahead of
+    `_ensure_migration` and this reds on `crashed` (`ScriptExhausted` for the
+    migrate session) with `sweep-migrate` in `state.tasks`."""
+    write_ledger(project, {"DW-1": "open"})
+    head = git(project.project, "rev-parse", "HEAD")
+    engine, _adapter = make_sweep(project, [])
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    engine.state.sweep_ledger_in_doubt = True  # a previous process's verdict
+    engine._save()
+    # the hand-repair: legacy prose appended to the doubted ledger, uncommitted
+    with project.deferred_work.open("a", encoding="utf-8") as stream:
+        stream.write("\n" + LEGACY_LEDGER)
+    before = project.deferred_work.read_text(encoding="utf-8")
+    assert deferredwork.has_legacy(before)
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    assert resumed._ledger_doubt_inherited
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert adapter.sessions == []  # no migrate session
+    assert MIGRATE_KEY not in resumed.state.tasks
+    assert project.deferred_work.read_text(encoding="utf-8") == before  # not rewritten
+    assert _records(resumed, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    [done] = _records(resumed, "sweep-repeat-done")
+    assert done["reason"] == done["stop_cause"] == "ledger-unreadable"
+    assert done["cycles"] == 0  # this cycle did no work
+    assert "not fit to publish" in (resumed.run_dir / "ATTENTION").read_text(encoding="utf-8")
     assert resumed.state.sweep_ledger_in_doubt is True
 
 

@@ -478,7 +478,9 @@ breaking changes may land in a minor release.
   withholds the resume's in-flight recovery pass whole: a bundle re-armed out of
   band by `bmad-loop resolve` is not re-driven while the mirror is on disk — its
   own commit is a whole-tree `git add -A` — and is journaled as withheld and then
-  stranded rather than dispatched around the gate (DW-218/219).
+  stranded rather than dispatched around the gate. Legacy prose met on such a
+  resume is not migrated either: the rewrite session and its commit are refused
+  on the doubt's own `ledger-unreadable` stop and repair notice (DW-218/219).
 
 - Withhold sweep bundles and ledger commits after close, re-apply, or idle decision
   faults; preserve pre-answers while the ledger is in doubt (DW-216/217/220).
