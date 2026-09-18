@@ -443,7 +443,11 @@ _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
 #     A name-free collapse (a single ``unrouted_field_count`` integer) closes this
 #     and was OFFERED AND DECLINED, in favour of the per-key marker's diagnostic
 #     value — a maintainer can see WHICH off-schema key a session invented, which is
-#     most of why the record is read.
+#     most of why the record is read. The suffix also carries the name PAST the
+#     egress backstop: `sanitize.guard` repairs a pseudonymizer original only where
+#     it stands alone, and ``AcmeVaultTenant_present`` is one token to it — so a
+#     key that happens to be a registered story key or branch is not re-aliased
+#     here the way the same string would be as a bare value.
 #  2. Arbitrary key SHAPES, which follows from 1 and is easy to miss: nothing
 #     constrains an LLM-authored key to be identifier-shaped, so a free-text key
 #     survives as a JSON key with the suffix glued on —
@@ -465,6 +469,26 @@ _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
 # field because some other table happened to cover it would mislead the next reader.
 _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     "preference-escalation": frozenset({"type", "severity", "detail"}),
+    # The six kinds `render_markdown` lifts out of the scrubbed collection and
+    # prints as a JSON block in the DEFAULT dump (DW-191/192/201/246). Their names ARE
+    # authored here, so the premise above does not hold for them — an unclaimed
+    # key on one of these is a field a future producer added without routing.
+    # Declared anyway, because Markdown is the render an operator pastes into an
+    # issue: on these kinds an unrouted field fails closed to `<name>_present`
+    # instead of riding `scrub_json` into the block, and the row that adds a field
+    # to one of them has to add it here as well, where a reviewer sees it. The
+    # DROP fields (`message`, `repo`, `error`, `reason`) and the aliased `commit`
+    # are named for completeness, on the same reasoning as `detail` above: the
+    # set states the record's shape, and the stricter tables still reach them
+    # first.
+    "sweep-ledger-commit": frozenset({"message", "commit", "file"}),
+    "sweep-ledger-commit-clean": frozenset({"message", "file"}),
+    "sweep-ledger-commit-refused": frozenset({"message", "file", "refuse_cause", "error"}),
+    "sweep-ledger-commit-unavailable": frozenset({"message", "repo", "error", "file"}),
+    # DW-246/250. `dw_ids` is a `_JOURNAL_KEYLIST_FIELDS` name and aliases before
+    # this table is consulted; named for the same completeness as `commit` above.
+    "sweep-ledger-commit-withheld": frozenset({"message", "file", "reason", "dw_ids"}),
+    "sweep-repeat-done": frozenset({"cycles", "reason", "stop_cause"}),
 }
 
 # Policy keys whose values can carry secrets/paths/free text. Dropped or reduced
