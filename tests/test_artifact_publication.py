@@ -1706,6 +1706,25 @@ def test_external_spec_tracked_declaration_swap_is_refused_by_preparation(projec
     assert task.artifact_payload == {}
 
 
+def test_preparation_never_reopens_a_tracked_deliverable_behind_the_sealed_commit(
+    publication_case, monkeypatch
+):
+    # The rel-set check must be read off the classification alone: a tracked
+    # deliverable removed from the working tree after `finalize_commit` sealed
+    # it is tolerated (the commit carries it), not a refusal (CodeRabbit on
+    # #795 round 4).
+    task, paths, source = publication_case
+    monkeypatch.setattr(publication.verify, "path_tracked", lambda *_: True)
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, source)
+    assert set(task.artifact_tracked_source_oids) == {"report.bin", "spec.md"}
+    (source.implementation_artifacts / "report.bin").unlink()
+
+    publication.prepare(task, paths, source)
+
+    assert task.artifact_payload == {}
+
+
 def test_read_fault_retains_baseline_and_refuses_payload(publication_case, monkeypatch):
     task, paths, source = publication_case
     report = source.implementation_artifacts / "report.bin"
