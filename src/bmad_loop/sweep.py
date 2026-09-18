@@ -6383,6 +6383,7 @@ class SweepEngine(Engine):
         if inaccessible:
             headline = "deferred-work ledger inaccessible"
             verb = "read"
+            diagnosis = "the ledger could not be read"
             repair = (
                 "Repair the ledger's path, permissions or storage by hand (the "
                 "orchestrator must be able to read it)"
@@ -6390,6 +6391,7 @@ class SweepEngine(Engine):
         else:
             headline = "deferred-work ledger unreadable"
             verb = "decode"
+            diagnosis = "the ledger could not be decoded"
             repair = "Repair the ledger by hand (it must be valid UTF-8)"
         notice = (
             f"**ACTION REQUIRED — {headline}**\n"
@@ -6409,10 +6411,13 @@ class SweepEngine(Engine):
             "from dev at the review-leg reclose, rollback policy governing",
         )
         self._save()
+        # The persisted reason (`state.paused_reason`, `run-paused`, the status
+        # summary) carries the same diagnosis as the notice: an operator reading
+        # only these surfaces must not be told to repair encoding that is fine.
         raise RunPaused(
             f"bundle {task.story_key}: its ledger close for {ids} could not be "
-            f"published because the ledger could not be decoded ({error}); repair "
-            "the ledger by hand, then resume",
+            f"published because {diagnosis} ({error}); repair the ledger by hand, "
+            "then resume",
             PAUSE_STORY_GATE,
             task.story_key,
         )

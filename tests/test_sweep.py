@@ -4393,8 +4393,12 @@ def _corrupt_ledger_before_mark(
     return _UNDECODABLE_LEDGER
 
 
-def _assert_bundle_close_pause(engine, task_key, *, site, dw_ids, fault_mode="decode"):
-    """The DW-280 row and notice, shared by the three sites."""
+def _assert_bundle_close_pause(
+    engine, task_key, *, site, dw_ids, fault_mode="decode", paused_reason=None
+):
+    """The DW-280 row and notice, shared by the three sites. `paused_reason` is
+    the raised `RunPaused.reason` for a caller that invokes the site directly
+    (no `run()` loop persisted it); otherwise `state.paused_reason` is read."""
     [refused] = _records(engine, "sweep-bundle-close-refused")
     assert refused["story_key"] == task_key
     assert refused["site"] == site
@@ -4405,6 +4409,10 @@ def _assert_bundle_close_pause(engine, task_key, *, site, dw_ids, fault_mode="de
     # `ledger-unreadable` with a UTF-8 steer — the sweep's two existing tokens,
     # never the decode token for both.
     attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    # ...and the persisted pause reason (`state.paused_reason`, `run-paused`)
+    # carries the same diagnosis, not the notice's alone.
+    if paused_reason is None:
+        paused_reason = engine.state.paused_reason or ""
     if fault_mode == "decode":
         assert refused["reason"] == "ledger-unreadable"
         assert "not valid UTF-8" in refused["error"]
@@ -4412,6 +4420,8 @@ def _assert_bundle_close_pause(engine, task_key, *, site, dw_ids, fault_mode="de
         assert "could not decode" in attention
         assert "must be valid UTF-8" in attention
         assert "permissions or storage" not in attention
+        assert "the ledger could not be decoded" in paused_reason
+        assert "could not be read" not in paused_reason
     else:
         assert refused["reason"] == "ledger-inaccessible"
         assert "PermissionError" in refused["error"]
@@ -4419,6 +4429,8 @@ def _assert_bundle_close_pause(engine, task_key, *, site, dw_ids, fault_mode="de
         assert "could not read" in attention
         assert "permissions or storage" in attention
         assert "valid UTF-8" not in attention
+        assert "the ledger could not be read" in paused_reason
+        assert "could not be decoded" not in paused_reason
     # the sweep's route, not the engine's
     assert _records(engine, "ledger-read-refused") == []
     assert "ACTION REQUIRED" in attention
@@ -4636,6 +4648,7 @@ def test_review_leg_reclose_pauses_when_the_ledger_turns_undecodable_under_the_l
         fault_mode=fault_mode,
         site="bundle-reclose-locked",
         dw_ids=["DW-1", "DW-2"],
+        paused_reason=raised.value.reason,
     )
     assert "sweep-bundle-reclosed" not in journal_kinds(engine)
     assert project.deferred_work.read_bytes() == expected  # nothing flipped
