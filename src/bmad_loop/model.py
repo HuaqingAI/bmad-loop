@@ -212,6 +212,24 @@ def _rebased_on(path: str | None, root: Path) -> str | None:
     return str(root / path)
 
 
+def _baseline_artifacts_from(raw: object) -> dict[str, list[int] | None] | None:
+    """Rehydrate `StoryTask.baseline_artifacts` from state.json: a mapping of
+    path -> `[mtime_ns, size]` or `None`. Anything else — a pre-upgrade absent
+    key, or a shape a hand edit mangled — reads as "no snapshot", on which the
+    artifact-only receipt refuses rather than guesses."""
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, list[int] | None] = {}
+    for key, value in raw.items():
+        if value is None:
+            out[str(key)] = None
+        elif isinstance(value, list) and len(value) == 2:
+            out[str(key)] = [int(value[0]), int(value[1])]
+        else:
+            return None
+    return out
+
+
 @dataclass
 class StoryTask:
     story_key: str
@@ -265,6 +283,15 @@ class StoryTask:
     # user already had on disk are never deleted. None = pre-upgrade run (no
     # snapshot); rollback then removes no untracked files at all.
     baseline_untracked: list[str] | None = None
+    # Attempt-start fingerprints (`[st_mtime_ns, st_size]`, or None when the entry
+    # was listed but could not be measured) of every IGNORED entry under
+    # `implementation_artifacts`, keyed by repo-relative posix path — the baseline
+    # the bundle path's artifact-only receipt (DW-273) measures ownership against,
+    # since ignored paths have no git baseline of their own. Stamped beside the
+    # pair above at every genuinely new attempt, cleared with them. None = no
+    # snapshot (a story task, a pre-upgrade run, or a capture that degraded), on
+    # which the receipt refuses.
+    baseline_artifacts: dict[str, list[int] | None] | None = None
     # Deferred-work bookkeeping is persisted before its readers land so an older
     # state.json remains resumable throughout the forward-port.  The nullable
     # snapshot text and its captured flag are deliberately separate: None means
@@ -462,6 +489,7 @@ class StoryTask:
             "salvage_refile_pending": self.salvage_refile_pending,
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
+            "baseline_artifacts": self.baseline_artifacts,
             "baseline_ledger_digest": self.baseline_ledger_digest,
             "pre_harvest_ledger": self.pre_harvest_ledger,
             "pre_harvest_ledger_captured": self.pre_harvest_ledger_captured,
@@ -578,6 +606,7 @@ class StoryTask:
         self.release_spec_paths_from_mount()
         self.baseline_commit = None
         self.baseline_untracked = None
+        self.baseline_artifacts = None
 
     def rebase_spec_paths_on(self, root: Path) -> None:
         """Re-absolutize both spec-ownership paths against the tree that owns them.
@@ -665,6 +694,7 @@ class StoryTask:
                 if d.get("baseline_untracked") is not None
                 else None
             ),
+            baseline_artifacts=_baseline_artifacts_from(d.get("baseline_artifacts")),
             baseline_ledger_digest=(
                 str(d.get("baseline_ledger_digest"))
                 if d.get("baseline_ledger_digest") is not None

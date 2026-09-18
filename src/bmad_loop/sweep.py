@@ -6286,6 +6286,7 @@ class SweepEngine(Engine):
         )
         task.baseline_commit = None
         task.baseline_untracked = None
+        task.baseline_artifacts = None
         self._save()
         raise RunPaused(reason, PAUSE_STORY_GATE, task.story_key)
 
@@ -6936,6 +6937,28 @@ class SweepEngine(Engine):
                     )
         self.journal.append("sweep-bundle-close-carried", story_key=task.story_key, dw_ids=carried)
 
+    def _artifact_baseline(self, task: StoryTask) -> dict[str, list[int] | None] | None:
+        """Fingerprint the ignored entries under `implementation_artifacts` at the
+        attempt's start, so `verify_dev_bundle`'s artifact-only receipt (DW-273)
+        credits only what THIS attempt creates or changes. Stamped from
+        `self.workspace` — the unit under isolation — like the baseline pair the
+        receipt is measured beside. Observation may degrade: a git fault journals
+        `bundle-artifact-baseline-unavailable` and stamps `None`, on which the
+        receipt refuses (the attempt is still driven; only the relaxation is
+        withheld), rather than ending the run over a probe a bundle with a real
+        change never needs."""
+        paths = self.workspace.paths
+        try:
+            return verify.artifact_dir_snapshot(self.workspace.root, paths.implementation_artifacts)
+        except verify.GitError as e:
+            self.journal.append(
+                "bundle-artifact-baseline-unavailable",
+                story_key=task.story_key,
+                attempt=task.attempt,
+                error=str(e),
+            )
+            return None
+
     def _verify_dev_artifacts(self, task: StoryTask, result_json: dict | None):
         outcome = verify.verify_dev_bundle(
             task,
@@ -6946,10 +6969,11 @@ class SweepEngine(Engine):
         )
         # The accepted artifact-only receipt (DW-273) is never silent: one row per
         # accepted attempt, mirroring `Engine._verify_dev_artifacts`'s
-        # `park-proof-of-work-skipped`. `count` is the receipt listing's size — a
-        # count of IGNORED files under `implementation_artifacts`, not of
-        # entries this session wrote, since ignored paths carry no baseline to
-        # attribute against. The bound is the park record's: the flag rides the
+        # `park-proof-of-work-skipped`. `count` is the number of IGNORED files
+        # under `implementation_artifacts` this ATTEMPT created or changed —
+        # measured against the `_artifact_baseline` snapshot, since ignored paths
+        # carry no git baseline to attribute against — never the directory's
+        # whole listing. The bound is the park record's: the flag rides the
         # `passed()` return, so a receipt refused by the dw_ids cross-check inside
         # `verify_dev_bundle` records nothing, while the `[verify]` commands, the
         # review gate (`verify_review_bundle` still requires every id `done`) and

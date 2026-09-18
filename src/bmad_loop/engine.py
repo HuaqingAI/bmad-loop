@@ -2434,6 +2434,16 @@ class Engine:
             or task.dispatched_spec_snapshot is not None
         )
 
+    def _artifact_baseline(self, task: StoryTask) -> dict[str, list[int] | None] | None:
+        """The attempt-start snapshot behind the artifact-only receipt (DW-273).
+
+        The receipt is the bundle leg's alone (`verify.verify_dev_bundle`), so the
+        story engine stamps nothing — `None`, on which the receipt refuses — and
+        spends no git call on it; `SweepEngine` overrides with the real
+        `verify.artifact_dir_snapshot`."""
+        del task
+        return None
+
     def _dev_phase(self, task: StoryTask, resume_result: SessionResult | None = None) -> bool:
         if resume_result is None:
             # A fresh invocation cannot consume a snapshot armed by an earlier,
@@ -2470,6 +2480,13 @@ class Engine:
                 # later isolated carry. Crash replay never enters this branch.
                 if feedback is None:
                     task.harvested_deferrals = []
+                    # The artifact-only receipt's ownership baseline (DW-273) is
+                    # re-stamped on the same rule: a rolled-back attempt's IGNORED
+                    # residue survives the rollback (`git clean -x` never runs), so
+                    # without a fresh snapshot the next attempt would be credited
+                    # with it. A fixable repair keeps the chain's snapshot for the
+                    # same reason it keeps the tree.
+                    task.baseline_artifacts = self._artifact_baseline(task)
                 # A fresh-baseline dispatch replaces stale ownership. A fixable
                 # repair inherits the current working tree, but retains the chain's
                 # first bound snapshot because a later non-fixable retry resets all

@@ -1240,8 +1240,15 @@ JOURNAL_KINDS = frozenset(
         # configured `implementation_artifacts` held ignored (`!!`) entries. Mirrors
         # the sprint leg's `park-proof-of-work-skipped`. `story_key` and `dw_ids`
         # are routed, `attempt` and `count` (the number of ignored files under the
-        # artifacts dir, never of entries this session wrote) are benign.
+        # artifacts dir THIS attempt created or changed, measured against the
+        # attempt-start snapshot below) are benign.
         "bundle-artifact-only-accepted",
+        # The receipt's attempt-start snapshot (`verify.artifact_dir_snapshot`)
+        # could not be taken — a `GitError` on the listing — so the task carries
+        # no ownership baseline and the receipt refuses for this attempt; the
+        # attempt is still driven. `story_key` is an alias, `attempt` benign,
+        # `error` (the git detail) in `diagnostics._JOURNAL_DROP_FIELDS`.
+        "bundle-artifact-baseline-unavailable",
         "bundle-start",
         "decision-answered",
         "decision-pending",

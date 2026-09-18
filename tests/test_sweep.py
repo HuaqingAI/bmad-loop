@@ -22650,7 +22650,7 @@ def test_bundle_gate_excludes_the_nested_ledger_under_the_monorepo_shape(project
 # ------------------------- the bundle's artifact-only receipt, engine-driven (DW-273)
 
 
-def _artifact_only_bundle_tree(project):
+def _artifact_only_bundle_tree(project, engine):
     """`_bmad-output/` gitignored and COMMITTED before the baseline, so the bundle
     spec written under `implementation_artifacts` afterwards is invisible to the
     ordinary proof-of-work probe and visible only to a `--ignored` listing — the
@@ -22663,6 +22663,10 @@ def _artifact_only_bundle_tree(project):
     write_ledger(project, {"DW-1": "open"}, commit=False)
     task = StoryTask(story_key="dw-fix-things", epic=0, dw_ids=["DW-1"])
     task.baseline_commit = verify.rev_parse_head(project.repo_root)
+    # the attempt-start snapshot `_dev_phase` stamps through the sweep's own
+    # `_artifact_baseline` override, taken BEFORE the spec below is written so
+    # the spec is this attempt's residue and the ledger written above is not
+    task.baseline_artifacts = engine._artifact_baseline(task)
     sp = bundle_spec_path(project, "fix-things")
     write_spec(sp, "done", task.baseline_commit)
     return task, sp
@@ -22681,7 +22685,7 @@ def test_bundle_artifact_only_receipt_is_accepted_and_journaled(project):
     Ablation, MEASURED: drop `artifact_only_dir=` from `verify_dev_bundle`'s call
     into `_verify_shared_gates` and this fails on `assert outcome.ok`."""
     engine, _ = make_sweep(project, [], policy=_harvest_bundle_policy(attempts=1))
-    task, sp = _artifact_only_bundle_tree(project)
+    task, sp = _artifact_only_bundle_tree(project, engine)
 
     # the control: no assertion, the ordinary refusal, no record
     refused = engine._verify_dev_artifacts(task, {"workflow": "auto-dev", "spec_file": str(sp)})
@@ -22691,9 +22695,9 @@ def test_bundle_artifact_only_receipt_is_accepted_and_journaled(project):
         e for e in engine.journal.entries() if e["kind"] == "bundle-artifact-only-accepted"
     ] == []
 
-    # `count` is pinned to FILES — the spec and the ledger `_artifact_only_bundle_tree`
-    # wrote, both ignored: dropping `--untracked-files=all` collapses the listing
-    # to one directory record and the count reads 1
+    # `count` is pinned to the files THIS ATTEMPT wrote: the spec, written after
+    # the snapshot, and not the ledger `_artifact_only_bundle_tree` wrote before
+    # it — both ignored, both listed, one owned
     assert {p.name for p in project.implementation_artifacts.iterdir()} == {
         sp.name,
         project.deferred_work.name,
@@ -22709,7 +22713,187 @@ def test_bundle_artifact_only_receipt_is_accepted_and_journaled(project):
     assert rows[0]["story_key"] == "dw-fix-things"
     assert rows[0]["attempt"] == task.attempt
     assert rows[0]["dw_ids"] == ["DW-1"]
-    assert rows[0]["count"] == 2
+    assert rows[0]["count"] == 1
+
+
+def test_bundle_artifact_only_receipt_refuses_residue_that_predates_the_attempt(project):
+    """The ownership half of the receipt, through the engine's wiring: an asserted
+    artifact-only bundle over a tree whose ignored residue was ALL there when the
+    attempt started — the snapshot `_artifact_baseline` stamped lists every entry
+    with its current fingerprint — is refused with the ordinary prefix and the
+    receipt's "none created or changed" cause, and no row is written. A session
+    that wrote nothing cannot clear the gate on last week's erratum.
+
+    Ablation, MEASURED: make `_artifact_dir_owned_entries` return every listed
+    entry (drop the baseline comparison) and this fails on `assert not refused.ok`
+    with a `bundle-artifact-only-accepted` row of count 2."""
+    engine, _ = make_sweep(project, [], policy=_harvest_bundle_policy(attempts=1))
+    task, sp = _artifact_only_bundle_tree(project, engine)
+    # everything now on disk predates "this" attempt
+    task.baseline_artifacts = engine._artifact_baseline(task)
+    assert task.baseline_artifacts is not None and len(task.baseline_artifacts) == 2
+
+    refused = engine._verify_dev_artifacts(
+        task, {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+    )
+
+    assert not refused.ok and refused.retryable
+    assert refused.reason.startswith("no changes in worktree since baseline commit (")
+    assert "lists 2 ignored entries, none created or changed by this attempt" in refused.reason
+    assert refused.artifact_only_accepted is False
+    assert [
+        e for e in engine.journal.entries() if e["kind"] == "bundle-artifact-only-accepted"
+    ] == []
+
+
+def test_bundle_artifact_baseline_degrades_when_git_refuses_the_snapshot(project, monkeypatch):
+    """`_artifact_baseline` is observation, so a `GitError` on the snapshot's
+    listing degrades — `bundle-artifact-baseline-unavailable` naming the fault,
+    `None` stamped — rather than ending the run; the receipt then refuses this
+    attempt for want of a snapshot while a bundle with a real change still passes
+    the ordinary arm.
+
+    Ablation: drop the `except verify.GitError` and this raises out of
+    `_artifact_baseline`."""
+    engine, _ = make_sweep(project, [], policy=_harvest_bundle_policy(attempts=1))
+    task, sp = _artifact_only_bundle_tree(project, engine)
+
+    def fault(repo, artifact_dir):
+        raise verify.GitError("simulated: git status timed out")
+
+    monkeypatch.setattr(verify, "artifact_dir_snapshot", fault)
+    assert engine._artifact_baseline(task) is None
+    [row] = [
+        e for e in engine.journal.entries() if e["kind"] == "bundle-artifact-baseline-unavailable"
+    ]
+    assert row["story_key"] == "dw-fix-things"
+    assert row["attempt"] == task.attempt
+    assert "git status timed out" in row["error"]
+
+    task.baseline_artifacts = None
+    refused = engine._verify_dev_artifacts(
+        task, {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+    )
+    assert not refused.ok and refused.retryable
+    assert "no attempt-start snapshot" in refused.reason
+
+
+def _artifact_only_dev_effect(project, name, dw_ids, *, write_spec_file: bool):
+    """A bundle dev session whose ONLY residue is its spec under the gitignored
+    artifacts dir (`write_spec_file=True`), or that writes nothing at all — both
+    asserting `artifact_only` in the result. Mirrors `bundle_dev_effect` with
+    `write_src=False` plus the assertion, which the mock adapter hands the engine
+    verbatim as `result_json`."""
+
+    def effect(spec):
+        baseline = verify.rev_parse_head(project.project)
+        sp = bundle_spec_path(project, name)
+        if write_spec_file:
+            write_spec(sp, "done", baseline)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": f"dw-{name}",
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "tasks_total": 1,
+                "tasks_done": 1,
+                "verification": [],
+                "escalations": [],
+                "dw_ids": list(dw_ids),
+                "followup_review_recommended": False,
+                "artifact_only": True,
+            },
+        )
+
+    return effect
+
+
+def test_dev_phase_stamps_the_artifact_snapshot_so_the_run_credits_only_its_own_residue(project):
+    """DW-273 end to end through `engine.run()`: `_dev_phase` stamps
+    `baseline_artifacts` through the sweep's `_artifact_baseline` override at the
+    attempt's start, so a bundle whose session wrote its spec under the ignored
+    artifacts dir clears the gate on THAT file alone — the stale erratum planted
+    before the run is in the snapshot and is not counted — and the snapshot
+    persists on the task in state.json.
+
+    Ablation: drop the `task.baseline_artifacts = self._artifact_baseline(task)`
+    stamp from `Engine._dev_phase` and this fails on the receipt's "no
+    attempt-start snapshot" refusal (the task ends failed, no accepted row)."""
+    ignore_before_commit(project, "_bmad-output/")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ignore bmad output")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    stale = project.implementation_artifacts / "last-weeks-erratum.md"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("old\n", encoding="utf-8")
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "erratum"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            _artifact_only_dev_effect(project, "fix-things", ["DW-1"], write_spec_file=True),
+        ],
+        policy=_harvest_bundle_policy(attempts=1),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix-things"]
+    assert task.phase == Phase.DONE
+    stale_rel = stale.relative_to(project.repo_root).as_posix()
+    assert task.baseline_artifacts is not None
+    assert stale_rel in task.baseline_artifacts
+    assert load_state(engine.run_dir).tasks["dw-fix-things"].baseline_artifacts == (
+        task.baseline_artifacts
+    )
+    [row] = _records(engine, "bundle-artifact-only-accepted")
+    assert row["count"] == 1  # the spec; not the stale erratum, not the ledger
+
+
+def test_bundle_that_writes_nothing_cannot_clear_the_gate_on_stale_ignored_residue(project):
+    """The hole the snapshot closes, end to end: the same stale erratum under the
+    ignored artifacts dir, a session that asserts `artifact_only` and writes
+    NOTHING — before the snapshot, the listing of that erratum was the receipt
+    and the bundle closed DW-1 on it. Now the attempt is refused with the
+    ownership cause, no accepted row is written, and the id stays open."""
+    ignore_before_commit(project, "_bmad-output/")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ignore bmad output")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    sp = bundle_spec_path(project, "fix-things")
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    # the spec too predates the run, already `done`: nothing for the session to do
+    write_spec(sp, "done", verify.rev_parse_head(project.project))
+    (project.implementation_artifacts / "last-weeks-erratum.md").write_text(
+        "old\n", encoding="utf-8"
+    )
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "erratum"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            _artifact_only_dev_effect(project, "fix-things", ["DW-1"], write_spec_file=False),
+        ],
+        policy=_harvest_bundle_policy(attempts=1),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert engine.state.tasks["dw-fix-things"].phase != Phase.DONE
+    assert _records(engine, "bundle-artifact-only-accepted") == []
+    assert ledger_entries(project)["DW-1"].open
+    [decision] = _records(engine, "dev-decision")
+    assert decision["reason"].startswith("no changes in worktree since baseline commit (")
+    # the spec, the erratum and the ledger: all three predate the run
+    assert "lists 3 ignored entries, none created or changed by this attempt" in decision["reason"]
 
 
 def test_bundle_artifact_only_receipt_leaves_the_review_ledger_gate_intact(project):
@@ -22718,7 +22902,7 @@ def test_bundle_artifact_only_receipt_leaves_the_review_ledger_gate_intact(proje
     `verify_review_bundle` on those ids exactly as before, and the receipt closed
     nothing in the ledger on its own."""
     engine, _ = make_sweep(project, [], policy=_harvest_bundle_policy(attempts=1))
-    task, sp = _artifact_only_bundle_tree(project)
+    task, sp = _artifact_only_bundle_tree(project, engine)
 
     accepted = engine._verify_dev_artifacts(
         task, {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}

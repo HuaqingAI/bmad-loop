@@ -18,7 +18,15 @@ breaking changes may land in a minor release.
   authorship proof `park_asserted` uses), and `verify_dev_bundle` — the bundle path
   alone — accepts ignored (`!!`) entries in a `git status --ignored` listing scoped to the artifacts dir
   once the ordinary probe found nothing, journaling `bundle-artifact-only-accepted`
-  with the listing's `count`. The review gate's every-id-`done` check is unchanged.
+  with the `count`. Only entries THIS attempt created or changed count: the sweep
+  engine fingerprints (`lstat` mtime and size) the dir's ignored entries at each
+  genuinely new attempt's start (`StoryTask.baseline_artifacts`, persisted in
+  state.json; `-z` listing, so a non-ASCII name is a path the gate can measure),
+  and residue that all predates the attempt, a task with no snapshot, or an entry
+  unmeasurable at either end refuses the receipt rather than letting a session
+  that wrote nothing clear the gate on last week's erratum. A git fault taking the
+  snapshot degrades to `bundle-artifact-baseline-unavailable` (the attempt is
+  still driven). The review gate's every-id-`done` check is unchanged.
 
 - Announce a ledger publish that publishes nothing (`sweep-ledger-commit-clean`), for every
   outcome that publishes nothing. An ignored path reads clean, so a project
