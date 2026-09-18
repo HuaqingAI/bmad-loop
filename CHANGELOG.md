@@ -471,7 +471,11 @@ breaking changes may land in a minor release.
 - Bind tracked and pending-tracked isolated bundle deliverables to their accepted
   Git-normalized bytes and validate their exact staged entries before commit (DW-300).
   Drift now pauses with path-only recovery evidence and retains the source mount;
-  the validated index is committed without a second working-tree staging pass.
+  the validated index is committed without a second working-tree staging pass. The
+  no-op arm is validated too: an index reset to baseline after the staged validation
+  (a concurrent writer) no longer reads as "nothing to commit" with the accepted chain
+  orphaned and baseline recorded as the bundle's commit — the committed-tree validator
+  runs against baseline, the original chain and index are restored, and the run pauses.
 
 - Sample destination pathname identity after streamed artifact probes, refusing observed
   detachment while retaining checked-fallback races (DW-301).

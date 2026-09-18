@@ -6438,6 +6438,90 @@ def test_finalize_commit_restores_original_chain_when_hook_mutates_validated_ind
     assert git(project.project, "show", "HEAD:src.txt") == "skill commit bytes"
 
 
+def test_finalize_commit_no_op_arm_validates_baseline_and_restores_chain_on_index_reset(project):
+    """The no-op arm sits INSIDE the validated window: "nothing staged" is read
+    off the index after the staged validator returned, so an index reset to
+    baseline in between (a concurrent writer) reads as a clean no-op while the
+    snapshot says a pending-tracked deliverable was staged. Before the fix
+    (#795 review) that returned `None` with HEAD soft-reset to baseline — the
+    accepted skill chain orphaned and the caller free to record baseline as the
+    commit. Now the committed-tree validator runs against baseline itself,
+    refuses, and the original chain AND index are restored; the deliverable is
+    still on disk, untracked, for the replay's `add -A`.
+
+    Ablation: drop the validator call from the no-op arm and this reds on
+    `pytest.raises` — `finalize_commit` returns None with HEAD at baseline."""
+    baseline = verify.rev_parse_head(project.project)
+    src = project.project / "src.txt"
+    src.write_text("skill commit bytes\n")
+    git(project.project, "add", "--", "src.txt")
+    git(project.project, "commit", "-q", "-m", "skill: implementation")
+    original_head = verify.rev_parse_head(project.project)
+    deliverable = project.project / "report.bin"
+    deliverable.write_bytes(b"pending-tracked deliverable")
+    rel = deliverable.relative_to(project.repo_root).as_posix()
+    accepted_oid = verify.git_normalized_blob_oid(project.repo_root, rel, deliverable)
+    validated = []
+
+    def snapshot_then_concurrent_reset():
+        snapshot = verify.staged_blob_oids(project.repo_root, (rel,))
+        git(project.project, "read-tree", baseline)  # the concurrent writer
+        return snapshot
+
+    def validate_commit(revision, staged_snapshot):
+        validated.append(revision)
+        if verify.revision_blob_oids(project.repo_root, revision, (rel,)) != staged_snapshot:
+            raise RuntimeError("committed deliverable drift")
+
+    with pytest.raises(RuntimeError, match="committed deliverable drift"):
+        verify.finalize_commit(
+            project.project,
+            baseline,
+            "story: via bmad-loop",
+            staged_validator=snapshot_then_concurrent_reset,
+            committed_validator=validate_commit,
+        )
+
+    assert validated == [baseline]  # validated against the tree "nothing" would leave
+    assert verify.rev_parse_head(project.project) == original_head
+    assert git(project.project, "show", "HEAD:src.txt") == "skill commit bytes"
+    assert deliverable.read_bytes() == b"pending-tracked deliverable"
+    assert (
+        verify.staged_blob_oids(project.repo_root, (rel,)) == {}
+    )  # index restored: untracked again
+    assert accepted_oid not in git(project.project, "ls-files", "-s")
+
+
+def test_finalize_commit_no_op_arm_returns_none_when_the_snapshot_is_already_in_baseline(project):
+    """The honest no-op: the deliverable's accepted bytes are in baseline already
+    and nothing else changed, so the validator agrees with baseline and the
+    pre-existing `None` contract stands — HEAD at baseline, no commit."""
+    deliverable = project.project / "report.bin"
+    deliverable.write_bytes(b"already landed")
+    git(project.project, "add", "--", "report.bin")
+    git(project.project, "commit", "-q", "-m", "baseline carries the deliverable")
+    baseline = verify.rev_parse_head(project.project)
+    rel = deliverable.relative_to(project.repo_root).as_posix()
+    validated = []
+
+    def validate_commit(revision, staged_snapshot):
+        validated.append(revision)
+        if verify.revision_blob_oids(project.repo_root, revision, (rel,)) != staged_snapshot:
+            raise RuntimeError("committed deliverable drift")
+
+    sha = verify.finalize_commit(
+        project.project,
+        baseline,
+        "story: via bmad-loop",
+        staged_validator=lambda: verify.staged_blob_oids(project.repo_root, (rel,)),
+        committed_validator=validate_commit,
+    )
+
+    assert sha is None
+    assert validated == [baseline]
+    assert verify.rev_parse_head(project.project) == baseline
+
+
 def test_staged_blob_oid_requires_an_exact_literal_stage_zero_blob(project):
     literal = project.project / "artifact[1].txt"
     neighbour = project.project / "artifact1.txt"

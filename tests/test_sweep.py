@@ -25785,6 +25785,72 @@ def test_post_staging_git_deliverable_writer_cannot_enter_commit(project, monkey
     assert shown.returncode == 0 and shown.stdout == accepted
 
 
+@pytest.mark.parametrize("kind", ["tracked", "pending-tracked"])
+def test_post_staging_index_reset_cannot_close_the_bundle_as_a_no_op(project, monkeypatch, kind):
+    """A concurrent index reset to baseline AFTER the staged validation returned
+    makes `finalize_commit`'s "nothing staged" probe read clean (#795 review):
+    with HEAD already soft-reset, the accepted skill chain was orphaned, the
+    task recorded baseline as its commit, the merge carried nothing and the
+    bundle closed DONE with its Git deliverable destroyed at teardown. Now the
+    no-op arm validates baseline against the snapshot: the run pauses with the
+    refusal journaled and the unit retained, and a resume replays the commit
+    from the intact working tree with no session spent.
+
+    Ablation: drop the validator call from `finalize_commit`'s no-op arm and
+    the first `summary.paused` reds — the bundle lands as DONE on baseline."""
+    from bmad_loop import artifact_publication
+
+    effect, destination, accepted = _git_bound_publication_bundle(project, kind)
+    before = destination.read_bytes() if destination.exists() else None
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False),
+    )
+    validate_staged = artifact_publication.validate_staged
+    reset = []
+
+    def snapshot_then_concurrent_reset(task, source):
+        snapshot = validate_staged(task, source)
+        if not reset:
+            reset.append(verify.rev_parse_head(source.repo_root))
+            git(source.repo_root, "read-tree", task.baseline_commit)  # the concurrent writer
+        return snapshot
+
+    monkeypatch.setattr(artifact_publication, "validate_staged", snapshot_then_concurrent_reset)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix"]
+    assert task.phase != Phase.DONE
+    assert task.commit_sha is None
+    assert reset and verify.rev_parse_head(Path(task.worktree_path)) == reset[0]  # chain restored
+    assert Path(task.worktree_path).is_dir()
+    assert (destination.read_bytes() if destination.exists() else None) == before
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert "report.bin" in refusal["error"]
+    assert "commit validation failed" in summary.paused_reason
+
+    resumed, resumed_adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert resumed_adapter.sessions == []
+    durable = resumed.state.tasks["dw-fix"]
+    assert durable.phase == Phase.DONE
+    assert durable.commit_sha not in (None, durable.baseline_commit)
+    assert destination.read_bytes() == accepted
+    shown = verify.git_bytes(
+        project.project,
+        "show",
+        "HEAD:_bmad-output/implementation-artifacts/report.bin",
+    )
+    assert shown.returncode == 0 and shown.stdout == accepted
+    assert not Path(durable.worktree_path).exists()
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+
+
 def test_pre_merge_branch_advance_cannot_replace_accepted_git_deliverable(project, monkeypatch):
     effect, destination, accepted = _git_bound_publication_bundle(project, "tracked")
     engine, _ = make_sweep(

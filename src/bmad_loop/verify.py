@@ -5331,6 +5331,19 @@ def finalize_commit(
     HEAD back to the original chain before refusing. The working tree is never
     touched, so a failure leaves the chain intact.
 
+    The no-op arm is validated the same way. "Nothing staged" is read off the
+    index AFTER the staged validator returned, so an index reset to `baseline`
+    inside that window (a concurrent writer — the same class the committed-tree
+    validator exists for) reads as a clean no-op while the validated snapshot
+    says a deliverable was staged. Returning `None` there would leave HEAD at
+    `baseline` with the accepted chain orphaned and let the caller record
+    `baseline` as the commit — a bundle closing without the pending-tracked
+    deliverable it was accepted on (#795 review). So when a committed-tree
+    validator is given, the no-op arm runs it against `baseline` itself: the
+    snapshot must already be IN the baseline tree for "nothing to commit" to be
+    true, and a disagreement restores the original chain and index (`reset
+    --mixed`) before the refusal propagates.
+
     Residual-artifacts note (BMAD-METHOD #2563): the skill now commits every file
     of the reviewed diff and deliberately leaves unrelated `git status` residue
     uncommitted (files outside the change's scope). The `add -A` here sweeps that
@@ -5356,6 +5369,19 @@ def finalize_commit(
     # index now holds the cumulative diff vs baseline; nothing staged → no-op
     rc, _ = _git(repo, "diff", "--cached", "--quiet")
     if rc == 0:
+        if committed_validator is not None:
+            try:
+                committed_validator(baseline, staged_snapshot)
+            except BaseException as exc:
+                # HEAD already sits at `baseline` and the index is whatever the
+                # concurrent writer left; put both back on the accepted chain.
+                restore_rc, restore_out = _git(repo, "reset", "--mixed", original_head)
+                if restore_rc != 0:
+                    raise GitError(
+                        "no-op tree validation failed; additionally failed to restore "
+                        f"HEAD to {original_head[:12]}: {restore_out}"
+                    ) from exc
+                raise
         return None
     rc, out = _git(repo, "commit", "-m", message)
     if rc != 0:
