@@ -492,10 +492,10 @@ breaking changes may land in a minor release.
   instead of crashing as `run-crash` — replaying the recorded session result where
   one exists (dev and review legs), re-driving the leg otherwise. Residual, recorded
   as a deferral: `deferredwork` mutators' own locked re-reads and the review-timeout
-  salvage refile still raise. `runs.unreadable_sweep_ledger` gains the `except
-OSError` arm — its own permissions-or-storage attribution on the `bmad-loop sweep`
-  route the sweep's own stop already gives — a recorded reversal: the arm was
-  written, struck by the DW-204 resolution on scope grounds, and is restored under
+  salvage refile still raise. `runs.unreadable_sweep_ledger` gains the
+  `except OSError` arm — its own permissions-or-storage attribution on the
+  `bmad-loop sweep` route the sweep's own stop already gives — a recorded
+  reversal: the arm was written, struck by the DW-204 resolution on scope grounds, and is restored under
   DW-234's accepted decision; the TUI's stopgap `except OSError` around the probe is
   removed as dead.
 - Propagate ledger metadata refusals consistently across supported Python versions
