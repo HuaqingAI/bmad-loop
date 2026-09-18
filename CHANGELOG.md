@@ -13,7 +13,9 @@ breaking changes may land in a minor release.
   (DW-273). A bundle whose only deliverable lives under a gitignored
   `implementation_artifacts` (a spec-only erratum) burned every attempt on
   `no changes in worktree since baseline commit`. The bundle dev session may assert
-  `Artifact only: true` in its `## Auto Run Result` marker, and `verify_dev_bundle` —
+  `Artifact only: true` in its `## Auto Run Result` marker (`Artifact only`,
+  `artifact_only` or `Artifact-only` — at least one separator between the words, so
+  the fused `Artifactonly` asserts nothing), and `verify_dev_bundle` —
   the bundle path alone — then accepts ignored entries under the artifacts dir once
   the ordinary probe found nothing, journaling `bundle-artifact-only-accepted`. Only
   artifacts this attempt created or changed count; residue that predates the attempt

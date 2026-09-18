@@ -591,6 +591,27 @@ def test_synth_artifact_only_absent_line_fails_closed(tmp_path):
     assert rj["artifact_only"] is False
 
 
+@pytest.mark.parametrize(
+    "line",
+    ["Artifactonly: true", "artifactonly: true", "**Artifactonly:** **true**"],
+    ids=["fused", "fused-lower", "fused-bold"],
+)
+def test_synth_artifact_only_fused_words_fail_closed(tmp_path, line):
+    """The contract's spellings put at least one space, underscore or hyphen
+    between the two words; the fused `Artifactonly` is none of them, and a
+    malformed or accidental token must not relax the bundle gate (#794 review).
+    Ablation: `[ _-]+` back to `[ _-]*` in `ARTIFACT_ONLY_LINE_RE` and every row
+    reds on `is True`."""
+    sp = _artifact_only_spec(tmp_path, line=line)
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+    assert devcontract._artifact_only_asserted(line) is False
+
+
 def test_synth_artifact_only_false_value_fails_closed(tmp_path):
     sp = _artifact_only_spec(tmp_path, line="Artifact only: false")
 
