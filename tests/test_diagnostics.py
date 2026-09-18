@@ -2126,11 +2126,20 @@ def test_markdown_sweep_unknown_key_fails_closed_before_the_backstop(project):
             "sweep-ledger-commit-unavailable",
             {"message": "m", "repo": HOME_PATH, "error": "fatal", "file": "deferred-work.md"},
         ),
+        (
+            "sweep-ledger-commit-withheld",
+            {
+                "message": "m",
+                "file": "deferred-work.md",
+                "reason": "ledger-in-doubt",
+                "dw_ids": ["DW-7"],
+            },
+        ),
         ("sweep-repeat-done", {"cycles": 2, "reason": "no-open", "stop_cause": "no-open"}),
     ],
 )
 def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared):
-    """The five kinds `render_markdown` prints as a JSON block carry a declared
+    """The six kinds `render_markdown` prints as a JSON block carry a declared
     schema, so a field a future producer adds WITHOUT routing collapses to a
     presence marker instead of riding `scrub_json` into the pasted dump. Graded
     both ways, as the `preference-escalation` row is: the off-schema value is GONE
@@ -2156,6 +2165,9 @@ def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared)
             assert name not in scrubbed and scrubbed[f"{name}_present"] is True
     if "commit" in declared:
         assert scrubbed["commit"].startswith("commit-")
+    if "dw_ids" in declared:
+        # the keylist route runs ahead of the schema: aliased, never collapsed
+        assert len(scrubbed["dw_ids"]) == 1 and "DW-7" not in json.dumps(scrubbed)
 
 
 def test_env_tmux_version_folds_a_multi_line_probe(monkeypatch):
