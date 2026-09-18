@@ -6293,7 +6293,7 @@ class SweepEngine(Engine):
         self,
         task: StoryTask,
         ledger: Path,
-        error: str,
+        fault: deferredwork.LedgerReadError,
         *,
         site: str,
         dw_ids: list[str],
@@ -6302,6 +6302,20 @@ class SweepEngine(Engine):
         its own lock (DW-280): journal `sweep-bundle-close-refused`, notify with
         the RESUME route, save, and raise `RunPaused` at the story gate on the
         task, its phase and `bundle_closes_intended` exactly as they were.
+
+        `fault` is the mutator's own exception, not its text, so the row keeps
+        the classification `LedgerReadFault` (DW-279) exists to carry: an OS
+        metadata/text-read refusal (`EACCES`, `EIO`, a vanished mount) journals
+        `reason="ledger-inaccessible"` and steers the operator at the path's
+        permissions or storage, where undecodable bytes journal
+        `reason="ledger-unreadable"` and steer at the UTF-8 — the same two tokens
+        and the same repairs `sweep-cycle-ledger-refused` and
+        `sweep-preanswer-prune-refused` split. A `LedgerReadFault` is tested
+        AHEAD of the parent class, as the read contract requires, and its
+        `OSError` cause is what the token is read from: the wrapper alone, with
+        no chained `OSError`, is treated as the decode arm rather than guessed
+        at. `error` is the exception's own text either way, which already names
+        the ledger path and, for the OS arm, the `OSError` class and errno.
 
         The sweep's own route for the two calls `Engine._pause_for_ledger_repair`
         names as NOT covered — `_close_bundle_ledger_when_spec_status` (the
@@ -6342,32 +6356,48 @@ class SweepEngine(Engine):
         attempt to baseline (rollback policy governing) and the bundle is
         re-driven from dev, whose accepted close then lands. That last is the
         pre-existing sweep resume shape, not widened here."""
+        inaccessible = isinstance(fault, deferredwork.LedgerReadFault) and isinstance(
+            fault.__cause__, OSError
+        )
+        error = str(fault)
         self.journal.append(
             "sweep-bundle-close-refused",
             story_key=task.story_key,
             dw_ids=list(dw_ids),
             site=site,
             ledger=str(ledger),
-            reason="ledger-unreadable",
+            reason="ledger-inaccessible" if inaccessible else "ledger-unreadable",
             error=error,
         )
         ids = ", ".join(dw_ids)
         # `error` is `LedgerReadError`'s text and already begins with the ledger's
         # path, so neither string names the path a second time (the engine's
         # `_pause_for_ledger_repair` does the same). One wording for all three
-        # sites, no per-site branch. No "COMMIT the fix" steer, unlike
+        # sites, no per-site branch; the ONLY fork is the fault class, so the
+        # remediation matches the refusal — a permissions or storage repair is
+        # not a UTF-8 one. No "COMMIT the fix" steer, unlike
         # `_pause_on_intent_refusal`: at the accepted-dev site the session's
         # uncommitted work sits beside the ledger, and a whole-tree commit by hand
         # would swallow it under the repair. The bundle's own commit carries a
         # tracked ledger's repair once it lands.
+        if inaccessible:
+            headline = "deferred-work ledger inaccessible"
+            verb = "read"
+            repair = (
+                "Repair the ledger's path, permissions or storage by hand (the "
+                "orchestrator must be able to read it)"
+            )
+        else:
+            headline = "deferred-work ledger unreadable"
+            verb = "decode"
+            repair = "Repair the ledger by hand (it must be valid UTF-8)"
         notice = (
-            "**ACTION REQUIRED — deferred-work ledger unreadable**\n"
+            f"**ACTION REQUIRED — {headline}**\n"
             f"Bundle **{task.story_key}** was about to publish a ledger close for "
             f"{ids} (a close, or a re-assertion of one after review), but the "
-            f"orchestrator could not decode the deferred-work ledger to publish it: "
+            f"orchestrator could not {verb} the deferred-work ledger to publish it: "
             f"{error}.\n"
-            "This write did not land and no work was discarded. Repair the ledger by "
-            "hand (it must be valid UTF-8)"
+            f"This write did not land and no work was discarded. {repair}"
         )
         gates.notify(
             self.policy,
@@ -6718,7 +6748,7 @@ class SweepEngine(Engine):
             # `except OSError` would ever see it. The record above stays as
             # assigned — it is what the resume's re-drive closes.
             self._pause_for_bundle_close_repair(
-                task, ledger, str(e), site=site, dw_ids=list(task.dw_ids)
+                task, ledger, e, site=site, dw_ids=list(task.dw_ids)
             )
         if marked:
             self.journal.append(kind, story_key=task.story_key, dw_ids=marked)
@@ -6864,7 +6894,7 @@ class SweepEngine(Engine):
             self._pause_for_bundle_close_repair(
                 task,
                 ledger,
-                str(e),
+                e,
                 site="bundle-close-carry-locked",
                 dw_ids=list(task.bundle_closes_intended),
             )

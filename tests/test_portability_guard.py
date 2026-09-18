@@ -1270,9 +1270,9 @@ JOURNAL_KINDS = frozenset(
         # `sweep-bundle-close-carry-refused`, not the engine's
         # `ledger-read-refused`. No new diagnostics routing: `story_key` is an
         # alias, `dw_ids` (the ids the close was about to publish) is a keylist,
-        # `site` and `ledger` are benign, and `reason` (the fixed token
-        # `ledger-unreadable`) and `error` (the decode detail) are both in
-        # `diagnostics._JOURNAL_DROP_FIELDS`.
+        # `site` and `ledger` are benign, and `reason` (one of the fixed tokens
+        # `ledger-unreadable` / `ledger-inaccessible`, by fault class) and `error`
+        # (the decode or OS detail) are both in `diagnostics._JOURNAL_DROP_FIELDS`.
         "sweep-bundle-close-refused",
         "sweep-bundle-closed",
         # DW-144. A reset in-flight bundle task adopting the ids of the bundle now

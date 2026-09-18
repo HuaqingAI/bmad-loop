@@ -491,7 +491,10 @@ breaking changes may land in a minor release.
   untouched, so `bmad-loop resume` re-drives the close — with no session spent at
   the accepted-dev close and the carry; through the sweep's restart arm (the
   bundle re-driven from dev) at the reclose. DW-279 extends the same locked-read
-  route to OS metadata/text-read faults; lock/write failures remain raw `OSError`.
+  route to OS metadata/text-read faults, and the row keeps that classification:
+  `reason="ledger-inaccessible"` with a permissions-or-storage steer for an OS
+  refusal, `reason="ledger-unreadable"` with a UTF-8 steer for undecodable bytes,
+  never the decode token for both; lock/write failures remain raw `OSError`.
 
 - Pause for repair under `ledger-read-refused` with a `-locked` site, instead of
   `run-crash`, when a deferred-work ledger turns undecodable inside a mutator's own

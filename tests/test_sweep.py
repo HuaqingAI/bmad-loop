@@ -4400,11 +4400,27 @@ def _assert_bundle_close_pause(engine, task_key, *, site, dw_ids, fault_mode="de
     assert refused["site"] == site
     assert refused["dw_ids"] == dw_ids
     assert refused["ledger"] == str(engine.paths.deferred_work)
-    assert refused["reason"] == "ledger-unreadable"
-    assert ("not valid UTF-8" if fault_mode == "decode" else "PermissionError") in refused["error"]
+    # The row keeps `LedgerReadFault`'s classification (DW-279): an OS refusal is
+    # `ledger-inaccessible` with a permissions/storage steer, undecodable bytes
+    # `ledger-unreadable` with a UTF-8 steer — the sweep's two existing tokens,
+    # never the decode token for both.
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    if fault_mode == "decode":
+        assert refused["reason"] == "ledger-unreadable"
+        assert "not valid UTF-8" in refused["error"]
+        assert "ledger unreadable" in attention
+        assert "could not decode" in attention
+        assert "must be valid UTF-8" in attention
+        assert "permissions or storage" not in attention
+    else:
+        assert refused["reason"] == "ledger-inaccessible"
+        assert "PermissionError" in refused["error"]
+        assert "ledger inaccessible" in attention
+        assert "could not read" in attention
+        assert "permissions or storage" in attention
+        assert "valid UTF-8" not in attention
     # the sweep's route, not the engine's
     assert _records(engine, "ledger-read-refused") == []
-    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
     assert "ACTION REQUIRED" in attention
     assert str(engine.paths.deferred_work) in attention
     assert f"then `bmad-loop resume {engine.state.run_id}`" in attention
