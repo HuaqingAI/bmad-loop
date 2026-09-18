@@ -453,8 +453,11 @@ breaking changes may land in a minor release.
   bundle, dropping an id the ledger no longer holds open under a fifth `drop_cause`,
   `entry-not-open`; a ledger read that refuses screens nothing and journals
   `sweep-decision-open-set-refused` (DW-214).
-- Recover stranded decision closes at the sweep's no-open exit, while withholding
-  the new decision recovery path when the run retains ledger doubt (DW-222).
+- Recover stranded decision closes at the sweep's no-open exit, withholding the
+  whole recovery publish — its already-resolved term too, since the commit is of
+  the file — while the run retains ledger doubt; the close phase's own two commit
+  arms read the same verdict, so a resume that inherited a doubt no longer walks a
+  half-landed decision flip into HEAD ahead of the dispatch gate (DW-222).
 - Retry ledger publication before repeating sweeps stop on `no-progress` or
   `max-cycles`; rename the commit message to
   `chore(sweep): commit ledger at the sweep cycle boundary` (DW-223).

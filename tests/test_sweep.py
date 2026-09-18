@@ -14779,11 +14779,13 @@ def _half_written_ledger(project) -> None:
     resume `_close_resolved` runs `mark_done_many` over an id the ledger no longer
     carries: it closes nothing, and `_resolved_write_pending`'s per-id positive
     proof answers False, so DW-193's stranded-close arm takes no publish. Left as
-    `done` instead, that arm would commit the whole ledger file — half-write and
-    all — before `_cycle`'s gate is ever consulted, and no assertion below could
-    tell a working gate from a broken one. (That arm publishing a `done` no
-    completed close ever wrote is a real residual, and a separate question from
-    this one.)"""
+    `done` instead, that arm used to commit the whole ledger file — half-write and
+    all — before `_cycle`'s gate was ever consulted, and no assertion below could
+    tell a working gate from a broken one. That residual is closed now — both of
+    `_close_resolved`'s commit arms and `_publish_stranded_close` sit behind
+    `_ledger_unfit_to_publish()`, graded by the two
+    `test_an_inherited_doubt_withholds_*` rows — but the shape stays as it was so
+    these rows keep grading the FLAG alone and not the publishers' gate."""
     write_ledger(project, {"DW-2": "done", "DW-3": "open"}, commit=False)
 
 
@@ -15742,6 +15744,144 @@ def test_a_landed_effect_cannot_release_a_mirror_the_close_phase_armed(project, 
     [done] = _records(resumed, "sweep-repeat-done")
     assert done["reason"] == "ledger-unreadable"
     assert done["stop_cause"] == done["reason"]
+
+
+def test_an_inherited_doubt_withholds_the_no_open_exits_recovery_publish(project):
+    """The inherited mirror gates the WHOLE stranded-close publish at the no-open
+    exit, not only its decision-id term.
+
+    Shape (the Codex P1 on #792, and the residual `_half_written_ledger`'s
+    docstring names): a cached plan whose `already_resolved` id reads `done` on
+    disk, beside a decision id a half-landed effect flipped to `done` without its
+    `decision:` line — the very fault that persisted `sweep_ledger_in_doubt` —
+    and the process dies before either reaches HEAD. The resume finds nothing
+    open and takes the exit. There the resolved-id probe answers True on its own,
+    and with the doubt applied only to the decision-id term the `or`
+    short-circuits past it: `_commit_ledger` publishes the ledger WHOLE, the
+    unaudited flip included, ahead of every gate that withholds it.
+
+    Built directly rather than through a crash: the mirror and the two `done` ids
+    are the whole premise, and how the crash left them is graded by the DW-218/219
+    rows above. HEAD is asserted to hold both ids `open` first, so the claim is
+    about a publish that did not happen, not a diff that was already clean.
+
+    Ablation: restore the pre-fix `_resolved_write_pending(ledger, resolved_ids)
+    or (...)` spelling in `_publish_stranded_close` and this reds with one
+    `sweep-ledger-commit` row and DW-2's `done` in the HEAD blob."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    rel = ledger_rel(project)
+    head = git(project.project, "rev-parse", "HEAD")
+    engine, _adapter = make_sweep(project, [])
+    _cache_triage(
+        engine,
+        triage_result(
+            ["DW-1", "DW-2"],
+            already_resolved=[{"id": "DW-1", "evidence": "fixed by a1b2c3d"}],
+            decisions=[
+                _decision(
+                    "DW-2",
+                    [
+                        {"key": "1", "label": "Close it", "effect": "close"},
+                        {"key": "2", "label": "Keep", "effect": "keep-open"},
+                    ],
+                )
+            ],
+        ),
+    )
+    engine.state.sweep_ledger_in_doubt = True  # a previous process's verdict
+    engine._save()
+    mark_ledger_done(project, ["DW-1", "DW-2"])  # both landed, neither published
+    assert not deferredwork.open_ids(project.deferred_work.read_text(encoding="utf-8"))
+    assert _ledger_differs_from_head(project)
+
+    resumed, resumed_adapter = resume_sweep(project, engine, [])
+    assert resumed._ledger_doubt_inherited  # premise: the mirror was read as inherited
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert resumed_adapter.sessions == []
+    assert "sweep-nothing-open" in journal_kinds(resumed)
+    assert _records(resumed, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert _ledger_differs_from_head(project)
+    at_head = {
+        e.id: e for e in deferredwork.parse_ledger(git(project.project, "show", f"HEAD:{rel}"))
+    }
+    assert at_head["DW-1"].open and at_head["DW-2"].open
+    assert resumed.state.sweep_ledger_in_doubt is True  # ...and nothing released it
+
+
+@pytest.mark.parametrize("arm", ["closed", "pending"])
+def test_an_inherited_doubt_withholds_the_close_phases_own_publish(project, arm):
+    """The same precedence one phase earlier: `_close_resolved` runs at the top of
+    every cycle `_cycle` starts, BEFORE the dispatch gate reads the mirror, and
+    both of its commit arms publish the ledger whole.
+
+    `closed`: this pass's `mark_done_many` flips the already-resolved id itself — a
+    write that LANDS, which is the proof `_release_ledger_doubt` refuses for an
+    inherited arm, since it says nothing about the bytes a previous process left.
+    `pending`: the id already reads `done` on disk (DW-193's arm). Either way the
+    file carries DW-2's unaudited flip, and either commit would walk it into HEAD
+    while the gate two phases later withholds every bundle over the same bytes.
+
+    The open set is kept non-empty (DW-3, skipped) so the run reaches a cycle and
+    not the no-open exit, whose own publisher the row above grades. The cycle's
+    outcome is otherwise the DW-218/219 shape: bundles withheld, the
+    `ledger-unreadable` stop, the mirror still on disk.
+
+    Ablation: drop `not self._ledger_unfit_to_publish()` from either commit arm
+    in `_close_resolved` and its row reds with a `sweep-ledger-commit` row and
+    DW-2 `done` in the HEAD blob."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open", "DW-3": "open"})
+    rel = ledger_rel(project)
+    head = git(project.project, "rev-parse", "HEAD")
+    engine, _adapter = make_sweep(project, [], policy=repeat_policy())
+    _cache_triage(
+        engine,
+        triage_result(
+            ["DW-1", "DW-2", "DW-3"],
+            already_resolved=[{"id": "DW-1", "evidence": "fixed by a1b2c3d"}],
+            # DW-2 is the decision whose effect half-landed; unattended, it is
+            # skipped here and writes nothing
+            decisions=[
+                _decision(
+                    "DW-2",
+                    [
+                        {"key": "1", "label": "Close it", "effect": "close"},
+                        {"key": "2", "label": "Keep", "effect": "keep-open"},
+                    ],
+                )
+            ],
+            skip=[{"id": "DW-3", "reason": "next time"}],
+        ),
+    )
+    engine.state.sweep_ledger_in_doubt = True  # a previous process's verdict
+    engine._save()
+    # DW-2: the half-landed decision effect the mirror is about; DW-1 per `arm`
+    mark_ledger_done(project, ["DW-1", "DW-2"] if arm == "pending" else ["DW-2"])
+    assert deferredwork.open_ids(project.deferred_work.read_text(encoding="utf-8")) >= {"DW-3"}
+
+    resumed, resumed_adapter = resume_sweep(project, engine, [])
+    assert resumed._ledger_doubt_inherited
+    summary = resumed.run()
+
+    assert not summary.crashed and not summary.paused
+    assert resumed_adapter.sessions == []
+    # premise, after the fact: the phase ran and took the arm under test
+    assert ledger_entries(project)["DW-1"].done
+    assert [r["dw_ids"] for r in _records(resumed, "sweep-resolved-closed")] == (
+        [["DW-1"]] if arm == "closed" else []
+    )
+    assert _records(resumed, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    at_head = {
+        e.id: e for e in deferredwork.parse_ledger(git(project.project, "show", f"HEAD:{rel}"))
+    }
+    assert at_head["DW-1"].open and at_head["DW-2"].open
+    [done] = _records(resumed, "sweep-repeat-done")
+    assert done["reason"] == done["stop_cause"] == "ledger-unreadable"
+    assert resumed.state.sweep_ledger_in_doubt is True
+    assert load_state(resumed.run_dir).sweep_ledger_commit_owed is True  # the debt stays
 
 
 def test_a_reapply_effect_landing_after_an_earlier_one_faulted_releases_the_mirror(

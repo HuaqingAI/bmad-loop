@@ -1384,12 +1384,15 @@ class SweepEngine(Engine):
         """This cycle's verdict from BOTH phases that can raise it (DW-216/217/220),
         OR the RUN's persisted one (DW-218/219).
 
-        The dispatch gate in `_cycle`, `_loop`'s shared stop arm and
-        `_prune_pre_answers`' refusal all read the doubt through here, so a future
+        The dispatch gate in `_cycle`, `_loop`'s shared stop arm,
+        `_prune_pre_answers`' refusal, and every ledger PUBLISHER a resume can
+        reach ahead of that gate — `_close_resolved`'s two commit arms,
+        `_publish_stranded_close`, the decision phase's tail publish and the
+        top-of-`_loop` debt settle — all read the doubt through here, so a future
         arming site cannot be wired into one reader and missed by the others —
         which is precisely how the close phase's fault reached `_write_intent`'s
         bare `read_for_write` while the gate above it saw a False latch. The
-        persisted term is added HERE for the same reason: one reader, five
+        persisted term is added HERE for the same reason: one reader, many
         consumers, no second spelling to keep in step.
 
         The persisted term is safe beside the two cycle-scoped ones. `_loop` stops
@@ -2068,12 +2071,21 @@ class SweepEngine(Engine):
         circuit on empty `ids` before reading anything, so a fresh sweep's "no git
         at all" property is untouched.
 
-        The NEW decision term also respects the run's ledger-doubt verdict. A
-        failed decision effect can leave a decodable done flip without its audit
-        line, and a crash can preserve that doubt across a resume. Readability
-        alone must not authorize publishing those bytes. This guard applies only
-        to the new term, preserving the existing already-resolved arm; it does
-        not add a phase gate or change the shared per-id probe.
+        BOTH terms sit behind the run's ledger-doubt verdict
+        (`_ledger_unfit_to_publish()`), read once ahead of either probe. A failed
+        decision effect can leave a decodable done flip without its audit line,
+        and DW-218/219 preserve that doubt across a resume; readability alone must
+        not authorize publishing those bytes. The gate has to cover the
+        already-resolved term too, and not only the decision term DW-222 added,
+        because the commit is of the FILE: a plan carrying a stranded
+        already-resolved close beside the doubted flip answers True on its first
+        probe, the `or` short-circuits past a decision-term guard, and
+        `_commit_ledger` publishes the ledger whole — the unaudited flip included —
+        at the one exit no dispatch gate ever sees (the Codex P1 on #792, and the
+        residual `_close_resolved`'s inventory names). A withheld publish reads
+        nothing and journals nothing here: the doubt already reached disk with its
+        own rows, `_loop`'s no-open stop follows unchanged, and the repair is the
+        documented one — a human edits the ledger and starts a fresh sweep.
 
         WHAT THE PROBE PROVES HERE is weaker than the rule's wording suggests, and
         reading it as a contradiction is the trap. This exit is reached only when
@@ -2141,6 +2153,11 @@ class SweepEngine(Engine):
         if plan is None:
             self.journal.append("sweep-triage-reload-failed", errors=errors)
             return
+        if self._ledger_unfit_to_publish():
+            # Ahead of BOTH probes, not inside the `or` (see the docstring): the
+            # commit is of the file, so a doubted ledger is withheld whichever
+            # term would have authorized it.
+            return
         ledger = self.workspace.paths.deferred_work
         resolved_ids = [entry.id for entry in plan.already_resolved]
         decision_ids = [decision.id for decision in plan.decisions]
@@ -2149,10 +2166,9 @@ class SweepEngine(Engine):
             # two terms through `_resolved_write_pending`'s `all(...)` and narrow the
             # arm that shipped. Short-circuit is deliberate too: a plan whose
             # already-resolved ids already prove the write never reads twice.
-            pending = self._resolved_write_pending(ledger, resolved_ids) or (
-                not self._ledger_unfit_to_publish()
-                and self._resolved_write_pending(ledger, decision_ids)
-            )
+            pending = self._resolved_write_pending(
+                ledger, resolved_ids
+            ) or self._resolved_write_pending(ledger, decision_ids)
         except (deferredwork.LedgerReadError, OSError, ValueError, StateRootError) as e:
             # The UNION, because either probe can be the one that faulted and the
             # row is the operator's only account of which ids went unproven.
@@ -3522,12 +3538,26 @@ class SweepEngine(Engine):
             # the debt ahead of the write (`_owe_ledger_commit`) and `_loop`
             # settles it at the top of a resume.
             #
+            # ...and BOTH arms sit behind the run's ledger-doubt verdict, the
+            # inherited mirror in particular (DW-218/219): this phase runs at the
+            # top of every cycle, ahead of the dispatch gate that reads the same
+            # verdict, and its commit is of the FILE — so a resume that inherited
+            # a doubt over a half-landed decision effect would walk that flip into
+            # HEAD here, under this message, before `_cycle` withholds a single
+            # bundle over the same bytes. A write that lands THIS pass is not a
+            # release either: `_release_ledger_doubt` refuses an inherited arm on
+            # exactly that proof. Withheld, the debt latched above stays for the
+            # bytes on disk, the `sweep-resolved-closed` row still says what was
+            # written, and the run ends where the doubt ends it. Same rule the
+            # decision phase's tail publish and `_publish_stranded_close` apply.
+            #
             # the ledger file: `mark_done_many` above wrote the ledger
-            self._commit_ledger(
-                "chore(sweep): close resolved deferred-work entries",
-                path=self.workspace.paths.deferred_work,
-                family="ledger",
-            )
+            if not self._ledger_unfit_to_publish():
+                self._commit_ledger(
+                    "chore(sweep): close resolved deferred-work entries",
+                    path=self.workspace.paths.deferred_work,
+                    family="ledger",
+                )
         elif pending:
             # These ids read `done` on disk while this pass flipped none of them —
             # the shape a crash between a previous pass's write and its commit
@@ -3543,12 +3573,13 @@ class SweepEngine(Engine):
             # this pass latched (`owed_here`) is NOT retracted here: the probe just
             # proved a durable close on disk, so a commit that degrades leaves a
             # real debt for the next resume's settle, exactly as the `closed` arm's
-            # would.
-            self._commit_ledger(
-                "chore(sweep): close resolved deferred-work entries",
-                path=self.workspace.paths.deferred_work,
-                family="ledger",
-            )
+            # would. Behind the same doubt gate as that arm, for the same reason.
+            if not self._ledger_unfit_to_publish():
+                self._commit_ledger(
+                    "chore(sweep): close resolved deferred-work entries",
+                    path=self.workspace.paths.deferred_work,
+                    family="ledger",
+                )
         else:
             # zero ids flipped is zero bytes written: nothing to settle
             self._retract_ledger_commit(owed_here)
