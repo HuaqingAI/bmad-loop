@@ -3988,15 +3988,22 @@ class SweepEngine(Engine):
         #   THIS cycle. Replacing it from an `answers` that started empty would
         #   turn a transient refusal into permanent loss of every answer it held
         #   (DW-264), so `store_unreadable` is set on those two arms alone and
-        #   BOTH write-backs below are withheld while it is set — the answers stay
-        #   in memory for this cycle's bundling and the row
+        #   the SEEDED write-back below is withheld while it is set — the adopted
+        #   answers stay in memory for this cycle's bundling and the row
         #   `sweep-decisions-store-write-withheld` names the ids that did not
-        #   persist. The withheld check precedes the write at both sites, so a
-        #   withheld write is never also reported as a failed one.
+        #   persist (a resume re-adopts them from the project store). The
+        #   INTERACTIVE arm has no second copy, so there the PROMPT is withheld
+        #   instead (`sweep-decisions-prompt-withheld`, below): an answer taken
+        #   at a prompt this cycle would live in memory alone, and a crash before
+        #   the bundle it authorizes is materialized would lose it — nothing reads
+        #   a `build` back off the ledger's `decision:` line (#794 review). The
+        #   withheld check precedes the write at the seeded site, so a withheld
+        #   write is never also reported as a failed one.
         answers: dict[str, dict[str, Any]] = {}
         unusable: dict[str, Any] = {}
         malformed: list[str] = []
         store_unreadable = False
+        store_fault = ""  # the refusal's text, for the prompt-withheld notice below
         # `stat()` + `S_ISREG`, not `is_file()` (DW-248, the DW-224 shape). The
         # convenience probe splits by RUNTIME on a metadata fault: 3.11-3.13
         # re-raise a `PermissionError` out of this bookkeeping read — aborting the
@@ -4015,6 +4022,7 @@ class SweepEngine(Engine):
             self.journal.append("sweep-decisions-reload-failed", errors=[f"unreadable: {exc}"])
             store_mode = None
             store_unreadable = True  # DW-264: the bytes may be fine; withhold the writes
+            store_fault = str(exc)
         if store_mode is not None and stat.S_ISREG(store_mode):
             try:
                 stored = _read_json(decisions_path)
@@ -4025,6 +4033,7 @@ class SweepEngine(Engine):
             except OSError as exc:
                 self.journal.append("sweep-decisions-reload-failed", errors=[f"unreadable: {exc}"])
                 store_unreadable = True
+                store_fault = str(exc)
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self.journal.append("sweep-decisions-reload-failed", errors=[f"unreadable: {exc}"])
             else:
@@ -4424,6 +4433,37 @@ class SweepEngine(Engine):
             # silently swallowing the announcement rather than repeating it.
             for decision in pending:
                 self._quarantine(self.state.sweep_skipped_decisions, decision.id)
+        elif store_unreadable and pending:
+            # DW-264's interactive half, re-drawn (#794 review): while the run
+            # store could not be read this cycle, an answer taken at the prompt
+            # could not be persisted — the write is withheld for the reason above,
+            # and unlike the seeded arm's adopted answers it has no second copy.
+            # Taking it anyway left the authorization in memory alone: the effect
+            # walk landed the ledger's `decision:` line, but nothing reads a `build`
+            # back off that line, so a process that died between the answer and
+            # `_materialize_bundles`' save resumed with the old store, re-asked the
+            # question (or, unattended, quarantined it) and the human's `build` was
+            # lost. So the question is NOT put: one row names the ids not asked,
+            # the notice tells the human what to repair, and the decisions stay
+            # pending and UNQUARANTINED — the unattended arm's quarantine is what
+            # stops a repeated announcement, and these were never announced as
+            # skipped — so the next interactive sweep over a readable store asks
+            # them. `store_fault` is the refusal's own text; `dw_ids` and `file`
+            # are the withheld row's fields, `error` is diagnostics-dropped.
+            self.journal.append(
+                "sweep-decisions-prompt-withheld",
+                file=decisions_path.name,
+                dw_ids=[d.id for d in pending],
+                error=store_fault,
+            )
+            gates.notify(
+                self.policy,
+                self.run_dir,
+                f"{len(pending)} deferred-work decisions not asked",
+                f"{decisions_path} could not be read ({store_fault}), so an answer could "
+                "not be persisted and none was taken — fix the file, then run "
+                "`bmad-loop sweep` interactively again",
+            )
         else:
             for decision in pending:
                 # announce before blocking on input so observers (TUI, ATTENTION
@@ -4449,31 +4489,20 @@ class SweepEngine(Engine):
                     "effect": option.effect,
                     "answered_at": self._today(),
                 }
-                if store_unreadable:
-                    # DW-264, withheld FIRST, as at the seeded site: the answer
-                    # stays in `answers`, the effect walk and `decision-answered`
-                    # below still run, only the persist is skipped.
-                    self.journal.append(
-                        "sweep-decisions-store-write-withheld",
-                        file=decisions_path.name,
-                        dw_ids=[decision.id],
-                    )
-                else:
-                    # Deliberately BARE, unlike the seeded write-back above
-                    # (DW-262): a human just answered at a prompt, and a write that
-                    # FAILS must stop the sweep loudly rather than be spent on a
-                    # bundle a resume cannot reconstruct — the seeded arm can
-                    # re-adopt from the project store; this one has no second copy.
-                    # The WITHHELD branch above is the one deliberate exception:
-                    # after an `OSError` read refusal (DW-264) writing here would
-                    # replace valid answers the refusal merely hid, and the
-                    # ledger's `decision:` line is the durable record of the
-                    # answer — the store is re-read next cycle.
-                    atomic_write_text_confined(  # same file, same reasoning as above (#363, #593)
-                        decisions_path,
-                        json.dumps({**unusable, **answers}, indent=2),  # as above
-                        confine_root=project_root,
-                    )
+                # Deliberately BARE, unlike the seeded write-back above (DW-262):
+                # a human just answered at a prompt, and a write that FAILS must
+                # stop the sweep loudly rather than be spent on a bundle a resume
+                # cannot reconstruct — the seeded arm can re-adopt from the
+                # project store; this one has no second copy. Not reached while
+                # the store could not be READ this cycle (DW-264): that arm
+                # withholds the prompt itself above, since a write here would
+                # replace valid answers the refusal merely hid and an answer held
+                # only in memory does not survive a crash.
+                atomic_write_text_confined(  # same file, same reasoning as above (#363, #593)
+                    decisions_path,
+                    json.dumps({**unusable, **answers}, indent=2),  # as above
+                    confine_root=project_root,
+                )
                 self.journal.append(
                     "decision-answered",
                     dw_id=decision.id,

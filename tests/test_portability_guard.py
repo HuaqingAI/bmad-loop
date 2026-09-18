@@ -1423,9 +1423,18 @@ JOURNAL_KINDS = frozenset(
         # non-object top level do NOT withhold — there the replacement is the
         # repair. Same fields as the failed row minus `error`; the withheld check
         # precedes the write, so one write never lands on both rows. The seeded
-        # site emits ONE row listing every id adopted this cycle; the interactive
-        # site emits one row per answer, naming that answer's id alone.
+        # site is the only writer since #794's review: the interactive arm
+        # withholds the PROMPT instead (next row).
         "sweep-decisions-store-write-withheld",
+        # DW-264's interactive half (#794 review). While `<run>/decisions.json`
+        # could not be READ this cycle, the human is not asked: an answer taken at
+        # the prompt could not be persisted (the write is withheld above), it has
+        # no second copy, and nothing reads a `build` back off the ledger's
+        # `decision:` line, so a crash before the bundle was materialized lost the
+        # authorization. `file` is the store's basename, `dw_ids` the pending ids
+        # not asked, `error` the read refusal's text (diagnostics-dropped); the
+        # decisions stay pending and unquarantined for the next interactive run.
+        "sweep-decisions-prompt-withheld",
         "sweep-inflight-redrive",
         "sweep-inflight-stranded",
         # DW-243. `_ensure_bundle_intent`'s regeneration read of the ledger

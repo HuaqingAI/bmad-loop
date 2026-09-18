@@ -648,13 +648,16 @@ breaking changes may land in a minor release.
   refusal) to a new `sweep-decisions-store-write-failed` journal kind naming the adopted
   ids, and carry on with the answers in memory, instead of aborting an otherwise healthy
   sweep; the interactive write-back stays bare so a human's answer whose write FAILS still
-  stops the sweep loudly — a write WITHHELD under DW-264 is the one deliberate exception
-  (DW-262).
-- Withhold both `<run>/decisions.json` write-backs for the cycle when the store's metadata
-  probe or content read was refused with an `OSError`, journaling
-  `sweep-decisions-store-write-withheld` with the ids whose answers stay in memory, so a
-  transient read refusal no longer replaces a store of valid answers with an empty map;
-  decode faults and a non-object top level still replace the file wholesale (DW-264).
+  stops the sweep loudly (DW-262).
+- Withhold the seeded `<run>/decisions.json` write-back for the cycle when the store's
+  metadata probe or content read was refused with an `OSError`, journaling
+  `sweep-decisions-store-write-withheld` with the adopted ids whose answers stay in memory,
+  so a transient read refusal no longer replaces a store of valid answers with an empty
+  map; decode faults and a non-object top level still replace the file wholesale (DW-264).
+  In the same cycle the interactive prompt is not put at all
+  (`sweep-decisions-prompt-withheld`, ATTENTION notice): an answer that cannot be
+  persisted is not taken, so a crash can no longer lose a `build` authorization held only
+  in memory; the decisions stay pending for the next interactive sweep.
 - Raise a refused ledger out of the five write-bearing mutators (`mark_done_many`,
   `mark_seen_again_many`, `mark_open_many`, `record_decision`, `archive_closed`) on
   every interpreter: their pre-lock presence guard is `stat()` + `S_ISREG` and the

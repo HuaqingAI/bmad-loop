@@ -19337,18 +19337,18 @@ def test_a_directory_at_the_run_store_does_not_abort_the_sweep(project):
 
 
 @pytest.mark.parametrize("fault", ["stat", "read_text"])
-@pytest.mark.parametrize("arm", ["seeded", "interactive"])
-def test_an_unreadable_run_store_withholds_both_write_backs(project, monkeypatch, fault, arm):
+def test_an_unreadable_run_store_withholds_the_seeded_write_back(project, monkeypatch, fault):
     """DW-264. An `OSError` at the store's metadata probe or its content read says
     nothing about the BYTES on disk: a store full of valid answers merely could
-    not be read this cycle, and `answers`/`unusable` start empty, so either
+    not be read this cycle, and `answers`/`unusable` start empty, so the seeded
     write-back would replace it with a map that had lost every answer it held.
-    Both write-backs are now WITHHELD while that flag is set: the answer taken this
-    cycle stays in memory (the seeded id is adopted; the interactive answer is
-    journaled `decision-answered` and its ledger `decision:` line lands), the old
+    It is WITHHELD while that flag is set: the adopted answer stays in memory for
+    this cycle's bundling (a resume re-adopts it from the project store), the old
     bytes survive untouched, and one `sweep-decisions-store-write-withheld` names
     the id that did not persist. No `sweep-decisions-store-write-failed` row: the
-    withheld check precedes the write, so no write is attempted at all.
+    withheld check precedes the write, so no write is attempted at all. The
+    interactive arm under the same flag is the next row's: it has no second copy,
+    so there the PROMPT is withheld rather than the write.
 
     The two decode arms (truncated JSON, non-object top level) deliberately do NOT
     withhold — the `test_whole_file_fault_is_replaced_by_*` rows above pin that
@@ -19358,26 +19358,23 @@ def test_an_unreadable_run_store_withholds_both_write_backs(project, monkeypatch
     and `read_bytes` (untouched by both fault helpers) reads it back afterwards.
 
     Ablation: stop setting `store_unreadable` on the `stat` (metadata) arm and the
-    `stat` rows red on the surviving bytes — the write lands and replaces DW-2's
-    answer; stop setting it on the content `OSError` arm and the `read_text` rows
-    red the same way. Fold the split content arm back into one
+    `stat` row reds on the surviving bytes — the write lands and replaces DW-2's
+    answer; stop setting it on the content `OSError` arm and the `read_text` row
+    reds the same way. Fold the split content arm back into one
     `except (json.JSONDecodeError, OSError, UnicodeDecodeError)` without the flag
-    and both `read_text` rows red. Move the withheld check AFTER the `try` and the
-    seeded rows red on the surviving bytes too — the write lands before the row
-    is written, which is the ordering the withheld-first check exists to forbid."""
+    and the `read_text` row reds. Move the withheld check AFTER the `try` and both
+    rows red on the surviving bytes too — the write lands before the row is
+    written, which is the ordering the withheld-first check exists to forbid."""
     from bmad_loop import decisions as decisions_store
 
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
     old = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
     original_bytes = json.dumps({"DW-2": old}).encode("utf-8")
     plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
-    if arm == "seeded":
-        pre_store = decisions_store.store_path(project.project)
-        pre_store.parent.mkdir(parents=True, exist_ok=True)
-        pre_store.write_text(json.dumps({"DW-1": old}), encoding="utf-8")
-        engine, _ = make_sweep(project, [])
-    else:
-        engine, _ = make_sweep(project, [], answers=["1"], prompting=True)
+    pre_store = decisions_store.store_path(project.project)
+    pre_store.parent.mkdir(parents=True, exist_ok=True)
+    pre_store.write_text(json.dumps({"DW-1": old}), encoding="utf-8")
+    engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
     run_store = engine.run_dir / "decisions.json"
     run_store.write_bytes(original_bytes)
@@ -19398,13 +19395,65 @@ def test_an_unreadable_run_store_withholds_both_write_backs(project, monkeypatch
     assert withheld["dw_ids"] == ["DW-1"]
     assert "error" not in withheld  # nothing was attempted, so nothing to report
     assert _records(engine, "sweep-decisions-store-write-failed") == []
+    assert _records(engine, "sweep-decisions-prompt-withheld") == []  # nothing to ask
     assert run_store.read_bytes() == original_bytes  # old answers survive the cycle
-    if arm == "seeded":
-        assert [r["dw_id"] for r in _records(engine, "decision-preanswered")] == ["DW-1"]
+    assert [r["dw_id"] for r in _records(engine, "decision-preanswered")] == ["DW-1"]
+
+
+@pytest.mark.parametrize("fault", ["stat", "read_text"])
+def test_an_unreadable_run_store_withholds_the_interactive_prompt(project, monkeypatch, fault):
+    """DW-264's interactive half, re-drawn (#794 review). The first cut took the
+    human's answer and withheld only its WRITE, on the theory that the ledger's
+    `decision:` line was the durable record. It is not one anything reads: a
+    `build` answer lived in memory alone, and a process that died between the
+    answer and `_materialize_bundles`' save resumed with the old store, re-asked
+    the question — or, unattended, quarantined it — and the authorization was
+    lost. An answer that cannot be persisted is therefore not TAKEN: the prompter
+    is never called (an empty script here would raise `StopIteration` if it
+    were), no `decision-pending`/`decision-answered` row is written, the ledger
+    gets no `decision:` line, one `sweep-decisions-prompt-withheld` names the ids
+    not asked with the refusal's text, the ATTENTION notice says what to repair,
+    and the decision stays pending and UNQUARANTINED so the next interactive
+    sweep over a readable store asks it. The old bytes survive, as in the seeded
+    row, and no store write is attempted or reported.
+
+    Ablation: restore the prompt loop for the unreadable store (drop the `elif`)
+    and both rows red on the prompter being called with an empty script; keep the
+    loop but restore the old in-loop write-withhold and they red on
+    `decision-answered` present and the `decision:` line landed."""
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    old = {"key": "1", "label": "Widen", "effect": "build", "intent": "widen the field"}
+    original_bytes = json.dumps({"DW-2": old}).encode("utf-8")
+    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
+    engine, _ = make_sweep(project, [], answers=[], prompting=True)  # asking would raise
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    run_store = engine.run_dir / "decisions.json"
+    run_store.write_bytes(original_bytes)
+    if fault == "stat":
+        fault_metadata_probe(monkeypatch, run_store, "stat")
     else:
-        [answered] = _records(engine, "decision-answered")
-        assert answered["dw_id"] == "DW-1" and answered["effect"] == "build"
-        assert "decision:" in ledger_entries(project)["DW-1"].body  # effect walk still ran
+        fault_read_text(monkeypatch, run_store)
+
+    answers, closed, _unlanded = engine._decisions_phase(plan)  # never raises
+
+    assert "DW-1" not in answers and closed == 0
+    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
+    assert reload_failed["errors"][0].startswith("unreadable: ")
+    [withheld] = _records(engine, "sweep-decisions-prompt-withheld")
+    assert withheld["file"] == "decisions.json"
+    assert withheld["dw_ids"] == ["DW-1"]
+    assert "Permission denied" in withheld["error"]
+    assert _records(engine, "decision-pending") == []
+    assert _records(engine, "decision-answered") == []
+    assert _records(engine, "decision-skipped-unattended") == []
+    assert _records(engine, "sweep-decisions-store-write-withheld") == []
+    assert _records(engine, "sweep-decisions-store-write-failed") == []
+    assert "decision:" not in ledger_entries(project)["DW-1"].body  # no effect ran
+    assert "DW-1" not in engine.state.sweep_skipped_decisions  # asked again next time
+    assert run_store.read_bytes() == original_bytes  # old answers survive the cycle
+    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    assert "1 deferred-work decisions not asked" in attention
+    assert "could not be read" in attention and "interactively again" in attention
 
 
 def test_an_unreadable_run_store_does_not_withhold_on_a_decode_fault(project):
