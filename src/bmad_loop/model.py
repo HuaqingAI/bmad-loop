@@ -223,9 +223,17 @@ def _baseline_artifacts_from(raw: object) -> dict[str, list[int] | None] | None:
     for key, value in raw.items():
         if value is None:
             out[str(key)] = None
-        elif isinstance(value, list) and len(value) == 2:
-            out[str(key)] = [int(value[0]), int(value[1])]
+        elif (
+            isinstance(value, list)
+            and len(value) == 2
+            # `bool` is an `int`; a `[true, 42]` is a mangled record, not a fingerprint
+            and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
+        ):
+            out[str(key)] = [value[0], value[1]]
         else:
+            # Never `int(...)` a value here: a `["bad", 42]` or `[null, 42]` must
+            # read as "no snapshot", not raise out of `from_dict` and keep the
+            # whole run state — and `bmad-loop resume` — from loading.
             return None
     return out
 

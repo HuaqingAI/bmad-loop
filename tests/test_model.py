@@ -1181,13 +1181,21 @@ def test_story_task_baseline_artifacts_round_trips_and_defaults_none():
         {"_bmad-output/impl/spec.md": [1]},
         {"_bmad-output/impl/spec.md": "1700000000:42"},
         {"_bmad-output/impl/spec.md": [1, 2, 3]},
+        {"_bmad-output/impl/spec.md": ["bad", 42]},
+        {"_bmad-output/impl/spec.md": [None, 42]},
+        {"_bmad-output/impl/spec.md": [1.5, 42]},
+        {"_bmad-output/impl/spec.md": [True, 42]},
     ],
 )
 def test_story_task_baseline_artifacts_mangled_shape_reads_as_no_snapshot(mangled):
     """A hand-edited state.json whose snapshot is not path -> 2-int list (or None)
     is not partially trusted: the whole field reads as `None`, so the receipt
     refuses for want of a snapshot instead of crediting entries against a
-    baseline half of which was dropped."""
+    baseline half of which was dropped — and a non-integer element never RAISES
+    out of `from_dict`, which would keep the whole run state (and `bmad-loop
+    resume`) from loading over one mangled fingerprint.
+
+    Ablation: convert with `int(value[0])` and the `"bad"`/`None` rows raise."""
     d = StoryTask(story_key="dw-bundle", epic=0).to_dict()
     d["baseline_artifacts"] = mangled
 
