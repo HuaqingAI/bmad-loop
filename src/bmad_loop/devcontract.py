@@ -75,16 +75,20 @@ STATUS_LINE_RE = re.compile(
 # the literal value `true` ALONE on the line asserts — anchored to end of line so
 # prose such as
 # `Artifact only: true for the ledger, false for code` is no assertion; neither is
-# `false`, a bare label, or any other token. Every gap is HORIZONTAL whitespace of
-# any kind (`[^\S\r\n]` — space, tab, NBSP..., never CR/LF), so as with
-# `Status:`, the label and its value must share one line. `Artifact only:`
-# followed by `true` on the next line, or `Artifact only` with `: true` on the
-# next line, is a bare label and a stray token, not an assertion. Matches are
-# read through `_artifact_only_asserted`, which skips a match inside a fenced
-# block (a pasted example within the marker).
+# `false`, a bare label, or any other token. Every gap is `_HORIZONTAL_WS_RE`
+# (space, tab, NBSP... — never CR/LF nor the vertical separators `splitlines`
+# honours), so as with `Status:`, the label and its value must share one line.
+# `Artifact only:` followed by `true` on the next line, or `Artifact only` with
+# `: true` on the next line, is a bare label and a stray token, not an
+# assertion — and so is `Artifact only:\x0btrue`, which `[^\S\r\n]` admitted
+# while MULTILINE `$` anchors on LF alone (#795 review). Matches are read
+# through `_artifact_only_asserted`, which skips a match inside a fenced block
+# (a pasted example within the marker).
 ARTIFACT_ONLY_LINE_RE = re.compile(
-    r"^[^\S\r\n]*(?:[-*][^\S\r\n]*)?(?:\*\*)?artifact[ _-]+only(?:\*\*)?[^\S\r\n]*:"
-    r"(?:\*\*)?[^\S\r\n]*(?:\*\*)?[^\S\r\n]*true(?:\*\*)?[^\S\r\n]*$",
+    rf"^{_HORIZONTAL_WS_RE}*(?:[-*]{_HORIZONTAL_WS_RE}*)?"
+    rf"(?:\*\*)?artifact[ _-]+only(?:\*\*)?{_HORIZONTAL_WS_RE}*:"
+    rf"(?:\*\*)?{_HORIZONTAL_WS_RE}*(?:\*\*)?{_HORIZONTAL_WS_RE}*true"
+    rf"(?:\*\*)?{_HORIZONTAL_WS_RE}*$",
     re.IGNORECASE | re.MULTILINE,
 )
 

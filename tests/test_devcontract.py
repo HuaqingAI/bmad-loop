@@ -651,6 +651,31 @@ def test_synth_artifact_only_newline_separated_value_fails_closed(tmp_path):
     assert devcontract._artifact_only_asserted("Artifact only\n: true") is False
 
 
+@pytest.mark.parametrize(
+    "separator",
+    ["\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
+    ids=["vt", "ff", "fs", "gs", "rs", "nel", "ls", "ps"],
+)
+@pytest.mark.parametrize("gap", ["after-colon", "before-colon", "leading-bullet"])
+def test_artifact_only_rejects_vertical_separators(separator, gap):
+    r"""The same fail-open DW-285 closed for `Status:`: `[^\S\r\n]` admits
+    every separator `str.splitlines` treats as a line boundary except CR/LF,
+    while MULTILINE `$` anchors on LF alone — so `Artifact only:\x0btrue` read
+    as one line and minted the receipt where every other reader of the marker
+    sees a bare label and a stray token (#795 review). Every gap now takes
+    `_HORIZONTAL_WS_RE`; NBSP and tab still assert.
+
+    Ablation: restore `[^\S\r\n]` to any one gap and its row mints."""
+    if gap == "after-colon":
+        line = f"Artifact only:{separator}true"
+    elif gap == "before-colon":
+        line = f"Artifact only{separator}: true"
+    else:
+        line = f"-{separator}Artifact only: true"
+    assert devcontract._artifact_only_asserted(line) is False
+    assert devcontract._artifact_only_asserted(line.replace(separator, "\u00a0")) is True
+
+
 def test_synth_artifact_only_trailing_prose_fails_closed(tmp_path):
     """The value is anchored to end of line: `true` followed by prose is a
     sentence, not an assertion."""

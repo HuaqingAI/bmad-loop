@@ -497,7 +497,9 @@ breaking changes may land in a minor release.
   replay idempotently.
 
 - Refuse concatenated `Artifactonly: true` assertions while preserving accepted
-  separated spellings (DW-291).
+  separated spellings (DW-291). The artifact-only line's gaps now take the same
+  horizontal-whitespace class as `Status:` (DW-285), so a vertical separator such as
+  `\x0b` between the label and `true` no longer mints the receipt.
 
 - Preserve attempt binding and seed-delivery observer fallbacks when named path
   resolution guards receive embedded-NUL or lone-surrogate faults (DW-292/DW-294).

@@ -584,9 +584,12 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "located",
         "log_pos",
         "malformed",
-        # `artifact-publication-refused` size-admission diagnostics. Both are raw
-        # byte counts derived by the bounded publication reader, never authored
-        # text or identifiers; the refused path remains inside dropped `error`.
+        # `artifact-publication-refused` size-admission diagnostics. The two
+        # counts are raw byte totals derived by the bounded publication reader,
+        # and `measurement_is_lower_bound` is the bool saying the count stopped
+        # at the limit (the reader is bounded, so a growing file is measured "at
+        # least"); none is authored text or an identifier, and the refused path
+        # remains inside dropped `error`.
         "limit_bytes",
         "measured_bytes",
         "measurement_is_lower_bound",
