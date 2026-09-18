@@ -475,7 +475,12 @@ breaking changes may land in a minor release.
 
 - Resume a pending review-timeout salvage refile over the preserved product after
   ledger repair, rerunning verification without rebuilding or new dev/review sessions
-  under either rollback policy; retain ordinary commit gates (DW-278).
+  under either rollback policy; retain ordinary commit gates (DW-278). The latch is
+  set at every salvage's handoff save — the first, fault-free salvage included, not
+  only the repair-pause arm — so a host lost between that save and the commit
+  (notification, a `pre_commit_gate` workflow) replays the salvage with zero sessions
+  instead of restart recovery, which erased the published refile under rollback and
+  paused without it.
 
 - Notify operators when a ledger snapshot outage leaves story-declared deferred
   closes unapplied, naming the story, every declared ID, and the fault (DW-277).

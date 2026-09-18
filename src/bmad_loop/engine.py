@@ -3347,9 +3347,20 @@ class Engine:
                     site="review-timeout-salvage-refile-locked",
                 )
             task.followup_review_recommended = False
-        # Keep recovery authority through notification and commit-gate saves.
-        # The cleared recommendation records successful publication, so replay
-        # re-verifies without appending again. COMMITTING takes over the latch.
+        # Latch the salvage BEFORE the handoff save, on the fault-free path too
+        # — not only from the repair-pause arm above (#794 review). This save is
+        # the last one before `_commit`'s COMMITTING save, and `gates.notify` plus
+        # any `pre_commit_gate` workflow run between them: a host death there
+        # leaves REVIEW_VERIFY over a timeout record, which `_resumable_session`
+        # never matches (the record is not `completed`), so without the latch
+        # resume falls to restart recovery — a rollback erases the refile just
+        # published and re-drives dev and review over finished, verify-green
+        # work, and no rollback pauses for manual recovery. Latched, resume
+        # replays THIS timeout through `_pending_salvage_session`: the preserved
+        # product is verified again, and the cleared recommendation records the
+        # successful publication so the replay appends nothing twice. COMMITTING
+        # takes over the latch (`_commit` clears it with its own save).
+        task.salvage_refile_pending = True
         self._save()
         self.journal.append(
             "review-timeout-salvage",
