@@ -22896,6 +22896,125 @@ def test_bundle_that_writes_nothing_cannot_clear_the_gate_on_stale_ignored_resid
     assert "lists 3 ignored entries, none created or changed by this attempt" in decision["reason"]
 
 
+def _wt_artifact_only_dev(project, name="fix", dw_ids=("DW-1",)):
+    """`wt_bundle_dev` with NO source change: the session writes its spec and an
+    erratum under the unit worktree's rebased artifacts dir and asserts
+    `artifact_only` — the DW-236 shape run under `scm.isolation = "worktree"`."""
+
+    def effect(spec):
+        wt = project.rebased(spec.cwd)
+        baseline = verify.rev_parse_head(spec.cwd)
+        sp = wt.implementation_artifacts / f"spec-dw-{name}.md"
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        write_spec(sp, "done", baseline)
+        (wt.implementation_artifacts / "erratum.md").write_text("the deliverable\n")
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": f"dw-{name}",
+                "spec_file": str(sp),
+                "baseline_commit": baseline,
+                "tasks_total": 1,
+                "tasks_done": 1,
+                "verification": [],
+                "escalations": [],
+                "dw_ids": list(dw_ids),
+                "followup_review_recommended": False,
+                "artifact_only": True,
+            },
+        )
+
+    return effect
+
+
+def test_isolated_bundle_artifact_only_receipt_is_refused_because_teardown_destroys_it(project):
+    """Under `scm.isolation = "worktree"` an in-tree gitignored artifacts dir is
+    rebased into the unit worktree, so the receipt's listing measures the
+    worktree's copy. An artifact-only unit contributes no tracked change, the
+    merge lands nothing, and `merge_local`'s success teardown removes the worktree
+    — with the accepted spec and erratum in it; `_carry_isolated_ledger_writes`
+    copies no file. Before the veto (#794 review) that bundle went DONE with a
+    `bundle-artifact-only-accepted` row of count 2, `DW-1` read `done`, and the
+    main checkout held only the ledger: a close whose evidence had been destroyed.
+
+    Now `_artifact_only_withheld` vetoes the receipt for a rebased artifacts dir,
+    so the attempt keeps the ordinary refusal with the isolation cause appended,
+    writes no accepted row, and `DW-1` stays `open` for a run that can carry the
+    work — loud and recoverable where the acceptance was silent loss. The main
+    checkout's artifacts dir is untouched either way; the row pins that too.
+
+    Two layers, both MEASURED. Drop `artifact_only_withheld=` from the sweep's
+    `verify_dev_bundle` call alone and this reds on the CAUSE: `_artifact_baseline`
+    still stamps `None` for the vetoed unit, so the gate refuses for want of a
+    snapshot — the right verdict under a misleading name. Drop that skip too and
+    it reds on `phase != DONE` with the accepted row present — the
+    destroyed-deliverable shape above."""
+    ignore_before_commit(project, "_bmad-output/")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ignore bmad output")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "erratum"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan)] + [_wt_artifact_only_dev(project)] * 3,
+        policy=isolated_policy(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    task = engine.state.tasks["dw-fix"]
+    assert task.phase != Phase.DONE
+    assert task.baseline_artifacts is None  # vetoed: no snapshot is taken either
+    assert _records(engine, "bundle-artifact-only-accepted") == []
+    assert ledger_entries(project)["DW-1"].open
+    reasons = [r["reason"] for r in _records(engine, "dev-decision") if r["reason"]]
+    assert reasons and all(
+        r.startswith(
+            "no changes in worktree since baseline commit (artifact-only receipt refused: "
+        )
+        and "rebased into the unit worktree" in r
+        for r in reasons
+    )
+    # nothing of the unit's reached the main checkout — and nothing was destroyed there
+    assert sorted(p.name for p in project.implementation_artifacts.iterdir()) == [
+        project.deferred_work.name
+    ]
+
+
+def test_artifact_only_withheld_keys_on_the_artifacts_dir_moving_not_on_isolation(
+    project, tmp_path
+):
+    """The veto compares PATHS: the rebased in-tree dir names the worktree copy
+    the teardown removes, while an out-of-tree artifacts dir is left unmoved by
+    `ProjectPaths.rebased`, read through the mount and survives — so the receipt
+    stands there, as it does in place. `replace(project, project=..., repo_root=...)`
+    is exactly the shape `rebased` produces for an out-of-tree dir: a new root
+    with the artifacts dir where it was.
+    Ablation: compare `self._isolated()` instead of the two paths and the shared
+    row reds with a veto on a dir the teardown never touches."""
+    from bmad_loop.workspace import Workspace
+
+    engine, _ = make_sweep(project, [], policy=_harvest_bundle_policy(attempts=1))
+    assert engine._artifact_only_withheld() is None  # in place: the checkout itself
+
+    wt = tmp_path / "unit"
+    wt.mkdir()
+    engine.workspace = Workspace(root=wt, paths=project.rebased(wt))
+    withheld = engine._artifact_only_withheld()
+    assert withheld is not None
+    assert str(engine.workspace.paths.implementation_artifacts) in withheld
+    assert "rebased into the unit worktree" in withheld
+
+    shared = replace(project, project=wt, repo_root=wt)  # artifacts dir did not move
+    assert shared.implementation_artifacts == project.implementation_artifacts
+    engine.workspace = Workspace(root=wt, paths=shared)
+    assert engine._artifact_only_withheld() is None
+
+
 def test_bundle_artifact_only_receipt_leaves_the_review_ledger_gate_intact(project):
     """The receipt relaxes the dev proof-of-work gate and NOTHING downstream: an
     accepted artifact-only bundle whose ledger ids are still open is refused by

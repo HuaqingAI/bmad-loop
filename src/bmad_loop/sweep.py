@@ -6937,6 +6937,40 @@ class SweepEngine(Engine):
                     )
         self.journal.append("sweep-bundle-close-carried", story_key=task.story_key, dw_ids=carried)
 
+    def _artifact_only_withheld(self) -> str | None:
+        """Why the artifact-only receipt (DW-273) cannot be honoured for the unit
+        `self.workspace` names whatever it writes — or `None` when it can.
+
+        Under `scm.isolation = "worktree"` an IN-TREE `implementation_artifacts`
+        is rebased into the unit worktree (`ProjectPaths.rebased`), so the
+        receipt's listing measures the worktree's copy of a gitignored dir. An
+        artifact-only result contributes no tracked change to the unit branch,
+        `integrate_unit` merges that unchanged branch and `merge_local` then
+        removes the worktree; `_carry_isolated_ledger_writes` re-applies the
+        ledger CLOSE to the main checkout but copies no file, so the accepted
+        spec or erratum — the bundle's sole deliverable — is destroyed with the
+        worktree while the ids read `done` (#794 review). Refusing the receipt
+        keeps such a bundle on the ordinary `no changes in worktree` retry, which
+        is loud and leaves the ids `open`, rather than landing a close whose
+        evidence no longer exists. An out-of-tree artifacts dir is left where it
+        is by `rebased`, is read directly through the mount and survives the
+        teardown, so the receipt stands there; so does `isolation = "none"`, where
+        the workspace IS the main checkout. Carrying the owned entries back
+        before teardown is the fix that would lift this; it is not this method's.
+
+        Compared by path, not by isolation flag: the flag says a worktree exists,
+        the path says whether the artifacts dir moved into it."""
+        unit_dir = self.workspace.paths.implementation_artifacts
+        if unit_dir == self.paths.implementation_artifacts:
+            return None
+        return (
+            "implementation_artifacts is rebased into the unit worktree under "
+            f'scm.isolation = "worktree" ({unit_dir}), and an ignored artifact written '
+            "there is removed with the worktree after the merge — nothing carries it to "
+            "the main checkout, so it cannot stand as the bundle's deliverable; move the "
+            'artifacts dir outside the code tree or run the bundle with isolation = "none"'
+        )
+
     def _artifact_baseline(self, task: StoryTask) -> dict[str, list[int] | None] | None:
         """Fingerprint the ignored entries under `implementation_artifacts` at the
         attempt's start, so `verify_dev_bundle`'s artifact-only receipt (DW-273)
@@ -6946,7 +6980,12 @@ class SweepEngine(Engine):
         `bundle-artifact-baseline-unavailable` and stamps `None`, on which the
         receipt refuses (the attempt is still driven; only the relaxation is
         withheld), rather than ending the run over a probe a bundle with a real
-        change never needs."""
+        change never needs. `None` without a git call when
+        `_artifact_only_withheld` has already vetoed the receipt for this unit:
+        the gate refuses ahead of its snapshot arm, so a snapshot would measure
+        ownership nothing will read."""
+        if self._artifact_only_withheld() is not None:
+            return None
         paths = self.workspace.paths
         try:
             return verify.artifact_dir_snapshot(self.workspace.root, paths.implementation_artifacts)
@@ -6966,6 +7005,7 @@ class SweepEngine(Engine):
             result_json,
             review_enabled=self._dev_review_enabled(),
             engine_written=self._harvest_gate_exclude(task),
+            artifact_only_withheld=self._artifact_only_withheld(),
         )
         # The accepted artifact-only receipt (DW-273) is never silent: one row per
         # accepted attempt, mirroring `Engine._verify_dev_artifacts`'s

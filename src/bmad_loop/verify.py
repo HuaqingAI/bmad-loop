@@ -3752,6 +3752,7 @@ def _verify_shared_gates(
     allow_ancestor_baseline: bool = False,
     fm: dict[str, Any] | None = None,
     artifact_only_dir: Path | None = None,
+    artifact_only_withheld: str | None = None,
 ) -> _SharedGateResult:
     """The workflow-tag, expected-status, baseline-match, and proof-of-work gates
     shared verbatim by :func:`verify_dev`, :func:`verify_dev_bundle`, and
@@ -3824,7 +3825,17 @@ def _verify_shared_gates(
     this gate never reads ``rj`` for it. It lives HERE rather than after the fact
     for the reason ``skipped_proof_zero_diff`` does: the ordinary probe's baseline
     can be re-anchored by the newer-claim branch above, and "the gate found
-    nothing" is known at exactly one point."""
+    nothing" is known at exactly one point.
+
+    ``artifact_only_withheld`` is the caller's veto over that receipt, consulted
+    only when a directory was passed and ahead of every listing: a non-``None``
+    string refuses the receipt with that text as the cause, spawning no git. It
+    exists for what this gate cannot see — ``SweepEngine`` passes it when
+    ``paths`` is a unit worktree's rebase of an in-tree artifacts dir under
+    ``scm.isolation = "worktree"``, where an accepted ignored artifact is torn
+    down with the worktree after the merge and nothing carries it to the main
+    checkout (#794 review), so accepting would let the bundle land while its
+    sole deliverable is destroyed."""
     workflow = rj.get("workflow")
     if workflow != DEV_WORKFLOW:
         return _SharedGateResult(
@@ -3975,6 +3986,15 @@ def _verify_shared_gates(
                 reason = "no changes in worktree since baseline commit"
                 if artifact_only_dir is None:
                     return _SharedGateResult(VerifyOutcome.retry(reason))
+                # The caller's veto first, ahead of every listing: nothing the
+                # worktree holds can be credited when the worktree's teardown is
+                # what happens to it next.
+                if artifact_only_withheld is not None:
+                    return _SharedGateResult(
+                        VerifyOutcome.retry(
+                            f"{reason} (artifact-only receipt refused: {artifact_only_withheld})"
+                        )
+                    )
                 # The receipt (DW-273): consulted only here, after the ordinary
                 # probe positively found nothing, and only on the leg whose caller
                 # asked. `None` (outside the tree, or git refused) and `[]` (git
@@ -4278,6 +4298,7 @@ def verify_dev_bundle(
     review_enabled: bool = True,
     *,
     engine_written: tuple[str, ...] = (),
+    artifact_only_withheld: str | None = None,
 ) -> VerifyOutcome:
     """verify_dev for a deferred-work bundle: bundles have no sprint-status
     entry. The orchestrator owns the bundle→dw-id binding (``task.dw_ids``,
@@ -4313,7 +4334,13 @@ def verify_dev_bundle(
     off ``lstat`` fingerprints (mtime and size) rather than content — a rewrite
     that lands byte-identical with a preserved mtime is invisible to it, as it
     is to the ordinary probe. The assertion selects the receipt; the snapshot is
-    what makes it proof."""
+    what makes it proof.
+
+    ``artifact_only_withheld`` is forwarded to the shared gate as its veto over
+    the receipt: the caller's reason the receipt cannot be honoured for THIS
+    unit whatever it wrote (``SweepEngine._artifact_only_withheld`` — an in-tree
+    artifacts dir rebased into a unit worktree, whose accepted artifacts the
+    teardown would destroy). ``None`` leaves the receipt to the snapshot."""
     rj = result_mapping(result_json)
     spec_file = rj.get("spec_file")
     if not spec_file:
@@ -4338,6 +4365,7 @@ def verify_dev_bundle(
         extra_exclude=engine_written,
         allow_ancestor_baseline=True,
         artifact_only_dir=paths.implementation_artifacts if artifact_only else None,
+        artifact_only_withheld=artifact_only_withheld,
     )
     if gate.outcome is not None:
         return gate.outcome
