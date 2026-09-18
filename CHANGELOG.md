@@ -493,6 +493,8 @@ breaking changes may land in a minor release.
   dev, repair, or review verification (DW-290). Preparation now refuses post-verification byte
   or declaration drift before freezing a payload, retains the source mount and evidence for
   recovery, and cannot refresh authority by replaying the same accepted result after a crash.
+  It re-derives the tracked declaration set too, so a spec outside `implementation_artifacts`
+  cannot swap one tracked deliverable for another after acceptance (Codex P1 on #795).
 
 - Bound isolated artifact publication payload preparation (DW-289) to measured raw-byte
   defaults of 5 MiB per ignored file and 10 MiB aggregate. Preflight now rejects an

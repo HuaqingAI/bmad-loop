@@ -738,7 +738,21 @@ def prepare(
     file_max_bytes: int = DEFAULT_FILE_MAX_BYTES,
     payload_max_bytes: int = DEFAULT_PAYLOAD_MAX_BYTES,
 ) -> None:
-    """Freeze ignored bytes only when they match final accepted verification."""
+    """Freeze ignored bytes only when they match final accepted verification.
+
+    The tracked selection is re-derived too and its rel SET must equal the
+    accepted one. The ignored map alone would let a spec that lives outside
+    ``implementation_artifacts`` — and so is never itself a selected deliverable
+    — swap one tracked declaration for another after acceptance (#795 review):
+    the staged and committed validators only ever consult the ACCEPTED tracked
+    rels, so the swapped-in path would ride the commit unproven. Preparation
+    runs after ``finalize_commit``'s ``git add -A``, so every pending-tracked
+    rel is tracked by now and the two key sets are directly comparable. Only
+    the keys are compared: the accepted rels' blob identities were already
+    proven on the validated index and the committed tree, and the working tree
+    behind a sealed commit is not the authority — a writer landing there after
+    staging is tolerated by design (it cannot enter the commit), not a refusal.
+    """
     # A frozen payload is the durable publication intent, including legacy runs
     # that predate accepted-source binding. Never reread its source on replay.
     if task.artifact_payload is not None:
@@ -752,6 +766,7 @@ def prepare(
     selected = _selected_sources(
         task,
         source,
+        collect_tracked_identities=True,
         file_max_bytes=file_max_bytes,
         payload_max_bytes=payload_max_bytes,
     )
@@ -764,6 +779,12 @@ def prepare(
         )
         raise PublicationError(
             "artifact deliverables changed since accepted verification: " + ", ".join(differing)
+        )
+    if selected.tracked_oids.keys() != task.artifact_tracked_source_oids.keys():
+        differing = sorted(selected.tracked_oids.keys() ^ task.artifact_tracked_source_oids.keys())
+        raise PublicationError(
+            "tracked artifact deliverables changed since accepted verification: "
+            + ", ".join(differing)
         )
     task.artifact_payload = {
         rel: base64.b64encode(data).decode("ascii") for rel, data in selected.contents.items()
