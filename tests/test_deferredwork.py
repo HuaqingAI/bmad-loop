@@ -1805,6 +1805,108 @@ def test_mark_done_many_is_all_or_nothing_on_a_write_failure(tmp_path, monkeypat
     assert p.read_bytes() == before  # nothing partially applied
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda p: mark_done_many(p, ["DW-1"], "2026-07-24", "note"), id="mark_done_many"
+        ),
+        pytest.param(
+            lambda p: record_decision(p, "DW-1", "2026-07-24", "Keep", "why"),
+            id="record_decision",
+        ),
+    ],
+)
+def test_a_failed_publish_leaves_as_a_typed_ledger_write_error(tmp_path, monkeypatch, mutate):
+    """The mutators' atomic write fails as `LedgerWriteError`: an `OSError` — so
+    every `except OSError` caller keeps its degrade — that a caller which must fail
+    loud on a lost publish can name AHEAD of that arm, where a bare `OSError` was
+    indistinguishable from the lock's. The original fault stays chained as
+    `__cause__` and named in the message, and nothing partial reaches disk.
+
+    Ablation: make `_publish` a bare `atomic_write_text` call and the
+    `isinstance(..., LedgerWriteError)` assertion reds while `OSError` still
+    passes — which is exactly the split the type exists to make."""
+    p = tmp_path / "deferred-work.md"
+    p.write_text(LEDGER, encoding="utf-8")
+    before = p.read_bytes()
+
+    def boom(path, text):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(deferredwork, "atomic_write_text", boom)
+
+    with pytest.raises(OSError) as exc:
+        mutate(p)
+
+    assert isinstance(exc.value, deferredwork.LedgerWriteError)
+    assert isinstance(exc.value.__cause__, OSError)
+    assert exc.value.__cause__.errno == 28
+    assert "No space left on device" in str(exc.value)
+    assert p.read_bytes() == before
+
+
+def test_a_release_fault_after_a_landed_publish_is_typed_and_the_bytes_stay(tmp_path, monkeypatch):
+    """`ledger_lock` releases AFTER the body published, and the release can fault
+    — Windows' `LK_UNLCK`, `os.close` anywhere. Before this, that reached callers
+    as the same bare `OSError` a failed `os.open` does, while the bytes were on
+    disk: a degrade arm read a landed close as one that never happened. It leaves
+    as `LedgerLockReleaseError` (an `OSError`, so degrade callers are unchanged),
+    with the release fault chained, and the ledger carries the closure.
+
+    The second half pins what the type is NOT, and what a double fault does: a
+    release fault on top of a body fault is not a landed publish, so it never
+    wears this type — and it does not get to REPLACE the body's fault either, the
+    way a `with` statement would. For a body that raised `LedgerWriteError` that
+    replacement would be a bare `OSError`, the very type the sweep's degrade arms
+    read as a lock never acquired. The body's fault leaves, with the release fault
+    chained as `__context__` and added as a note.
+
+    Ablation: restore `with file_lock(lock_path): yield` in `ledger_lock` and the
+    `isinstance(..., LedgerLockReleaseError)` assertion reds while `OSError` still
+    passes."""
+    import contextlib
+
+    p = tmp_path / "deferred-work.md"
+    p.write_text(LEDGER, encoding="utf-8")
+    real_file_lock = deferredwork.file_lock
+
+    @contextlib.contextmanager
+    def releasing_faults(path, **kwargs):
+        try:
+            with real_file_lock(path, **kwargs):
+                yield
+        finally:
+            raise OSError(9, "Bad file descriptor")  # the release, body done or not
+
+    monkeypatch.setattr(deferredwork, "file_lock", releasing_faults)
+
+    with pytest.raises(OSError) as exc:
+        mark_done_many(p, ["DW-1"], "2026-07-24", "note")
+    assert isinstance(exc.value, deferredwork.LedgerLockReleaseError)
+    assert isinstance(exc.value.__cause__, OSError) and exc.value.__cause__.errno == 9
+    assert "Bad file descriptor" in str(exc.value)
+    entries = {e.id: e for e in parse_ledger(p.read_text(encoding="utf-8"))}
+    assert not entries["DW-1"].open  # the publish landed
+
+    # a body fault under a faulting release: the body's fault leaves, not this type
+    # and not the bare release OSError — graded on the typed WRITE fault, since that
+    # is the one a downgrade would hand to a degrade arm
+    p.write_text(LEDGER, encoding="utf-8")
+    monkeypatch.setattr(
+        deferredwork,
+        "atomic_write_text",
+        lambda path, text: (_ for _ in ()).throw(OSError(28, "No space left on device")),
+    )
+    with pytest.raises(deferredwork.LedgerWriteError) as exc2:
+        mark_done_many(p, ["DW-1"], "2026-07-24", "note")
+    assert not isinstance(exc2.value, deferredwork.LedgerLockReleaseError)
+    assert isinstance(exc2.value.__cause__, OSError) and exc2.value.__cause__.errno == 28
+    assert isinstance(exc2.value.__context__, OSError) and exc2.value.__context__.errno == 9
+    assert any("release faulted" in note for note in exc2.value.__notes__)
+    assert p.read_text(encoding="utf-8") == LEDGER  # nothing published
+
+
 def test_mark_done_many_skips_an_already_done_entry(tmp_path):
     """Idempotent for a resume that re-drives a close that already landed: no
     second resolution line, and the id is not reported as newly marked."""

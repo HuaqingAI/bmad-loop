@@ -1,5 +1,6 @@
 """Pre-answer store, discovery of missed decisions, and out-of-band apply."""
 
+import contextlib
 import json
 import shutil
 import sys
@@ -72,23 +73,54 @@ def test_store_round_trip_and_prune(project):
     assert decisions.load_pre_answers(project.project) == {}
 
 
+def test_a_store_writer_that_cannot_lock_writes_nothing(project, monkeypatch):
+    """A failed acquisition propagates without touching the store: a write that
+    could not be serialized fails loudly rather than proceeding unlocked. The
+    error shape is the one `msvcrt.locking` raises when its ~10 s retry runs out
+    — a routine outcome on the Windows legs, not a contrived one. Patched at
+    `deferredwork.file_lock` because the store's writers take the ledger's lock
+    helper keyed on the store path (DW-161); the `StateRootError` sibling of this
+    row is `test_a_store_noop_succeeds_when_no_state_root_is_derivable`."""
+    _opt = DecisionOption(key="1", label="Build it", effect="build", intent="do it")
+    decisions.record_pre_answer(project.project, "DW-1", _opt, date="2026-06-13")
+    store = decisions.store_path(project.project)
+    before = store.read_bytes()
+
+    @contextlib.contextmanager
+    def unavailable(path, **kwargs):
+        raise OSError(11, "Resource deadlock avoided")
+        yield  # pragma: no cover — unreachable
+
+    monkeypatch.setattr(deferredwork, "file_lock", unavailable)
+
+    with pytest.raises(OSError):
+        decisions.record_pre_answer(project.project, "DW-2", _opt, date="2026-06-13")
+    with pytest.raises(OSError):
+        decisions.drop_pre_answer(project.project, "DW-1", answer=json.loads(before)["DW-1"])
+    assert store.read_bytes() == before
+
+
 def test_drop_pre_answer_removes_one_entry_and_leaves_the_rest(project):
     """DW-143's store primitive at its own layer. `prune_pre_answers` above is
     covered directly; its single-id sibling was reachable only through
     `SweepEngine._materialize_bundles`, which cannot see the returned bool at all
     and pins the no-op branch only indirectly.
 
-    Three claims: the bool reports whether an entry was actually there (both
+    Four claims: the bool reports whether an entry was actually removed (all
     branches), an absent id writes NOTHING — the file's bytes are untouched, so the
     keep-open drop of an answer that only ever lived in `<run>/decisions.json`
-    cannot re-serialize a store it has no business rewriting — and a real removal
-    carries every sibling through, the unusable one included, since
-    `load_pre_answers` validates only the top level and an unrelated write must not
-    delete a human's corrupt entry.
+    cannot re-serialize a store it has no business rewriting — an id whose entry is
+    no longer the `answer` being retired is left alone the same way (the caller's
+    copy is a stale read; what the store holds now is a human's LATER answer, and
+    deleting it on the strength of the stale copy is exactly the loss the keyword
+    exists to refuse), and a real removal carries every sibling through, the
+    unusable one included, since `load_pre_answers` validates only the top level
+    and an unrelated write must not delete a human's corrupt entry.
 
-    Ablation: drop the `if dw_id not in data: return False` early return and the
-    bool and the byte-equality both redden; write `_write_store(project, {})` and
-    the siblings redden."""
+    Ablation: drop the `dw_id not in data` half of the early return and the bool
+    and the byte-equality both redden; drop the `data[dw_id] != answer` half and
+    the replaced-entry branch reddens; write `_write_store(project, {})` and the
+    siblings redden."""
     opt = DecisionOption(key="1", label="Build it", effect="build", intent="do it")
     decisions.record_pre_answer(project.project, "DW-7", opt, date="2026-06-13")
     decisions.record_pre_answer(project.project, "DW-8", opt, date="2026-06-13")
@@ -98,18 +130,25 @@ def test_drop_pre_answer_removes_one_entry_and_leaves_the_rest(project):
     data["DW-9"] = ["not a decision answer at all"]
     store.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
     before = store.read_bytes()
+    dw7 = decisions.load_pre_answers(project.project)["DW-7"]
 
     # an id the store never held: False, and not one byte written
-    assert decisions.drop_pre_answer(project.project, "DW-404") is False
+    assert decisions.drop_pre_answer(project.project, "DW-404", answer=dw7) is False
     assert store.read_bytes() == before
 
-    assert decisions.drop_pre_answer(project.project, "DW-7") is True
+    # an id the store holds under a DIFFERENT value than the one being retired — a
+    # human re-answered it since the caller read its copy: False, not one byte written
+    superseded = {**dw7, "answered_at": "2026-06-01"}
+    assert decisions.drop_pre_answer(project.project, "DW-7", answer=superseded) is False
+    assert store.read_bytes() == before
+
+    assert decisions.drop_pre_answer(project.project, "DW-7", answer=dw7) is True
     remaining = decisions.load_pre_answers(project.project)
     assert set(remaining) == {"DW-8", "DW-9"}
     assert remaining["DW-8"]["intent"] == "do it"
     assert remaining["DW-9"] == ["not a decision answer at all"]
     # and removing the same id twice is False the second time
-    assert decisions.drop_pre_answer(project.project, "DW-7") is False
+    assert decisions.drop_pre_answer(project.project, "DW-7", answer=dw7) is False
 
 
 def test_load_pre_answers_tolerates_garbage(project):
@@ -1770,7 +1809,7 @@ def test_a_removal_refuses_a_readonly_store_rather_than_skipping(project):
     store.chmod(0o444)
     try:
         with pytest.raises(PermissionError):
-            decisions.drop_pre_answer(project.project, "DW-7")
+            decisions.drop_pre_answer(project.project, "DW-7", answer=json.loads(before)["DW-7"])
     finally:
         store.chmod(0o644)
 
@@ -1824,7 +1863,6 @@ def test_apply_pre_answer_is_one_ledger_transaction(
     — that the no-close path still writes the pair's bytes, leaves the entry
     open, and serializes its store write behind the ledger's.
     """
-    import contextlib
 
     from bmad_loop.sweep import Decision
 
@@ -1898,18 +1936,30 @@ _LOCKED_WRITERS = {
     ),
     "drop_pre_answer": (
         lambda p: _seed_store(p, ["DW-7"]),
-        lambda p: decisions.drop_pre_answer(p.project, "DW-7"),
+        lambda p: decisions.drop_pre_answer(
+            p.project, "DW-7", answer=decisions.load_pre_answers(p.project)["DW-7"]
+        ),
     ),
 }
 
 # The read-provable no-ops. `record_pre_answer` has none — it always publishes
-# bytes — so it is absent by construction rather than by omission.
+# bytes — so it is absent by construction rather than by omission. `drop_pre_answer`
+# has two: an absent id, and a present one the store no longer holds as the value
+# being retired (a human's later replacement — the DW-143 provenance guard).
+_STALE = {"key": "9", "label": "Old", "effect": "keep-open", "answered_at": "2026-01-01"}
 _NOOP_WRITERS = {
     "prune_pre_answers": (
         lambda p: decisions.prune_pre_answers(p.project, {"DW-7"}),  # nothing to drop
         [],
     ),
-    "drop_pre_answer": (lambda p: decisions.drop_pre_answer(p.project, "DW-404"), False),
+    "drop_pre_answer:absent": (
+        lambda p: decisions.drop_pre_answer(p.project, "DW-404", answer=_STALE),
+        False,
+    ),
+    "drop_pre_answer:replaced": (
+        lambda p: decisions.drop_pre_answer(p.project, "DW-7", answer=_STALE),
+        False,
+    ),
 }
 
 
