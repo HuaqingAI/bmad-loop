@@ -12916,6 +12916,11 @@ def test_a_reapply_whose_ledger_write_faults_degrades_and_carries_on(project, mo
             "the ledger file is gone",
             id="file-gone",
         ),
+        pytest.param(
+            lambda project: project.deferred_work.write_text(""),
+            "the ledger holds no entry for this id",
+            id="file-emptied",
+        ),
     ],
 )
 def test_a_reapply_whose_write_reports_no_line_is_not_counted_closed(
@@ -12946,11 +12951,20 @@ def test_a_reapply_whose_write_reports_no_line_is_not_counted_closed(
     since nothing was re-applied; the miss attributed with THIS row's sentence; and
     no commit.
 
-    Ablations, RUN: replace `if not recorded:` with `if False:` and both rows red
+    The `file-emptied` row is the edge between the other two: a ledger truncated
+    to 0 bytes is a file the recorder REACHED and found no entry in, so it takes
+    the missing-entry sentence — where the text-only observation reader answers
+    the same `""` it answers for absence, and `_non_write_state` once tested that
+    text for truth and called the file gone (PR #794 review). It is why the
+    sentence asks the presence-aware `observe_ledger`.
+
+    Ablations, RUN: replace `if not recorded:` with `if False:` and all rows red
     with `closed == 1` and a `sweep-decision-effect-reapplied` row for a line that
     was never written. Replace `_non_write_state`'s `the ledger file is gone` return
     with the missing-entry sentence and the `file-gone` row alone reds — the
-    `entry-gone` row cannot see that branch, which is why both are here."""
+    `entry-gone` row cannot see that branch, which is why both are here. Switch
+    `_non_write_state` back to `read_for_observation` + `not text` and the
+    `file-emptied` row alone reds with "the ledger file is gone"."""
     write_ledger(project, {"DW-1": "open"})
     engine, _ = make_sweep(project, [])
     _seed_run_store(engine, {"DW-1": _stored_close_answer()})

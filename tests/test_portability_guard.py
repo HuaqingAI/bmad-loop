@@ -126,8 +126,10 @@ LEDGER_RECEIVER_NAMES = {"ledger", "ledger_path", "deferred_work"}
 LEDGER_OWNER_RECEIVER_NAMES = {"path", "archive_path"}
 LEDGER_OWNER = "deferredwork.py"
 # The two arms' own bodies: the one place a bare `read_text` of the ledger is the
-# point rather than a bypass.
-LEDGER_READER_BODIES = {"read_for_write", "read_for_observation"}
+# point rather than a bypass. The observation arm's body is `observe_ledger`, the
+# presence-aware reader `read_for_observation` projects to text (PR #794 review);
+# the projection holds no `read_text` of its own.
+LEDGER_READER_BODIES = {"read_for_write", "observe_ledger"}
 
 # The one file allowed to CALL ``verify_commands_outcome`` — and within it, only
 # from inside ``_verify_review_commands``, the helper that resolves the review

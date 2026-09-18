@@ -1039,6 +1039,39 @@ def test_decisions_names_an_absent_ledger_rather_than_a_missing_entry(project, c
     assert "DW-1: no decision line was written: the ledger file is gone" in out
 
 
+def test_decisions_names_a_missing_entry_for_a_present_empty_ledger(project, capsys, monkeypatch):
+    """The edge between the two siblings above, and the reason the outcome line
+    asks the presence-aware reader (`observe_ledger`) rather than testing the
+    text-only reader's `""` for truth: a ledger truncated to 0 bytes mid-prompt is
+    a file the recorder REACHED and found no entry in — the missing-entry news —
+    where the text-only reader answers the same `""` it answers for absence, and
+    the outcome line then told the operator the file was gone, with every
+    `decision:` line already written (PR #794 review; the edge the DW-281/282
+    CHANGELOG entry recorded as accepted).
+
+    Ablation: switch the site back to `read_for_observation` + `elif not text:`
+    and this reds with "the ledger file is gone" while both siblings still pass."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_rich_decision(project)
+
+    class _StubPrompter:
+        def ask(self, decision):
+            project.deferred_work.write_text("")  # present, 0 bytes: reached, nothing in it
+            return decision.option("2")  # choose close
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert "closed now" not in out
+    assert "the ledger file is gone" not in out
+    assert "DW-1: no decision line was written: the ledger holds no entry for this id" in out
+
+
 @pytest.mark.parametrize(
     "refusals,note",
     [

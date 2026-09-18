@@ -5453,6 +5453,56 @@ def test_read_for_observation_returns_the_text_verbatim(tmp_path):
     assert deferredwork.read_for_observation(path) == (LEDGER, None)
 
 
+@pytest.mark.parametrize(
+    "shape, expected",
+    [
+        pytest.param("absent", (None, None), id="absent"),
+        pytest.param("directory", (None, None), id="directory-is-absence"),
+        pytest.param("empty", ("", None), id="present-0-byte"),
+        pytest.param("text", (LEDGER, None), id="present-text"),
+    ],
+)
+def test_observe_ledger_keeps_a_present_empty_ledger_distinct_from_absence(
+    tmp_path, shape, expected
+):
+    """The presence-aware OBSERVATION reader: `None` text is absence — ENOENT, or a
+    present non-regular file, the same classification `read_for_observation`
+    reports as `""` — and `""` is a ledger that EXISTS and holds nothing. The two
+    sentence-writing sites (`cli.cmd_decisions`' non-write outcome and
+    `SweepEngine._non_write_state`) took absence from the text-only reader's
+    empty text and so called a present 0-byte ledger "gone" (PR #794 review);
+    this is the reader they ask instead. The `present-0-byte` row is the one the
+    text-only projection cannot carry.
+    Ablation: `return "" , None` for absence (or `text or ""` in the body) and
+    the `absent`/`directory` rows red against the `present-0-byte` row."""
+    path = tmp_path / "deferred-work.md"
+    if shape == "directory":
+        path.mkdir()
+    elif shape == "empty":
+        path.write_text("")
+    elif shape == "text":
+        path = write_ledger(tmp_path)
+
+    assert deferredwork.observe_ledger(path) == expected
+
+
+def test_observe_ledger_attributes_a_fault_with_no_text(tmp_path, monkeypatch):
+    """A fault answers `None` text, not `""`: the caller cannot tell a refused
+    ledger's contents, so the reader must not hand back a value that reads as a
+    present, empty one. `read_for_observation` projects the same fault to `""`,
+    which is the contract its parsing callers already hold.
+    Ablation: return `""` on the fault arm and the `None` assertion reds."""
+    path = write_ledger(tmp_path)
+    fault_read_text(monkeypatch, path)
+
+    text, fault = deferredwork.observe_ledger(path)
+    projected_text, projected_fault = deferredwork.read_for_observation(path)
+
+    assert text is None
+    assert fault is not None and fault.startswith("PermissionError: ")
+    assert (projected_text, projected_fault) == ("", fault)
+
+
 def test_read_for_observation_degrades_on_undecodable_bytes(tmp_path):
     """The OBSERVATION arm never raises — it hands back an empty text plus an
     ATTRIBUTED fault, so a caller holding a journal records which fault it degraded

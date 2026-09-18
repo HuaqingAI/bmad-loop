@@ -4923,11 +4923,17 @@ class SweepEngine(Engine):
         and it never raises — a ledger that has gone unreadable since the refusal
         answers the empty text, which falls through to "no entry carries this id",
         the same sentence the pre-DW-167 code gave. Absence is the reader's own
-        `("", None)` answer, not an `is_file()` pre-gate (DW-265): that gate
+        `(None, None)` answer, not an `is_file()` pre-gate (DW-265): that gate
         suppresses every OS error on Python 3.14 and answers False, so a refused
         ledger was reported as GONE there — a sentence that tells the operator
         every `decision:` line already written went with it, when the file is
-        sitting in place, unreadable.
+        sitting in place, unreadable. The reader is the presence-aware
+        `observe_ledger`, not `read_for_observation`, for the mirror-image reason
+        (PR #794 review): the text-only reader answers the same `""` for a
+        present 0-byte ledger as for a missing one, so testing the text's
+        truthiness called a ledger that EXISTS and holds no entry gone. `None`
+        is absence; `""` is a present, empty ledger, and falls through to the
+        missing-entry sentence like any other text without this id.
 
         `.done`, never `not .open` — the derivation `DWEntry.done`'s docstring
         exists to refuse. Two states of the entry fall through to the
@@ -4947,10 +4953,10 @@ class SweepEngine(Engine):
         otherwise let this sentence describe a different entry than the write
         did."""
         ledger = self.workspace.paths.deferred_work
-        text, fault = deferredwork.read_for_observation(ledger)
-        if fault is None and not text:
+        text, fault = deferredwork.observe_ledger(ledger)
+        if fault is None and text is None:
             return "the ledger file is gone"
-        entry = next((e for e in deferredwork.parse_ledger(text) if e.id == dw_id), None)
+        entry = next((e for e in deferredwork.parse_ledger(text or "") if e.id == dw_id), None)
         if entry is not None and entry.done:
             return "the ledger entry is present but no longer open"
         return "the ledger holds no entry for this id"

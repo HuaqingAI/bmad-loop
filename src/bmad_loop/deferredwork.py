@@ -59,6 +59,9 @@ the classification recorded at the site:
   or a flag, and nothing is written from it. Absence answers ``("", None)``; both
   ``OSError`` and ``UnicodeDecodeError`` degrade to ``("", "<Class>: <msg>")`` so
   the caller can journal the attributed fault and carry on. It never raises.
+  :func:`observe_ledger` is the same arm with presence kept: ``None`` text for
+  absence, ``""`` for a present 0-byte ledger — for the sites whose sentence
+  says whether the file is there rather than what it holds.
   The helper never raising does not oblige its CALLER to stay quiet: the arm is
   about who WRITES, not about how loud the response is. An observation caller may
   legitimately answer louder than a silent degrade — ``cli._sweep_dry_run`` fails
@@ -340,14 +343,24 @@ def read_for_write(path: Path) -> str | None:
         raise LedgerReadError(f"{path} is not valid UTF-8: {e}") from e
 
 
-def read_for_observation(path: Path) -> tuple[str, str | None]:
-    """OBSERVATION arm of the ledger-read contract (DW-146).
+def observe_ledger(path: Path) -> tuple[str | None, str | None]:
+    """OBSERVATION arm of the ledger-read contract (DW-146), presence-aware.
 
-    Returns ``(text, fault)``. Absence is not a fault: it answers ``("", None)``,
-    the empty text every observation site already read for a missing ledger. Both
-    ``OSError`` and ``UnicodeDecodeError`` degrade to ``("", "<Class>: <msg>")``
-    — attributed, so a caller holding a journal can record WHICH fault it
-    degraded on rather than reporting an empty ledger. Never raises.
+    Returns ``(text, fault)``. Absence is not a fault: it answers ``(None, None)``.
+    A present, readable ledger answers its text — ``""`` for a 0-byte file, which
+    is a ledger that EXISTS and holds no entry, not a missing one. Both ``OSError``
+    and ``UnicodeDecodeError`` degrade to ``(None, "<Class>: <msg>")`` —
+    attributed, so a caller holding a journal can record WHICH fault it degraded
+    on rather than reporting an empty ledger. Never raises.
+
+    This is the reader for a site whose SENTENCE turns on presence — "the ledger
+    file is gone" against "the ledger holds no entry for this id" — because
+    :func:`read_for_observation` folds absence and a 0-byte file into the one
+    empty text, and testing that text's truthiness reported a present, empty
+    ledger as gone (PR #794 review). Presence is taken from the same ``stat`` the
+    read is gated on, never from a second probe beside it: two probes could
+    disagree across a rival's unlink, and a second ``is_file()`` would bring back
+    the Python 3.14 suppression DW-254 retired.
 
     Both arms share the ``ENOENT``/``ENOTDIR``/non-regular classification and
     differ in DISPOSITION. The probe is ``Path.stat`` + ``S_ISREG``, the same as
@@ -375,16 +388,34 @@ def read_for_observation(path: Path) -> tuple[str, str | None]:
         try:
             st = path.stat()
         except (FileNotFoundError, NotADirectoryError):
-            return "", None
+            return None, None
         if not S_ISREG(st.st_mode):
-            return "", None
+            return None, None
         return path.read_text(encoding="utf-8"), None
     except (OSError, UnicodeDecodeError, ValueError) as e:
         # `ValueError`: `Path.stat` raises it for a path the OS cannot encode (an
         # embedded NUL). `probe_absence` ABSORBS that class as absence at the
         # write arm (DW-256); this arm never calls it — never-raises keeps the
         # `ValueError` an attributed fault rather than classifying it as absence.
-        return "", f"{e.__class__.__name__}: {e}"
+        return None, f"{e.__class__.__name__}: {e}"
+
+
+def read_for_observation(path: Path) -> tuple[str, str | None]:
+    """OBSERVATION arm of the ledger-read contract (DW-146).
+
+    Returns ``(text, fault)``. Absence is not a fault: it answers ``("", None)``,
+    the empty text every observation site already read for a missing ledger. Both
+    ``OSError`` and ``UnicodeDecodeError`` degrade to ``("", "<Class>: <msg>")``
+    — attributed, so a caller holding a journal can record WHICH fault it
+    degraded on rather than reporting an empty ledger. Never raises.
+
+    The text-only projection of :func:`observe_ledger`: a 0-byte ledger and a
+    missing one answer the same ``""`` here, which is right for every site that
+    parses the text (nothing to parse either way) and wrong for a site whose
+    sentence says whether the FILE is there — those call :func:`observe_ledger`.
+    """
+    text, fault = observe_ledger(path)
+    return text or "", fault
 
 
 def _ledger_present(path: Path) -> bool:

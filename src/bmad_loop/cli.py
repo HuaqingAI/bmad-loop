@@ -4237,14 +4237,23 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             # so the fault never reached the `except` and a ledger sitting in
             # place, unreadable, was reported as GONE, the sentence that says every
             # `decision:` line already written went with it. The reader never
-            # raises: absence is its own `("", None)` answer, and a refused ledger
+            # raises: absence is its own `(None, None)` answer, and a refused ledger
             # is an attributed fault on every interpreter, which keeps the
             # "ledger state unavailable" wording.
+            #
+            # `observe_ledger`, not `read_for_observation`: this sentence says
+            # whether the FILE is there, and the text-only reader folds a present
+            # 0-byte ledger into the same `""` as a missing one, so testing the
+            # text reported a ledger that exists and holds no entry as GONE — the
+            # sentence that tells the operator every `decision:` line already
+            # written went with it (PR #794 review). `None` is absence; `""` is a
+            # present, empty ledger, which the recorder reached and found no entry
+            # in, the same news as any other missing entry.
             outcome = "no decision line was written"
-            text, fault = deferredwork.read_for_observation(paths.deferred_work)
+            text, fault = deferredwork.observe_ledger(paths.deferred_work)
             if fault is not None:
                 outcome += "; ledger state unavailable"
-            elif not text:
+            elif text is None:
                 outcome += ": the ledger file is gone"
             else:
                 outcome += ": the ledger holds no entry for this id"

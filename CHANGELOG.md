@@ -708,10 +708,11 @@ breaking changes may land in a minor release.
   — not "the ledger file is gone" — and the sweep arm no longer ends `run()` with a
   `PermissionError` on 3.11–3.13. The sweep-arm exposure is the window between the
   recorder's False answer and the diagnostic probe (a ledger refused at the recorder
-  itself already took the `except` arm). Absence still reads "gone" at both sites; a
-  present 0-byte ledger now reads "the ledger file is gone" at `bmad-loop decisions`
-  where it read "holds no entry" — the edge DW-265 recorded for the dry-run listing
-  (DW-281, DW-282).
+  itself already took the `except` arm). Absence still reads "gone" at both sites, and
+  a present 0-byte ledger reads "holds no entry" at both — the recorder reached it and
+  found nothing — through a presence-aware sibling of the observation reader
+  (`deferredwork.observe_ledger`, `None` text for absence) rather than the text-only
+  reader's empty text, which had made an empty ledger read as gone (DW-281, DW-282).
 - Absorb pathlib's ignored winerrors (21 `ERROR_NOT_READY`, 123 `ERROR_INVALID_NAME`,
   1921 `ERROR_CANT_RESOLVE_FILENAME`) and the `ValueError` a non-encodable path raises as
   ABSENCE at the ledger's repair/write reader, the five mutators' pre-lock guard and both
