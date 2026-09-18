@@ -474,8 +474,11 @@ breaking changes may land in a minor release.
   inherited across a resume, so in those two states it is deliberately stickier and
   waits for a human repair plus a fresh sweep. The mirror also outranks the
   persisted commit debt (`sweep_ledger_commit_owed`): a resume that inherits both
-  skips the top-of-`_loop` settle, since the doubted bytes are the debt
-  (DW-218/219).
+  skips the top-of-`_loop` settle, since the doubted bytes are the debt. And it
+  withholds the resume's in-flight recovery pass whole: a bundle re-armed out of
+  band by `bmad-loop resolve` is not re-driven while the mirror is on disk — its
+  own commit is a whole-tree `git add -A` — and is journaled as withheld and then
+  stranded rather than dispatched around the gate (DW-218/219).
 
 - Withhold sweep bundles and ledger commits after close, re-apply, or idle decision
   faults; preserve pre-answers while the ledger is in doubt (DW-216/217/220).

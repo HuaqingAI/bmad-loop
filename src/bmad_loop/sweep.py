@@ -1758,25 +1758,55 @@ class SweepEngine(Engine):
     def _loop(self) -> None:
         ledger = self.workspace.paths.deferred_work
         cycle = max(1, self.state.sweep_cycle)
-        recovered = self._finish_inflight_bundles()
-        # The debt term is gated on the RUN's persisted doubt (DW-218/219): a
-        # process that armed `_record_ledger_doubt` and then died between an
-        # effect's publish and its commit resumes with BOTH latches set, and the
-        # debt describes exactly the bytes the doubt refuses to publish — the
-        # settle would walk the half-written ledger into HEAD ahead of every gate
-        # that withholds it. The doubt outranks the debt: the settle is skipped,
-        # the debt stays latched, and the run ends where the doubt ends it (the
-        # withheld dispatch, then `ledger-unreadable`); the repair is a human
-        # editing the ledger and starting a fresh `bmad-loop sweep`, a NEW run
-        # with fresh state, so the unsettled debt contaminates nothing. Read
-        # through `_ledger_unfit_to_publish()` like every other consumer of the
-        # verdict — at this point the two cycle-scoped latches are still clear, so
-        # only the inherited mirror can answer. The recovery term is NOT gated:
-        # a recovered bundle's ledger restore is the bundle's own baseline, not
-        # the doubted write, and it published under the same shape before.
-        if recovered or (
-            self.state.sweep_ledger_commit_owed and not self._ledger_unfit_to_publish()
-        ):
+        if self._ledger_unfit_to_publish():
+            # DW-218/219, one gate AHEAD of `_cycle`'s dispatch gate. Read through
+            # `_ledger_unfit_to_publish()` like every other consumer of the
+            # verdict; here the two cycle-scoped latches are still clear, so only
+            # the inherited mirror can answer. A doubt is armed only in the two
+            # phases that run before dispatch, so no bundle THIS process armed a
+            # doubt over can be in flight — but a bundle re-armed out of band can:
+            # `bmad-loop resolve` resets an escalated bundle to PENDING, and a run
+            # paused on a stop request in the withheld branch (DW-219) carries
+            # that re-arm into its resume. Re-driving it here is the dispatch the
+            # gate below exists to refuse — the bundle's own `commit_story` /
+            # `finalize_commit` opens with a whole-tree `git add -A` that sweeps
+            # the doubted ledger into HEAD — so the recovery pass is withheld
+            # whole, the COMMITTING-window arm included. The bundles stay
+            # nonterminal and `_warn_stranded_bundles` names them at the cycle
+            # that follows; this row covers the no-open exit, which has no cycle.
+            # The repair is the doubt's: a human edits the ledger and starts a
+            # fresh `bmad-loop sweep`, whose triage re-bundles the still-open ids.
+            inflight = [
+                t.story_key
+                for t in self.state.tasks.values()
+                if BUNDLE_KEY_RE.match(t.story_key) and not t.terminal
+            ]
+            recovered = 0
+            if inflight:
+                self.journal.append(
+                    "sweep-bundles-withheld",
+                    cycle=cycle,
+                    bundles_not_run=len(inflight),
+                    reason="ledger-unreadable",
+                    story_keys=inflight,
+                )
+        else:
+            recovered = self._finish_inflight_bundles()
+        # ...and the same verdict gates the publish that follows either trigger.
+        # The DEBT term is the one that can still be armed here: a process that
+        # armed `_record_ledger_doubt` and then died between an effect's publish
+        # and its commit resumes with BOTH latches set, and the debt describes
+        # exactly the bytes the doubt refuses to publish — the settle would walk
+        # the half-written ledger into HEAD ahead of every gate that withholds
+        # it. The doubt outranks the debt: the settle is skipped, the debt stays
+        # latched, and the run ends where the doubt ends it (the withheld
+        # dispatch, then `ledger-unreadable`); a fresh sweep is a NEW run with
+        # fresh state, so the unsettled debt contaminates nothing. `recovered` is
+        # 0 under doubt by construction above; it sits inside the gate anyway,
+        # so the publisher cannot be reached by a trigger added later.
+        if (
+            recovered or self.state.sweep_ledger_commit_owed
+        ) and not self._ledger_unfit_to_publish():
             # a recovered bundle's ledger restore can leave the LEDGER dirty, and
             # triage plus the first bundle baseline read it, so it is published
             # here. Only it: unrelated dirt in the same repository is left for

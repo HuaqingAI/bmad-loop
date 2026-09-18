@@ -19900,6 +19900,61 @@ def test_regenerated_intent_when_bundle_file_missing(project):
     assert str(intent) in adapter.sessions[0].prompt  # the dev session got the rebuilt file
 
 
+def test_an_inherited_doubt_withholds_the_inflight_redrive_and_its_publish(project):
+    """A bundle re-armed out of band is not re-driven — and nothing is published
+    for it — while the run's ledger doubt is on disk (the CodeRabbit finding on
+    #792, widened by one step).
+
+    Doubt is armed only in the two phases that run ahead of dispatch, so no bundle
+    THIS process armed a doubt over is ever in flight; the reachable shape is the
+    re-arm: `bmad-loop resolve` resets an escalated bundle to PENDING, and a run
+    paused with the mirror on disk carries that re-arm into its resume. There
+    `_finish_inflight_bundles` ran before anything read the verdict, and the
+    bundle's own commit is a whole-tree `git add -A` — the very publish the
+    dispatch gate refuses, reached by a different door — with the post-recovery
+    `_commit_ledger` behind it ungated on the same doubt.
+
+    Premise before outcome: the task is asserted PENDING and re-armed on disk with
+    the mirror beside it, HEAD is captured, and the adapter carries the scripted
+    dev/review pair a re-drive WOULD consume, so "no session ran" is an assertion
+    the setup could not satisfy by accident.
+
+    Ablation: restore the bare `recovered = self._finish_inflight_bundles()` at
+    the top of `_loop` and this reds on the first assertion — dev and review
+    sessions run, the task reaches DONE, and DW-1's close lands in HEAD under the
+    bundle's commit. Dropping only the `not self._ledger_unfit_to_publish()` from
+    the publish that follows is defense in depth (`recovered` is 0 under doubt by
+    construction) and is not separately graded here."""
+    engine = _run_to_dev_escalation(project)
+    runs.rearm_escalation(
+        engine.run_dir, "dw-fix", isolated_redrive=False, resolution_recorded=True
+    )
+    state = load_state(engine.run_dir)
+    assert state.tasks["dw-fix"].phase == Phase.PENDING and state.tasks["dw-fix"].rearmed
+    state.sweep_ledger_in_doubt = True  # a previous process's verdict, beside the re-arm
+    save_state(engine.run_dir, state)
+    head = git(project.project, "rev-parse", "HEAD")
+
+    resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
+    assert resumed._ledger_doubt_inherited
+    summary = resumed.run()
+
+    assert adapter.sessions == []  # the re-drive was withheld: no dev, no review
+    assert not summary.crashed and not summary.paused
+    assert resumed.state.tasks["dw-fix"].phase == Phase.PENDING  # still in flight
+    assert "sweep-inflight-redrive" not in journal_text(resumed)
+    withheld = _records(resumed, "sweep-bundles-withheld")
+    assert withheld[0]["story_keys"] == ["dw-fix"] and withheld[0]["bundles_not_run"] == 1
+    assert withheld[0]["reason"] == "ledger-unreadable"
+    # ...and the cycle that followed said so too, the way any survivor is announced
+    [stranded] = _records(resumed, "sweep-inflight-stranded")
+    assert stranded["story_keys"] == ["dw-fix"]
+    assert _records(resumed, "sweep-ledger-commit") == []
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert ledger_entries(project)["DW-1"].open
+    assert resumed.state.sweep_ledger_in_doubt is True
+
+
 def test_stranded_bundle_task_warns_loudly(project):
     write_ledger(project, {"DW-1": "open"})
     engine, _ = make_sweep(project, [])
