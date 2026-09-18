@@ -6987,11 +6987,15 @@ class SweepEngine(Engine):
         worktree while the ids read `done` (#794 review). Refusing the receipt
         keeps such a bundle on the ordinary `no changes in worktree` retry, which
         is loud and leaves the ids `open`, rather than landing a close whose
-        evidence no longer exists. An out-of-tree artifacts dir is left where it
-        is by `rebased`, is read directly through the mount and survives the
-        teardown, so the receipt stands there; so does `isolation = "none"`, where
-        the workspace IS the main checkout. Carrying the owned entries back
-        before teardown is the fix that would lift this; it is not this method's.
+        evidence no longer exists. The receipt stands under `isolation = "none"`,
+        where the workspace IS the main checkout — and that is the ONLY shape it
+        stands in: an out-of-tree artifacts dir is left where it is by `rebased`
+        and survives the teardown, so this veto does not fire on it, but the
+        receipt is refused for it anyway by the gate's own listing
+        (`_artifact_dir_entries` answers `None` for a dir outside the repo — git
+        lists nothing there), so moving the dir out of the tree is no remedy
+        (#794 review). Carrying the owned entries back before teardown is the
+        fix that would lift this; it is not this method's.
 
         Compared by path, not by isolation flag: the flag says a worktree exists,
         the path says whether the artifacts dir moved into it."""
@@ -7002,8 +7006,8 @@ class SweepEngine(Engine):
             "implementation_artifacts is rebased into the unit worktree under "
             f'scm.isolation = "worktree" ({unit_dir}), and an ignored artifact written '
             "there is removed with the worktree after the merge — nothing carries it to "
-            "the main checkout, so it cannot stand as the bundle's deliverable; move the "
-            'artifacts dir outside the code tree or run the bundle with isolation = "none"'
+            "the main checkout, so it cannot stand as the bundle's deliverable; run the "
+            'bundle with isolation = "none"'
         )
 
     def _artifact_baseline(self, task: StoryTask) -> dict[str, list[int] | None] | None:

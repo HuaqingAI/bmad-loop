@@ -23053,12 +23053,22 @@ def test_artifact_only_withheld_keys_on_the_artifacts_dir_moving_not_on_isolatio
 ):
     """The veto compares PATHS: the rebased in-tree dir names the worktree copy
     the teardown removes, while an out-of-tree artifacts dir is left unmoved by
-    `ProjectPaths.rebased`, read through the mount and survives — so the receipt
-    stands there, as it does in place. `replace(project, project=..., repo_root=...)`
-    is exactly the shape `rebased` produces for an out-of-tree dir: a new root
-    with the artifacts dir where it was.
+    `ProjectPaths.rebased` and survives — so THIS veto does not fire on it, and
+    the gate goes on to refuse the receipt for it on its own (`_artifact_dir_entries`
+    lists nothing outside the repo). The veto's job is the teardown hazard only;
+    it must not fold in a refusal the gate already owns, or its sentence would
+    name a hazard that is not the reason. `replace(project, project=...,
+    repo_root=...)` is exactly the shape `rebased` produces for an out-of-tree
+    dir: a new root with the artifacts dir where it was.
+    The sentence names the ONE remedy that works, `isolation = "none"`, and not
+    "move the artifacts dir outside the code tree" (#794 review): that dir escapes
+    this veto but is refused by the gate's own listing regardless
+    (`test_verify_dev_bundle_artifacts_dir_outside_the_tree_refuses_without_git`),
+    so advertising it sends the operator through every attempt again.
+
     Ablation: compare `self._isolated()` instead of the two paths and the shared
-    row reds with a veto on a dir the teardown never touches."""
+    row reds with a veto on a dir the teardown never touches; restore the
+    "outside the code tree" remedy to the sentence and the wording row reds."""
     from bmad_loop.workspace import Workspace
 
     engine, _ = make_sweep(project, [], policy=_harvest_bundle_policy(attempts=1))
@@ -23071,6 +23081,8 @@ def test_artifact_only_withheld_keys_on_the_artifacts_dir_moving_not_on_isolatio
     assert withheld is not None
     assert str(engine.workspace.paths.implementation_artifacts) in withheld
     assert "rebased into the unit worktree" in withheld
+    assert 'isolation = "none"' in withheld
+    assert "outside the code tree" not in withheld  # a remedy the gate refuses anyway
 
     shared = replace(project, project=wt, repo_root=wt)  # artifacts dir did not move
     assert shared.implementation_artifacts == project.implementation_artifacts

@@ -19,10 +19,11 @@ breaking changes may land in a minor release.
   artifacts this attempt created or changed count; residue that predates the attempt
   or cannot be measured refuses the receipt, and a fault taking the attempt's
   snapshot degrades to `bundle-artifact-baseline-unavailable` with the attempt still
-  driven. Under `scm.isolation = "worktree"` the receipt is refused for an in-tree
-  artifacts dir, since the success teardown would remove the accepted artifact with
-  the worktree; an out-of-tree dir is unaffected. The review gate's every-id-`done`
-  check is unchanged.
+  driven. Under `scm.isolation = "worktree"` the receipt is refused outright, since
+  the success teardown would remove the accepted artifact with the worktree — the
+  receipt works only for an in-tree ignored dir, so `isolation = "none"` is the one
+  configuration that honours it. The review gate's every-id-`done` check is
+  unchanged.
 
 - Announce a ledger publish that publishes nothing (`sweep-ledger-commit-clean`), for every
   outcome that publishes nothing. An ignored path reads clean, so a project
