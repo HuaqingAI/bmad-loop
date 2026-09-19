@@ -1006,6 +1006,33 @@ def test_receipt_captures_and_restores_a_tracked_entry_type_change(project, tmp_
     )
 
 
+def test_receipt_capture_skips_an_uninitialized_submodule(project, tmp_path):
+    """A target cloned without `--recurse-submodules` holds every gitlink as an
+    empty directory with no `.git` of its own. The capture probed each one for
+    its superproject, git discovered the enclosing repository instead (whose
+    superproject is nothing), and every modern bundle integration into such a
+    target refused with "changed ownership" over a submodule the unit never
+    touched (Codex, #796 review). An empty directory at an indexed gitlink is
+    an unpopulated checkout — git's own shape — with nothing to capture; a
+    populated directory that is not this repository's checkout still is not.
+
+    Ablation: drop the emptiness test and the uninitialized row reds on the
+    raise."""
+    repo = project.project
+    _origin, checkout, _old = _add_test_submodule(repo, tmp_path)
+    git(repo, "submodule", "deinit", "-q", "-f", "--", "module")
+    assert checkout.is_dir() and not any(checkout.iterdir())
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ())
+
+    assert (snapshots, submodules) == ([], [])
+    (checkout / "stray.txt").write_text("not a checkout\n")
+    with pytest.raises(verify.IntegrationEvidenceError, match="changed ownership"):
+        verify.capture_integration_state(repo, run_dir, "d" * 32, ())
+
+
 def test_receipt_detects_index_only_submodule_gitlink_drift(project, tmp_path):
     repo = project.project
     origin, checkout, old_submodule = _add_test_submodule(repo, tmp_path)

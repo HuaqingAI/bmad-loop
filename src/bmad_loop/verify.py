@@ -996,7 +996,11 @@ def _capture_integration_state_into(
     submodules: list[dict[str, object]] = []
     for rel in _indexed_submodules(repo):
         _validated, checkout = _confined_repo_operand(repo, rel)
-        if not checkout.is_dir():
+        # an unpopulated gitlink — a clone without `--recurse-submodules` —
+        # is an empty directory with no `.git`: git's shape, nothing to
+        # capture, and a probe from inside it would find the superproject
+        # itself and call the submodule foreign (#796 review)
+        if not checkout.is_dir() or not any(checkout.iterdir()):
             continue
         repo_root = repo.resolve(strict=True)
         if checkout.resolve(strict=True) != repo_root.joinpath(*rel.split("/")):

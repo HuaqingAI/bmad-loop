@@ -519,7 +519,9 @@ breaking changes may land in a minor release.
   (`a` deleted, `a/b` added) integrates — the capture read the leaf beneath
   the file as a fault rather than as absent, pausing before the merge and
   again on every resume — and its refusal restores the old shape through the
-  parent path alone, git refusing the pair.
+  parent path alone, git refusing the pair; a target cloned without
+  `--recurse-submodules`, every gitlink an empty directory, integrates too —
+  the capture probed each one for its superproject and called it foreign.
 
 - Recover sweep migration publication faults without persisting unearned `DONE`
   state (DW-296/DW-297). Persist accepted baseline/rewrite records, clear a
