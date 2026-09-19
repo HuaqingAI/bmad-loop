@@ -481,7 +481,9 @@ breaking changes may land in a minor release.
   checkout, or sealed into the squash leg's own commit, is refused and restored
   rather than recorded as `unit-merged` — and the accepted artifact paths are
   resolved before the receipt is armed, so a resolver refusal pauses ahead of any
-  target mutation instead of snapshotting short of them.
+  target mutation instead of snapshotting short of them. A collision-cleanup fault
+  restores only the paths the cleanup touched, never a planned path it had not
+  reached.
 
 - Recover sweep migration publication faults without persisting unearned `DONE`
   state (DW-296/DW-297). Persist accepted baseline/rewrite records, clear a

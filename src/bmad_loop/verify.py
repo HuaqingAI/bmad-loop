@@ -4609,8 +4609,19 @@ def apply_incoming_collision_plan(
     plan: IncomingCollisionPlan,
     *,
     before_mutate: Callable[[str], bool] | None = None,
+    progress: list[str] | None = None,
 ) -> list[str]:
-    """Apply an already snapshotted collision plan without widening its paths."""
+    """Apply an already snapshotted collision plan without widening its paths.
+
+    ``progress``, when given, receives each path as it is TAKEN UP — after its
+    ``before_mutate`` reading passed and before its first mutation — so a caller
+    whose restore must reach exactly what this touched reads it after any
+    failure: the paths already cleaned plus the one in flight, never the ones
+    still ahead. Those may carry fresh operator state by the time the failure
+    lands, and restoring them from the snapshot would flatten it (#796 review);
+    the ``cleaned`` an `IntegrationCleanupChangedError` carries is the same
+    inventory minus the in-flight path, which that error proved untouched.
+    """
     if not plan.cleaned:
         return []
     current = dirty_paths(repo)
@@ -4642,6 +4653,8 @@ def apply_incoming_collision_plan(
     for path in plan.cleaned:
         if before_mutate is not None and not before_mutate(path):
             raise IntegrationCleanupChangedError(cleaned)
+        if progress is not None:
+            progress.append(path)
         if path in untracked:  # untracked: delete it, then prune emptied dirs
             fp = repo / path
             fp.unlink(missing_ok=True)

@@ -28233,6 +28233,76 @@ def test_replay_refuses_changed_receipt_owned_collision_before_cleanup(project, 
     assert "unit-merged" not in journal_kinds(resumed)
 
 
+def test_collision_cleanup_fault_restores_only_the_paths_it_touched(project, monkeypatch):
+    """A `GitError`/`OSError` mid-cleanup used to restore the WHOLE collision
+    plan from the receipt snapshot — the crash-replay arm gates its restore on
+    `integration_cleanup_state_recoverable` and the identity arm on the error's
+    own `cleaned`, but the ordinary-fault arm reached for
+    `collision_plan.cleaned`. With two collisions, a fault on the first after
+    a concurrent writer changed the second flattened that fresh operator edit
+    over a path the run never touched (#796 review). The cleanup now reports
+    its progress — finished paths plus the one in flight — and the restore
+    reaches exactly those.
+
+    Two collisions: the leaked untracked `report.bin` (first, untracked →
+    unlink) and the tracked `src.txt` the pre_merge stage dirties (second).
+    The writer lands on `src.txt` after the run's last pre-cleanup identity
+    reading and the unlink of `report.bin` faults. Ablation: restore
+    `collision_plan.cleaned` in the fault arm and this reds on `src.txt` —
+    the snapshot's bytes, the operator's gone."""
+    effect, destination, accepted = _git_bound_publication_bundle(project, "pending-tracked")
+    destination.write_bytes(accepted)
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    emit = engine._worktree_flow._emit
+
+    def add_second_collision(stage, task, *args, **kwargs):
+        if stage == "pre_merge":
+            source = Path(task.worktree_path) / "src.txt"
+            (project.project / "src.txt").write_bytes(source.read_bytes())
+        return emit(stage, task, *args, **kwargs)
+
+    monkeypatch.setattr(engine._worktree_flow, "_emit", add_second_collision)
+    target_head = verify.rev_parse_head(project.repo_root)
+    apply_plan = verify.apply_incoming_collision_plan
+    report_rel = destination.relative_to(project.repo_root).as_posix()
+    real_unlink = Path.unlink
+
+    def fault_on_report(self, missing_ok=False):
+        if self.name == "report.bin":
+            raise PermissionError(f"synthetic unlink fault: {self}")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    def writer_then_fault(repo, plan, **kwargs):
+        assert list(plan.cleaned) == [report_rel, "src.txt"]  # order the test relies on
+        (project.project / "src.txt").write_bytes(b"fresh operator bytes")
+        monkeypatch.setattr(Path, "unlink", fault_on_report)
+        try:
+            return apply_plan(repo, plan, **kwargs)
+        finally:
+            monkeypatch.setattr(Path, "unlink", real_unlink)
+
+    monkeypatch.setattr(verify, "apply_incoming_collision_plan", writer_then_fault)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    reason = engine.state.paused_reason or ""
+    assert reason.startswith("target collision cleanup failed after receipt capture")
+    assert "synthetic unlink fault" in reason and "restoration failed" not in reason
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert "unit-merge-started" not in journal_kinds(engine)
+    # the path in flight is back at its snapshot; the untouched one keeps the operator's edit
+    assert destination.read_bytes() == accepted
+    assert (project.project / "src.txt").read_bytes() == b"fresh operator bytes"
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert Path(durable.worktree_path).is_dir()
+
+
 def test_partial_collision_cleanup_crash_restores_before_replanning(project, monkeypatch):
     effect, destination, accepted = _git_bound_publication_bundle(project, "pending-tracked")
     destination.write_bytes(accepted)

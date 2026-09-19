@@ -3098,6 +3098,14 @@ class WorktreeFlow:
                 self._pause_integration_evidence(
                     task, exc, prefix="target collision cleanup could not be armed"
                 )
+        # What the cleanup has TOUCHED, for the restore in the except arm: the
+        # paths it finished plus the one in flight when it failed. Never the
+        # whole plan — a path still ahead may hold fresh operator state by then,
+        # and the snapshot would flatten it (#796 review). The identity error's
+        # own `cleaned` is this inventory minus the in-flight path, which that
+        # error proved untouched. Bound before the `try` so a probe fault ahead
+        # of the cleanup restores nothing rather than naming an unbound list.
+        progress: list[str] = []
         try:
             if receipt_required and not landed:
                 assert attempt is not None
@@ -3137,6 +3145,7 @@ class WorktreeFlow:
                     repo,
                     collision_plan,
                     before_mutate=cleanup_identity_unchanged,
+                    progress=progress,
                 )
                 if cleaned_without_receipt is None
                 else cleaned_without_receipt
@@ -3155,7 +3164,7 @@ class WorktreeFlow:
                         include_paths=(
                             e.cleaned
                             if isinstance(e, verify.IntegrationCleanupChangedError)
-                            else collision_plan.cleaned
+                            else tuple(progress)
                         ),
                     )
                 except (verify.GitError, OSError, RuntimeError, ValueError) as restore_exc:
