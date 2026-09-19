@@ -838,8 +838,12 @@ def _validated_submodule_checkout(
     if expected is None:
         # captured unpopulated: an empty directory, or none, is the captured
         # shape; a populated one is attempt-era — owned, it is the restore's
-        # to remove (`allow_missing`, the restore's own reading); foreign, or
-        # in any reading asked to verify, it is changed receipt-owned state
+        # to remove (`allow_missing`, the restore's own reading); a plain
+        # directory, no `.git` entry, is the commit's in the gitlink's place
+        # (a tracked directory replacing it), which `git restore` empties
+        # ahead of the restore's reading, so that reading judges what is
+        # left; a repository of any other kind is foreign; and in any reading
+        # asked to verify, populated is changed receipt-owned state
         if not checkout.is_dir():
             return checkout
         root = repo.resolve(strict=True)
@@ -849,13 +853,15 @@ def _validated_submodule_checkout(
             )
         if not any(checkout.iterdir()):
             return checkout
+        if verify_head or not allow_missing:
+            raise IntegrationEvidenceError("target submodule checkout was not restored")
+        if not (checkout / ".git").exists():
+            return checkout
         # git names the superproject for any repository at an indexed
         # gitlink, a fresh `git init` included; the clone's git dir under
         # `.git/modules` is what marks it this repository's submodule
         if not _submodule_git_dir_in_modules(root, checkout):
             raise IntegrationEvidenceError("persisted target submodule checkout changed ownership")
-        if verify_head or not allow_missing:
-            raise IntegrationEvidenceError("target submodule checkout was not restored")
         return checkout
     if allow_missing and not checkout.is_dir():
         return checkout
@@ -888,10 +894,21 @@ def _restore_submodule_checkouts(
             # attempt-era whole (the receipt proved the directory empty), and
             # git's own shape is the empty directory (#796 review). Ownership
             # was proved before the first mutation; `.git/modules` keeps the
-            # clone, exactly as `submodule deinit` would leave it.
+            # clone, exactly as `submodule deinit` would leave it. A directory
+            # of any other kind still standing — the commit's own files are
+            # already restored away — is the proved-absent directory's
+            # doctrine: nothing the restore can attribute is removed.
             checkout = _validated_submodule_checkout(
                 repo, entry, verify_head=False, revision=old_revision, allow_missing=True
             )
+            if (
+                checkout.is_dir()
+                and any(checkout.iterdir())
+                and not _submodule_git_dir_in_modules(repo.resolve(strict=True), checkout)
+            ):
+                raise IntegrationRestoreError(
+                    f"target submodule directory contains unowned state: {rel}"
+                )
             _empty_submodule_directory(repo, checkout)
             continue
         rc, detail = _git(repo, "submodule", "update", "--init", "--checkout", "--", rel)
@@ -2380,6 +2397,7 @@ def integrated_introduced_directories_drift(
     run_dir: Path,
     snapshots: object,
     *,
+    submodules: object = None,
     operation_identity: str | None = None,
 ) -> tuple[str, ...]:
     """Entries under a directory the integrated commit created that it does not hold.
@@ -2395,7 +2413,11 @@ def integrated_introduced_directories_drift(
     same, and ``absent_parents`` never names it — the ancestor existed — but
     the receipt captured the entry under its own path as ``regular`` or
     ``symlink``, so a captured non-directory the commit now holds only as a
-    prefix is a root too (#796 review). Each topmost such directory is walked
+    prefix is a root too (#796 review) — as is a gitlink the receipt recorded
+    unpopulated (``submodules``, ``head`` None: an empty directory, nothing
+    snapshotted) that the commit replaced with a tracked directory, which
+    the submodule reading accepts as the commit's own by its lack of a
+    ``.git`` and reads no further (#796 review). Each topmost such directory is walked
     on disk, symlinks never followed, against the commit's inventory: a file or
     symlink must be a path the commit holds, a directory a prefix it holds —
     or a gitlink, whose populated checkout is `validate_integrated_submodule_state`'s
@@ -2405,8 +2427,8 @@ def integrated_introduced_directories_drift(
     there is nothing to walk; a symlink in its place is drift. Path-only
     evidence, sorted.
     """
-    validated, _submodules = validate_integration_state_schema(
-        run_dir, snapshots, [], operation_identity
+    validated, validated_submodules = validate_integration_state_schema(
+        run_dir, snapshots, [] if submodules is None else submodules, operation_identity
     )
     roots: set[str] = set()
     replaced: set[str] = set()
@@ -2417,12 +2439,16 @@ def integrated_introduced_directories_drift(
             roots.add(str(parents[-1]))  # captured from the path upward: last is topmost
         if entry["state"] in {"regular", "symlink"}:
             replaced.add(str(entry["path"]))
+    for entry in validated_submodules:
+        if entry.get("head") is None:
+            replaced.add(str(entry["path"]))
     if not roots and not replaced:
         return ()
     inventory = _revision_inventory(repo, revision)
     held = _inventory_held_paths(inventory)
-    # a captured file the commit holds only as a prefix stands where the
-    # commit made a directory; one it still holds, or deleted, is no root
+    # a captured file, or unpopulated gitlink, the commit holds only as a
+    # prefix stands where the commit made a directory; one it still holds,
+    # or deleted, is no root
     roots.update(rel for rel in replaced if rel in held and rel not in inventory)
     if not roots:
         return ()
@@ -2636,7 +2662,9 @@ def validate_integrated_submodule_state(
                 checkout = repo / rel
                 if rel in unpopulated and checkout.is_dir() and any(checkout.iterdir()):
                     if rel in held_paths and not (checkout / ".git").exists():
-                        continue  # the commit's own directory in its place
+                        # the commit's own directory in its place — walked
+                        # against the commit by the introduced-directory reading
+                        continue
                     raise IntegrationEvidenceError(
                         "target hook changed an integrated submodule checkout"
                     )

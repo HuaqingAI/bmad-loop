@@ -5,6 +5,7 @@ Exercised against the conftest `project` sandbox (a real git repo at
 helpers carry no engine wiring yet — they are the plumbing Phase 3 builds on.
 """
 
+import functools
 import os
 import shutil
 import subprocess
@@ -1231,6 +1232,117 @@ def test_integrated_unpopulated_gitlink_a_hook_populated_reads_as_introduced(
             verify.validate_integrated_submodule_state(
                 repo, submodules, prospective_paths=("module",), revision=integrated
             )
+
+
+@pytest.mark.parametrize("anchored", [True, False], ids=["anchored", "checked-path"])
+@pytest.mark.parametrize("residue", ["none", "ignored-file", "ignored-directory"])
+def test_integrated_directory_replacing_an_unpopulated_gitlink_is_walked(
+    project, tmp_path, monkeypatch, residue, anchored
+):
+    """The incoming commit replaces an unpopulated gitlink with a tracked
+    directory: the submodule reading accepts the directory as the commit's
+    own (no `.git` inside), the superproject's diff and status readings never
+    list an ignored entry, and the walk had no root — the empty directory
+    existed at capture, so the new descendants record no absent parent, and
+    the submodule capture snapshots nothing at a gitlink (Codex, #796
+    review). The receipt recorded the gitlink unpopulated, though, so a
+    captured-unpopulated gitlink the commit holds only as a prefix is a root
+    of the walk like any directory the commit created, and a hook's
+    gitignored write under it is refused by path. The restore of a clean
+    replacement puts the gitlink and its empty directory back, `git restore`
+    having taken the commit's own files; the pre-restore reading, which
+    called that plain directory a checkout of changed ownership, lets it
+    through for exactly that. Residue left in it is the proved-absent
+    directory's doctrine: nothing the restore cannot attribute is removed,
+    and it refuses with the path named, the residue in place.
+
+    Ablation: leave the unpopulated entries out of the roots and the residue
+    rows red on the drift reading; remove the unowned-state test from the
+    restore and they red on the residue removed."""
+    repo = project.project
+    if not anchored:
+        monkeypatch.setattr(verify, "DIR_FD_ANCHORED_WRITES", False)
+    _origin, checkout, old_submodule = _uninitialized_submodule(repo, tmp_path)
+    (repo / ".gitignore").write_text("*.tmp\ncache/\n")
+    git(repo, "add", "--", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore hook output")
+    old = verify.rev_parse_head(repo)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, ("module", "module/x")
+    )
+    assert submodules[0]["head"] is None
+    assert [entry["path"] for entry in snapshots] == ["module/x"]
+    git(repo, "rm", "-q", "--cached", "--", "module")
+    git(repo, "config", "-f", ".gitmodules", "--remove-section", "submodule.module")
+    (checkout / "x").write_text("the commit's own\n")
+    git(repo, "add", "--", ".gitmodules", "module/x")
+    git(repo, "commit", "-q", "-m", "integrated: module becomes a directory")
+    integrated = verify.rev_parse_head(repo)
+    if residue == "ignored-file":
+        (checkout / "cache.tmp").write_text("target hook output\n")
+        expected = ("module/cache.tmp",)
+    elif residue == "ignored-directory":
+        (checkout / "cache").mkdir()
+        (checkout / "cache" / "y").write_text("target hook output\n")
+        expected = ("module/cache",)
+    else:
+        expected = ()
+    assert git(repo, "status", "--porcelain", "-uall") == ""
+    assert (
+        verify.validate_integrated_submodule_state(
+            repo, submodules, prospective_paths=("module", "module/x"), revision=integrated
+        )
+        == ()
+    )
+    assert verify.integrated_stray_paths(repo, tolerated=(), incoming=("module", "module/x")) == ()
+
+    assert (
+        verify.integrated_introduced_directories_drift(
+            repo,
+            integrated,
+            run_dir,
+            snapshots,
+            submodules=submodules,
+            operation_identity="e" * 32,
+        )
+        == expected
+    )
+
+    restore = functools.partial(
+        verify.restore_integration_ref,
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=integrated,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity="e" * 32,
+    )
+    if residue != "none":
+        with pytest.raises(verify.IntegrationRestoreError, match="unowned state: module"):
+            restore()
+        assert verify.rev_parse_head(repo) == integrated
+        assert sorted(entry.name for entry in checkout.iterdir()) == [expected[0].split("/")[1]]
+        return
+    restore()
+
+    assert verify.rev_parse_head(repo) == old
+    assert checkout.is_dir() and not any(checkout.iterdir())
+    assert git(repo, "ls-files", "--stage", "--", "module").startswith(f"160000 {old_submodule}")
+    assert git(repo, "status", "--porcelain", "-uall", "--ignored") == ""
+    assert verify.integration_restoration_complete(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=integrated,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity="e" * 32,
+    )
 
 
 def test_receipt_detects_index_only_submodule_gitlink_drift(project, tmp_path):

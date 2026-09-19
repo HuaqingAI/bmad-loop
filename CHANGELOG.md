@@ -487,13 +487,16 @@ breaking changes may land in a minor release.
   the strays the guard tolerated before the merge); the restore reverts what
   the hook staged and leaves unstaged and untracked entries in place, named
   for the operator; and a directory the unit creates, where the receipt
-  proved nothing was — or where the receipt captured a tracked file or
-  symlink the unit replaced — is walked on disk against the integrated
-  commit, so a hook's gitignored write or nested `.git` there — which no
-  `status` reading lists — is refused too (that restore is the proved-absent
-  directory's existing doctrine: it removes nothing it cannot attribute, and
-  pauses as not safely restorable with the path named; the replaced file's
-  restore goes through its own path, git taking the directory with it). A unit
+  proved nothing was — or where the receipt captured a tracked file, a
+  symlink, or an unpopulated gitlink the unit replaced — is walked on disk
+  against the integrated commit, so a hook's gitignored write or nested
+  `.git` there — which no `status` reading lists — is refused too (that
+  restore is the proved-absent directory's existing doctrine: it removes
+  nothing it cannot attribute, and pauses as not safely restorable with the
+  path named; the replaced file's restore goes through its own path, git
+  taking the directory with it, and the replaced gitlink's puts the empty
+  directory back once git has taken the commit's files, refusing over
+  anything else left there). A unit
   that deletes a populated target submodule integrates: git leaves the checkout
   behind (`?? path/`), which is accepted only as the exact captured checkout
   and otherwise refused, with the refusal's restore undoing a hook's writes

@@ -3572,7 +3572,8 @@ class WorktreeFlow:
                         "entries left in place): " + ", ".join(strays)
                     )
                 # And the one place none of those list: a directory the commit
-                # created where the receipt proved nothing was, walked on disk
+                # created where the receipt proved nothing was — or proved a
+                # file, a symlink, or an unpopulated gitlink — walked on disk
                 # — a hook's gitignored write or nested `.git` there is
                 # attempt-era with everything else in it (#796 review).
                 residue = verify.integrated_introduced_directories_drift(
@@ -3580,6 +3581,7 @@ class WorktreeFlow:
                     expected_revision,
                     self.run_dir,
                     attempt["snapshots"],
+                    submodules=attempt["submodules"],
                     operation_identity=attempt["operation_identity"],
                 )
                 if residue:
