@@ -632,6 +632,68 @@ def test_receipt_restores_exact_staged_index_and_worktree_bytes(project, tmp_pat
     )
 
 
+def test_restoration_complete_ignores_operator_dirt_outside_the_receipt_inventory(
+    project, tmp_path
+):
+    """`integration_restoration_complete` reads the worktree WHOLE-TREE on the
+    receipt arm (`git diff` takes no stdin pathspec) and used to count every
+    unstaged tracked edit outside the snapshot as residue — so a file the
+    operator edited after the receipt was armed, which the restore never
+    touched, turned a completed restore into "incomplete", at refusal time and
+    on every replay until they cleared it (#796 review). The reading is now
+    scoped to the receipt-attributable inventory, as the legacy arm's pathspec
+    already scoped it; dirt ON that inventory still reads incomplete.
+
+    Ablation: drop the `& set(paths)` and the bystander row reds."""
+    repo = project.project
+    bystander = repo / "bystander.txt"
+    bystander.write_text("committed\n")
+    (repo / "feature.txt").write_text("baseline\n")
+    git(repo, "add", "--", "bystander.txt", "feature.txt")
+    git(repo, "commit", "-q", "-m", "baseline")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    operation = "c" * 32
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, operation, ("feature.txt",)
+    )
+    old = verify.rev_parse_head(repo)
+    (repo / "feature.txt").write_text("integrated\n")
+    git(repo, "add", "--", "feature.txt")
+    git(repo, "commit", "-q", "-m", "integrated")
+    new = verify.rev_parse_head(repo)
+    # the operator's edit lands after the receipt was armed, on a path the
+    # integration never touched
+    bystander.write_text("operator edit during the merge window\n")
+
+    verify.restore_integration_ref(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity=operation,
+    )
+
+    assert verify.rev_parse_head(repo) == old
+    assert bystander.read_text() == "operator edit during the merge window\n"  # untouched
+    assert git(repo, "diff", "--name-only") == "bystander.txt"
+    complete = dict(
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity=operation,
+    )
+    assert verify.integration_restoration_complete(repo, "refs/heads/main", **complete)
+    # dirt on the inventory itself is still residue
+    (repo / "feature.txt").write_text("residue\n")
+    assert not verify.integration_restoration_complete(repo, "refs/heads/main", **complete)
+
+
 def test_receipt_restores_intent_to_add_index_entry(project, tmp_path):
     repo = project.project
     candidate = repo / "intent.txt"

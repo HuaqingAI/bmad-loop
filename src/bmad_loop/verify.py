@@ -2363,6 +2363,15 @@ def integration_restoration_complete(
             return False
     if not paths:
         return True
+    # The worktree reading is scoped to the receipt-attributable inventory
+    # (`paths`: commit delta, post-hook index delta, accepted artifact paths)
+    # — on the legacy arm as a pathspec, on the receipt arm as a whole-tree
+    # read filtered here, since `git diff` takes no stdin pathspec and a wide
+    # inventory stays off argv. A tracked file the OPERATOR edited, unstaged,
+    # after the receipt was armed sits outside that inventory: it is theirs,
+    # the restore never touched it, and it must not turn a completed restore
+    # into "incomplete" — at refusal time, and again on every replay until
+    # they clear it (#796 review).
     path_args = () if run_dir is not None else tuple(_literal_specs(paths))
     worktree_delta = _nul_git_paths(
         git_bytes(
@@ -2377,7 +2386,7 @@ def integration_restoration_complete(
         unavailable="restored target worktree evidence is unavailable",
     )
     submodule_paths = {str(entry["path"]) for entry in validated_submodules}
-    return not (set(worktree_delta) - snapshot_paths - submodule_paths)
+    return not (set(worktree_delta) & set(paths) - snapshot_paths - submodule_paths)
 
 
 def last_commit_for(repo: Path, path: Path) -> str:
