@@ -3655,6 +3655,133 @@ def test_integrated_introduced_directory_refuses_an_entry_status_never_lists(
     )
 
 
+@pytest.mark.parametrize("anchored", [True, False], ids=["anchored", "checked-path"])
+@pytest.mark.parametrize("residue", ["ignored-file", "nested-repo"])
+@pytest.mark.parametrize("shape", ["file", "symlink", "file-deep"])
+def test_integrated_directory_replacing_a_tracked_entry_is_walked(
+    project, tmp_path, monkeypatch, shape, residue, anchored
+):
+    """A directory the incoming commit puts where a tracked file (or symlink)
+    stood is one it created just as much as one where nothing stood — but
+    `absent_parents` stops at the first existing ancestor, and the file
+    exists, so the receipt named no proved-absent directory and the walk had
+    no root: a target hook's gitignored write or nested `.git` under the new
+    directory went unseen and the run recorded `unit-merged` over it (Codex,
+    #796 review). The receipt already proves what stood there — the entry
+    is captured under its own path as `regular` or `symlink` — so a path the
+    receipt proved a non-directory and the commit now holds only as a prefix
+    is a root of the walk. A leaf deeper down (`a/b/c`) records `a/b`
+    absent; the walk starts at `a` all the same. On that refusal the restore
+    puts the entry back through its own path, git taking the directory —
+    the hook's residue with it, the receipt having proved the path a file —
+    and the restoration reads complete, on the descriptor-anchored restore
+    and the checked-path one alike.
+
+    Ablation: derive roots from `absent_parents` alone and every row reds on
+    the drift reading."""
+    repo = project.project
+    if not anchored:
+        monkeypatch.setattr(verify, "DIR_FD_ANCHORED_WRITES", False)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (repo / ".gitignore").write_text("*.tmp\n")
+    git(repo, "add", "--", ".gitignore")
+    if shape == "symlink":
+        os.symlink("src.txt", repo / "a")
+    else:
+        (repo / "a").write_text("a file\n")
+    git(repo, "add", "--", "a")
+    git(repo, "commit", "-q", "-m", "a is an entry")
+    old = verify.rev_parse_head(repo)
+    leaf = "a/b/c" if shape == "file-deep" else "a/b"
+    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ("a", leaf))
+    by_path = {entry["path"]: entry for entry in snapshots}
+    assert by_path["a"]["state"] == ("symlink" if shape == "symlink" else "regular")
+    assert by_path[leaf]["absent_parents"] == (["a/b"] if shape == "file-deep" else [])
+    git(repo, "rm", "-q", "--", "a")
+    (repo / leaf).parent.mkdir(parents=True)
+    (repo / leaf).write_text("a directory\n")
+    git(repo, "add", "--", leaf)
+    git(repo, "commit", "-q", "-m", "integrated: a becomes a directory")
+    integrated = verify.rev_parse_head(repo)
+    if residue == "ignored-file":
+        (repo / "a" / "cache.tmp").write_text("target hook output\n")
+        expected = ("a/cache.tmp",)
+    else:
+        git(repo / "a", "init", "-q")
+        expected = ("a/.git",)
+    assert git(repo, "status", "--porcelain", "-uall") == ""
+    assert verify.integrated_paths_drift(repo, integrated, ("a", leaf)) == ()
+    assert verify.integrated_stray_paths(repo, tolerated=(), incoming=("a", leaf)) == ()
+
+    assert (
+        verify.integrated_introduced_directories_drift(
+            repo, integrated, run_dir, snapshots, operation_identity="e" * 32
+        )
+        == expected
+    )
+
+    verify.restore_integration_ref(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=integrated,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity="e" * 32,
+    )
+
+    assert verify.rev_parse_head(repo) == old
+    if shape == "symlink":
+        assert os.readlink(repo / "a") == "src.txt"
+    else:
+        assert (repo / "a").read_text() == "a file\n"
+    assert git(repo, "status", "--porcelain", "-uall", "--ignored") == ""
+    assert verify.integration_restoration_complete(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=integrated,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity="e" * 32,
+    )
+
+
+def test_integrated_directory_replacing_a_tracked_entry_accepts_its_own_contents(project, tmp_path):
+    """The walk over a directory that replaced a tracked file accepts exactly
+    what the commit holds under it; and a receipt-captured file the commit
+    still holds as a file — or deletes outright — is no root at all."""
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (repo / "a").write_text("a file\n")
+    (repo / "kept").write_text("kept\n")
+    (repo / "gone").write_text("gone\n")
+    git(repo, "add", "--", "a", "kept", "gone")
+    git(repo, "commit", "-q", "-m", "three files")
+    snapshots, _submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, ("a", "a/b", "a/deep/leaf", "kept", "gone")
+    )
+    git(repo, "rm", "-q", "--", "a", "gone")
+    (repo / "a" / "deep").mkdir(parents=True)
+    (repo / "a" / "b").write_text("a directory\n")
+    (repo / "a" / "deep" / "leaf").write_text("a directory\n")
+    (repo / "kept").write_text("kept, edited\n")
+    git(repo, "add", "--", "a", "kept")
+    git(repo, "commit", "-q", "-m", "integrated: a becomes a directory")
+    integrated = verify.rev_parse_head(repo)
+
+    assert (
+        verify.integrated_introduced_directories_drift(
+            repo, integrated, run_dir, snapshots, operation_identity="e" * 32
+        )
+        == ()
+    )
+
+
 def test_integrated_introduced_directory_accepts_the_commit_s_own_contents(project, tmp_path):
     """The walk accepts exactly what the integrated commit holds under the new
     directory — files, nested directories, a symlink — and leaves an

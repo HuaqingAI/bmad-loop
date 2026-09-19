@@ -2390,8 +2390,13 @@ def integrated_introduced_directories_drift(
     paths, `integrated_stray_paths` takes ``status`` without ``--ignored``,
     which also never names a ``.git``. So a target hook writing a gitignored
     file into the new directory, or initialising a repository inside it, went
-    unseen (#796 review). Each topmost proved-absent directory is walked on
-    disk, symlinks never followed, against the commit's inventory: a file or
+    unseen (#796 review). A directory the commit put where a tracked file or
+    symlink stood (``a`` deleted, ``a/b`` added) is the commit's just the
+    same, and ``absent_parents`` never names it — the ancestor existed — but
+    the receipt captured the entry under its own path as ``regular`` or
+    ``symlink``, so a captured non-directory the commit now holds only as a
+    prefix is a root too (#796 review). Each topmost such directory is walked
+    on disk, symlinks never followed, against the commit's inventory: a file or
     symlink must be a path the commit holds, a directory a prefix it holds —
     or a gitlink, whose populated checkout is `validate_integrated_submodule_state`'s
     to read (with ``--ignored``, the path having been proved absent) and is
@@ -2404,15 +2409,23 @@ def integrated_introduced_directories_drift(
         run_dir, snapshots, [], operation_identity
     )
     roots: set[str] = set()
+    replaced: set[str] = set()
     for entry in validated:
         parents = entry.get("absent_parents")
         assert isinstance(parents, list)
         if parents:
             roots.add(str(parents[-1]))  # captured from the path upward: last is topmost
-    if not roots:
+        if entry["state"] in {"regular", "symlink"}:
+            replaced.add(str(entry["path"]))
+    if not roots and not replaced:
         return ()
     inventory = _revision_inventory(repo, revision)
     held = _inventory_held_paths(inventory)
+    # a captured file the commit holds only as a prefix stands where the
+    # commit made a directory; one it still holds, or deleted, is no root
+    roots.update(rel for rel in replaced if rel in held and rel not in inventory)
+    if not roots:
+        return ()
     drift: list[str] = []
     for root in sorted(roots):
         if any(root.startswith(f"{other}/") for other in roots):
