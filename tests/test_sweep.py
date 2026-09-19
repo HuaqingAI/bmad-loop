@@ -27320,6 +27320,86 @@ def test_target_hook_rewriting_an_incoming_source_path_is_refused_and_restored(
         ("ff", "post-merge"),
     ],
 )
+def test_target_hook_recreating_a_deleted_incoming_path_is_refused_and_restored(
+    project, strategy, hook_name
+):
+    """The incoming-path reading above proves the post-hook index and checkout
+    against the integrated commit through two whole-tree `git diff` listings —
+    and `git diff` reports only what the index tracks. So an incoming path the
+    unit DELETES, which a TARGET hook then recreates without staging, went
+    unseen on every leg: `status` showed `?? retired.txt`, both diffs stayed
+    empty, and with the incoming set excluded from the receipt's snapshot
+    comparison too, the run recorded `unit-merged` and retired its rollback
+    receipt over hook-made content the integrated commit does not hold (Codex,
+    #796 review). For a deleted incoming path the commit's authority is "absent
+    from the checkout": the reading now probes the filesystem for exactly
+    those, and every leg is refused through the receipt route — the exact
+    pre-attempt target restored (the file is back, as committed), source
+    retained, never `unit-merged`.
+
+    Ablation: drop the absent-path probe from `integrated_paths_drift` and
+    every row reds on `summary.paused` — the run finished, `unit-merged`
+    journaled, `retired.txt` on disk with the hook's bytes and absent from
+    HEAD."""
+    retired = project.project / "retired.txt"
+    retired.write_text("the unit deletes me\n")
+    git(project.project, "add", "--", "retired.txt")
+    git(project.project, "commit", "-q", "-m", "retired.txt present on the target")
+    effect, _expected = _ignored_publication_bundle(project)
+    target_head = verify.rev_parse_head(project.repo_root)
+
+    def deleting_effect(spec):
+        (spec.cwd / "retired.txt").unlink()
+        return effect(spec)
+
+    hook = project.project / ".git" / "hooks" / hook_name
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        "  printf 'target hook recreation' > retired.txt\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), deleting_effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    # the exact pre-attempt target is back: ref, index and checkout alike
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert retired.read_text() == "the unit deletes me\n"
+    assert git(project.project, "status", "--porcelain") == ""
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt.get("outcome") == "refused-restored"
+    assert "unit-merged" not in journal_kinds(engine)
+    assert not durable.artifact_publication_complete
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert refusal["error"].endswith("incoming paths after integration: retired.txt")
+    assert "target hook recreation" not in refusal["error"]  # path-only evidence
+    # the unit is retained for recovery with its accepted commit intact
+    assert Path(durable.worktree_path).is_dir()
+    assert verify.branch_exists(project.repo_root, durable.branch)
+    assert durable.commit_sha not in (None, durable.baseline_commit)
+    assert (
+        git(project.project, "ls-tree", "--name-only", durable.commit_sha, "--", "retired.txt")
+        == ""
+    )
+
+
+@pytest.mark.parametrize(
+    ("strategy", "hook_name"),
+    [
+        ("merge", "pre-merge-commit"),
+        ("squash", "pre-commit"),
+        ("ff", "post-merge"),
+    ],
+)
 def test_target_hook_force_added_ignored_only_artifact_is_refused(project, strategy, hook_name):
     effect, _expected = _ignored_publication_bundle(project)
     destination = project.implementation_artifacts / "report.bin"

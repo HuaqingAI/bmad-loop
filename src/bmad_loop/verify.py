@@ -2036,6 +2036,15 @@ def integrated_paths_drift(repo: Path, revision: str, paths: Iterable[str]) -> t
     ``git diff`` takes no stdin pathspec, and a whole-tree read is what keeps
     a wide incoming set off argv. Path-only evidence; an unreadable probe
     raises rather than answering.
+
+    Those readings cover only what the index tracks, so they cannot see an
+    incoming path the integrated commit DELETES and a hook then recreates
+    without staging: ``status`` shows ``?? path``, both diffs stay empty
+    (#796 review). For a deleted incoming path the commit's authority is
+    "absent from the checkout", so that leg is a filesystem probe — any
+    entry at the path, plain, symlink, or gitignored, is drift. The
+    commit's own inventory (``ls-tree -r``, whole-tree for the same argv
+    reason) says which incoming paths it deleted.
     """
     selected = {_portable_integration_path(path) for path in paths}
     if not selected:
@@ -2052,6 +2061,14 @@ def integrated_paths_drift(repo: Path, revision: str, paths: Iterable[str]) -> t
             for path in (os.fsdecode(raw) for raw in proc.stdout.split(b"\0") if raw)
             if path in selected
         )
+    proc = git_bytes(repo, "ls-tree", "-r", "--name-only", "-z", revision)
+    if proc.returncode != 0:
+        raise IntegrationEvidenceError("the integrated commit's path inventory could not be read")
+    held = {os.fsdecode(raw) for raw in proc.stdout.split(b"\0") if raw}
+    for path in sorted(selected - held):
+        _validated, candidate = _confined_repo_operand(repo, path)
+        if candidate.exists() or candidate.is_symlink():
+            drift.append(path)
     return tuple(dict.fromkeys(drift))
 
 

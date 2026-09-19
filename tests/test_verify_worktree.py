@@ -3145,3 +3145,57 @@ def test_capture_diff_uncapped_includes_large_file(project):
     (repo / "big.bin").write_text("x" * 200_000)
     diff = verify.capture_diff(repo, base, max_file_bytes=None)  # no cap
     assert "big.bin" in diff and "skipped" not in diff
+
+
+@pytest.mark.parametrize("recreated_as", ["file", "symlink", "ignored"])
+def test_integrated_paths_drift_sees_a_deleted_incoming_path_recreated_untracked(
+    project, recreated_as
+):
+    """`integrated_paths_drift` reads two whole-tree `git diff` listings against
+    the integrated commit, and `git diff` reports only index-tracked paths — so
+    an incoming path the integrated commit DELETES, which a TARGET hook then
+    recreates without staging, was invisible to both readings: `status` shows
+    `?? path`, both diffs are empty, the run recorded `unit-merged` and retired
+    the rollback receipt over hook-made content the commit does not hold
+    (Codex, #796 review). For a deleted incoming path the integrated commit's
+    authority is "absent from the checkout", so that leg is a filesystem probe
+    — any entry at the path, plain, symlink, or gitignored, is drift.
+
+    Ablation: drop the absent-path probe and every row reds on the empty
+    drift tuple."""
+    repo = project.project
+    if recreated_as == "ignored":
+        (repo / ".gitignore").write_text("gone.bin\n")
+        git(repo, "add", "--", ".gitignore")
+    (repo / "gone.bin").write_text("incoming deletes me\n")
+    git(repo, "add", "-f", "--", "gone.bin")
+    git(repo, "commit", "-q", "-m", "gone.bin present")
+    git(repo, "rm", "-q", "--", "gone.bin")
+    git(repo, "commit", "-q", "-m", "integrated: delete gone.bin")
+    integrated = verify.rev_parse_head(repo)
+    assert verify.integrated_paths_drift(repo, integrated, ("gone.bin",)) == ()
+
+    if recreated_as == "symlink":
+        os.symlink("src.txt", repo / "gone.bin")
+    else:
+        (repo / "gone.bin").write_text("hook recreated me\n")
+
+    assert git(repo, "diff", "--name-only", integrated) == ""
+    assert git(repo, "diff", "--cached", "--name-only", integrated) == ""
+    assert verify.integrated_paths_drift(repo, integrated, ("gone.bin",)) == ("gone.bin",)
+
+
+def test_integrated_paths_drift_accepts_an_absent_deleted_incoming_path(project):
+    """The absent-path probe is one-directional: a deleted incoming path that
+    IS absent from the checkout is the integrated commit's own state, not
+    drift — and a path the commit still holds keeps the diff readings as its
+    authority, so an unchanged one is not reported either."""
+    repo = project.project
+    (repo / "gone.bin").write_text("incoming deletes me\n")
+    git(repo, "add", "--", "gone.bin")
+    git(repo, "commit", "-q", "-m", "gone.bin present")
+    git(repo, "rm", "-q", "--", "gone.bin")
+    git(repo, "commit", "-q", "-m", "integrated: delete gone.bin")
+    integrated = verify.rev_parse_head(repo)
+
+    assert verify.integrated_paths_drift(repo, integrated, ("gone.bin", "src.txt")) == ()
