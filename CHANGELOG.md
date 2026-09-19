@@ -587,24 +587,28 @@ breaking changes may land in a minor release.
   is still named; and the receipt's absent-parent topology is read by
   git's slash hierarchy, the one the capture wrote: the Windows reading took
   `a:` for a drive and a backslash for a separator, so a POSIX receipt naming
-  such a parent was refused as malformed at the replay that needed it. A
-  resume retires a live receipt on its
-  recorded completion only when the `unit-merged` row names the receipt's
-  operation identity and the target's reflog holds the transition under it
-  with the target still at that result — a coding session holds the writable
-  run directory and can append a `unit-merged` row under its own key, which
-  used to read as validated completion after a host lost between the merge
-  and validation (receipt gone, merge skipped, publication over an unread
-  target); any other row replays the merge, which re-validates under the
-  receipt. With no live receipt — a host lost before one was armed — a
-  bare row is not a modern bundle's completion either: a retired receipt
-  leaves its row naming the operation the target reflog holds, the one
-  piece of the record a session cannot append; anything else replays the
-  merge — an integration that made no ref update (an artifact-only
-  bundle's squash stages nothing) included, since a target that already
-  holds the source proves nothing about bytes another writer changed
-  since, and its replay stages nothing again and re-validates (the released
-  legacy payload integrates without a receipt and keeps its bare row).
+  such a parent was refused as malformed at the replay that needed it. No
+  record retires a live receipt or stands for a modern bundle's
+  completion: a coding session holds the writable run directory and can
+  append a `unit-merged` row under its own key — the receipt's operation
+  identity included — and it holds the shared repository, so the target
+  reflog transition under that identity is its to write too (`git
+  update-ref -m bmad-loop-integrate:<id>`, on a branch checked out in
+  another worktree as well); reading the pair as the validated completion
+  skipped the deterministic target validation after a host loss (receipt
+  gone, merge skipped, publication over whatever the session had put on
+  the target). A live receipt always replays the merge, which finds the
+  moved ref under the receipt and validates it, or pauses with evidence;
+  with no live receipt — a host lost before one was armed, or after a
+  successful integration retired it — the merge replays while the unit's
+  source is still mounted (it stages nothing again over a landed result,
+  re-validates the target's bytes and re-records — an integration that
+  made no ref update, an artifact-only bundle's squash, the same way), and
+  once the completed integration has consumed the source (worktree torn
+  down, branch gone) the completion stands only on the target as it is
+  now — the unit's commit in its history and every accepted artifact blob
+  in its tree and index — or pauses naming the reason (the released legacy
+  payload integrates without a receipt and keeps its bare row).
 
 - Recover sweep migration publication faults without persisting unearned `DONE`
   state (DW-296/DW-297). Persist accepted baseline/rewrite records, clear a
