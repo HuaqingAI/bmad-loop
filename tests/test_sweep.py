@@ -27542,6 +27542,102 @@ def test_target_hook_writing_an_ignored_file_beside_an_incoming_path_is_refused(
     assert verify.branch_exists(project.repo_root, durable.branch)
 
 
+@pytest.mark.parametrize("write", ["kept", "rewritten"])
+@pytest.mark.parametrize(
+    ("strategy", "hook_name"),
+    [
+        ("merge", "pre-merge-commit"),
+        ("squash", "pre-commit"),
+        ("ff", "post-merge"),
+    ],
+)
+def test_an_ignored_file_the_incoming_gitignore_uncovers_is_not_a_hooks_stray(
+    project, strategy, hook_name, write
+):
+    """The incoming commit drops an ignore rule (`.gitignore` is an incoming
+    path) and the target already holds a file that rule covered: ignored
+    before the merge, so the pre-merge guard never listed it and the
+    `tolerated` set does not hold it, and `??` after — so the whole-tree
+    stray reading named it as a hook's write, the integration was restored,
+    and every retry did the same until the operator deleted a file that was
+    there before the attempt (Codex, #796 review). The receipt's sealed
+    ignored-entry listing holds that file with its `lstat` identity, and an
+    untracked entry after the hooks that the listing recorded, at that same
+    identity, predates the attempt and is left out of the stray finding
+    (`kept`): the run lands and the file stays where it is, `??` now. One the
+    listing holds under another identity was written during the attempt and
+    is still named (`rewritten`) — the ignored-entry reading cannot, since it
+    lists what is ignored NOW.
+
+    Ablation: drop the recorded-identity exclusion and the `kept` rows red on
+    `summary.paused`; exclude every recorded path without comparing identity
+    and the `rewritten` rows red — the run finishes over the hook's bytes."""
+    effect, expected = _ignored_publication_bundle(project)
+    (project.project / ".gitignore").write_text(
+        (project.project / ".gitignore").read_text() + "scratch.log\n"
+    )
+    git(project.project, "add", "--", ".gitignore")
+    git(project.project, "commit", "-q", "-m", "ignore the scratch log")
+    (project.project / "scratch.log").write_text("here before the attempt\n")
+    assert git(project.project, "status", "--porcelain", "-uall") == ""
+    target_head = verify.rev_parse_head(project.repo_root)
+    if write == "rewritten":
+        hook = project.project / ".git" / "hooks" / hook_name
+        hook.write_text(
+            "#!/bin/sh\n"
+            'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+            "  printf 'target hook mutation' > scratch.log\n"
+            "fi\n"
+        )
+        hook.chmod(0o755)
+
+    def drops_the_ignore_rule(spec):
+        result = effect(spec)
+        ignore = spec.cwd / ".gitignore"  # committed by the run
+        ignore.write_text(ignore.read_text().replace("scratch.log\n", ""))
+        return result
+
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), drops_the_ignore_rule],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    if write == "kept":
+        assert not summary.paused and not summary.crashed, _records(
+            engine, "artifact-publication-refused"
+        )
+        assert "unit-merged" in journal_kinds(engine)
+        assert durable.artifact_publication_complete
+        assert durable.integration_attempt is None
+        assert verify.rev_parse_head(project.repo_root) != target_head
+        assert "scratch.log" not in (project.project / ".gitignore").read_text()
+        assert (project.project / "scratch.log").read_text() == "here before the attempt\n"
+        assert git(project.project, "status", "--porcelain", "-uall") == "?? scratch.log"
+        assert (project.implementation_artifacts / "spec-dw-fix.md").read_bytes() == (
+            expected["spec"]
+        )
+        return
+    assert summary.paused and not summary.crashed
+    assert "unit-merged" not in journal_kinds(engine)
+    assert not durable.artifact_publication_complete
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert "changed paths outside the incoming set after integration" in refusal["error"]
+    assert refusal["error"].endswith("scratch.log")
+    assert "target hook mutation" not in refusal["error"]  # path-only evidence
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    # named, and left in place: the receipt never read ignored bytes
+    assert (project.project / "scratch.log").read_text() == "target hook mutation"
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt.get("outcome") == "refused-restored"
+    assert Path(durable.worktree_path).is_dir()
+    assert verify.branch_exists(project.repo_root, durable.branch)
+
+
 @pytest.mark.parametrize(
     ("strategy", "hook_name"),
     [

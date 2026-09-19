@@ -2736,22 +2736,30 @@ def ignored_entries(repo: Path) -> dict[str, str]:
             below = path.removeprefix(prefix)
             if below.startswith(_AUTOMATOR_RECORD_PREFIXES) or below in _AUTOMATOR_RECORD_FILES:
                 continue
-        try:
-            entry = os.lstat(os.fsencode(repo / path))
-        except FileNotFoundError:
-            continue
-        entries[path] = ":".join(
-            str(value)
-            for value in (
-                entry.st_size,
-                entry.st_mtime_ns,
-                entry.st_ctime_ns,
-                entry.st_ino,
-                entry.st_dev,
-                entry.st_mode,
-            )
-        )
+        identity = _lstat_identity(repo, path)
+        if identity is not None:
+            entries[path] = identity
     return dict(sorted(entries.items()))
+
+
+def _lstat_identity(repo: Path, path: str) -> str | None:
+    """``lstat`` identity of a tree entry — size, mtime, ctime, inode, device,
+    mode — or ``None`` for one that is gone."""
+    try:
+        entry = os.lstat(os.fsencode(repo / path))
+    except FileNotFoundError:
+        return None
+    return ":".join(
+        str(value)
+        for value in (
+            entry.st_size,
+            entry.st_mtime_ns,
+            entry.st_ctime_ns,
+            entry.st_ino,
+            entry.st_dev,
+            entry.st_mode,
+        )
+    )
 
 
 def capture_ignored_entries(
@@ -2934,6 +2942,8 @@ def integrated_stray_paths(
     tolerated: Iterable[str],
     incoming: Iterable[str],
     retained_checkouts: Iterable[str] = (),
+    run_dir: Path | None = None,
+    ignored: object = None,
 ) -> tuple[str, ...]:
     """Paths dirty after the target's hooks that no receipt reading owns.
 
@@ -2950,23 +2960,36 @@ def integrated_stray_paths(
     (`automator_dirty_paths`; #796 review) — minus what other readings
     own — the ``tolerated`` set, the ``incoming`` set (the diff readings' and
     the absent-path probe's), and every ``retained_checkouts`` leftover with
-    everything under it (the submodule reading's). Path-only evidence, in
-    sorted order. Ceilings: ignored entries are not read here either, and
-    the reading cannot tell a hook from a writer that raced the merge — a
-    per-worktree Editor leaking into the main checkout in that window — and
-    names both; the restore reverts what a hook STAGED (the post-hook index
-    delta is in its inventory) and leaves unstaged and untracked entries
-    where they are, for the operator the pause names them to.
+    everything under it (the submodule reading's) — and minus an untracked
+    entry the receipt's sealed ``ignored`` listing (`capture_ignored_entries`,
+    read from ``run_dir``) recorded at the identity it has now: an ignored
+    file that was already there, which the pre-merge guard never listed
+    because it was ignored, and which an incoming ``.gitignore`` change
+    uncovered, so ``status`` lists it ``??`` after the hooks; it predates
+    the attempt and stays where it is, while one the listing holds under
+    another identity was written during the attempt and is named (#796
+    review). Path-only evidence, in sorted order. Ceilings: ignored entries
+    are not read here either, and the reading cannot tell a hook from a
+    writer that raced the merge — a per-worktree Editor leaking into the
+    main checkout in that window — and names both; the restore reverts what
+    a hook STAGED (the post-hook index delta is in its inventory) and leaves
+    unstaged and untracked entries where they are, for the operator the
+    pause names them to.
     """
     excluded = {_portable_integration_path(path) for path in (*tolerated, *incoming)}
     prefixes = tuple(
         f"{_portable_integration_path(path)}/" for path in dict.fromkeys(retained_checkouts)
     )
+    recorded: dict[str, str] = {}
+    if ignored is not None and run_dir is not None:
+        recorded = _recorded_ignored_entries(run_dir, validate_ignored_entries_evidence(ignored))
     strays: list[str] = []
-    for path in (*dirty_paths(repo), *automator_dirty_paths(repo)):
+    for path, xy in (*dirty_paths(repo).items(), *automator_dirty_paths(repo).items()):
         if path in excluded or path.rstrip("/") in excluded:
             continue
         if any(path == prefix or path.startswith(prefix) for prefix in prefixes):
+            continue
+        if xy == "??" and path in recorded and _lstat_identity(repo, path) == recorded[path]:
             continue
         strays.append(path)
     return tuple(sorted(strays))

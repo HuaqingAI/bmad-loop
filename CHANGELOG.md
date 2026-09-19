@@ -578,7 +578,13 @@ breaking changes may land in a minor release.
   control characters in a name, every reading round-trips them
   NUL-delimited, and holding them everywhere paused each modern bundle that
   touched such a file as malformed (containment — absolute, `..`, `.git`, NUL —
-  holds on every host), and the receipt's absent-parent topology is read by
+  holds on every host); an ignored file that was already there and that an
+  incoming `.gitignore` change uncovers — `??` after the merge, never in
+  the tolerated set since the pre-merge guard never listed it — is no
+  longer named as a hook's stray when the receipt's ignored listing holds
+  it at the identity it still has (it used to pause every retry until the
+  operator deleted it), while one the listing holds under another identity
+  is still named; and the receipt's absent-parent topology is read by
   git's slash hierarchy, the one the capture wrote: the Windows reading took
   `a:` for a drive and a backslash for a separator, so a POSIX receipt naming
   such a parent was refused as malformed at the replay that needed it. A

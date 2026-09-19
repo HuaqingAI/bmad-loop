@@ -3605,15 +3605,20 @@ class WorktreeFlow:
                 # above has no baseline in the receipt, so the whole-tree
                 # reading closes it — after the hooks the target may hold
                 # exactly the strays the guard tolerated before the merge,
-                # and nothing else (#796 review). The plan is read from the
-                # receipt, not the local variable: a replay that finds the
-                # ref already moved plans no collisions of its own.
+                # plus an ignored file that was already there and that an
+                # incoming `.gitignore` change uncovered (the receipt's
+                # ignored listing holds it at its identity), and nothing
+                # else (#796 review). The plan is read from the receipt,
+                # not the local variable: a replay that finds the ref
+                # already moved plans no collisions of its own.
                 cleanup_plan = attempt.get("cleanup_plan") or {}
                 strays = verify.integrated_stray_paths(
                     repo,
                     tolerated=cleanup_plan.get("tolerated", ()),
                     incoming=prospective_paths,
                     retained_checkouts=retained_checkouts,
+                    run_dir=self.run_dir,
+                    ignored=attempt.get("ignored"),
                 )
                 if strays:
                     raise verify.IntegrationEvidenceError(
