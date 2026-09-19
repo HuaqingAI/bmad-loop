@@ -506,7 +506,12 @@ breaking changes may land in a minor release.
   remove, and that leftover is accepted only owned, at the captured HEAD, and
   holding nothing beyond what the integrated tree holds under it. A gitlink
   the unit adds is read the same way as a captured one — index at the gitlink
-  (skip-worktree accepted on a sparse target's out-of-cone gitlink),
+  (skip-worktree accepted on a sparse target's out-of-cone gitlink; an
+  operator's assume-unchanged bit on a captured gitlink is recorded and
+  preserved — every modern integration into a target holding one paused,
+  even of a bundle that never touched the submodule — a hook's flip of the
+  captured word is drift, and the restore puts the word back where
+  `git restore` cleared it),
   a populated checkout this repository's, clean (ignored entries included, the
   path having been proved absent), at the gitlink — since an
   incoming `.gitmodules` with `ignore = all` hides a hook's `submodule update

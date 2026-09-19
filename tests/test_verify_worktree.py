@@ -901,7 +901,9 @@ def test_receipt_restores_populated_submodule_checkout(project, tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ())
-    assert submodules == [{"path": "module", "head": old_submodule, "gitlink": old_submodule}]
+    assert submodules == [
+        {"path": "module", "head": old_submodule, "gitlink": old_submodule, "flags": "0"}
+    ]
     old = verify.rev_parse_head(repo)
     commit(origin, "payload.txt", "submodule new\n", "advance submodule")
     new_submodule = verify.rev_parse_head(origin)
@@ -1072,7 +1074,7 @@ def test_receipt_captures_an_uninitialized_submodule_as_unpopulated(project, tmp
     snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ())
 
     assert snapshots == []
-    assert submodules == [{"path": "module", "head": None, "gitlink": old}]
+    assert submodules == [{"path": "module", "head": None, "gitlink": old, "flags": "0"}]
     (checkout / "stray.txt").write_text("not a checkout\n")
     with pytest.raises(verify.IntegrationEvidenceError, match="changed ownership"):
         verify.capture_integration_state(repo, run_dir, "d" * 32, ())
@@ -3977,7 +3979,9 @@ def test_integrated_submodule_deletion_accepts_the_leftover_checkout(project, tm
     snapshots, submodules = verify.capture_integration_state(
         repo, run_dir, "d" * 32, ("module", ".gitmodules")
     )
-    assert submodules == [{"path": "module", "head": old_submodule, "gitlink": old_submodule}]
+    assert submodules == [
+        {"path": "module", "head": old_submodule, "gitlink": old_submodule, "flags": "0"}
+    ]
     integrated = _integrate_submodule_deletion(repo, leftover=True)
     assert git(repo, "status", "--porcelain") == "?? module/"
     incoming = ("module", ".gitmodules")
@@ -4268,6 +4272,141 @@ def test_integrated_gitlink_outside_a_sparse_cone_is_accepted(project, tmp_path)
     git(repo, "sparse-checkout", "disable")
 
 
+@pytest.mark.parametrize("touched", ["unrelated", "updated"], ids=["unrelated", "updated"])
+def test_receipt_preserves_an_operator_s_assume_unchanged_gitlink(project, tmp_path, touched):
+    """`git update-index --assume-unchanged` on a submodule is released index
+    configuration an operator sets before the run (`flags: 8000`), and it
+    hides nothing from readings taken from disk — yet the gitlink predicate
+    accepted only `0` and skip-worktree, so a target holding such a
+    submodule anywhere, even one the unit never touches, paused every modern
+    integration on "no longer the captured indexed gitlink" (Codex, #796
+    review). The receipt now records the gitlink's flag word and every
+    untouched gitlink's reading compares it exactly. A gitlink the commit
+    rewrote may carry its captured word or a fresh one — `git merge` writes
+    the entry anew and clears the bit, where a fast-forward or squash keeps
+    it (git 2.55) — and `git restore` clears it too, so a refusal's restore
+    of a gitlink the unit updated puts the word back and completeness reads
+    it exactly; an unrelated gitlink is never restored through and keeps it.
+
+    Ablation: drop `8000` from the captured words and both rows red on the
+    capture; match the captured word alone in the integrated reading and the
+    updated row reds on "submodule gitlink"; skip
+    `_restore_gitlink_index_flags` and it reds on completeness."""
+    repo = project.project
+    origin, checkout, old_submodule = _add_test_submodule(repo, tmp_path)
+    git(repo, "update-index", "--assume-unchanged", "--", "module")
+    assert git(repo, "ls-files", "-v", "--", "module") == "h module"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    prospective = ("module",) if touched == "updated" else ("src.txt",)
+    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, prospective)
+    assert submodules == [
+        {"path": "module", "head": old_submodule, "gitlink": old_submodule, "flags": "8000"}
+    ]
+    old = verify.rev_parse_head(repo)
+    if touched == "updated":
+        commit(origin, "payload.txt", "submodule new\n", "advance submodule")
+        new_submodule = verify.rev_parse_head(origin)
+        git(checkout, "fetch", "-q", "origin")
+        git(checkout, "checkout", "-q", "--detach", new_submodule)
+        git(repo, "update-index", "--cacheinfo", f"160000,{new_submodule},module")
+    else:
+        (repo / "src.txt").write_text("integrated\n")
+        git(repo, "add", "--", "src.txt")
+    git(repo, "commit", "-q", "-m", "integrated")
+    new = verify.rev_parse_head(repo)
+    # the rewritten entry lost the bit, as under `git merge`; the untouched one keeps it
+    assert git(repo, "ls-files", "-v", "--", "module") == (
+        "H module" if touched == "updated" else "h module"
+    )
+
+    assert verify.integration_nonref_state_unchanged(
+        repo, run_dir, snapshots, submodules, exclude_paths=prospective, operation_identity="c" * 32
+    )
+    assert (
+        verify.validate_integrated_submodule_state(
+            repo, submodules, prospective_paths=prospective, revision=new
+        )
+        == ()
+    )
+    verify.restore_integration_ref(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity="c" * 32,
+    )
+
+    assert verify.rev_parse_head(repo) == old
+    assert verify.rev_parse_head(checkout) == old_submodule
+    assert git(repo, "ls-files", "-v", "--", "module") == "h module"
+    assert verify.integration_restoration_complete(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity="c" * 32,
+    )
+
+
+@pytest.mark.parametrize("reading", ["nonref-unchanged", "integrated"])
+def test_receipt_refuses_a_hook_s_flip_of_a_captured_gitlink_s_flags(project, tmp_path, reading):
+    """The captured word is matched exactly: a hook setting assume-unchanged
+    on a gitlink the receipt captured without it — or clearing one it
+    captured with it — is drift in both directions.
+
+    Ablation: accept any captured word in `_gitlink_index_matches` and every
+    row reds."""
+    repo = project.project
+    _origin, _checkout, _old_submodule = _add_test_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ("module",))
+    assert submodules[0]["flags"] == "0"
+    revision = verify.rev_parse_head(repo)
+    git(repo, "update-index", "--assume-unchanged", "--", "module")
+
+    if reading == "nonref-unchanged":
+        assert not verify.integration_nonref_state_unchanged(
+            repo, run_dir, _snapshots, submodules, operation_identity="c" * 32
+        )
+    else:
+        with pytest.raises(verify.IntegrationEvidenceError, match="submodule gitlink"):
+            verify.validate_integrated_submodule_state(
+                repo, submodules, prospective_paths=("module",), revision=revision
+            )
+
+
+def test_receipt_reads_a_submodule_entry_without_a_flag_word(project, tmp_path):
+    """A receipt written before the flag word was recorded carries no
+    `flags`: the schema accepts it, and the readings take the fresh-gitlink
+    words for it — `0` accepted, assume-unchanged drift as before."""
+    repo = project.project
+    _origin, _checkout, old_submodule = _add_test_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ())
+    legacy = [{"path": "module", "head": old_submodule, "gitlink": old_submodule}]
+
+    assert verify.integration_nonref_state_unchanged(
+        repo, run_dir, snapshots, legacy, operation_identity="c" * 32
+    )
+    git(repo, "update-index", "--assume-unchanged", "--", "module")
+    assert not verify.integration_nonref_state_unchanged(
+        repo, run_dir, snapshots, legacy, operation_identity="c" * 32
+    )
+    with pytest.raises(verify.IntegrationEvidenceError, match="malformed"):
+        verify.validate_integration_state_schema(
+            run_dir, snapshots, [{**legacy[0], "flags": "20004000"}], "c" * 32
+        )
+
+
 def test_integrated_gitlink_with_a_foreign_index_flag_is_refused(project, tmp_path):
     """Skip-worktree is the one flag word a gitlink may carry besides none;
     any other bit a hook sets on the entry is still drift."""
@@ -4311,7 +4450,9 @@ def test_integrated_submodule_deletion_in_a_linked_worktree_target(project, tmp_
     _snapshots, submodules = verify.capture_integration_state(
         linked, run_dir, "f" * 32, ("module", ".gitmodules")
     )
-    assert submodules == [{"path": "module", "head": old_submodule, "gitlink": old_submodule}]
+    assert submodules == [
+        {"path": "module", "head": old_submodule, "gitlink": old_submodule, "flags": "0"}
+    ]
     integrated = _integrate_submodule_deletion(linked, leftover=True)
     assert git(linked, "status", "--porcelain") == "?? module/"
     incoming = ("module", ".gitmodules")

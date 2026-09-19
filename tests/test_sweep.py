@@ -28125,7 +28125,7 @@ def test_populated_submodule_checkout_is_captured_forwarded_and_restored(project
     task = load_state(engine.run_dir).tasks["dw-fix"]
     assert task.integration_attempt is not None
     assert task.integration_attempt["submodules"] == [
-        {"path": "module", "head": old_submodule, "gitlink": old_submodule}
+        {"path": "module", "head": old_submodule, "gitlink": old_submodule, "flags": "0"}
     ]
     assert task.integration_attempt["outcome"] == "refused-restored"
     assert "unit-merged" not in journal_kinds(engine)
@@ -28200,6 +28200,45 @@ def test_bundle_deleting_a_populated_target_submodule_integrates(project, tmp_pa
     durable = load_state(engine.run_dir).tasks["dw-fix"]
     assert durable.artifact_publication_complete
     assert durable.integration_attempt is None  # retired with the integration
+
+
+@pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
+def test_bundle_integrates_into_a_target_with_an_assume_unchanged_submodule(
+    project, tmp_path, strategy
+):
+    """A target whose populated submodule an operator marked
+    `update-index --assume-unchanged` (`flags: 8000`, released index
+    configuration) could complete no modern integration, even of a bundle
+    that never touches the submodule: the gitlink predicate accepted only
+    `0` and skip-worktree, so the pre-`unit-merged` reading called the
+    untouched entry "no longer the captured indexed gitlink" and every leg
+    paused (Codex, #796 review). The receipt records the gitlink's flag word
+    and the reading compares it exactly, so the bit is preserved through
+    integration and the run records `unit-merged`.
+
+    Ablation: drop `8000` from the captured words and every leg reds on the
+    capture, before the merge."""
+    old_submodule = _seed_populated_target_submodule(project, tmp_path)
+    git(project.project, "update-index", "--assume-unchanged", "--", "module")
+    assert git(project.project, "ls-files", "-v", "--", "module") == "h module"
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+    assert "unit-merged" in journal_kinds(engine)
+    assert git(project.project, "ls-files", "-v", "--", "module") == "h module"
+    assert verify.rev_parse_head(project.project / "module") == old_submodule
+    assert git(project.project, "status", "--porcelain", "--untracked-files=no") == ""
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.artifact_publication_complete
+    assert durable.integration_attempt is None
 
 
 @pytest.mark.parametrize(

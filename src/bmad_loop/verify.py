@@ -731,17 +731,33 @@ def _indexed_submodules(repo: Path) -> list[str]:
     return paths
 
 
-# `ls-files --debug` flag words a stage-0 gitlink may carry: none, or
-# skip-worktree alone (CE_SKIP_WORKTREE | CE_EXTENDED), which a cone-mode
-# sparse checkout sets on every entry outside the cone — gitlinks included —
-# and which hides nothing from the readings here, since a checkout is read
-# from disk rather than through the index (#796 review). Intent-to-add,
-# assume-unchanged, or anything else is not a gitlink's shape.
-_GITLINK_INDEX_FLAGS = frozenset({"0", "40004000"})
+# `ls-files --debug` flag words a stage-0 gitlink the integration introduces
+# may carry: none, or skip-worktree alone (CE_SKIP_WORKTREE | CE_EXTENDED),
+# which a cone-mode sparse checkout sets on every entry outside the cone —
+# gitlinks included — and which hides nothing from the readings here, since
+# a checkout is read from disk rather than through the index (#796 review).
+# Intent-to-add, assume-unchanged, or anything else is not a fresh gitlink's
+# shape: a hook set it.
+_FRESH_GITLINK_INDEX_FLAGS = frozenset({"0", "40004000"})
+# ...and the words a captured gitlink may carry: those, or either with the
+# assume-unchanged bit (CE_VALID, `8000`) an operator set before the run —
+# `git update-index --assume-unchanged` on a submodule is released index
+# configuration, and it too hides nothing from a reading taken from disk.
+# The receipt records the word (`flags`) so a reading compares it exactly:
+# an operator's bit is preserved, a hook's flip is drift, and the restore
+# puts the word back where `git restore` cleared it (#796 review).
+_GITLINK_INDEX_FLAGS = _FRESH_GITLINK_INDEX_FLAGS | frozenset({"8000", "4000c000"})
 
 
-def _gitlink_index_matches(current: dict[str, object], oid: str) -> bool:
-    """Whether ``current`` (an `_index_state` reading) is exactly the gitlink ``oid``."""
+def _gitlink_index_matches(
+    current: dict[str, object], oid: str, *, flags: Collection[object] | None = None
+) -> bool:
+    """Whether ``current`` (an `_index_state` reading) is exactly the gitlink ``oid``.
+
+    ``flags`` are the flag words accepted on the entry; ``None`` (a receipt
+    written before the word was recorded, or a gitlink the integration
+    introduces) accepts any word a fresh gitlink may carry.
+    """
     entries = current.get("entries")
     if current.get("intent_to_add") or not isinstance(entries, list) or len(entries) != 1:
         return False
@@ -751,8 +767,14 @@ def _gitlink_index_matches(current: dict[str, object], oid: str) -> bool:
         and entry.get("mode") == "160000"
         and entry.get("oid") == oid
         and entry.get("stage") == 0
-        and entry.get("flags") in _GITLINK_INDEX_FLAGS
+        and entry.get("flags") in (_FRESH_GITLINK_INDEX_FLAGS if flags is None else flags)
     )
+
+
+def _captured_gitlink_flags(entry: dict[str, object]) -> tuple[str] | None:
+    """The one word a captured gitlink must carry, or ``None`` for a receipt without one."""
+    flags = entry.get("flags")
+    return None if flags is None else (str(flags),)
 
 
 def _submodule_checkout_owned(root: Path, checkout: Path) -> bool:
@@ -827,7 +849,9 @@ def _validated_submodule_checkout(
                 "persisted target submodule is not anchored to the old revision"
             )
     else:
-        if not _gitlink_index_matches(_index_state(repo, rel), gitlink):
+        if not _gitlink_index_matches(
+            _index_state(repo, rel), gitlink, flags=_captured_gitlink_flags(entry)
+        ):
             raise IntegrationEvidenceError(
                 "persisted target submodule is no longer the captured indexed gitlink"
             )
@@ -910,6 +934,7 @@ def _restore_submodule_checkouts(
                     f"target submodule directory contains unowned state: {rel}"
                 )
             _empty_submodule_directory(repo, checkout)
+            _restore_gitlink_index_flags(repo, rel, entry.get("flags"))
             continue
         rc, detail = _git(repo, "submodule", "update", "--init", "--checkout", "--", rel)
         if rc != 0:
@@ -942,6 +967,18 @@ def _restore_submodule_checkouts(
             raise IntegrationRestoreError(
                 f"target submodule checkout restoration is not clean for {rel}"
             )
+        _restore_gitlink_index_flags(repo, rel, entry.get("flags"))
+
+
+def _restore_gitlink_index_flags(repo: Path, rel: str, flags: object) -> None:
+    """Put a captured gitlink's index flag word back: `git restore` clears it.
+
+    ``flags`` None is a receipt written before the word was recorded, with
+    nothing to put back.
+    """
+    if flags is None:
+        return
+    _apply_index_flags(repo, rel, int(str(flags), 16))
 
 
 def _empty_submodule_directory(repo: Path, checkout: Path) -> None:
@@ -1090,16 +1127,9 @@ def _capture_integration_state_into(
                 raise IntegrationEvidenceError(
                     "target submodule checkout escaped its indexed location"
                 )
-            index = _index_state(repo, rel)
-            entries = index["entries"]
-            if (
-                not isinstance(entries, list)
-                or len(entries) != 1
-                or entries[0].get("mode") != "160000"
-                or entries[0].get("stage") != 0
-            ):
-                raise IntegrationEvidenceError("target submodule index evidence is malformed")
-            submodules.append({"path": rel, "head": None, "gitlink": entries[0]["oid"]})
+            submodules.append(
+                {"path": rel, "head": None, **_captured_gitlink_entry(_index_state(repo, rel))}
+            )
             continue
         if checkout.resolve(strict=True) != repo_root.joinpath(*rel.split("/")):
             raise IntegrationEvidenceError("target submodule checkout escaped its indexed location")
@@ -1113,19 +1143,29 @@ def _capture_integration_state_into(
             raise IntegrationEvidenceError(
                 "populated target submodule must be clean before integration"
             )
-        index = _index_state(repo, rel)
-        entries = index["entries"]
-        if (
-            not isinstance(entries, list)
-            or len(entries) != 1
-            or entries[0].get("mode") != "160000"
-            or entries[0].get("stage") != 0
-        ):
-            raise IntegrationEvidenceError("target submodule index evidence is malformed")
         submodules.append(
-            {"path": rel, "head": rev_parse_head(checkout), "gitlink": entries[0]["oid"]}
+            {
+                "path": rel,
+                "head": rev_parse_head(checkout),
+                **_captured_gitlink_entry(_index_state(repo, rel)),
+            }
         )
     return snapshots, submodules
+
+
+def _captured_gitlink_entry(index: dict[str, object]) -> dict[str, object]:
+    """The ``gitlink`` and ``flags`` a submodule receipt entry records from its index reading."""
+    entries = index["entries"]
+    if (
+        index.get("intent_to_add")
+        or not isinstance(entries, list)
+        or len(entries) != 1
+        or entries[0].get("mode") != "160000"
+        or entries[0].get("stage") != 0
+        or entries[0].get("flags") not in _GITLINK_INDEX_FLAGS
+    ):
+        raise IntegrationEvidenceError("target submodule index evidence is malformed")
+    return {"gitlink": entries[0]["oid"], "flags": entries[0]["flags"]}
 
 
 def capture_integration_state(
@@ -1247,11 +1287,15 @@ def validate_integration_state_schema(
     validated_submodules: list[dict[str, object]] = []
     seen.clear()
     for raw in submodules:
-        if not isinstance(raw, dict) or set(raw) != {"path", "head", "gitlink"}:
+        # `flags`: the gitlink's captured index flag word; a receipt written
+        # before it was recorded reads with the fresh-gitlink words
+        if not isinstance(raw, dict) or set(raw) - {"flags"} != {"path", "head", "gitlink"}:
             raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
         rel = _portable_integration_path(raw.get("path"))
         head = raw.get("head")
         gitlink = raw.get("gitlink")
+        if "flags" in raw and raw["flags"] not in _GITLINK_INDEX_FLAGS:
+            raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
         # `head` None: the gitlink was unpopulated at capture — an empty
         # directory, git's shape for a clone without `--recurse-submodules`
         # — and the receipt owns that emptiness (#796 review)
@@ -1818,21 +1862,26 @@ def _restore_receipt_index(repo: Path, snapshots: list[dict[str, object]]) -> No
                 f"target intent-to-add restoration failed for {rel}: {detail}"
             )
     for rel, flags in extended_flags:
-        for enabled, option in (
-            (bool(flags & 0x8000), "assume-unchanged"),
-            (bool(flags & 0x40000000), "skip-worktree"),
-        ):
-            rc, detail = _git(
-                repo,
-                "update-index",
-                f"--{'' if enabled else 'no-'}{option}",
-                "--",
-                rel,
+        _apply_index_flags(repo, rel, flags)
+
+
+def _apply_index_flags(repo: Path, rel: str, flags: int) -> None:
+    """Set or clear the assume-unchanged and skip-worktree bits of ``rel`` to ``flags``."""
+    for enabled, option in (
+        (bool(flags & 0x8000), "assume-unchanged"),
+        (bool(flags & 0x40000000), "skip-worktree"),
+    ):
+        rc, detail = _git(
+            repo,
+            "update-index",
+            f"--{'' if enabled else 'no-'}{option}",
+            "--",
+            rel,
+        )
+        if rc != 0:
+            raise IntegrationRestoreError(
+                f"target index flag restoration failed for {rel}: {detail}"
             )
-            if rc != 0:
-                raise IntegrationRestoreError(
-                    f"target index flag restoration failed for {rel}: {detail}"
-                )
 
 
 def _receipt_index_complete(repo: Path, snapshots: list[dict[str, object]]) -> bool:
@@ -2638,10 +2687,12 @@ def validate_integrated_submodule_state(
         return ()
     captured: dict[str, dict[str, object]] = {}
     unpopulated: set[str] = set()
+    captured_flags: dict[str, object] = {}
     for raw in submodules:
         if not isinstance(raw, dict) or raw.get("path") not in prospective:
             continue
         rel = _portable_integration_path(raw.get("path"))
+        captured_flags[rel] = raw.get("flags")
         # captured unpopulated: the receipt proved an empty directory, so a
         # checkout there after the hooks is attempt-era in full and reads
         # as one the commit introduced — ignored entries counted, no
@@ -2700,7 +2751,15 @@ def validate_integrated_submodule_state(
             continue
         if kind != b"commit":
             raise IntegrationEvidenceError("integrated target submodule evidence is malformed")
-        if not _gitlink_index_matches(_index_state(repo, rel), oid):
+        # a captured gitlink the commit rewrote may carry its captured word
+        # or a fresh one — `git merge` writes the entry anew, clearing an
+        # assume-unchanged bit that a fast-forward or squash keeps — and a
+        # word that is neither is a hook's (#796 review)
+        captured_word = captured_flags.get(rel)
+        accepted_words = (
+            None if captured_word is None else _FRESH_GITLINK_INDEX_FLAGS | {str(captured_word)}
+        )
+        if not _gitlink_index_matches(_index_state(repo, rel), oid, flags=accepted_words):
             raise IntegrationEvidenceError("target hook changed an integrated submodule gitlink")
         checkout = repo / rel
         # an unpopulated gitlink is an empty directory: git's shape, nothing to read
