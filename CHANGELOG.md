@@ -491,8 +491,10 @@ breaking changes may land in a minor release.
   any other; the restore reverts what
   the hook staged and leaves unstaged and untracked entries in place, named
   for the operator; and a directory the unit creates, where the receipt
-  proved nothing was — or where the receipt captured a tracked file, a
-  symlink, or an unpopulated gitlink the unit replaced — is walked on disk
+  proved nothing was — or proved an empty untracked directory, which git
+  never tracks and no reading lists — or where the receipt captured a
+  tracked file, a symlink, or an unpopulated gitlink the unit replaced — is
+  walked on disk
   against the integrated commit, so a hook's gitignored write or nested
   `.git` there — which no `status` reading lists — is refused too (that
   restore is the proved-absent directory's existing doctrine: it removes

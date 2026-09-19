@@ -3984,6 +3984,134 @@ def test_integrated_directory_replacing_a_tracked_entry_accepts_its_own_contents
     )
 
 
+@pytest.mark.parametrize("anchored", [True, False], ids=["anchored", "checked-path"])
+@pytest.mark.parametrize("residue", ["none", "ignored-file", "nested-repo"])
+@pytest.mark.parametrize("depth", ["direct", "deep"])
+def test_integrated_directory_that_was_empty_at_capture_is_walked(
+    project, tmp_path, monkeypatch, depth, residue, anchored
+):
+    """Git never tracks an empty directory, so an untracked empty `newdir/`
+    already standing where the commit adds `newdir/tracked` (an IDE's, an
+    earlier hook's) is invisible to every git reading — and `absent_parents`
+    stopped at it, the parent existing, so the walk had no root and a
+    hook's gitignored write or nested `.git` under it retired the receipt
+    unverified (Codex, #796 review). The receipt now proves the first
+    existing ancestor empty (`empty_parents`), which makes everything under
+    it after the hooks attempt-era, exactly as under a proved-absent
+    directory: walked against the commit, and on a refusal the restore
+    leaves the directory absent or empty again — residue is the
+    proved-absent doctrine's: nothing unattributable is removed, and the
+    restore's own reading refuses before the ref moves, the run pausing as
+    not safely restorable with the residue in place.
+
+    Ablation: record no `empty_parents` and the residue rows red on the
+    drift reading; drop them from the completeness reading and they red on
+    the restore going through."""
+    repo = project.project
+    if not anchored:
+        monkeypatch.setattr(verify, "DIR_FD_ANCHORED_WRITES", False)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (repo / ".gitignore").write_text("*.tmp\n")
+    git(repo, "add", "--", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore hook output")
+    old = verify.rev_parse_head(repo)
+    (repo / "newdir").mkdir()
+    assert git(repo, "status", "--porcelain", "-uall", "--ignored") == ""
+    leaf = "newdir/deep/tracked" if depth == "deep" else "newdir/tracked"
+    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, (leaf,))
+    [entry] = snapshots
+    assert entry["absent_parents"] == (["newdir/deep"] if depth == "deep" else [])
+    assert entry["empty_parents"] == ["newdir"]
+    (repo / leaf).parent.mkdir(parents=True, exist_ok=True)
+    (repo / leaf).write_text("incoming\n")
+    git(repo, "add", "--", leaf)
+    git(repo, "commit", "-q", "-m", "integrated")
+    integrated = verify.rev_parse_head(repo)
+    if residue == "ignored-file":
+        (repo / "newdir" / "cache.tmp").write_text("target hook output\n")
+        expected = ("newdir/cache.tmp",)
+    elif residue == "nested-repo":
+        git(repo / "newdir", "init", "-q")
+        expected = ("newdir/.git",)
+    else:
+        expected = ()
+    assert git(repo, "status", "--porcelain", "-uall") == ""
+    assert verify.integrated_paths_drift(repo, integrated, (leaf,)) == ()
+    assert verify.integrated_stray_paths(repo, tolerated=(), incoming=(leaf,)) == ()
+
+    assert (
+        verify.integrated_introduced_directories_drift(
+            repo, integrated, run_dir, snapshots, operation_identity="e" * 32
+        )
+        == expected
+    )
+
+    restore = functools.partial(
+        verify.restore_integration_ref,
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=integrated,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity="e" * 32,
+    )
+    if residue != "none":
+        with pytest.raises(verify.IntegrationRestoreError, match="before the target ref"):
+            restore()
+        assert verify.rev_parse_head(repo) == integrated
+        assert (repo / expected[0]).exists()
+        return
+    restore()
+
+    assert verify.rev_parse_head(repo) == old
+    assert not (repo / leaf).exists()
+    assert not (repo / "newdir").exists() or not any((repo / "newdir").iterdir())
+    assert verify.integration_restoration_complete(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=integrated,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity="e" * 32,
+    )
+
+
+def test_receipt_records_no_empty_parent_for_other_ancestors(project, tmp_path):
+    """Only an empty directory is proved: a populated one holds what the
+    receipt never read; a file ancestor is the entry-type transition's; an
+    unpopulated gitlink is the submodule reading's; the repository root is
+    nobody's; and a receipt written before the key reads as it did."""
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (repo / "held").mkdir()
+    (repo / "held" / "present.txt").write_text("already here\n")
+    (repo / "a").write_text("a file\n")
+    git(repo, "add", "--", "a")
+    git(repo, "commit", "-q", "-m", "a is a file")
+    _origin, _checkout, _old = _uninitialized_submodule(repo, tmp_path)
+
+    snapshots, _submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, ("held/new.txt", "a/b", "module/x", "root.txt", "src.txt")
+    )
+
+    by_path = {entry["path"]: entry for entry in snapshots}
+    assert all(entry["empty_parents"] == [] for entry in by_path.values())
+    legacy = [{k: v for k, v in by_path["src.txt"].items() if k != "empty_parents"}]
+    assert verify.integration_nonref_state_unchanged(
+        repo, run_dir, legacy, [], operation_identity="e" * 32
+    )
+    with pytest.raises(verify.IntegrationEvidenceError, match="malformed"):
+        verify.validate_integration_state_schema(
+            run_dir, [{**by_path["src.txt"], "empty_parents": ["held"]}], [], "e" * 32
+        )
+
+
 def test_integrated_introduced_directory_accepts_the_commit_s_own_contents(project, tmp_path):
     """The walk accepts exactly what the integrated commit holds under the new
     directory — files, nested directories, a symlink — and leaves an

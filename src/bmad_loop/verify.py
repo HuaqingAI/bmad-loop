@@ -1024,6 +1024,17 @@ def _capture_integration_state_into(
         while parent != repo and not parent.exists() and not parent.is_symlink():
             absent_parents.append(parent.relative_to(repo).as_posix())
             parent = parent.parent
+        # the first existing ancestor, when it is an empty directory, is
+        # proved empty: git never tracks one, so nothing else reads it, and
+        # everything under it after the hooks is attempt-era exactly as
+        # under a proved-absent directory (#796 review). A populated one
+        # holds what the receipt never read; a file is the entry-type
+        # transition's; an unpopulated gitlink the submodule reading's.
+        empty_parents: list[str] = []
+        if parent != repo and not parent.is_symlink() and parent.is_dir():
+            parent_rel = parent.relative_to(repo).as_posix()
+            if parent_rel not in indexed_submodules and not any(parent.iterdir()):
+                empty_parents.append(parent_rel)
         try:
             mode = candidate.lstat().st_mode
         except (FileNotFoundError, NotADirectoryError):
@@ -1039,6 +1050,7 @@ def _capture_integration_state_into(
                     "tracked": tracked,
                     "index": index,
                     "absent_parents": absent_parents,
+                    "empty_parents": empty_parents,
                 }
             )
             continue
@@ -1075,6 +1087,7 @@ def _capture_integration_state_into(
                     "tracked": tracked,
                     "index": index,
                     "absent_parents": absent_parents,
+                    "empty_parents": empty_parents,
                     "sidecar": sidecar.relative_to(run_dir).as_posix(),
                     "size": size,
                     "sha256": digest,
@@ -1112,6 +1125,7 @@ def _capture_integration_state_into(
                 "tracked": tracked,
                 "index": index,
                 "absent_parents": absent_parents,
+                "empty_parents": empty_parents,
                 "sidecar": sidecar.relative_to(run_dir).as_posix(),
                 "size": size,
                 "sha256": digest,
@@ -1241,8 +1255,25 @@ def validate_integration_state_schema(
             if PureWindowsPath(parent) != expected_parent:
                 raise IntegrationEvidenceError("persisted target integration snapshot is malformed")
             expected_parent = expected_parent.parent
+        # `empty_parents`: the first existing ancestor, proved an empty
+        # directory at capture — at most one, the one above the topmost
+        # absent parent (or the path); a receipt written before the key
+        # proved nothing there (#796 review)
+        empty_parents = raw.get("empty_parents", [])
+        if (
+            not isinstance(empty_parents, list)
+            or len(empty_parents) > 1
+            or any(not isinstance(parent, str) for parent in empty_parents)
+        ):
+            raise IntegrationEvidenceError("persisted target integration snapshot is malformed")
+        validated_empty = [_portable_integration_path(parent) for parent in empty_parents]
+        for parent in validated_empty:
+            if PureWindowsPath(parent) != expected_parent or expected_parent == PureWindowsPath():
+                raise IntegrationEvidenceError("persisted target integration snapshot is malformed")
         seen.add(rel)
         expected_keys = {"path", "state", "tracked", "index", "absent_parents"}
+        if "empty_parents" in raw:
+            expected_keys.add("empty_parents")
         if state in {"regular", "symlink"}:
             expected_keys |= {"sidecar", "size", "sha256"}
             if state == "regular":
@@ -1290,6 +1321,7 @@ def validate_integration_state_schema(
         normalized = dict(raw)
         normalized["index"] = index
         normalized["absent_parents"] = validated_parents
+        normalized["empty_parents"] = validated_empty
         validated_snapshots.append(normalized)
 
     validated_submodules: list[dict[str, object]] = []
@@ -2248,6 +2280,17 @@ def _receipt_snapshots_complete(
                 candidate = repo / str(parent)
                 if candidate.exists() or candidate.is_symlink():
                     return False
+            # a proved-empty parent is restored when it is empty again, or
+            # gone — git removes a directory its restore emptied; residue
+            # there is attempt-era the restore could not attribute
+            raw_empty = entry.get("empty_parents")
+            assert isinstance(raw_empty, list)
+            for parent in raw_empty:
+                candidate = repo / str(parent)
+                if candidate.is_symlink() or (candidate.exists() and not candidate.is_dir()):
+                    return False
+                if candidate.is_dir() and any(candidate.iterdir()):
+                    return False
             continue
         if entry["state"] == "symlink":
             if not target.is_symlink():
@@ -2566,7 +2609,11 @@ def integrated_introduced_directories_drift(
     unpopulated (``submodules``, ``head`` None: an empty directory, nothing
     snapshotted) that the commit replaced with a tracked directory, which
     the submodule reading accepts as the commit's own by its lack of a
-    ``.git`` and reads no further (#796 review). Each topmost such directory is walked
+    ``.git`` and reads no further (#796 review) — and as is a directory the
+    receipt proved EMPTY (``empty_parents``: the first existing ancestor of
+    an incoming path, which git never tracks and no reading lists), whose
+    every entry after the hooks is attempt-era the same way (#796 review).
+    Each topmost such directory is walked
     on disk, symlinks never followed, against the commit's inventory: a file or
     symlink must be a path the commit holds, a directory a prefix it holds —
     or a gitlink, whose populated checkout is `validate_integrated_submodule_state`'s
@@ -2586,6 +2633,9 @@ def integrated_introduced_directories_drift(
         assert isinstance(parents, list)
         if parents:
             roots.add(str(parents[-1]))  # captured from the path upward: last is topmost
+        empty = entry.get("empty_parents")
+        assert isinstance(empty, list)
+        roots.update(str(parent) for parent in empty)  # proved empty: the topmost root
         if entry["state"] in {"regular", "symlink"}:
             replaced.add(str(entry["path"]))
     for entry in validated_submodules:
