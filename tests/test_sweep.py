@@ -27412,6 +27412,81 @@ def test_target_hook_changing_a_path_outside_the_incoming_set_is_refused(
         ("ff", "post-merge"),
     ],
 )
+def test_target_hook_writing_an_ignored_file_into_a_new_directory_is_refused(
+    project, strategy, hook_name
+):
+    """A directory the unit creates (`newdir/tracked` incoming) stands where the
+    receipt proved nothing was, so everything in it is attempt-era — but a
+    TARGET hook's gitignored write there (`newdir/cache.tmp`) is listed by no
+    reading: not the diff readings (tracked paths), not the whole-tree stray
+    reading (`status` without `--ignored`), and the incoming set is excluded
+    from the snapshot comparison. The run recorded `unit-merged` and retired
+    the receipt over the hook's file (Codex, #796 review). The new directory
+    is now walked on disk against the integrated commit, and the write is
+    refused by path.
+
+    The restore is the receipt's existing doctrine for a proved-absent
+    directory: it removes an empty one or an owned submodule checkout and
+    refuses over anything else, which may be fresh operator state — so this
+    pause is the "could not be restored safely" arm, both messages in the
+    refusal record, the hook's file left where it is, the source retained.
+
+    Ablation: return `()` from `integrated_introduced_directories_drift` and
+    every row reds on `summary.paused` — the run finished, ids `done`, over
+    the hook's file."""
+    effect, _expected = _ignored_publication_bundle(project)
+    (project.project / ".gitignore").write_text(
+        (project.project / ".gitignore").read_text() + "*.tmp\n"
+    )
+    git(project.project, "add", "--", ".gitignore")
+    git(project.project, "commit", "-q", "-m", "ignore hook output")
+    hook = project.project / ".git" / "hooks" / hook_name
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        "  printf 'target hook mutation' > newdir/cache.tmp\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+
+    def creates_a_directory(spec):
+        result = effect(spec)
+        (spec.cwd / "newdir").mkdir()
+        (spec.cwd / "newdir" / "tracked").write_text("incoming\n")  # committed by the run
+        return result
+
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), creates_a_directory],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert "unit-merged" not in journal_kinds(engine)
+    assert not durable.artifact_publication_complete
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert "wrote into a directory the integration created: newdir/cache.tmp" in refusal["error"]
+    assert "target hook mutation" not in refusal["error"]  # path-only evidence
+    # never removed: the receipt cannot attribute a non-empty directory
+    assert (project.project / "newdir" / "cache.tmp").read_text() == "target hook mutation"
+    assert "could not be restored safely" in (engine.state.paused_reason or "")
+    assert Path(durable.worktree_path).is_dir()
+    assert verify.branch_exists(project.repo_root, durable.branch)
+    assert durable.commit_sha not in (None, durable.baseline_commit)
+
+
+@pytest.mark.parametrize(
+    ("strategy", "hook_name"),
+    [
+        ("merge", "pre-merge-commit"),
+        ("squash", "pre-commit"),
+        ("ff", "post-merge"),
+    ],
+)
 def test_target_hook_recreating_a_deleted_incoming_path_is_refused_and_restored(
     project, strategy, hook_name
 ):

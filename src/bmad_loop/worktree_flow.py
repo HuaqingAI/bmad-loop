@@ -3571,6 +3571,22 @@ class WorktreeFlow:
                         "integration (staged changes restored; unstaged and untracked "
                         "entries left in place): " + ", ".join(strays)
                     )
+                # And the one place none of those list: a directory the commit
+                # created where the receipt proved nothing was, walked on disk
+                # — a hook's gitignored write or nested `.git` there is
+                # attempt-era with everything else in it (#796 review).
+                residue = verify.integrated_introduced_directories_drift(
+                    repo,
+                    expected_revision,
+                    self.run_dir,
+                    attempt["snapshots"],
+                    operation_identity=attempt["operation_identity"],
+                )
+                if residue:
+                    raise verify.IntegrationEvidenceError(
+                        "target hook wrote into a directory the integration created: "
+                        + ", ".join(residue)
+                    )
                 if verify.ref_revision(repo, target_ref) != expected_revision:
                     raise verify.IntegrationEvidenceError(
                         "target moved during artifact integration validation"

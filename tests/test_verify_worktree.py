@@ -3282,6 +3282,115 @@ def test_integrated_paths_drift_accepts_an_incoming_entry_type_change(project, s
     assert verify.integrated_paths_drift(repo, integrated, incoming) == ()
 
 
+def _integrate_new_directory(repo, run_dir):
+    """Arm a receipt over `newdir/tracked` while `newdir` is absent, then commit
+    the integrated shape: the directory created by the commit, holding exactly
+    the file it tracks. Returns the receipt's snapshots and the integrated
+    revision."""
+    snapshots, _submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, ("newdir/tracked", "src.txt")
+    )
+    [entry] = [entry for entry in snapshots if entry["path"] == "newdir/tracked"]
+    assert entry["state"] == "absent" and entry["absent_parents"] == ["newdir"]
+    (repo / "newdir").mkdir()
+    (repo / "newdir" / "tracked").write_text("incoming\n")
+    git(repo, "add", "--", "newdir/tracked")
+    git(repo, "commit", "-q", "-m", "integrated: newdir/tracked")
+    return snapshots, verify.rev_parse_head(repo)
+
+
+@pytest.mark.parametrize("residue", ["ignored-file", "ignored-directory", "nested-repo"])
+def test_integrated_introduced_directory_refuses_an_entry_status_never_lists(
+    project, tmp_path, residue
+):
+    """A directory the incoming commit creates stands where the receipt proved
+    nothing was (`absent_parents`), so everything in it is attempt-era — yet
+    the readings after the hooks see only what git lists: the diff readings
+    cover tracked paths, and the whole-tree stray reading takes `status`
+    without `--ignored`, which also never names a `.git`. A target hook
+    writing a gitignored file (or directory) into the new directory, or
+    initialising a repository inside it, left the run recording
+    `unit-merged` and retiring the receipt over it (Codex, #796 review). The
+    new directory is now walked on disk against the integrated commit's
+    inventory: every file must be a path the commit holds, every directory a
+    prefix it holds (or a gitlink, whose checkout is the submodule
+    reading's), and anything else is drift by path.
+
+    Ablation: return `()` and every row reds."""
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (repo / ".gitignore").write_text("*.tmp\ncache/\n")
+    git(repo, "add", "--", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore hook output")
+    snapshots, integrated = _integrate_new_directory(repo, run_dir)
+    if residue == "ignored-file":
+        (repo / "newdir" / "cache.tmp").write_text("target hook output\n")
+        expected = ("newdir/cache.tmp",)
+    elif residue == "ignored-directory":
+        (repo / "newdir" / "cache").mkdir()
+        (repo / "newdir" / "cache" / "x").write_text("target hook output\n")
+        expected = ("newdir/cache",)
+    else:
+        git(repo / "newdir", "init", "-q")
+        expected = ("newdir/.git",)
+    assert git(repo, "status", "--porcelain", "-uall") == ""
+    assert verify.integrated_paths_drift(repo, integrated, ("newdir/tracked", "src.txt")) == ()
+    assert verify.integrated_stray_paths(repo, tolerated=(), incoming=("newdir/tracked",)) == ()
+
+    assert (
+        verify.integrated_introduced_directories_drift(
+            repo, integrated, run_dir, snapshots, operation_identity="e" * 32
+        )
+        == expected
+    )
+
+
+def test_integrated_introduced_directory_accepts_the_commit_s_own_contents(project, tmp_path):
+    """The walk accepts exactly what the integrated commit holds under the new
+    directory — files, nested directories, a symlink — and leaves an
+    introduced gitlink's populated checkout to the submodule reading, which
+    reads it with `--ignored`; an absent directory (nothing snapshotted was
+    ever written) has nothing to walk."""
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    origin = tmp_path / "sub-origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    commit(origin, "payload.txt", "submodule\n", "submodule baseline")
+    snapshots, _submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, ("newdir/tracked", "newdir/deep/leaf", "newdir/link", "newdir/sub")
+    )
+    (repo / "newdir" / "deep").mkdir(parents=True)
+    (repo / "newdir" / "tracked").write_text("incoming\n")
+    (repo / "newdir" / "deep" / "leaf").write_text("incoming\n")
+    os.symlink("tracked", repo / "newdir" / "link")
+    git(repo, "add", "--", "newdir")
+    git(
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(origin),
+        "newdir/sub",
+    )
+    git(repo, "commit", "-q", "-m", "integrated: newdir")
+    integrated = verify.rev_parse_head(repo)
+    (repo / "newdir" / "sub" / "hook.txt").write_text("the submodule reading's\n")
+
+    assert (
+        verify.integrated_introduced_directories_drift(
+            repo, integrated, run_dir, snapshots, operation_identity="e" * 32
+        )
+        == ()
+    )
+
+
 def _integrate_submodule_deletion(repo, *, leftover):
     """Commit the integrated shape git leaves when a merge deletes a populated
     submodule: gitlink and `.gitmodules` entry gone from HEAD and index, and —

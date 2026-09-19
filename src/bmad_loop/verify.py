@@ -2224,6 +2224,78 @@ def integrated_stray_paths(
     return tuple(sorted(strays))
 
 
+def integrated_introduced_directories_drift(
+    repo: Path,
+    revision: str,
+    run_dir: Path,
+    snapshots: object,
+    *,
+    operation_identity: str | None = None,
+) -> tuple[str, ...]:
+    """Entries under a directory the integrated commit created that it does not hold.
+
+    The receipt proved every ``absent_parents`` directory absent before the
+    attempt, so whatever stands in one after the hooks is attempt-era — and the
+    readings above see only what git lists: the diff readings cover tracked
+    paths, `integrated_stray_paths` takes ``status`` without ``--ignored``,
+    which also never names a ``.git``. So a target hook writing a gitignored
+    file into the new directory, or initialising a repository inside it, went
+    unseen (#796 review). Each topmost proved-absent directory is walked on
+    disk, symlinks never followed, against the commit's inventory: a file or
+    symlink must be a path the commit holds, a directory a prefix it holds —
+    or a gitlink, whose populated checkout is `validate_integrated_submodule_state`'s
+    to read (with ``--ignored``, the path having been proved absent) and is
+    not descended into. Anything else is reported by path, an unheld
+    directory as itself rather than its contents. A directory that is not
+    there is nothing to walk; a symlink in its place is drift. Path-only
+    evidence, sorted.
+    """
+    validated, _submodules = validate_integration_state_schema(
+        run_dir, snapshots, [], operation_identity
+    )
+    roots: set[str] = set()
+    for entry in validated:
+        parents = entry.get("absent_parents")
+        assert isinstance(parents, list)
+        if parents:
+            roots.add(str(parents[-1]))  # captured from the path upward: last is topmost
+    if not roots:
+        return ()
+    inventory = _revision_inventory(repo, revision)
+    held = _inventory_held_paths(inventory)
+    drift: list[str] = []
+    for root in sorted(roots):
+        if any(root.startswith(f"{other}/") for other in roots):
+            continue
+        _validated, top = _confined_repo_operand(repo, root)
+        if top.is_symlink():
+            drift.append(root)
+            continue
+        if not top.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(top, followlinks=False):
+            base = Path(dirpath).relative_to(repo).as_posix()
+            for name in sorted(dirnames):
+                rel = f"{base}/{name}"
+                child = Path(dirpath) / name
+                if child.is_symlink():
+                    if rel not in inventory:
+                        drift.append(rel)
+                    continue
+                row = inventory.get(rel)
+                if row is not None and row[0] == b"160000":
+                    dirnames.remove(name)
+                    continue
+                if rel not in held:
+                    drift.append(rel)
+                    dirnames.remove(name)
+            for name in filenames:
+                rel = f"{base}/{name}"
+                if rel not in inventory:
+                    drift.append(rel)
+    return tuple(sorted(drift))
+
+
 def revision_tree_oid(repo: Path, revision: str) -> str:
     """The tree object id ``revision`` seals (``rev-parse <revision>^{tree}``)."""
     rc, tree, detail = _git_out(repo, "rev-parse", f"{revision}^{{tree}}")
