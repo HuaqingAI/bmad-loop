@@ -1507,6 +1507,54 @@ def test_integrated_directory_replacing_an_unpopulated_gitlink_is_walked(
     )
 
 
+@pytest.mark.parametrize("ignore", ["dirty", "all"])
+@pytest.mark.parametrize("shape", ["untracked", "edited", "staged"])
+def test_receipt_reads_a_captured_checkouts_own_status(project, tmp_path, ignore, shape):
+    """The superproject's `status` reports a submodule's modified and
+    untracked content only as `submodule.<name>.ignore` allows — `dirty` or
+    `all` in a tracked `.gitmodules` hides it — so a hook's write into a
+    captured checkout outside the incoming set was listed by no whole-tree
+    reading, and the receipt reading took only ownership and HEAD (Codex,
+    #796 review). It takes the checkout's own `status -uall` now, the reading
+    the capture required empty.
+
+    Ablation: drop the cleanliness reading from `_validated_submodule_checkout`
+    and every row reds on the last assertion."""
+    repo = project.project
+    _origin, checkout, _old_submodule = _add_test_submodule(repo, tmp_path)
+    git(repo, "config", "-f", ".gitmodules", "submodule.module.ignore", ignore)
+    git(repo, "commit", "-q", "-am", "quiet the submodule's dirt")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ("src.txt",))
+    assert verify.integration_nonref_state_unchanged(
+        repo,
+        run_dir,
+        snapshots,
+        submodules,
+        exclude_paths=("src.txt",),
+        operation_identity="c" * 32,
+    )
+    if shape == "untracked":
+        (checkout / "hook.txt").write_text("target hook output\n")
+    else:
+        (checkout / "payload.txt").write_text("target hook output\n")
+        if shape == "staged":
+            git(checkout, "add", "--", "payload.txt")
+    # every superproject reading is blind under this configuration
+    assert verify.dirty_paths(repo) == {}
+    assert verify.integrated_stray_paths(repo, tolerated=(), incoming=("src.txt",)) == ()
+
+    assert not verify.integration_nonref_state_unchanged(
+        repo,
+        run_dir,
+        snapshots,
+        submodules,
+        exclude_paths=("src.txt",),
+        operation_identity="c" * 32,
+    )
+
+
 def test_receipt_detects_index_only_submodule_gitlink_drift(project, tmp_path):
     repo = project.project
     origin, checkout, old_submodule = _add_test_submodule(repo, tmp_path)
@@ -5802,6 +5850,44 @@ def test_incoming_collision_guard_reads_the_automator_directory(project, tmp_pat
         verify.integrated_stray_paths(repo, tolerated=plan.tolerated, incoming=("feature.txt",))
         == ()
     )
+
+
+@pytest.mark.parametrize("shape", ["tracked-modified", "untracked"])
+def test_incoming_collision_cleanup_applies_to_the_automator_directory(project, tmp_path, shape):
+    """The plan reads the automator directory (above), so a leak there the
+    incoming branch also changes — a tracked `.bmad-loop/bmad_loop_hook.py`
+    edited in the target, or an untracked one the branch introduces — is
+    planned as `cleaned`. The application re-read `dirty_paths` alone, which
+    excludes the whole `.bmad-loop/` subtree, so the planned path was missing
+    from the re-read and every integration attempt refused with "target
+    collision classification changed before cleanup", before its merge and
+    again on each resume (Codex, #796 review). Plan and application now share
+    one reading (`collision_dirty_paths`).
+
+    Ablation: re-read `dirty_paths` in `apply_incoming_collision_plan` and
+    both rows red on the raise."""
+    repo = project.project
+    (repo / ".bmad-loop").mkdir(exist_ok=True)
+    leak = repo / ".bmad-loop" / "bmad_loop_hook.py"
+    if shape == "tracked-modified":
+        leak.write_text("# relay\n")
+        git(repo, "add", "--", ".bmad-loop/bmad_loop_hook.py")
+        git(repo, "commit", "-q", "-m", "hook relay script")
+        _branch_with(repo, tmp_path, modifies={".bmad-loop/bmad_loop_hook.py": "# branch\n"})
+    else:
+        _branch_with(repo, tmp_path, adds={".bmad-loop/bmad_loop_hook.py": "# branch\n"})
+    leak.write_text("# editor leaked\n")
+    plan = verify.plan_incoming_collisions(repo, "main", "feat")
+    assert plan.cleaned == (".bmad-loop/bmad_loop_hook.py",)
+    assert plan.untracked == ((".bmad-loop/bmad_loop_hook.py",) if shape == "untracked" else ())
+
+    assert verify.apply_incoming_collision_plan(repo, plan) == [".bmad-loop/bmad_loop_hook.py"]
+
+    if shape == "tracked-modified":
+        assert leak.read_text() == "# relay\n"
+    else:
+        assert not leak.exists()
+    assert verify.collision_dirty_paths(repo) == {}
 
 
 def test_integrated_stray_paths_leaves_the_receipt_sets_to_their_own_readings(project, tmp_path):

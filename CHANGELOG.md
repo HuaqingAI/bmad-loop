@@ -488,7 +488,10 @@ breaking changes may land in a minor release.
   `.bmad-loop/` included — the hook relay script, a committed `policy.toml`,
   a profile overlay — with only the run's own records left out, and the
   pre-merge guard tolerating or blocking a stray there on the same terms as
-  any other — and a hook's `update-index --assume-unchanged` on a clean
+  any other (and cleaning one the unit's commit also changes: the cleanup
+  re-read the tree without `.bmad-loop/`, so a planned path there was
+  "missing" and every attempt refused before its merge, and again on each
+  resume) — and a hook's `update-index --assume-unchanged` on a clean
   tracked file outside the incoming set, which status never lists, is
   refused by the receipt's digest of every other index entry's flag word
   and named from its map of the marked ones (a rename's source is incoming
@@ -516,6 +519,12 @@ breaking changes may land in a minor release.
   written into a replaced leftover left out, and a `.bmad-loop/` the
   checkout's own rules ignore read like any other path there (the run's
   records are the target's alone, left out of the target's listing only);
+  a hook's plain write into a captured checkout the unit leaves alone —
+  which the superproject's `status` reports only as `submodule.<name>.ignore`
+  allows, and a tracked `.gitmodules` setting `dirty` or `all` to quiet
+  that noise hid from every whole-tree reading — is refused by the
+  checkout's own `status`, the reading the capture required empty, and the
+  restore's own;
   an untracked nested repository in the target — the one entry `status`
   still collapses, `vendor/` — is tolerated as `vendor` and passed over by
   the capture, its `.git` sealed at its identity, where its spelling had

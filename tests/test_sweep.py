@@ -28904,6 +28904,89 @@ def test_target_hook_writing_an_ignored_file_into_a_captured_submodule_is_refuse
     )
 
 
+@pytest.mark.parametrize("ignore", ["dirty", "all"])
+@pytest.mark.parametrize(
+    ("strategy", "hook_name"),
+    [("merge", "pre-merge-commit"), ("squash", "pre-commit"), ("ff", "post-merge")],
+)
+def test_target_hook_writing_into_a_captured_submodule_the_superproject_ignores_is_refused(
+    project, tmp_path, strategy, hook_name, ignore
+):
+    """A captured populated submodule the bundle leaves alone was read after
+    the hooks for ownership and HEAD, and its modified and untracked content
+    was left to the superproject's whole-tree `status` — which reports it
+    only as `submodule.<name>.ignore` allows. `dirty` or `all`, set in a
+    tracked `.gitmodules` to quiet exactly that noise, hides it, so a target
+    hook's plain write into such a checkout was listed by no reading and the
+    run recorded `unit-merged` and retired its receipt over it (Codex, #796
+    review). The receipt reading now takes the checkout's own `status`, the
+    one the capture required empty, whatever the superproject is configured
+    to report: refused on every leg, the target restored to the pre-attempt
+    commit, the checkout back clean at the captured HEAD — the restore's own
+    reading is the checkout's too, so the hook's file is gone.
+
+    Ablation: drop the cleanliness reading from `_validated_submodule_checkout`
+    and every row reds on `summary.paused` — the run finished over the hook's
+    file."""
+    origin = tmp_path / "sub-origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    (origin / "payload.txt").write_text("old\n")
+    git(origin, "add", "-A")
+    git(origin, "commit", "-q", "-m", "old submodule")
+    old_submodule = verify.rev_parse_head(origin)
+    git(
+        project.project,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(origin),
+        "module",
+    )
+    git(project.project, "config", "-f", ".gitmodules", "submodule.module.ignore", ignore)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "add populated submodule, quiet its dirt")
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    target_head = verify.rev_parse_head(project.repo_root)
+    hook = project.project / ".git" / "hooks" / hook_name
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        "  printf 'target hook output' > module/hook.txt\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    engine, _adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert git(project.project, "status", "--porcelain", "--untracked-files=no") == ""
+    assert git(project.project, "ls-files", "--stage", "--", "module").startswith(
+        f"160000 {old_submodule}"
+    )
+    assert verify.rev_parse_head(project.project / "module") == old_submodule
+    assert git(project.project / "module", "status", "--porcelain", "-uall") == ""
+    assert not (project.project / "module" / "hook.txt").exists()
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt.get("outcome") == "refused-restored"
+    assert "unit-merged" not in journal_kinds(engine)
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert refusal["error"].endswith(
+        "target hook changed receipt-owned index, worktree, ignored, or submodule state"
+    )
+
+
 def test_target_hook_writing_into_a_captured_submodules_automator_directory_is_refused(
     project, tmp_path
 ):

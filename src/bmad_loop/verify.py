@@ -954,9 +954,26 @@ def _validated_submodule_checkout(
         )
     if not _submodule_checkout_owned(root, checkout):
         raise IntegrationEvidenceError("persisted target submodule checkout changed ownership")
-    if verify_head and rev_parse_head(checkout) != expected:
-        raise IntegrationEvidenceError("target submodule checkout was not restored")
+    if verify_head:
+        if rev_parse_head(checkout) != expected:
+            raise IntegrationEvidenceError("target submodule checkout was not restored")
+        # the checkout's own reading, the one the capture required empty: the
+        # superproject's `status` reports a submodule's modified and untracked
+        # content only as `submodule.<name>.ignore` allows — `dirty` or `all`,
+        # set in a tracked `.gitmodules` to quiet exactly that noise, hides
+        # it — so a hook's write into a captured checkout the bundle leaves
+        # alone was listed by no superproject reading and the run recorded
+        # `unit-merged` over it (#796 review); the restore's own reading
+        # (`_restore_submodule_checkouts`) is this one too
+        if not _submodule_checkout_clean(checkout):
+            raise IntegrationEvidenceError("target submodule checkout is not clean")
     return checkout
+
+
+def _submodule_checkout_clean(checkout: Path) -> bool:
+    """Whether a populated checkout reports nothing under the capture's reading."""
+    status = git_bytes(checkout, "status", "--porcelain", "-z", "-uall")
+    return status.returncode == 0 and not status.stdout
 
 
 def _restore_submodule_checkouts(
@@ -3113,6 +3130,17 @@ def automator_dirty_paths(repo: Path) -> dict[str, str]:
     return result
 
 
+def collision_dirty_paths(repo: Path) -> dict[str, str]:
+    """The one dirty reading the collision plan, its application, and the
+    post-hook stray reading share: the tree outside the automator directory
+    (`dirty_paths`) plus the automator directory with the run's own records
+    left out (`automator_dirty_paths`). A plan read one way and applied
+    another refused every cleanup that named a `.bmad-loop/` path — planned
+    from the combined reading, then missing from the exclusion-only re-read
+    — and again on every resume (#796 review)."""
+    return {**dirty_paths(repo), **automator_dirty_paths(repo)}
+
+
 def integrated_stray_paths(
     repo: Path,
     *,
@@ -3161,7 +3189,7 @@ def integrated_stray_paths(
     if ignored is not None and run_dir is not None:
         recorded = _recorded_ignored_entries(run_dir, validate_ignored_entries_evidence(ignored))
     strays: list[str] = []
-    for path, xy in (*dirty_paths(repo).items(), *automator_dirty_paths(repo).items()):
+    for path, xy in collision_dirty_paths(repo).items():
         # `vendor/`: an untracked nested repository, tolerated as `vendor`
         if path in excluded or path.rstrip("/") in excluded:
             continue
@@ -5972,7 +6000,7 @@ def plan_incoming_collisions(
     # a stray there is tolerated or blocking on the same terms as any other,
     # and the tolerated set is what the post-hook stray reading leaves alone
     # (#796 review)
-    dirty = {**dirty_paths(repo), **automator_dirty_paths(repo)}
+    dirty = collision_dirty_paths(repo)
     if not dirty:
         return IncomingCollisionPlan((), (), ())
     incoming = branch_incoming_paths(repo, target, branch)
@@ -6062,7 +6090,10 @@ def apply_incoming_collision_plan(
     """
     if not plan.cleaned:
         return []
-    current = dirty_paths(repo)
+    # the plan's own reading, or a cleaned `.bmad-loop/` path — planned from
+    # the automator reading — is missing from the re-read and every
+    # integration refuses before its merge (#796 review)
+    current = collision_dirty_paths(repo)
     expected_cleaned = set(plan.cleaned)
     if any(path not in current for path in expected_cleaned):
         raise IntegrationEvidenceError("target collision classification changed before cleanup")
