@@ -1880,9 +1880,14 @@ class Engine:
         still mounted: the merge is replayed instead, the stronger reading. With
         the source consumed, the deterministic target validation the record
         would otherwise have stood in for (#796 review): the target head holds
-        ``task.commit_sha`` and `validate_integrated` accepts its tree and the
-        index at that head. Anything else pauses the run naming the reason —
-        there is no source left to replay and no receipt left to restore.
+        the unit's integration — ``task.commit_sha`` in its history, or, since
+        a squash seals a commit of its own and never that one (#796 review),
+        every change the unit made over ``task.baseline_commit`` folded into
+        its tree blob for blob — and `validate_integrated` accepts its tree
+        and the index at that head. Neither reading branches on the strategy:
+        both are the target as it is now. Anything else pauses the run naming
+        the reason — there is no source left to replay and no receipt left to
+        restore.
         """
         if task.worktree_path and Path(task.worktree_path).is_dir():
             return False
@@ -1895,9 +1900,19 @@ class Engine:
                 )
             head = verify.ref_revision(repo, f"refs/heads/{target}")
             if not verify.is_ancestor(repo, task.commit_sha, head):
-                raise verify.IntegrationEvidenceError(
-                    f"{target} does not hold the unit's commit {task.commit_sha}"
+                if not task.baseline_commit:
+                    raise verify.IntegrationEvidenceError(
+                        f"{target} does not hold the unit's commit {task.commit_sha} and "
+                        "the unit names no baseline to read its change set from"
+                    )
+                unfolded = verify.unfolded_changes(
+                    repo, task.baseline_commit, task.commit_sha, head
                 )
+                if unfolded:
+                    raise verify.IntegrationEvidenceError(
+                        f"{target} does not hold the unit's commit {task.commit_sha} nor "
+                        f"its changes over {task.baseline_commit} at " + ", ".join(unfolded)
+                    )
             artifact_publication.validate_integrated(task, self.paths, head)
         except (
             artifact_publication.PublicationError,

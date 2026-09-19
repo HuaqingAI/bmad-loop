@@ -3106,6 +3106,45 @@ def revision_tree_oid(repo: Path, revision: str) -> str:
     return tree
 
 
+def unfolded_changes(repo: Path, baseline: str, source: str, revision: str) -> tuple[str, ...]:
+    """Paths ``baseline..source`` changed that ``revision``'s tree does not hold as
+    ``source`` has them.
+
+    The reading a consumed integration stands on when ancestry cannot answer:
+    a squash seals a commit of its own, so the unit's commit is never in the
+    target's history, but every change it made over its baseline is in the
+    target's tree — each added or modified path held with ``source``'s mode
+    and object id, each deleted path absent (#796 review). One whole-tree
+    ``diff-tree`` between the unit's own commits and one whole-tree inventory
+    of ``revision``, the shape that keeps a wide change set off argv; renames
+    read as their two sides so a moved path's source is checked absent. Empty
+    when the tree folds the whole change set; an unreadable probe raises.
+    """
+    proc = git_bytes(repo, "diff-tree", "-r", "-z", "--no-renames", baseline, source)
+    if proc.returncode != 0:
+        raise IntegrationEvidenceError(
+            f"the unit's change set {baseline[:12]}..{source[:12]} could not be read in {repo}"
+        )
+    held = _revision_inventory(repo, revision)
+    unfolded: list[str] = []
+    fields = proc.stdout.split(b"\0")
+    # ``:<old mode> <new mode> <old oid> <new oid> <status>`` then the path, NUL-separated.
+    for metadata, raw_path in zip(fields[0::2], fields[1::2], strict=False):
+        try:
+            _old_mode, new_mode, _old_oid, new_oid, status = metadata.lstrip(b":").split(b" ", 4)
+        except ValueError as exc:
+            raise IntegrationEvidenceError("the unit's change set is malformed") from exc
+        path = os.fsdecode(raw_path)
+        row = held.get(path)
+        if status.startswith(b"D"):
+            if row is not None:
+                unfolded.append(path)
+            continue
+        if row is None or row[0] != new_mode or row[2] != os.fsdecode(new_oid):
+            unfolded.append(path)
+    return tuple(sorted(unfolded))
+
+
 def integration_cleanup_state_recoverable(
     repo: Path,
     run_dir: Path,

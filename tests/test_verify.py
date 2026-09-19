@@ -9739,3 +9739,58 @@ def test_verify_dev_roots_its_exclude_on_the_code_tree(project, tmp_path, monkey
     # genuinely different directories. Should the fixture ever collapse them, the
     # recorded-root assertion stops separating the two spellings and this reddens.
     assert paths.project != paths.repo_root
+
+
+def test_unfolded_changes_reads_a_squashed_unit_against_the_targets_tree(project):
+    """The reading a consumed squash integration stands on (#796 review): every
+    change the unit made over its baseline — an add, a rewrite, a delete, a
+    mode flip and a rename's two sides — is folded into the target's tree
+    blob for blob after a squash, whose commit is never the unit's descendant;
+    a target that drifted on any of them names exactly those paths.
+
+    Ablation: compare object ids alone and the mode-flip row reads folded;
+    skip the deleted arm and a resurrected path reads folded."""
+    repo = project.repo_root
+    (repo / "kept.txt").write_text("kept\n")
+    (repo / "gone.txt").write_text("gone\n")
+    (repo / "moved.txt").write_text("moved\n")
+    (repo / "flip.sh").write_text("#!/bin/sh\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "baseline")
+    baseline = git(repo, "rev-parse", "HEAD")
+    target = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    git(repo, "checkout", "-q", "-b", "unit")
+    (repo / "kept.txt").write_text("rewritten\n")
+    (repo / "added.txt").write_text("added\n")
+    (repo / "gone.txt").unlink()
+    (repo / "moved.txt").rename(repo / "renamed.txt")
+    git(repo, "add", "-A")
+    git(repo, "update-index", "--chmod=+x", "flip.sh")
+    git(repo, "commit", "-q", "-m", "unit")
+    source = git(repo, "rev-parse", "HEAD")
+    # `-f`: the index seals the chmod, the checkout never did (a filemode=false
+    # host never would), and the mode-only dirt would otherwise refuse the switch.
+    git(repo, "checkout", "-q", "-f", target)
+    git(repo, "merge", "-q", "--squash", "unit")
+    git(repo, "commit", "-q", "-m", "squash")
+    squashed = git(repo, "rev-parse", "HEAD")
+
+    assert not verify.is_ancestor(repo, source, squashed)
+    assert verify.unfolded_changes(repo, baseline, source, squashed) == ()
+    assert verify.unfolded_changes(repo, baseline, source, baseline) == (
+        "added.txt",
+        "flip.sh",
+        "gone.txt",
+        "kept.txt",
+        "moved.txt",
+        "renamed.txt",
+    )
+
+    (repo / "gone.txt").write_text("resurrected\n")
+    git(repo, "add", "-A")
+    git(repo, "update-index", "--chmod=-x", "flip.sh")
+    git(repo, "commit", "-q", "-m", "drift")
+    drifted = git(repo, "rev-parse", "HEAD")
+    assert verify.unfolded_changes(repo, baseline, source, drifted) == ("flip.sh", "gone.txt")
+    with pytest.raises(verify.IntegrationEvidenceError, match="change set"):
+        verify.unfolded_changes(repo, baseline, "0" * 40, drifted)

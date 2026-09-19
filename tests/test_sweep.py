@@ -29951,9 +29951,10 @@ def test_a_forged_reflog_transition_under_the_receipt_identity_does_not_retire_i
     assert Path(final.worktree_path).is_dir()
 
 
+@pytest.mark.parametrize("strategy", ["merge", "squash"])
 @pytest.mark.parametrize("target", ["holds", "artifact-rewritten", "commit-missing"])
 def test_a_consumed_sources_recorded_completion_stands_on_the_target_alone(
-    project, monkeypatch, target
+    project, monkeypatch, target, strategy
 ):
     """The one window where nothing can be replayed: the integration landed,
     retired its receipt, published and tore the worktree and branch down, and
@@ -29961,20 +29962,25 @@ def test_a_consumed_sources_recorded_completion_stands_on_the_target_alone(
     completion on the row and the reflog transition, both the session's to
     write (Codex, #796 review). With no source left to merge, the completion
     now stands on the target as it is now — the unit's commit in the target's
-    history and every accepted artifact blob in its tree and index — and the
-    carry proceeds (`holds`); a target that does not hold it pauses the run
-    naming the reason, the source consumed (`artifact-rewritten`: another
-    writer changed the accepted artifact after the merge; `commit-missing`:
-    the target was reset below the unit's commit).
+    history, or, since a squash seals no such commit (Codex, #796 review),
+    every change the unit made over its baseline folded into the target's
+    tree blob for blob — and every accepted artifact blob in its tree and
+    index — and the carry proceeds (`holds`); a target that does not hold it
+    pauses the run naming the reason, the source consumed
+    (`artifact-rewritten`: another writer changed the accepted artifact after
+    the merge; `commit-missing`: the target was reset below the unit's
+    integration).
 
     Ablation: return True from `_consumed_source_completion_holds` without
     reading the target and both refusing rows red — the carry runs and the
-    row's completion stands over a target that does not hold it."""
+    row's completion stands over a target that does not hold it. Drop the
+    folded-tree arm and every `squash` row pauses: a squash result is never
+    the unit's commit's descendant."""
     effect, destination, accepted = _git_bound_publication_bundle(project, "tracked")
     engine, original_adapter = make_sweep(
         project,
         [triage_effect(bundle_plan()), effect],
-        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
     )
     pre_merge_head = verify.rev_parse_head(project.repo_root)
     crash_at_merge_back(engine, after="merge")
@@ -29989,7 +29995,9 @@ def test_a_consumed_sources_recorded_completion_stands_on_the_target_alone(
     assert not verify.branch_exists(project.repo_root, durable.branch)
     assert destination.read_bytes() == accepted
     landed = verify.rev_parse_head(project.repo_root)
-    assert verify.is_ancestor(project.repo_root, durable.commit_sha, landed)
+    assert verify.is_ancestor(project.repo_root, durable.commit_sha, landed) == (
+        strategy == "merge"
+    )
     if target == "artifact-rewritten":
         destination.write_bytes(b"rewritten on the target after the merge")
         git(project.project, "add", "--", destination)
