@@ -2194,17 +2194,23 @@ def integration_cleanup_state_recoverable(
 
 
 def _integrated_submodule_checkout_unchanged(
-    repo: Path, rel: str, checkout: Path, *, allowed_heads: set[str]
+    repo: Path, rel: str, checkout: Path, *, allowed_heads: set[str], introduced: bool
 ) -> None:
     """A populated checkout at an incoming submodule path, after the target's hooks.
 
     Owned by this repository at its lexical location, clean, and at a HEAD the
-    integrated commit or the receipt vouches for; anything else is drift.
+    integrated commit or the receipt vouches for; anything else is drift. A
+    captured checkout is read as the receipt captured it, ignored files never
+    read; a checkout at a gitlink the commit ``introduced`` stands where the
+    receipt proved nothing was, so everything in it is attempt-era and the
+    reading asks for ignored entries too — a hook's write the submodule's own
+    ``.gitignore`` covers is still its output (#796 review).
     """
     root = repo.resolve(strict=True)
     if checkout.resolve(strict=True) != root.joinpath(*rel.split("/")):
         raise IntegrationEvidenceError("integrated target submodule checkout was redirected")
-    status = git_bytes(checkout, "status", "--porcelain", "-z", "-uall")
+    ignored = ("--ignored",) if introduced else ()
+    status = git_bytes(checkout, "status", "--porcelain", "-z", "-uall", *ignored)
     if (
         not _submodule_checkout_owned(root, checkout)
         or status.returncode != 0
@@ -2266,7 +2272,11 @@ def validate_integrated_submodule_state(
             if not checkout.is_dir():
                 continue
             _integrated_submodule_checkout_unchanged(
-                repo, rel, checkout, allowed_heads={str(raw.get("head")), str(raw.get("gitlink"))}
+                repo,
+                rel,
+                checkout,
+                allowed_heads={str(raw.get("head")), str(raw.get("gitlink"))},
+                introduced=False,
             )
             retained.append(rel)
             continue
@@ -2286,7 +2296,9 @@ def validate_integrated_submodule_state(
         if not checkout.is_dir() or not any(checkout.iterdir()):
             continue
         allowed_heads = {oid} if raw is None else {str(raw.get("head")), oid}
-        _integrated_submodule_checkout_unchanged(repo, rel, checkout, allowed_heads=allowed_heads)
+        _integrated_submodule_checkout_unchanged(
+            repo, rel, checkout, allowed_heads=allowed_heads, introduced=raw is None
+        )
     return tuple(retained)
 
 

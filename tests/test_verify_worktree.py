@@ -3536,3 +3536,38 @@ def test_integrated_new_submodule_at_the_gitlink_is_accepted(project, tmp_path, 
 
     assert retained == ()
     assert verify.integrated_paths_drift(repo, integrated, incoming) == ()
+
+
+def test_integrated_new_submodule_refuses_an_ignored_file_written_into_it(project, tmp_path):
+    """A new gitlink's checkout is read with `status -uall`, which does not
+    list ignored entries — so a target hook that initializes the new
+    submodule and writes a file its own `.gitignore` covers left the
+    reading empty, and the run recorded `unit-merged` over hook output the
+    receipt would then never restore (Codex, #796 review). The receipt
+    proved the path absent, so a checkout there is attempt-era in full and
+    ignored entries count; a captured checkout keeps its documented
+    reading, its ignored files never read. Ablation: drop `--ignored` from
+    the new-checkout reading and this reds on the missing raise."""
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ())
+    origin = tmp_path / "new-origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    (origin / ".gitignore").write_text("*.log\n")
+    commit(origin, "payload.txt", "new submodule\n", "new submodule with an ignore rule")
+    assert git(origin, "ls-files", "--", ".gitignore") == ".gitignore"
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(origin), "newmod")
+    git(repo, "commit", "-q", "-m", "integrated: add newmod")
+    integrated = verify.rev_parse_head(repo)
+    incoming = ("newmod", ".gitmodules")
+    (repo / "newmod" / "hook.log").write_text("target hook output\n")
+    assert git(repo / "newmod", "status", "--porcelain", "-uall") == ""
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="submodule checkout"):
+        verify.validate_integrated_submodule_state(
+            repo, submodules, prospective_paths=incoming, revision=integrated
+        )

@@ -28043,12 +28043,13 @@ def test_target_hook_writing_into_a_deleted_submodule_leftover_is_refused(
     assert refusal["error"].endswith("changed an integrated submodule checkout")
 
 
+@pytest.mark.parametrize("ignored", [False, True], ids=["plain", "ignored"])
 @pytest.mark.parametrize(
     ("strategy", "hook_name"),
     [("merge", "pre-merge-commit"), ("squash", "pre-commit"), ("ff", "post-merge")],
 )
 def test_target_hook_populating_an_incoming_new_submodule_is_refused(
-    project, tmp_path, strategy, hook_name
+    project, tmp_path, strategy, hook_name, ignored
 ):
     """The integrated-submodule reading iterated the receipt's captured
     submodules only, so a gitlink the bundle ADDS got no checkout validation
@@ -28064,15 +28065,21 @@ def test_target_hook_populating_an_incoming_new_submodule_is_refused(
 
     Ablation: drop the new-gitlink iteration and every leg reds on
     `summary.paused` — the run finished, `unit-merged` journaled, the hook's
-    file inside `newmod/` and HEAD holding the bundle's gitlink."""
+    file inside `newmod/` and HEAD holding the bundle's gitlink. The `ignored`
+    rows write a file the new submodule's own `.gitignore` covers, which the
+    plain `status -uall` reading never lists (Codex, #796 review): drop
+    `--ignored` from the introduced-checkout reading and those three red the
+    same way."""
     origin = tmp_path / "new-origin"
     origin.mkdir()
     git(origin, "init", "-q")
     git(origin, "config", "user.email", "test@example.com")
     git(origin, "config", "user.name", "Test")
     (origin / "payload.txt").write_text("new submodule\n")
+    (origin / ".gitignore").write_text("*.log\n")
     git(origin, "add", "-A")
     git(origin, "commit", "-q", "-m", "new submodule")
+    hook_file = "hook.log" if ignored else "hook.txt"
     effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
     target_head = verify.rev_parse_head(project.repo_root)
 
@@ -28095,7 +28102,7 @@ def test_target_hook_populating_an_incoming_new_submodule_is_refused(
         "#!/bin/sh\n"
         'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
         "  git -c protocol.file.allow=always submodule update -q --init -- newmod\n"
-        "  printf 'target hook output' > newmod/hook.txt\n"
+        f"  printf 'target hook output' > newmod/{hook_file}\n"
         "fi\n"
     )
     hook.chmod(0o755)

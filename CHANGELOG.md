@@ -486,7 +486,8 @@ breaking changes may land in a minor release.
   and otherwise refused, with the refusal's restore undoing a hook's writes
   into a captured submodule checkout rather than pausing unrestored. A gitlink
   the unit adds is read the same way as a captured one — index at the gitlink,
-  a populated checkout this repository's, clean, at the gitlink — since an
+  a populated checkout this repository's, clean (ignored entries included, the
+  path having been proved absent), at the gitlink — since an
   incoming `.gitmodules` with `ignore = all` hides a hook's `submodule update
 --init` and everything it writes from every `git diff` reading; the restore
   removes such a hook-made checkout at a receipt-proved-absent path — and the
