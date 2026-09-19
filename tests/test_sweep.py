@@ -24291,6 +24291,77 @@ def test_isolated_bundle_artifact_only_receipt_lands_through_publication_not_tea
     )
 
 
+def test_no_ref_update_refusal_writes_a_replayable_receipt(project, monkeypatch):
+    """An artifact-only unit's integration moves no ref — its squash stages
+    nothing, a `--no-ff` or `ff` of a source the target already holds is
+    "already up to date" — so `integration_ref_update` reads `None` and the
+    receipt's transition is pre -> pre. When post-integration validation then
+    refused (here: the declared ignored spec force-added into the target's
+    index by a concurrent writer), `_refuse_integrated_artifacts` restored the
+    target and persisted `outcome="refused-restored"` WITHOUT `old_revision` /
+    `new_revision` — the one shape `_validated_integration_attempt` refuses —
+    so every resume read "receipt is missing or malformed" and never reached
+    a re-arm (#796 review). The refusal now records the unchanged revision on
+    both sides; the resume then takes the no-ref-update arm it always had and
+    the coverage logic there carries the receipt through.
+
+    Ablation: drop the revisions on the refusal and this reds on the receipt's
+    `old_revision`, the resume behind it on `summary.paused`."""
+    ignore_before_commit(project, "_bmad-output/")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ignore bmad output")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "erratum"}]
+    )
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(plan), _wt_artifact_only_dev(project)],
+        policy=isolated_policy(keep_failed=False),
+    )
+    target_head = verify.rev_parse_head(project.repo_root)
+    destination = project.implementation_artifacts / "spec-dw-fix.md"
+    real_merge = verify.merge_branch
+
+    def writer_after_the_noop_merge(repo, branch, **kwargs):
+        result = real_merge(repo, branch, **kwargs)
+        assert verify.rev_parse_head(project.repo_root) == target_head  # nothing to merge
+        destination.write_text("concurrent writer\n")
+        git(project.project, "add", "-f", "--", str(destination))
+        return result
+
+    monkeypatch.setattr(verify, "merge_branch", writer_after_the_noop_merge)
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    receipt = durable.integration_attempt
+    assert receipt["outcome"] == "refused-restored"
+    assert receipt["old_revision"] == receipt["new_revision"] == target_head
+    assert receipt["pre_target_revision"] == target_head
+    # restored: the force-add is gone from index and checkout, the ref never moved
+    assert git(project.project, "ls-files", "--", str(destination)) == ""
+    assert not destination.exists()
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert "unit-merged" not in journal_kinds(engine)
+    assert Path(durable.worktree_path).is_dir()
+
+    monkeypatch.setattr(verify, "merge_branch", real_merge)
+    resumed, _ = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    task = resumed.state.tasks["dw-fix"]
+    assert task.phase == Phase.DONE and task.artifact_publication_complete
+    assert task.integration_attempt is None
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert destination.read_text().startswith("---\n")
+    assert not ledger_entries(project)["DW-1"].open
+    assert not Path(durable.worktree_path).exists()
+
+
 def test_bundle_artifact_only_receipt_leaves_the_review_ledger_gate_intact(project):
     """The receipt relaxes the dev proof-of-work gate and NOTHING downstream: an
     accepted artifact-only bundle whose ledger ids are still open is refused by

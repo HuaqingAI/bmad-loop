@@ -483,7 +483,11 @@ breaking changes may land in a minor release.
   resolved before the receipt is armed, so a resolver refusal pauses ahead of any
   target mutation instead of snapshotting short of them. A collision-cleanup fault
   restores only the paths the cleanup touched, never a planned path it had not
-  reached.
+  reached. Restoration completeness reads the receipt-attributable inventory, so an
+  operator's unstaged edit elsewhere during the merge window no longer fails a
+  completed restore or blocks its replay; a refused no-ref-update attempt records
+  its unchanged revision so the receipt stays replayable instead of reading as
+  malformed on resume.
 
 - Recover sweep migration publication faults without persisting unearned `DONE`
   state (DW-296/DW-297). Persist accepted baseline/rewrite records, clear a

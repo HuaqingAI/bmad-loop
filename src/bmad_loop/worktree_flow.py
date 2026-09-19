@@ -2640,6 +2640,15 @@ class WorktreeFlow:
                 task.story_key,
                 cause=restore_exc,
             )
+        if update is None:
+            # No ref update to own (an artifact-only bundle's squash stages
+            # nothing; a fast-forward of a source the target already holds):
+            # the transition is pre -> pre, and the receipt says so. An outcome
+            # without its revisions is the one shape `_validated_integration_attempt`
+            # refuses, and it used to be written here — every resume then read
+            # "receipt is missing or malformed" with no re-arm (#796 review).
+            attempt["old_revision"] = attempt["pre_target_revision"]
+            attempt["new_revision"] = attempt["pre_target_revision"]
         attempt["outcome"] = "refused-restored"
         task.integration_attempt = attempt
         self.journal.append(
