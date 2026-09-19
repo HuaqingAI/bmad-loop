@@ -3240,3 +3240,175 @@ def test_integrated_paths_drift_accepts_an_incoming_entry_type_change(project, s
     assert git(repo, "status", "--porcelain") == ""
 
     assert verify.integrated_paths_drift(repo, integrated, incoming) == ()
+
+
+def _integrate_submodule_deletion(repo, *, leftover):
+    """Commit the integrated shape git leaves when a merge deletes a populated
+    submodule: gitlink and `.gitmodules` entry gone from HEAD and index, and —
+    `warning: unable to rmdir 'module': Directory not empty` — the populated
+    checkout still on disk as `?? module/` unless git could remove it."""
+    git(repo, "rm", "-q", "--cached", "--", "module")
+    git(repo, "config", "-f", ".gitmodules", "--remove-section", "submodule.module")
+    git(repo, "add", "--", ".gitmodules")
+    git(repo, "commit", "-q", "-m", "integrated: delete module")
+    if not leftover:
+        shutil.rmtree(repo / "module")
+    return verify.rev_parse_head(repo)
+
+
+def test_integrated_submodule_deletion_accepts_the_leftover_checkout(project, tmp_path):
+    """A merge that deletes a populated submodule succeeds and leaves the
+    checkout on disk (`warning: unable to rmdir`, then `?? module/`). The
+    integrated-submodule reading demanded a gitlink row from the integrated
+    commit for every captured submodule in the incoming set, so that
+    deletion — a correct integrated commit necessarily has no row — raised
+    "evidence is unavailable", and every populated-submodule deletion was
+    refused and restored; the absent-path probe would then have called the
+    leftover hook drift (Codex, #796 review). The commit's authority for a
+    deleted gitlink is "no gitlink": the leftover is accepted only as the
+    exact captured checkout — owned by this repository, clean, at the
+    captured HEAD — and reported back so the absent-path probe leaves it to
+    this reading; a checkout git did remove is simply absent.
+
+    Ablation: drop the deleted-gitlink arm and the leftover row reds on the
+    raise; drop `retained_checkouts` from the probe and it reds on `module`
+    reported as drift."""
+    repo = project.project
+    _origin, checkout, old_submodule = _add_test_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "d" * 32, ("module", ".gitmodules")
+    )
+    assert submodules == [{"path": "module", "head": old_submodule, "gitlink": old_submodule}]
+    integrated = _integrate_submodule_deletion(repo, leftover=True)
+    assert git(repo, "status", "--porcelain") == "?? module/"
+    incoming = ("module", ".gitmodules")
+
+    retained = verify.validate_integrated_submodule_state(
+        repo, submodules, prospective_paths=incoming, revision=integrated
+    )
+
+    assert retained == ("module",)
+    assert checkout.is_dir()
+    assert (
+        verify.integrated_paths_drift(repo, integrated, incoming, retained_checkouts=retained) == ()
+    )
+    assert verify.integrated_paths_drift(repo, integrated, incoming) == ("module",)
+
+
+def test_integrated_submodule_deletion_accepts_a_removed_checkout(project, tmp_path):
+    repo = project.project
+    _add_test_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "d" * 32, ("module", ".gitmodules")
+    )
+    integrated = _integrate_submodule_deletion(repo, leftover=False)
+    incoming = ("module", ".gitmodules")
+
+    retained = verify.validate_integrated_submodule_state(
+        repo, submodules, prospective_paths=incoming, revision=integrated
+    )
+
+    assert retained == ()
+    assert (
+        verify.integrated_paths_drift(repo, integrated, incoming, retained_checkouts=retained) == ()
+    )
+
+
+@pytest.mark.parametrize("drift", ["nested-file", "moved-head", "not-a-checkout", "foreign-repo"])
+def test_integrated_submodule_deletion_refuses_a_changed_leftover(project, tmp_path, drift):
+    """The leftover is accepted as the exact captured checkout and nothing
+    else: a hook writing into it, moving its HEAD, replacing it with an
+    ordinary directory of the same name, or with a fresh repository of its
+    own (git dir at `module/.git`, not under this repository's
+    `.git/modules`, where a submodule's lives) is drift on an incoming path."""
+    repo = project.project
+    origin, checkout, _old_submodule = _add_test_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "d" * 32, ("module", ".gitmodules")
+    )
+    integrated = _integrate_submodule_deletion(repo, leftover=True)
+    if drift == "nested-file":
+        (checkout / "hook.txt").write_text("target hook output\n")
+    elif drift == "moved-head":
+        commit(origin, "payload.txt", "submodule new\n", "advance submodule")
+        git(checkout, "fetch", "-q", "origin")
+        git(checkout, "checkout", "-q", "--detach", verify.rev_parse_head(origin))
+    elif drift == "not-a-checkout":
+        shutil.rmtree(checkout)
+        checkout.mkdir()
+        (checkout / "hook.txt").write_text("target hook output\n")
+    else:
+        shutil.rmtree(checkout)
+        checkout.mkdir()
+        git(checkout, "init", "-q")
+        git(checkout, "config", "user.email", "test@example.com")
+        git(checkout, "config", "user.name", "Test")
+        commit(checkout, "payload.txt", "submodule old\n", "hook-made repository")
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="submodule checkout"):
+        verify.validate_integrated_submodule_state(
+            repo, submodules, prospective_paths=("module", ".gitmodules"), revision=integrated
+        )
+
+
+def test_integrated_submodule_deletion_leaves_a_file_at_the_path_to_the_probe(project, tmp_path):
+    """A hook that replaces the leftover with a plain file is not a checkout
+    at all: the reading retains nothing, and the absent-path probe reports
+    the path."""
+    repo = project.project
+    _origin, checkout, _old_submodule = _add_test_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "d" * 32, ("module", ".gitmodules")
+    )
+    integrated = _integrate_submodule_deletion(repo, leftover=True)
+    shutil.rmtree(checkout)
+    checkout.write_text("target hook output\n")
+    incoming = ("module", ".gitmodules")
+
+    retained = verify.validate_integrated_submodule_state(
+        repo, submodules, prospective_paths=incoming, revision=integrated
+    )
+
+    assert retained == ()
+    assert verify.integrated_paths_drift(
+        repo, integrated, incoming, retained_checkouts=retained
+    ) == ("module",)
+
+
+def test_integrated_submodule_replaced_by_a_file_is_held_by_the_diff_readings(project, tmp_path):
+    """A captured submodule the integrated commit replaced with a regular
+    file was refused as "malformed" evidence; the commit holds a blob there,
+    so the index and checkout readings against the commit are its authority
+    and the submodule reading has nothing to adjudicate."""
+    repo = project.project
+    _origin, checkout, _old_submodule = _add_test_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "d" * 32, ("module", ".gitmodules")
+    )
+    git(repo, "rm", "-q", "--cached", "--", "module")
+    git(repo, "config", "-f", ".gitmodules", "--remove-section", "submodule.module")
+    shutil.rmtree(checkout)
+    checkout.write_text("now a file\n")
+    git(repo, "add", "--", ".gitmodules", "module")
+    git(repo, "commit", "-q", "-m", "integrated: module becomes a file")
+    integrated = verify.rev_parse_head(repo)
+    incoming = ("module", ".gitmodules")
+
+    retained = verify.validate_integrated_submodule_state(
+        repo, submodules, prospective_paths=incoming, revision=integrated
+    )
+
+    assert retained == ()
+    assert (
+        verify.integrated_paths_drift(repo, integrated, incoming, retained_checkouts=retained) == ()
+    )

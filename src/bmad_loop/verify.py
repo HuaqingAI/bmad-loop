@@ -731,6 +731,32 @@ def _indexed_submodules(repo: Path) -> list[str]:
     return paths
 
 
+def _submodule_checkout_owned(root: Path, checkout: Path) -> bool:
+    """Whether a populated checkout is this repository's own submodule checkout.
+
+    While the index carries the gitlink, git names the superproject from the
+    checkout and it must be ``root``. A checkout whose gitlink an integration
+    deleted has no superproject any more — git leaves the populated directory
+    behind (``warning: unable to rmdir``) — and is this repository's by its git
+    dir living under ``.git/modules``, where git keeps a submodule's. A checkout
+    naming some other superproject, or one carrying its own git dir (a fresh
+    ``git init`` at the path), is not. Ceiling: a legacy submodule with its git
+    dir embedded in the checkout has no orphan proof and reads as foreign once
+    its gitlink is gone.
+    """
+    rc, superproject, _detail = _git_out(checkout, "rev-parse", "--show-superproject-working-tree")
+    if rc != 0:
+        return False
+    if superproject:
+        return Path(superproject).resolve(strict=True) == root
+    rc, git_dir, _detail = _git_out(checkout, "rev-parse", "--absolute-git-dir")
+    if rc != 0 or not git_dir:
+        return False
+    modules = root / ".git" / "modules"
+    resolved = Path(git_dir).resolve(strict=True)
+    return resolved != modules and resolved.is_relative_to(modules)
+
+
 def _validated_submodule_checkout(
     repo: Path,
     entry: dict[str, object],
@@ -780,8 +806,7 @@ def _validated_submodule_checkout(
         raise IntegrationEvidenceError(
             "persisted target submodule checkout escaped its indexed location"
         )
-    rc, superproject, _detail = _git_out(checkout, "rev-parse", "--show-superproject-working-tree")
-    if rc != 0 or not superproject or Path(superproject).resolve(strict=True) != root:
+    if not _submodule_checkout_owned(root, checkout):
         raise IntegrationEvidenceError("persisted target submodule checkout changed ownership")
     if verify_head and rev_parse_head(checkout) != expected:
         raise IntegrationEvidenceError("target submodule checkout was not restored")
@@ -809,7 +834,20 @@ def _restore_submodule_checkouts(
             raise IntegrationRestoreError(
                 f"target submodule checkout restoration failed for {rel}: {detail}"
             )
+        # The receipt captured this checkout clean under exactly this reading,
+        # so whatever it reports now — a target hook's write into the checkout
+        # (#796 review) — is attempt-era and the receipt's to undo: tracked
+        # content and index back to the captured HEAD, untracked files out.
+        # Ignored files were never read and are never touched.
         status = git_bytes(checkout, "status", "--porcelain", "-z", "-uall")
+        if status.returncode == 0 and status.stdout:
+            for reset in (("reset", "-q", "--hard"), ("clean", "-q", "-fd")):
+                rc, detail = _git(checkout, *reset)
+                if rc != 0:
+                    raise IntegrationRestoreError(
+                        f"target submodule checkout restoration failed for {rel}: {detail}"
+                    )
+            status = git_bytes(checkout, "status", "--porcelain", "-z", "-uall")
         if status.returncode != 0 or status.stdout:
             raise IntegrationRestoreError(
                 f"target submodule checkout restoration is not clean for {rel}"
@@ -2022,7 +2060,39 @@ def integration_nonref_state_unchanged(
     return True
 
 
-def integrated_paths_drift(repo: Path, revision: str, paths: Iterable[str]) -> tuple[str, ...]:
+def _revision_inventory(repo: Path, revision: str) -> dict[str, tuple[bytes, bytes, str]]:
+    """Every blob and gitlink ``revision`` seals, keyed by path: ``(mode, kind, oid)``.
+
+    One whole-tree ``ls-tree -r`` — the shape that keeps a wide incoming set off
+    argv — read by both post-integration readings that need to know what the
+    integrated commit holds at a path. Trees are not rows; a caller asking
+    about a directory asks through its prefix.
+    """
+    proc = git_bytes(repo, "ls-tree", "-r", "-z", revision)
+    if proc.returncode != 0:
+        raise IntegrationEvidenceError("the integrated commit's path inventory could not be read")
+    inventory: dict[str, tuple[bytes, bytes, str]] = {}
+    for record in proc.stdout.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, raw_path = record.split(b"\t", 1)
+            mode, kind, oid = metadata.split(b" ", 2)
+        except ValueError as exc:
+            raise IntegrationEvidenceError(
+                "the integrated commit's path inventory is malformed"
+            ) from exc
+        inventory[os.fsdecode(raw_path)] = (mode, kind, os.fsdecode(oid))
+    return inventory
+
+
+def integrated_paths_drift(
+    repo: Path,
+    revision: str,
+    paths: Iterable[str],
+    *,
+    retained_checkouts: Iterable[str] = (),
+) -> tuple[str, ...]:
     """Incoming ``paths`` whose post-hook index or worktree differ from ``revision``.
 
     The receipt's post-integration check excludes the incoming set from its
@@ -2047,11 +2117,16 @@ def integrated_paths_drift(repo: Path, revision: str, paths: Iterable[str]) -> t
     reason) says which incoming paths it deleted — and since that listing
     names blobs and gitlinks, never the trees above them, a path the commit
     turned into a directory (``a`` deleted, ``a/b`` added) counts as held
-    through the prefix, not deleted.
+    through the prefix, not deleted. One deleted shape is git's own and not
+    a hook's: the populated checkout a merge leaves behind when it deletes
+    a submodule (``warning: unable to rmdir``). `validate_integrated_submodule_state`
+    adjudicates those against the receipt and names the ones it accepted in
+    ``retained_checkouts``; the probe leaves exactly those to it.
     """
     selected = {_portable_integration_path(path) for path in paths}
     if not selected:
         return ()
+    retained = {_portable_integration_path(path) for path in retained_checkouts}
     drift: list[str] = []
     for cached in ((), ("--cached",)):
         proc = git_bytes(repo, "diff", *cached, "--name-only", "--no-renames", "-z", revision)
@@ -2064,16 +2139,11 @@ def integrated_paths_drift(repo: Path, revision: str, paths: Iterable[str]) -> t
             for path in (os.fsdecode(raw) for raw in proc.stdout.split(b"\0") if raw)
             if path in selected
         )
-    proc = git_bytes(repo, "ls-tree", "-r", "--name-only", "-z", revision)
-    if proc.returncode != 0:
-        raise IntegrationEvidenceError("the integrated commit's path inventory could not be read")
     held: set[str] = set()
-    for raw in proc.stdout.split(b"\0"):
-        if not raw:
-            continue
-        parts = os.fsdecode(raw).split("/")
+    for held_path in _revision_inventory(repo, revision):
+        parts = held_path.split("/")
         held.update("/".join(parts[:depth]) for depth in range(1, len(parts) + 1))
-    for path in sorted(selected - held):
+    for path in sorted(selected - held - retained):
         _validated, candidate = _confined_repo_operand(repo, path)
         if candidate.exists() or candidate.is_symlink():
             drift.append(path)
@@ -2128,42 +2198,78 @@ def integration_cleanup_state_recoverable(
     return True
 
 
+def _integrated_submodule_checkout_unchanged(
+    repo: Path, rel: str, checkout: Path, *, allowed_heads: set[str]
+) -> None:
+    """A populated checkout at an incoming submodule path, after the target's hooks.
+
+    Owned by this repository at its lexical location, clean, and at a HEAD the
+    integrated commit or the receipt vouches for; anything else is drift.
+    """
+    root = repo.resolve(strict=True)
+    if checkout.resolve(strict=True) != root.joinpath(*rel.split("/")):
+        raise IntegrationEvidenceError("integrated target submodule checkout was redirected")
+    status = git_bytes(checkout, "status", "--porcelain", "-z", "-uall")
+    if (
+        not _submodule_checkout_owned(root, checkout)
+        or status.returncode != 0
+        or status.stdout
+        or rev_parse_head(checkout) not in allowed_heads
+    ):
+        raise IntegrationEvidenceError("target hook changed an integrated submodule checkout")
+
+
 def validate_integrated_submodule_state(
     repo: Path,
     submodules: object,
     *,
     prospective_paths: Iterable[str],
     revision: str,
-) -> None:
-    """Validate legitimate incoming gitlink changes without ignoring checkout drift."""
+) -> tuple[str, ...]:
+    """Validate legitimate incoming gitlink changes without ignoring checkout drift.
+
+    The integrated commit is the authority for each captured submodule the
+    incoming set names. Where it still holds a gitlink, the post-hook index
+    must carry exactly that gitlink and a populated checkout must be the
+    receipt's or the commit's. Where it holds a blob instead, the index and
+    checkout readings against the commit are the authority and there is
+    nothing to adjudicate here. Where it holds nothing — the incoming commit
+    deleted the submodule — git itself leaves the populated checkout behind
+    (``warning: unable to rmdir``, then ``?? path/``), so a leftover is not a
+    hook's doing: it is accepted only as the exact captured checkout, owned,
+    clean, at the captured HEAD, and every leftover so accepted is returned
+    for `integrated_paths_drift` to leave to this reading (#796 review). A
+    checkout git could remove is simply absent; a file or foreign directory
+    in its place is drift.
+    """
     if not isinstance(submodules, list):
         raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
     prospective = set(preflight_integration_paths(prospective_paths))
+    inventory: dict[str, tuple[bytes, bytes, str]] | None = None
+    retained: list[str] = []
     for raw in submodules:
         if not isinstance(raw, dict) or raw.get("path") not in prospective:
             continue
         rel = _portable_integration_path(raw.get("path"))
-        proc = git_bytes(repo, "ls-tree", "-z", revision, "--", rel)
-        if proc.returncode != 0 or not proc.stdout:
-            raise IntegrationEvidenceError("integrated target submodule evidence is unavailable")
-        try:
-            metadata, raw_path = proc.stdout.removesuffix(b"\0").split(b"\t", 1)
-            mode, kind, oid = metadata.split(b" ", 2)
-        except ValueError as exc:
-            raise IntegrationEvidenceError(
-                "integrated target submodule evidence is malformed"
-            ) from exc
-        if mode != b"160000" or kind != b"commit" or os.fsdecode(raw_path) != rel:
+        if inventory is None:
+            inventory = _revision_inventory(repo, revision)
+        held = inventory.get(rel)
+        if held is None:
+            checkout = repo / rel
+            if not checkout.is_dir():
+                continue
+            _integrated_submodule_checkout_unchanged(
+                repo, rel, checkout, allowed_heads={str(raw.get("head")), str(raw.get("gitlink"))}
+            )
+            retained.append(rel)
+            continue
+        mode, kind, oid = held
+        if mode != b"160000":
+            continue
+        if kind != b"commit":
             raise IntegrationEvidenceError("integrated target submodule evidence is malformed")
         expected_index = {
-            "entries": [
-                {
-                    "mode": "160000",
-                    "oid": os.fsdecode(oid),
-                    "stage": 0,
-                    "flags": "0",
-                }
-            ],
+            "entries": [{"mode": "160000", "oid": oid, "stage": 0, "flags": "0"}],
             "intent_to_add": False,
         }
         if _index_state(repo, rel) != expected_index:
@@ -2171,23 +2277,10 @@ def validate_integrated_submodule_state(
         checkout = repo / rel
         if not checkout.is_dir():
             continue
-        root = repo.resolve(strict=True)
-        if checkout.resolve(strict=True) != root.joinpath(*rel.split("/")):
-            raise IntegrationEvidenceError("integrated target submodule checkout was redirected")
-        rc, superproject, _detail = _git_out(
-            checkout, "rev-parse", "--show-superproject-working-tree"
+        _integrated_submodule_checkout_unchanged(
+            repo, rel, checkout, allowed_heads={str(raw.get("head")), oid}
         )
-        status = git_bytes(checkout, "status", "--porcelain", "-z", "-uall")
-        allowed_heads = {str(raw.get("head")), os.fsdecode(oid)}
-        if (
-            rc != 0
-            or not superproject
-            or Path(superproject).resolve(strict=True) != root
-            or status.returncode != 0
-            or status.stdout
-            or rev_parse_head(checkout) not in allowed_heads
-        ):
-            raise IntegrationEvidenceError("target hook changed an integrated submodule checkout")
+    return tuple(retained)
 
 
 def restore_integration_nonref_state(

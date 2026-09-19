@@ -27922,6 +27922,127 @@ def test_populated_submodule_checkout_is_captured_forwarded_and_restored(project
     assert "unit-merged" not in journal_kinds(engine)
 
 
+def _seed_populated_target_submodule(project, tmp_path):
+    origin = tmp_path / "sub-origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    (origin / "payload.txt").write_text("old\n")
+    git(origin, "add", "-A")
+    git(origin, "commit", "-q", "-m", "old submodule")
+    git(
+        project.project,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(origin),
+        "module",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "add populated submodule")
+    return verify.rev_parse_head(origin)
+
+
+@pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
+def test_bundle_deleting_a_populated_target_submodule_integrates(project, tmp_path, strategy):
+    """A bundle that deletes the target's populated submodule could never
+    integrate: git merges the deletion and leaves the populated checkout on
+    disk (`warning: unable to rmdir 'module'`, then `?? module/`), and the
+    integrated-submodule reading demanded a gitlink row from the integrated
+    commit for every captured submodule the incoming set names — a correct
+    commit has none — so every such bundle was refused and restored on
+    every leg (Codex, #796 review). The leftover is git's, not a hook's: it
+    is accepted as the exact captured checkout (owned, clean, at the
+    captured HEAD), the run records `unit-merged`, and the checkout stays
+    on disk for the operator, `?? module/`, exactly as git left it.
+
+    Ablation: drop the deleted-gitlink arm and every leg reds on
+    `summary.paused`; keep it but drop `retained_checkouts` from the
+    absent-path probe and every leg reds the same way, the leftover now
+    reported as drift on `module`."""
+    old_submodule = _seed_populated_target_submodule(project, tmp_path)
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+
+    def deleting_effect(spec):
+        git(spec.cwd, "rm", "-q", "--", "module")
+        return effect(spec)
+
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), deleting_effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+    assert "unit-merged" in journal_kinds(engine)
+    assert not _records(engine, "artifact-publication-refused")
+    head = verify.rev_parse_head(project.repo_root)
+    assert git(project.project, "ls-tree", "--name-only", head, "--", "module") == ""
+    assert git(project.project, "ls-files", "--stage", "--", "module") == ""
+    assert git(project.project, "status", "--porcelain", "--untracked-files=no") == ""
+    assert git(project.project, "status", "--porcelain", "--", "module") == "?? module/"
+    assert verify.rev_parse_head(project.project / "module") == old_submodule
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.artifact_publication_complete
+    assert durable.integration_attempt is None  # retired with the integration
+
+
+@pytest.mark.parametrize(
+    ("strategy", "hook_name"),
+    [("merge", "pre-merge-commit"), ("squash", "pre-commit"), ("ff", "post-merge")],
+)
+def test_target_hook_writing_into_a_deleted_submodule_leftover_is_refused(
+    project, tmp_path, strategy, hook_name
+):
+    """The leftover is accepted only as the exact captured checkout: a target
+    hook writing into it after the merge deleted its gitlink is drift on an
+    incoming path, refused through the receipt route and restored."""
+    old_submodule = _seed_populated_target_submodule(project, tmp_path)
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    target_head = verify.rev_parse_head(project.repo_root)
+
+    def deleting_effect(spec):
+        git(spec.cwd, "rm", "-q", "--", "module")
+        return effect(spec)
+
+    hook = project.project / ".git" / "hooks" / hook_name
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        "  printf 'target hook output' > module/hook.txt\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    engine, _adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), deleting_effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    # the exact pre-attempt target is back, populated submodule included:
+    # gitlink in the index, checkout at the captured HEAD, the hook's file gone
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert git(project.project, "status", "--porcelain", "--untracked-files=no") == ""
+    assert verify.rev_parse_head(project.project / "module") == old_submodule
+    assert git(project.project / "module", "status", "--porcelain") == ""
+    assert not (project.project / "module" / "hook.txt").exists()
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt.get("outcome") == "refused-restored"
+    assert "unit-merged" not in journal_kinds(engine)
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert refusal["error"].endswith("changed an integrated submodule checkout")
+
+
 def test_missing_ref_update_evidence_never_authorizes_target_reset(project, monkeypatch):
     effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
     engine, _ = make_sweep(

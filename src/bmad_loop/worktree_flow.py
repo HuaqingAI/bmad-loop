@@ -3519,7 +3519,21 @@ class WorktreeFlow:
                             "target commit hook changed the squash result after the merge "
                             "resolved it"
                         )
-                drifted = verify.integrated_paths_drift(repo, expected_revision, prospective_paths)
+                # The submodule reading goes first: a populated checkout git
+                # left behind when the commit deleted its gitlink is git's, not
+                # a hook's, and only that reading can say so to the probe.
+                retained_checkouts = verify.validate_integrated_submodule_state(
+                    repo,
+                    attempt["submodules"],
+                    prospective_paths=prospective_paths,
+                    revision=expected_revision,
+                )
+                drifted = verify.integrated_paths_drift(
+                    repo,
+                    expected_revision,
+                    prospective_paths,
+                    retained_checkouts=retained_checkouts,
+                )
                 if drifted:
                     raise verify.IntegrationEvidenceError(
                         "target hook changed incoming paths after integration: "
@@ -3537,12 +3551,6 @@ class WorktreeFlow:
                         "target hook changed receipt-owned index, worktree, ignored, "
                         "or submodule state"
                     )
-                verify.validate_integrated_submodule_state(
-                    repo,
-                    attempt["submodules"],
-                    prospective_paths=prospective_paths,
-                    revision=expected_revision,
-                )
                 if verify.ref_revision(repo, target_ref) != expected_revision:
                     raise verify.IntegrationEvidenceError(
                         "target moved during artifact integration validation"

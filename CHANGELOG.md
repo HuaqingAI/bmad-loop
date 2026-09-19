@@ -480,8 +480,12 @@ breaking changes may land in a minor release.
   target hook's rewrite of an ordinary incoming source file, staged, left in the
   checkout, or sealed into the squash leg's own commit, is refused and restored
   rather than recorded as `unit-merged`; so is an incoming path the unit deletes
-  that a target hook recreates unstaged, which no index reading can see — and
-  the accepted artifact paths are
+  that a target hook recreates unstaged, which no index reading can see. A unit
+  that deletes a populated target submodule integrates: git leaves the checkout
+  behind (`?? path/`), which is accepted only as the exact captured checkout
+  and otherwise refused, with the refusal's restore undoing a hook's writes
+  into a captured submodule checkout rather than pausing unrestored — and the
+  accepted artifact paths are
   resolved before the receipt is armed, so a resolver refusal pauses ahead of any
   target mutation instead of snapshotting short of them. A collision-cleanup fault
   restores only the paths the cleanup touched, never a planned path it had not
