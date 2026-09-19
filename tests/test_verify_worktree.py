@@ -3670,28 +3670,12 @@ def test_integrated_submodule_deletion_in_a_linked_worktree_target(project, tmp_
     )
 
 
-def test_integrated_submodule_replaced_by_a_directory_is_left_to_the_diff_readings(
-    project, tmp_path
-):
-    """An incoming commit that replaces a captured submodule with an ordinary
-    tracked directory has no `ls-tree -r` row for the old gitlink path, only
-    for its descendants (`module/file.txt`). The deleted-gitlink arm read that
-    as "nothing held", took the directory git left the old checkout inside
-    (`warning: unable to rmdir`, so `.git` and the old payload sit beside the
-    new tracked file) for a leftover checkout, found the tracked file
-    "untracked" from the submodule's view, and refused a valid replacement
-    (Codex, #796 review). A path the commit holds through a prefix is held —
-    the same reading `integrated_paths_drift` takes — and its descendants are
-    the diff readings' business; the submodule reading has nothing to
-    adjudicate there. Ablation: drop the prefix reading and this reds on the
-    raise."""
-    repo = project.project
-    _origin, checkout, _old_submodule = _add_test_submodule(repo, tmp_path)
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    _snapshots, submodules = verify.capture_integration_state(
-        repo, run_dir, "d" * 32, ("module", "module/file.txt", ".gitmodules")
-    )
+def _integrate_submodule_replacement(repo, checkout):
+    """Commit the integrated shape git leaves when a merge replaces a populated
+    submodule with an ordinary tracked directory: gitlink and `.gitmodules`
+    entry gone, `module/file.txt` held by the commit and written INTO the
+    old checkout (`warning: unable to rmdir`), so `.git` and the old payload
+    sit beside the new tracked file."""
     git(repo, "rm", "-q", "--cached", "--", "module")
     git(repo, "config", "-f", ".gitmodules", "--remove-section", "submodule.module")
     (checkout / "file.txt").write_text("now a tracked directory\n")
@@ -3701,12 +3685,114 @@ def test_integrated_submodule_replaced_by_a_directory_is_left_to_the_diff_readin
     git(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},module/file.txt")
     git(repo, "add", "--", ".gitmodules")
     git(repo, "commit", "-q", "-m", "integrated: module becomes a directory")
-    integrated = verify.rev_parse_head(repo)
+    return verify.rev_parse_head(repo)
+
+
+def test_integrated_submodule_replaced_by_a_directory_retains_the_leftover_checkout(
+    project, tmp_path
+):
+    """An incoming commit that replaces a captured submodule with an ordinary
+    tracked directory has no `ls-tree -r` row for the old gitlink path, only
+    for its descendants (`module/file.txt`). The deleted-gitlink arm first
+    took the directory for a leftover checkout and refused a valid
+    replacement over the tracked file it found "untracked" from the
+    submodule's view; the prefix reading that fixed it (523b248c) then left
+    the leftover entirely to the diff readings — which cover only what the
+    superproject's index tracks, so a hook's untracked write into the old
+    checkout went unseen and the run recorded `unit-merged` over it (Codex,
+    #796 review). The leftover git left INSIDE the replaced directory is
+    adjudicated like the one it leaves at a deleted gitlink: owned by this
+    repository, at the captured HEAD, and holding nothing but what the
+    integrated tree holds under the path — the merge's own writes into it,
+    which the diff readings own — and it is retained so the whole-tree stray
+    reading leaves it to this one. Ablation: drop the replaced-directory arm
+    and this reds on `retained == ()`."""
+    repo = project.project
+    _origin, checkout, _old_submodule = _add_test_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "d" * 32, ("module", "module/file.txt", ".gitmodules")
+    )
+    integrated = _integrate_submodule_replacement(repo, checkout)
     assert (checkout / ".git").exists() and (checkout / "payload.txt").exists()
     assert (
         git(repo, "ls-tree", "-r", "--name-only", integrated, "--", "module") == "module/file.txt"
     )
     assert git(repo, "status", "--porcelain", "-uall") == "?? module/payload.txt"
+    assert git(checkout, "status", "--porcelain", "-uall") == "?? file.txt"
+    incoming = ("module", "module/file.txt", ".gitmodules")
+
+    retained = verify.validate_integrated_submodule_state(
+        repo, submodules, prospective_paths=incoming, revision=integrated
+    )
+
+    assert retained == ("module",)
+    assert (
+        verify.integrated_paths_drift(repo, integrated, incoming, retained_checkouts=retained) == ()
+    )
+    assert (
+        verify.integrated_stray_paths(
+            repo, tolerated=(), incoming=incoming, retained_checkouts=retained
+        )
+        == ()
+    )
+    assert verify.integrated_stray_paths(repo, tolerated=(), incoming=incoming) == (
+        "module/payload.txt",
+    )
+
+
+@pytest.mark.parametrize("drift", ["nested-file", "deleted-payload", "moved-head", "foreign-repo"])
+def test_integrated_submodule_replaced_by_a_directory_refuses_a_changed_leftover(
+    project, tmp_path, drift
+):
+    """The leftover inside the replaced directory is accepted as the captured
+    checkout plus the integrated tree's own writes and nothing else: a hook
+    writing an untracked file into it, deleting the captured payload the
+    integrated tree does not hold, moving its HEAD, or re-initialising it as
+    a repository of its own is drift on an incoming path."""
+    repo = project.project
+    origin, checkout, _old_submodule = _add_test_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "d" * 32, ("module", "module/file.txt", ".gitmodules")
+    )
+    integrated = _integrate_submodule_replacement(repo, checkout)
+    if drift == "nested-file":
+        (checkout / "hook.txt").write_text("target hook output\n")
+    elif drift == "deleted-payload":
+        (checkout / "payload.txt").unlink()
+    elif drift == "moved-head":
+        commit(origin, "payload.txt", "submodule new\n", "advance submodule")
+        git(checkout, "fetch", "-q", "origin")
+        git(checkout, "checkout", "-q", "--detach", verify.rev_parse_head(origin))
+    else:
+        (checkout / ".git").unlink()
+        git(checkout, "init", "-q")
+    incoming = ("module", "module/file.txt", ".gitmodules")
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="submodule checkout"):
+        verify.validate_integrated_submodule_state(
+            repo, submodules, prospective_paths=incoming, revision=integrated
+        )
+
+
+def test_integrated_submodule_replaced_by_a_directory_without_a_leftover(project, tmp_path):
+    """A replaced directory git could write cleanly — no `.git` inside it —
+    holds no checkout to adjudicate: nothing is retained, the directory's
+    contents are the diff readings' and the stray reading's business."""
+    repo = project.project
+    _origin, checkout, _old_submodule = _add_test_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "d" * 32, ("module", "module/file.txt", ".gitmodules")
+    )
+    integrated = _integrate_submodule_replacement(repo, checkout)
+    (checkout / ".git").unlink()
+    (checkout / "payload.txt").unlink()
+    assert git(repo, "status", "--porcelain", "-uall") == ""
     incoming = ("module", "module/file.txt", ".gitmodules")
 
     retained = verify.validate_integrated_submodule_state(
@@ -3714,9 +3800,10 @@ def test_integrated_submodule_replaced_by_a_directory_is_left_to_the_diff_readin
     )
 
     assert retained == ()
-    assert (
-        verify.integrated_paths_drift(repo, integrated, incoming, retained_checkouts=retained) == ()
-    )
+    (checkout / "hook.txt").write_text("target hook output\n")
+    assert verify.integrated_stray_paths(
+        repo, tolerated=(), incoming=incoming, retained_checkouts=retained
+    ) == ("module/hook.txt",)
 
 
 @pytest.mark.parametrize("shape", ["edited", "staged", "deleted", "untracked", "renamed"])

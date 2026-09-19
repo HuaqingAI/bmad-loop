@@ -2299,6 +2299,39 @@ def _integrated_submodule_checkout_unchanged(
         raise IntegrationEvidenceError("target hook changed an integrated submodule checkout")
 
 
+def _integrated_replaced_submodule_checkout_unchanged(
+    repo: Path,
+    rel: str,
+    checkout: Path,
+    *,
+    allowed_heads: set[str],
+    held: Iterable[str],
+) -> None:
+    """The leftover checkout inside a tracked directory that replaced its gitlink.
+
+    Owned by this repository at its lexical location (no gitlink names the
+    superproject any more, so ownership is its git dir under ``.git/modules``),
+    at a HEAD the receipt vouches for, and — read as its own repository, the
+    only reading that sees past the superproject's index — reporting no entry
+    but the integrated tree's own writes into it: every status row, joined
+    under ``rel``, must be a path ``held`` names. Anything else is a hook's.
+    """
+    root = repo.resolve(strict=True)
+    if checkout.resolve(strict=True) != root.joinpath(*rel.split("/")):
+        raise IntegrationEvidenceError("integrated target submodule checkout was redirected")
+    status = git_bytes(checkout, "status", "--porcelain", "-z", "-uall")
+    if (
+        not _submodule_checkout_owned(root, checkout)
+        or status.returncode != 0
+        or rev_parse_head(checkout) not in allowed_heads
+    ):
+        raise IntegrationEvidenceError("target hook changed an integrated submodule checkout")
+    held_paths = set(held)
+    for nested in _porcelain_paths(os.fsdecode(status.stdout)):
+        if f"{rel}/{nested}" not in held_paths:
+            raise IntegrationEvidenceError("target hook changed an integrated submodule checkout")
+
+
 def validate_integrated_submodule_state(
     repo: Path,
     submodules: object,
@@ -2320,16 +2353,22 @@ def validate_integrated_submodule_state(
     checkout, not a moved HEAD, not even a rewritten gitlink (#796 review).
 
     For a captured submodule the commit no longer holds as a gitlink: a blob
-    in its place, or a tree (the path held through a prefix — a submodule
-    replaced by a tracked directory), is the diff readings' business; nothing
-    at all means the incoming commit deleted the submodule, and git itself leaves the
+    in its place is the diff readings' business; nothing at all means the
+    incoming commit deleted the submodule, and git itself leaves the
     populated checkout behind (``warning: unable to rmdir``, then
     ``?? path/``), so a leftover is not a hook's doing. It is accepted only
     as the exact captured checkout — owned, clean, at the captured HEAD —
     and every leftover so accepted is returned for `integrated_paths_drift`
     and `integrated_stray_paths` to leave to this reading. A checkout git
     could remove is simply absent; a file or foreign directory in its place
-    is drift.
+    is drift. A tree in its place (the path held through a prefix — a
+    submodule replaced by a tracked directory) is the same leftover with the
+    commit's files written INTO it: its ``.git`` and old payload sit beside
+    the new tracked files, which the superproject's diff readings own, so the
+    leftover is read through its own status and may hold nothing but paths
+    the integrated tree holds under it (#796 review). Ceiling, for either
+    leftover: the receipt never read a captured checkout's ignored entries,
+    so a hook's write the leftover's own ``.gitignore`` covers is not seen.
     """
     if not isinstance(submodules, list):
         raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
@@ -2348,17 +2387,31 @@ def validate_integrated_submodule_state(
         held = inventory.get(rel)
         raw = captured.get(rel)
         if held is None:
-            if raw is None or rel in held_paths:
+            if raw is None:
                 continue
             checkout = repo / rel
+            allowed_heads = {str(raw.get("head")), str(raw.get("gitlink"))}
+            if rel in held_paths:
+                # A tracked directory in the submodule's place: git wrote the
+                # commit's files INTO the checkout it could not remove, so a
+                # leftover is one with its `.git` still there. Its descendants
+                # the commit holds are the diff readings'; the reading here is
+                # the leftover's own status, which may name only those.
+                if not checkout.is_dir() or not (checkout / ".git").exists():
+                    continue
+                _integrated_replaced_submodule_checkout_unchanged(
+                    repo,
+                    rel,
+                    checkout,
+                    allowed_heads=allowed_heads,
+                    held=inventory.keys(),
+                )
+                retained.append(rel)
+                continue
             if not checkout.is_dir():
                 continue
             _integrated_submodule_checkout_unchanged(
-                repo,
-                rel,
-                checkout,
-                allowed_heads={str(raw.get("head")), str(raw.get("gitlink"))},
-                introduced=False,
+                repo, rel, checkout, allowed_heads=allowed_heads, introduced=False
             )
             retained.append(rel)
             continue

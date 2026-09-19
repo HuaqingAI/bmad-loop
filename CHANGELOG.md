@@ -490,7 +490,11 @@ breaking changes may land in a minor release.
   that deletes a populated target submodule integrates: git leaves the checkout
   behind (`?? path/`), which is accepted only as the exact captured checkout
   and otherwise refused, with the refusal's restore undoing a hook's writes
-  into a captured submodule checkout rather than pausing unrestored. A gitlink
+  into a captured submodule checkout rather than pausing unrestored; a unit
+  that replaces a populated submodule with a tracked directory integrates the
+  same way — git writes the commit's files into the checkout it could not
+  remove, and that leftover is accepted only owned, at the captured HEAD, and
+  holding nothing beyond what the integrated tree holds under it. A gitlink
   the unit adds is read the same way as a captured one — index at the gitlink
   (skip-worktree accepted on a sparse target's out-of-cone gitlink),
   a populated checkout this repository's, clean (ignored entries included, the
