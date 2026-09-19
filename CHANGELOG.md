@@ -580,10 +580,13 @@ breaking changes may land in a minor release.
   target); any other row replays the merge, which re-validates under the
   receipt. With no live receipt — a host lost before one was armed — a
   bare row is not a modern bundle's completion either: a retired receipt
-  leaves its row naming the operation the target reflog holds, or, for an
-  integration that made no ref update, a target that already holds the
-  source or its tree; anything else replays the merge (the released legacy
-  payload integrates without a receipt and keeps its bare row).
+  leaves its row naming the operation the target reflog holds, the one
+  piece of the record a session cannot append; anything else replays the
+  merge — an integration that made no ref update (an artifact-only
+  bundle's squash stages nothing) included, since a target that already
+  holds the source proves nothing about bytes another writer changed
+  since, and its replay stages nothing again and re-validates (the released
+  legacy payload integrates without a receipt and keeps its bare row).
 
 - Recover sweep migration publication faults without persisting unearned `DONE`
   state (DW-296/DW-297). Persist accepted baseline/rewrite records, clear a

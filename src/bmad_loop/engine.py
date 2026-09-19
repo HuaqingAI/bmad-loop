@@ -1894,12 +1894,18 @@ class Engine:
 
         With no live receipt, the completion is a row naming an operation
         identity whose ``bmad-loop-integrate`` transition the target's reflog
-        holds — or, for an integration that made no ref update (an
-        artifact-only bundle's squash stages nothing; a fast-forward of a
-        source the target already holds), a target that already holds the
-        source or its tree, which is all such a replay could find to merge.
-        Evidence git cannot read cleanly is ``False`` here; the replay that
-        follows reads it again and pauses with its own reason.
+        holds: the one piece of it a session with the writable run directory
+        cannot append, since the journal — the row's operation identity
+        included — is its to write. An integration that made no ref update
+        (an artifact-only bundle's squash stages nothing; a fast-forward of a
+        source the target already holds) leaves no such transition and is
+        not read as complete here: a target that already holds the source is
+        no proof the target's bytes were validated (another writer may have
+        merged the branch and changed an accepted artifact since), so that
+        completion replays the merge, which stages nothing again, re-validates
+        and re-records (#796 review). Evidence git cannot read cleanly is
+        ``False`` here; the replay reads it again and pauses with its own
+        reason.
         """
         if not self.state.target_branch:
             return False
@@ -1915,16 +1921,9 @@ class Engine:
                     continue
                 if verify.integration_ref_update(repo, target_ref, operation) is not None:
                     return True
-            source = task.commit_sha
-            if not source:
-                return False
-            if verify.is_ancestor(repo, source, target_ref):
-                return True
-            return verify.revision_tree_oid(repo, source) == verify.revision_tree_oid(
-                repo, target_ref
-            )
         except (verify.GitError, OSError):
             return False
+        return False
 
     def _receipt_completion_recorded(
         self, task: StoryTask, merged_operations: set[tuple[str, str, str, str]]

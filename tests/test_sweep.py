@@ -29454,6 +29454,80 @@ def test_a_bare_unit_merged_row_does_not_stand_for_an_integration_never_armed(
     assert not Path(final.worktree_path).exists()
 
 
+def test_a_target_that_already_holds_the_source_is_no_completion_without_the_reflog(
+    project, monkeypatch
+):
+    """The no-receipt window again, with the target already holding the unit's
+    commit: another writer merged the branch and then changed an accepted
+    tracked artifact on the target. A bare `unit-merged` row plus "the source
+    is an ancestor" read as complete, and the resume published and carried
+    over target bytes no validation had read (Codex, #796 review). The target
+    holding the source proves nothing about its bytes; only the reflog
+    transition under a recorded operation does, and with none the resume
+    replays the merge — which stages nothing, re-validates, and refuses the
+    changed artifact.
+
+    Ablation: accept an ancestor source (or an equal tree) as the no-update
+    completion and the resume skips the merge and publishes over it."""
+    effect, destination, accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, original_adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    require_reflog = verify.require_ref_reflog
+
+    def forge_then_lose_host(*_args, **_kwargs):
+        task = engine.state.tasks["dw-fix"]
+        engine.journal.append(
+            "unit-merged",
+            story_key=task.story_key,
+            branch=task.branch,
+            target=engine.state.target_branch,
+            strategy="merge",
+            source=task.commit_sha,
+        )
+        raise SystemExit("host loss before the receipt is armed")
+
+    monkeypatch.setattr(verify, "require_ref_reflog", forge_then_lose_host)
+    with pytest.raises(SystemExit, match="before the receipt is armed"):
+        engine.run()
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is None and durable.commit_sha
+    # another writer: the branch merged, then the accepted artifact rewritten
+    git(project.project, "merge", "--no-ff", "-q", "-m", "merged elsewhere", durable.branch)
+    assert verify.is_ancestor(project.repo_root, durable.commit_sha, "refs/heads/main")
+    destination.write_bytes(b"rewritten on the target after the merge")
+    git(project.project, "add", "--", destination)
+    git(project.project, "commit", "-q", "-m", "artifact changed on the target")
+    target_head = verify.rev_parse_head(project.repo_root)
+    monkeypatch.setattr(verify, "require_ref_reflog", require_reflog)
+    merge = verify.merge_branch
+    replayed: list[str] = []
+
+    def merge_spy(*args, **kwargs):
+        replayed.append("merge")
+        return merge(*args, **kwargs)
+
+    monkeypatch.setattr(verify, "merge_branch", merge_spy)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert replayed == ["merge"]
+    assert summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert [session.role for session in original_adapter.sessions] == ["triage", "dev"]
+    final = load_state(resumed.run_dir).tasks["dw-fix"]
+    assert not final.artifact_publication_complete
+    assert "unit-merged" not in [
+        entry["kind"] for entry in resumed.journal.entries() if "operation_id" in entry
+    ]
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert destination.read_bytes() == b"rewritten on the target after the merge"
+    assert destination.read_bytes() != accepted
+
+
 def test_a_forged_unit_merged_row_cannot_retire_a_receipt_before_validation(project, monkeypatch):
     """A session's `unit-merged` row does not stand in for the receipt's own result.
 
@@ -30317,17 +30391,25 @@ def test_isolated_publication_crash_replays_frozen_bytes_before_sweep(
     ).write_text("unverified later edit")
     monkeypatch.setattr(artifact_publication, "atomic_write_bytes_confined", write)
 
-    def merged_once(*_args, **_kwargs):
-        raise AssertionError("a retired receipt's integration was merged again on resume")
+    merge = verify.merge_branch
+    merged_again: list[str] = []
 
-    # the receipt was retired with its row and the target's reflog transition
-    # under its operation: the resume reads that as merged and replays only
-    # the publication (#796 review)
-    monkeypatch.setattr(verify, "merge_branch", merged_once)
+    def merge_spy(*args, **kwargs):
+        merged_again.append("merge")
+        return merge(*args, **kwargs)
+
+    # the receipt was retired with its row and — when the integration moved
+    # the target — the reflog transition under its operation: the resume
+    # reads that as merged and replays only the publication. An artifact-only
+    # bundle's squash staged nothing and moved no ref, so it left no such
+    # transition; that completion replays the merge, which stages nothing
+    # again, re-validates and re-records (#796 review)
+    monkeypatch.setattr(verify, "merge_branch", merge_spy)
     resumed, adapter = resume_sweep(project, engine, [])
     summary = resumed.run()
     assert not summary.paused and not summary.crashed
     assert adapter.sessions == []
+    assert merged_again == (["merge"] if artifact_only else [])
     assert (project.implementation_artifacts / "spec-dw-fix.md").read_bytes() == expected["spec"]
     assert resumed.state.tasks["dw-fix"].artifact_publication_complete
     assert not Path(saved.worktree_path).exists()
