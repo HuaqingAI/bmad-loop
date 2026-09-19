@@ -43,7 +43,7 @@ from conftest import (
     write_spec,
 )
 
-from bmad_loop import deferredwork, platform_util, runs
+from bmad_loop import artifact_publication, deferredwork, platform_util, runs
 from bmad_loop import sweep as sweep_mod
 from bmad_loop import verify
 from bmad_loop.adapters.base import SessionResult
@@ -27097,6 +27097,70 @@ def test_target_commit_hook_artifact_drift_restores_and_retains_source(
 
 
 @pytest.mark.parametrize(
+    "fault",
+    [
+        artifact_publication.PublicationError("artifact path is a symlink: {root}"),
+        OSError("synthetic path fault on {root}"),
+    ],
+    ids=["refused", "os-fault"],
+)
+def test_unresolvable_artifact_paths_pause_before_the_integration_is_armed(
+    project, monkeypatch, fault
+):
+    """The accepted artifact paths are part of what the target receipt snapshots:
+    an ignored deliverable's destination is never in the merge's own delta, so
+    only that entry lets a hook's write to it be seen and restored. When the
+    resolver refuses — the target's `implementation_artifacts` swapped for a
+    symlink after acceptance, or replayed authority carrying a tracked rel the
+    path validator rejects — the run used to snapshot WITHOUT those paths and
+    integrate anyway; `validate_integrated` then refused on the same resolver
+    and the restore claimed "the exact pre-attempt target was restored" over a
+    snapshot that never covered the artifact paths (#796 review). Now the
+    refusal pauses before the receipt is armed, before collision cleanup and
+    before git runs: target untouched, source retained, no receipt to replay.
+
+    The `os-fault` row is the resolver dying on the filesystem rather than
+    refusing (the same pause, the same untouched target); it used to be pinned
+    the other way — merged, then `refused-restored` off the commit and index
+    deltas alone — which is exactly the short snapshot this test retires.
+
+    Ablation: return `()` from `_integration_artifact_paths` on the resolver's
+    refusal and this reds on `summary.paused` — the merge ran and the run
+    finished over a receipt that never covered the artifact paths."""
+    effect, _expected = _ignored_publication_bundle(project)
+    target_head = verify.rev_parse_head(project.repo_root)
+
+    def refuse(task, target):
+        raise type(fault)(str(fault).format(root=target.implementation_artifacts))
+
+    monkeypatch.setattr(artifact_publication, "integrated_artifact_repo_paths", refuse)
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+    kinds = journal_kinds(engine)
+    assert "unit-merge-started" not in kinds and "unit-merged" not in kinds
+    assert "merge-target-cleaned" not in kinds
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert git(project.project, "status", "--porcelain", "--untracked-files=no") == ""
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is None  # nothing armed, nothing to replay
+    assert not durable.artifact_publication_complete
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert refusal["error"] == str(fault).format(root=project.implementation_artifacts)
+    reason = engine.state.paused_reason or ""
+    assert reason.startswith(f"target integration evidence is unsafe: {refusal['error']}")
+    assert Path(durable.worktree_path).is_dir()
+    assert verify.branch_exists(project.repo_root, durable.branch)
+
+
+@pytest.mark.parametrize(
     ("strategy", "hook_name"),
     [
         ("merge", "pre-merge-commit"),
@@ -27760,46 +27824,6 @@ def test_saved_restoration_preserves_later_target_remedy_and_rearms(project):
     assert destination.read_bytes() == accepted
     assert final.integration_attempt is None
     assert final.artifact_publication_complete
-
-
-def test_restoration_path_inventory_oserror_keeps_refusal_recoverable(project, monkeypatch):
-    from bmad_loop import artifact_publication
-
-    effect, destination, _accepted = _git_bound_publication_bundle(project, "tracked")
-    target_head = verify.rev_parse_head(project.repo_root)
-    before = destination.read_bytes()
-    hook = project.project / ".git" / "hooks" / "pre-merge-commit"
-    hook.write_text(
-        "#!/bin/sh\n"
-        "printf 'target hook mutation' > "
-        "_bmad-output/implementation-artifacts/report.bin\n"
-        "git add -- _bmad-output/implementation-artifacts/report.bin\n"
-    )
-    hook.chmod(0o755)
-    engine, _ = make_sweep(
-        project,
-        [triage_effect(bundle_plan()), effect],
-        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
-    )
-
-    def fail_path_inventory(*_args, **_kwargs):
-        raise OSError("synthetic path fault")
-
-    monkeypatch.setattr(
-        artifact_publication,
-        "integrated_artifact_repo_paths",
-        fail_path_inventory,
-    )
-
-    summary = engine.run()
-
-    assert summary.paused and not summary.crashed
-    assert verify.rev_parse_head(project.repo_root) == target_head
-    assert destination.read_bytes() == before
-    durable = load_state(engine.run_dir).tasks["dw-fix"]
-    assert durable.integration_attempt is not None
-    assert durable.integration_attempt["outcome"] == "refused-restored"
-    assert Path(durable.worktree_path).is_dir()
 
 
 def test_disabled_target_reflog_refuses_before_git_mutation(project):

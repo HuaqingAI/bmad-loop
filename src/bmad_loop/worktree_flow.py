@@ -2498,15 +2498,19 @@ class WorktreeFlow:
         return attempt
 
     def _integration_artifact_paths(self, task: StoryTask) -> tuple[str, ...]:
+        """The accepted artifact paths on the target, for the receipt's snapshot and
+        its restore. Raises rather than degrading: an ignored deliverable's
+        destination is never in the merge's own delta, so this entry is the only
+        thing that lets a target hook's write to it be seen and restored. A
+        resolver refusal (the target's artifact dir swapped for a symlink after
+        acceptance, or replayed authority the path validator rejects) therefore
+        has to pause BEFORE the receipt is armed and anything on the target moves
+        — `merge_local` resolves once, ahead of the snapshot, and threads the
+        result to the restore — never snapshot short and let the later
+        `validate_integrated` refusal claim an exact restore over it (#796 review)."""
         if not task.dw_ids:
             return ()
-        try:
-            return artifact_publication.integrated_artifact_repo_paths(task, self.paths)
-        except (artifact_publication.PublicationError, OSError, RuntimeError, ValueError):
-            # Malformed accepted authority is itself a validation refusal. Commit
-            # and post-hook index deltas remain safe restoration scope; never
-            # derive extra authority from malformed data.
-            return ()
+        return artifact_publication.integrated_artifact_repo_paths(task, self.paths)
 
     def _retire_unmoved_integration_attempt(self, task: StoryTask) -> None:
         """Restore receipt cleanup, then retire a proven no-ref typed refusal."""
@@ -2571,6 +2575,8 @@ class WorktreeFlow:
         attempt: dict[str, str],
         update: verify.IntegrationRefUpdate | None,
         exc: BaseException,
+        *,
+        artifact_paths: tuple[str, ...],
     ) -> NoReturn:
         try:
             if update is not None:
@@ -2584,7 +2590,7 @@ class WorktreeFlow:
                     attempt["target_ref"],
                     old_revision=update.old_revision,
                     new_revision=update.new_revision,
-                    extra_paths=self._integration_artifact_paths(task),
+                    extra_paths=artifact_paths,
                     run_dir=self.run_dir,
                     snapshots=attempt["snapshots"],
                     submodules=attempt["submodules"],
@@ -2611,7 +2617,7 @@ class WorktreeFlow:
                     attempt["target_ref"],
                     old_revision=pre,
                     new_revision=pre,
-                    extra_paths=self._integration_artifact_paths(task),
+                    extra_paths=artifact_paths,
                     run_dir=self.run_dir,
                     snapshots=attempt["snapshots"],
                     submodules=attempt["submodules"],
@@ -2887,6 +2893,7 @@ class WorktreeFlow:
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return
         prospective_paths: tuple[str, ...] = ()
+        artifact_paths: tuple[str, ...] = ()
         if receipt_required:
             try:
                 prospective_paths = verify.preflight_integration_paths(
@@ -2896,13 +2903,27 @@ class WorktreeFlow:
                 self._pause_integration_evidence(
                     task, exc, prefix="target integration path preflight failed"
                 )
+            # Resolved once, here, and threaded to the restore: a refusal pauses
+            # before the receipt is armed and before cleanup or git touch the
+            # target (see `_integration_artifact_paths`).
+            try:
+                artifact_paths = self._integration_artifact_paths(task)
+            except (
+                artifact_publication.PublicationError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as exc:
+                self._pause_integration_evidence(
+                    task, exc, prefix="target integration evidence is unsafe"
+                )
         snapshot_paths = tuple(
             dict.fromkeys(
                 [
                     *prospective_paths,
                     *collision_plan.cleaned,
                     *collision_plan.tolerated,
-                    *self._integration_artifact_paths(task),
+                    *artifact_paths,
                 ]
             )
         )
@@ -2950,7 +2971,7 @@ class WorktreeFlow:
                                 target_ref,
                                 old_revision=update.old_revision,
                                 new_revision=update.new_revision,
-                                extra_paths=self._integration_artifact_paths(task),
+                                extra_paths=artifact_paths,
                                 run_dir=self.run_dir,
                                 snapshots=attempt["snapshots"],
                                 submodules=attempt["submodules"],
@@ -3485,9 +3506,13 @@ class WorktreeFlow:
                         "target moved during artifact integration validation"
                     )
             except artifact_publication.PublicationError as exc:
-                self._refuse_integrated_artifacts(task, attempt, update, exc)
+                self._refuse_integrated_artifacts(
+                    task, attempt, update, exc, artifact_paths=artifact_paths
+                )
             except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
-                self._refuse_integrated_artifacts(task, attempt, update, exc)
+                self._refuse_integrated_artifacts(
+                    task, attempt, update, exc, artifact_paths=artifact_paths
+                )
             self.journal.append(
                 "unit-merged",
                 story_key=task.story_key,
