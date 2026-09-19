@@ -915,6 +915,47 @@ def test_receipt_schema_refuses_nonportable_paths_before_restore(
     assert verify.rev_parse_head(project.project) == before
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the names are not Win32 names")
+@pytest.mark.parametrize(
+    "rel",
+    ["a:/file", "dir/b:c/d:/file", "back\\slash/nested\\dir/file", "c:/deep/er/file"],
+    ids=["drive-like", "colons", "backslashes", "drive-like-deep"],
+)
+def test_receipt_schema_reads_absent_parents_by_gits_slash_hierarchy(project, tmp_path, rel):
+    """`absent_parents` is captured by git's slash hierarchy (`Path.parent`
+    relative to the repository, `as_posix`), and the schema compared it under
+    `PureWindowsPath`, whose `parent` of `a:/file` is the drive root `a:\\`
+    while `a:` alone is drive-relative — so on POSIX, where `a:` is a plain
+    directory name `_portable_integration_path` admits, the receipt the
+    capture had just written was refused as malformed at the replay or
+    restore that needed it (Codex, #796 review). A name holding a backslash
+    is one segment to git and several to the Windows reading, the same way.
+    The structural check now reads the same slash hierarchy the capture wrote.
+
+    Ablation: compare under `PureWindowsPath` again and the `drive-like`,
+    `backslashes` and `drive-like-deep` rows red on the raise (`colons`
+    holds: a colon past the first segment is no drive to either reading;
+    it pins the shape that already round-tripped)."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    operation = "b" * 32
+    snapshots, submodules = verify.capture_integration_state(
+        project.project, run_dir, operation, (rel,)
+    )
+    [entry] = snapshots
+    parents = rel.split("/")[:-1]
+    assert entry["absent_parents"] == [
+        "/".join(parents[:depth]) for depth in range(len(parents), 0, -1)
+    ]
+
+    validated, _submodules = verify.validate_integration_state_schema(
+        run_dir, snapshots, submodules, operation
+    )
+
+    assert [item["path"] for item in validated] == [rel]
+    assert validated[0]["absent_parents"] == entry["absent_parents"]
+
+
 def _add_test_submodule(repo, tmp_path):
     origin = tmp_path / "sub-origin"
     origin.mkdir()

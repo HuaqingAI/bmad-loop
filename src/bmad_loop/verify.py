@@ -19,7 +19,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from stat import S_ISLNK, S_ISREG
 from typing import Any, Literal, assert_never, overload
 
@@ -1328,9 +1328,17 @@ def validate_integration_state_schema(
         validated_parents = [_portable_integration_path(parent) for parent in absent_parents]
         if len(set(validated_parents)) != len(validated_parents):
             raise IntegrationEvidenceError("persisted target integration snapshot is malformed")
-        expected_parent = PureWindowsPath(rel).parent
+        # git's slash hierarchy, the one the capture wrote (`Path.parent`
+        # relative to the repository, `as_posix`): under the Windows reading
+        # `a:/file`'s parent is the drive root and `a:` is drive-relative, and
+        # a name holding a backslash is several segments, so on POSIX — where
+        # both are plain names `_portable_integration_path` admits — the
+        # receipt the capture had just written was refused as malformed at
+        # the replay that needed it (#796 review). The Win32 name rules are
+        # that function's, on a Windows host alone.
+        expected_parent = PurePosixPath(rel).parent
         for parent in validated_parents:
-            if PureWindowsPath(parent) != expected_parent:
+            if PurePosixPath(parent) != expected_parent:
                 raise IntegrationEvidenceError("persisted target integration snapshot is malformed")
             expected_parent = expected_parent.parent
         # `empty_parents`: the first existing ancestor, proved an empty
@@ -1346,7 +1354,7 @@ def validate_integration_state_schema(
             raise IntegrationEvidenceError("persisted target integration snapshot is malformed")
         validated_empty = [_portable_integration_path(parent) for parent in empty_parents]
         for parent in validated_empty:
-            if PureWindowsPath(parent) != expected_parent or expected_parent == PureWindowsPath():
+            if PurePosixPath(parent) != expected_parent or expected_parent == PurePosixPath():
                 raise IntegrationEvidenceError("persisted target integration snapshot is malformed")
         seen.add(rel)
         expected_keys = {"path", "state", "tracked", "index", "absent_parents"}

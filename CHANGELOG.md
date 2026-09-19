@@ -578,7 +578,11 @@ breaking changes may land in a minor release.
   control characters in a name, every reading round-trips them
   NUL-delimited, and holding them everywhere paused each modern bundle that
   touched such a file as malformed (containment — absolute, `..`, `.git`, NUL —
-  holds on every host). A resume retires a live receipt on its
+  holds on every host), and the receipt's absent-parent topology is read by
+  git's slash hierarchy, the one the capture wrote: the Windows reading took
+  `a:` for a drive and a backslash for a separator, so a POSIX receipt naming
+  such a parent was refused as malformed at the replay that needed it. A
+  resume retires a live receipt on its
   recorded completion only when the `unit-merged` row names the receipt's
   operation identity and the target's reflog holds the transition under it
   with the target still at that result — a coding session holds the writable
