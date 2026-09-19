@@ -860,6 +860,7 @@ def test_collision_cleanup_rechecks_identity_at_each_mutation(project):
     [
         "../escape",
         "/absolute",
+        "nul\0byte",
         "C:drive-relative",
         "NUL",
         "line\nfeed",
@@ -867,17 +868,48 @@ def test_collision_cleanup_rechecks_identity_at_each_mutation(project):
         "nested/bad?.txt",
     ],
 )
-def test_receipt_schema_refuses_nonportable_paths_before_restore(project, tmp_path, path):
+@pytest.mark.parametrize("win32_names", [False, True], ids=["posix", "win32"])
+def test_receipt_schema_refuses_nonportable_paths_before_restore(
+    project, tmp_path, monkeypatch, path, win32_names
+):
+    """Containment — an absolute path, a `..` segment, a NUL — is refused on
+    every host. The Win32 name rules — reserved characters, device aliases, a
+    drive prefix, a backslash separator — held on every host too, and on POSIX
+    git permits `:`, `?`, `*`, `\\` and control characters in a name, the
+    NUL-delimited plumbing round-trips them, and every modern bundle touching
+    such a file paused before integration as malformed (Codex, #796 review).
+    Those rules now apply on a Windows host alone (`WIN32_PATH_NAMES`).
+
+    Ablation: apply the Win32 rules unconditionally and the `posix` rows for
+    the Win32-only names red on the raise."""
+    monkeypatch.setattr(verify, "WIN32_PATH_NAMES", win32_names)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     before = verify.rev_parse_head(project.project)
+    everywhere = path in {"../escape", "/absolute", "nul\0byte"}
 
-    with pytest.raises(verify.IntegrationEvidenceError, match="path is malformed"):
-        verify.validate_integration_state_schema(
+    if everywhere or win32_names:
+        with pytest.raises(verify.IntegrationEvidenceError, match="path is malformed"):
+            verify.validate_integration_state_schema(
+                run_dir,
+                [{"path": path, "state": "absent", "tracked": False}],
+                [],
+            )
+    else:
+        validated, _submodules = verify.validate_integration_state_schema(
             run_dir,
-            [{"path": path, "state": "absent", "tracked": False}],
+            [
+                {
+                    "path": path,
+                    "state": "absent",
+                    "tracked": False,
+                    "index": {"entries": [], "intent_to_add": False},
+                    "absent_parents": [],
+                }
+            ],
             [],
         )
+        assert [entry["path"] for entry in validated] == [path]
 
     assert verify.rev_parse_head(project.project) == before
 
@@ -1839,6 +1871,63 @@ def test_receipt_schema_binds_sidecar_to_operation_and_path(project, tmp_path):
     )
     with pytest.raises(verify.IntegrationEvidenceError, match="another operation"):
         verify.validate_integration_state_schema(run_dir, swapped, submodules, operation)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only git file names")
+@pytest.mark.parametrize("anchored", [True, False], ids=["anchored", "checked-path"])
+def test_receipt_captures_and_restores_a_posix_only_git_name(
+    project, tmp_path, monkeypatch, anchored
+):
+    """A tracked file whose name git permits on POSIX alone (`odd:name?*.txt`,
+    with a backslash and a tab in it) is captured, refused and restored like
+    any other: the sidecar is named by the path's digest, every git reading is
+    NUL-delimited and literal, and the receipt's own containment rules are
+    all that the name is held to on this host (Codex, #796 review)."""
+    if not anchored:
+        monkeypatch.setattr(verify, "DIR_FD_ANCHORED_WRITES", False)
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    name = "odd:na\\me?*\t.txt"
+    (repo / name).write_bytes(b"operator bytes")
+    git(repo, "add", "--", name)
+    git(repo, "commit", "-q", "-m", "posix-only name")
+    old = verify.rev_parse_head(repo)
+
+    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "b" * 32, (name,))
+
+    [entry] = snapshots
+    assert entry["path"] == name and entry["state"] == "regular"
+    (repo / name).write_bytes(b"integrated bytes")
+    git(repo, "add", "--", name)
+    git(repo, "commit", "-q", "-m", "integrated")
+    new = verify.rev_parse_head(repo)
+    (repo / name).write_bytes(b"hook rewrite")
+
+    verify.restore_integration_ref(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity="b" * 32,
+    )
+
+    assert verify.rev_parse_head(repo) == old
+    assert (repo / name).read_bytes() == b"operator bytes"
+    assert git(repo, "status", "--porcelain", "-uall") == ""
+    assert verify.integration_restoration_complete(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity="b" * 32,
+    )
 
 
 def test_receipt_schema_refuses_git_administration_operands(tmp_path):

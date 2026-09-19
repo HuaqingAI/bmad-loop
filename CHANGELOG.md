@@ -570,7 +570,13 @@ breaking changes may land in a minor release.
   and the receipt records such a gitlink unpopulated, so a checkout a target
   hook's `submodule update --init` makes there is the refusal's to remove
   (a repository of any other kind there refuses the restore) rather than
-  the next capture's baseline. A resume retires a live receipt on its
+  the next capture's baseline. Receipt paths are held to the Win32 name
+  rules — reserved characters, device aliases, a drive prefix, a backslash —
+  on a Windows host alone: on POSIX git permits `:`, `?`, `*`, `\` and
+  control characters in a name, every reading round-trips them
+  NUL-delimited, and holding them everywhere paused each modern bundle that
+  touched such a file as malformed (containment — absolute, `..`, `.git`, NUL —
+  holds on every host). A resume retires a live receipt on its
   recorded completion only when the `unit-merged` row names the receipt's
   operation identity and the target's reflog holds the transition under it
   with the target still at that result — a coding session holds the writable

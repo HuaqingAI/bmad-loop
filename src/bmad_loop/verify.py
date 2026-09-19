@@ -452,20 +452,39 @@ def _validated_index_state(value: object) -> dict[str, object]:
     return {"entries": normalized, "intent_to_add": intent}
 
 
+# Whether receipt paths are held to Win32 name rules: the host's own, like
+# `DIR_FD_ANCHORED_WRITES`, and monkeypatched by tests to read the other arm.
+WIN32_PATH_NAMES = sys.platform == "win32"
+
+
 def _portable_integration_path(value: object) -> str:
-    """Validate a persisted repository-relative operand before any mutation."""
+    """Validate a persisted repository-relative operand before any mutation.
+
+    Containment holds on every host: a string, non-empty, no NUL, not
+    absolute, no ``.``/``..``/empty segment, never a ``.git`` component or the
+    tree root. The Win32 name rules — reserved characters, control characters,
+    device aliases, a drive prefix, a backslash separator — hold on a Windows
+    host alone (`WIN32_PATH_NAMES`): on POSIX git permits ``:``, ``?``, ``*``,
+    ``\\`` and control characters short of NUL in a name, every reading here
+    round-trips them NUL-delimited, and holding them everywhere paused each
+    modern bundle that touched such a file as malformed (#796 review).
+    """
     if (
         not isinstance(value, str)
         or not value
+        or "\0" in value
         or value.startswith("/")
-        or PureWindowsPath(value).drive
+        or names_tree_root(value)
+        or any(part in ("", ".", "..") for part in value.split("/"))
+        or any(part.casefold() == ".git" for part in value.split("/"))
+    ):
+        raise IntegrationEvidenceError("persisted target integration path is malformed")
+    if WIN32_PATH_NAMES and (
+        PureWindowsPath(value).drive
         or "\\" in value
         or any(ord(char) < 32 or ord(char) == 127 for char in value)
         or any(char in '<>:"|?*' for char in value)
         or names_win32_alias(value)
-        or names_tree_root(value)
-        or any(part in ("", ".", "..") for part in value.split("/"))
-        or any(part.casefold() == ".git" for part in value.split("/"))
     ):
         raise IntegrationEvidenceError("persisted target integration path is malformed")
     return value
