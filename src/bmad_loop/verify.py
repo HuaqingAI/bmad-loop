@@ -2106,6 +2106,20 @@ def _revision_inventory(repo: Path, revision: str) -> dict[str, tuple[bytes, byt
     return inventory
 
 
+def _inventory_held_paths(inventory: dict[str, tuple[bytes, bytes, str]]) -> set[str]:
+    """Every path ``inventory`` holds, directly or as a tree above a held row.
+
+    ``ls-tree -r`` names blobs and gitlinks, never the trees above them, so a
+    path the commit turned into a directory (``a`` deleted, ``a/b`` added; a
+    submodule replaced by a tracked directory) is held through the prefix.
+    """
+    held: set[str] = set()
+    for path in inventory:
+        parts = path.split("/")
+        held.update("/".join(parts[:depth]) for depth in range(1, len(parts) + 1))
+    return held
+
+
 def integrated_paths_drift(
     repo: Path,
     revision: str,
@@ -2159,10 +2173,7 @@ def integrated_paths_drift(
             for path in (os.fsdecode(raw) for raw in proc.stdout.split(b"\0") if raw)
             if path in selected
         )
-    held: set[str] = set()
-    for held_path in _revision_inventory(repo, revision):
-        parts = held_path.split("/")
-        held.update("/".join(parts[:depth]) for depth in range(1, len(parts) + 1))
+    held = _inventory_held_paths(_revision_inventory(repo, revision))
     for path in sorted(selected - held - retained):
         _validated, candidate = _confined_repo_operand(repo, path)
         if candidate.exists() or candidate.is_symlink():
@@ -2266,8 +2277,9 @@ def validate_integrated_submodule_state(
     checkout, not a moved HEAD, not even a rewritten gitlink (#796 review).
 
     For a captured submodule the commit no longer holds as a gitlink: a blob
-    in its place is the diff readings' business; nothing at all means the
-    incoming commit deleted the submodule, and git itself leaves the
+    in its place, or a tree (the path held through a prefix — a submodule
+    replaced by a tracked directory), is the diff readings' business; nothing
+    at all means the incoming commit deleted the submodule, and git itself leaves the
     populated checkout behind (``warning: unable to rmdir``, then
     ``?? path/``), so a leftover is not a hook's doing. It is accepted only
     as the exact captured checkout — owned, clean, at the captured HEAD —
@@ -2286,12 +2298,13 @@ def validate_integrated_submodule_state(
             continue
         captured[_portable_integration_path(raw.get("path"))] = raw
     inventory = _revision_inventory(repo, revision)
+    held_paths = _inventory_held_paths(inventory)
     retained: list[str] = []
     for rel in sorted(prospective):
         held = inventory.get(rel)
         raw = captured.get(rel)
         if held is None:
-            if raw is None:
+            if raw is None or rel in held_paths:
                 continue
             checkout = repo / rel
             if not checkout.is_dir():

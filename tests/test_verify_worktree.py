@@ -3668,3 +3668,52 @@ def test_integrated_submodule_deletion_in_a_linked_worktree_target(project, tmp_
         verify.integrated_paths_drift(linked, integrated, incoming, retained_checkouts=retained)
         == ()
     )
+
+
+def test_integrated_submodule_replaced_by_a_directory_is_left_to_the_diff_readings(
+    project, tmp_path
+):
+    """An incoming commit that replaces a captured submodule with an ordinary
+    tracked directory has no `ls-tree -r` row for the old gitlink path, only
+    for its descendants (`module/file.txt`). The deleted-gitlink arm read that
+    as "nothing held", took the directory git left the old checkout inside
+    (`warning: unable to rmdir`, so `.git` and the old payload sit beside the
+    new tracked file) for a leftover checkout, found the tracked file
+    "untracked" from the submodule's view, and refused a valid replacement
+    (Codex, #796 review). A path the commit holds through a prefix is held —
+    the same reading `integrated_paths_drift` takes — and its descendants are
+    the diff readings' business; the submodule reading has nothing to
+    adjudicate there. Ablation: drop the prefix reading and this reds on the
+    raise."""
+    repo = project.project
+    _origin, checkout, _old_submodule = _add_test_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "d" * 32, ("module", "module/file.txt", ".gitmodules")
+    )
+    git(repo, "rm", "-q", "--cached", "--", "module")
+    git(repo, "config", "-f", ".gitmodules", "--remove-section", "submodule.module")
+    (checkout / "file.txt").write_text("now a tracked directory\n")
+    # staged the way a merge stages it — `git add` skips a path under the old
+    # checkout's `.git`, the merge writes the index entry directly
+    blob = git(repo, "hash-object", "-w", "--", "module/file.txt")
+    git(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},module/file.txt")
+    git(repo, "add", "--", ".gitmodules")
+    git(repo, "commit", "-q", "-m", "integrated: module becomes a directory")
+    integrated = verify.rev_parse_head(repo)
+    assert (checkout / ".git").exists() and (checkout / "payload.txt").exists()
+    assert (
+        git(repo, "ls-tree", "-r", "--name-only", integrated, "--", "module") == "module/file.txt"
+    )
+    assert git(repo, "status", "--porcelain", "-uall") == "?? module/payload.txt"
+    incoming = ("module", "module/file.txt", ".gitmodules")
+
+    retained = verify.validate_integrated_submodule_state(
+        repo, submodules, prospective_paths=incoming, revision=integrated
+    )
+
+    assert retained == ()
+    assert (
+        verify.integrated_paths_drift(repo, integrated, incoming, retained_checkouts=retained) == ()
+    )
