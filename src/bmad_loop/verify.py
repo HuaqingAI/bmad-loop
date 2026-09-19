@@ -762,7 +762,10 @@ def _submodule_checkout_owned(root: Path, checkout: Path) -> bool:
     checkout and it must be ``root``. A checkout whose gitlink an integration
     deleted has no superproject any more — git leaves the populated directory
     behind (``warning: unable to rmdir``) — and is this repository's by its git
-    dir living under ``.git/modules``, where git keeps a submodule's. A checkout
+    dir living under ``<git-dir>/modules``, where git keeps a submodule's: the
+    git dir git reports for ``root``, which is ``root/.git`` for a main
+    checkout and ``<common>/.git/worktrees/<id>`` for a target that is itself
+    a linked worktree, whose ``.git`` is a file (#796 review). A checkout
     naming some other superproject, or one carrying its own git dir (a fresh
     ``git init`` at the path), is not. Ceiling: a legacy submodule with its git
     dir embedded in the checkout has no orphan proof and reads as foreign once
@@ -776,7 +779,10 @@ def _submodule_checkout_owned(root: Path, checkout: Path) -> bool:
     rc, git_dir, _detail = _git_out(checkout, "rev-parse", "--absolute-git-dir")
     if rc != 0 or not git_dir:
         return False
-    modules = root / ".git" / "modules"
+    rc, root_git_dir, _detail = _git_out(root, "rev-parse", "--absolute-git-dir")
+    if rc != 0 or not root_git_dir:
+        return False
+    modules = Path(root_git_dir).resolve(strict=True) / "modules"
     resolved = Path(git_dir).resolve(strict=True)
     return resolved != modules and resolved.is_relative_to(modules)
 

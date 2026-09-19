@@ -3626,3 +3626,45 @@ def test_integrated_gitlink_with_a_foreign_index_flag_is_refused(project, tmp_pa
         verify.validate_integrated_submodule_state(
             repo, submodules, prospective_paths=("newmod",), revision=integrated
         )
+
+
+def test_integrated_submodule_deletion_in_a_linked_worktree_target(project, tmp_path):
+    """A target that is itself a linked worktree keeps its submodules' git
+    dirs under its own per-worktree git dir (`.git/worktrees/<id>/modules/`),
+    and its `.git` is a file. The orphan ownership proof looked for the git
+    dir under `<root>/.git/modules` — a main-checkout assumption — so a valid
+    submodule deletion on such a target read as a foreign directory and was
+    refused (Codex, #796 review). The modules directory is now derived from
+    the git dir git reports for the target. Ablation: assume `root/.git`
+    again and this reds on the raise."""
+    linked = tmp_path / "linked"
+    git(project.project, "worktree", "add", "-q", str(linked), "-b", "linked")
+    assert (linked / ".git").is_file()
+    origin = tmp_path / "sub-origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    commit(origin, "payload.txt", "submodule old\n", "submodule baseline")
+    old_submodule = verify.rev_parse_head(origin)
+    git(linked, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(origin), "module")
+    git(linked, "commit", "-q", "-m", "add populated submodule")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(
+        linked, run_dir, "f" * 32, ("module", ".gitmodules")
+    )
+    assert submodules == [{"path": "module", "head": old_submodule, "gitlink": old_submodule}]
+    integrated = _integrate_submodule_deletion(linked, leftover=True)
+    assert git(linked, "status", "--porcelain") == "?? module/"
+    incoming = ("module", ".gitmodules")
+
+    retained = verify.validate_integrated_submodule_state(
+        linked, submodules, prospective_paths=incoming, revision=integrated
+    )
+
+    assert retained == ("module",)
+    assert (
+        verify.integrated_paths_drift(linked, integrated, incoming, retained_checkouts=retained)
+        == ()
+    )
