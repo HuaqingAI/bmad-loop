@@ -1138,7 +1138,12 @@ def test_receipt_captures_and_restores_a_tracked_entry_type_change(
     assert verify.rev_parse_head(repo) == old
     assert git(repo, "status", "--porcelain", "-uall") == ""
     if shape in link_targets:
-        assert os.readlink(repo / "a") == link_targets[shape]
+        # The link's own bytes, back under its own path. On Windows CPython
+        # creates an absolute-target link under the extended-length `\\?\`
+        # prefix and `os.readlink` returns that substitute name (3.8+), so the
+        # escaping row's target reads back prefixed there — the same bytes git
+        # captured and the restore put back; the prefix is not the restore's.
+        assert os.readlink(repo / "a").removeprefix("\\\\?\\") == link_targets[shape]
         if shape == "resolving-symlink-to-directory":
             assert (repo / "dir" / "b").read_text() == "reachable through the link\n"
         elif shape == "escaping-symlink-to-directory":
