@@ -578,7 +578,12 @@ breaking changes may land in a minor release.
   used to read as validated completion after a host lost between the merge
   and validation (receipt gone, merge skipped, publication over an unread
   target); any other row replays the merge, which re-validates under the
-  receipt.
+  receipt. With no live receipt — a host lost before one was armed — a
+  bare row is not a modern bundle's completion either: a retired receipt
+  leaves its row naming the operation the target reflog holds, or, for an
+  integration that made no ref update, a target that already holds the
+  source or its tree; anything else replays the merge (the released legacy
+  payload integrates without a receipt and keeps its bare row).
 
 - Recover sweep migration publication faults without persisting unearned `DONE`
   state (DW-296/DW-297). Persist accepted baseline/rewrite records, clear a

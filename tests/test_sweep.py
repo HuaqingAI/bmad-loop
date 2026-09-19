@@ -29386,6 +29386,74 @@ def test_a_unit_merged_row_under_the_receipt_identity_needs_the_reflog_transitio
     assert not Path(final.worktree_path).exists()
 
 
+@pytest.mark.parametrize("row", ["bare", "unheld-operation"])
+def test_a_bare_unit_merged_row_does_not_stand_for_an_integration_never_armed(
+    project, monkeypatch, row
+):
+    """The no-receipt window: the host is lost after the terminal task is
+    persisted and before `_arm_integration_attempt` runs, so `integration_attempt`
+    is `None` and the receipt-bound completion reading is never entered. A
+    session's bare `unit-merged` row under the task's key then read as merged
+    — no merge replayed, publication and carries over a target the unit's
+    commit never reached (Codex, #796 review). A modern deferred-work task's
+    integration writes its row with the receipt's operation identity and
+    leaves the target reflog transition under it; a row without both — bare,
+    or naming an operation the target reflog does not hold — is not that
+    integration's, and the resume replays the merge.
+
+    Ablation: accept the bare key match for a task with no live receipt and
+    the `bare` row publishes without the unit's commit reaching the target;
+    accept any row that names an operation and the `unheld-operation` row
+    does the same."""
+    effect, destination, accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, original_adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    pre_merge_head = verify.rev_parse_head(project.repo_root)
+    require_reflog = verify.require_ref_reflog
+
+    def forge_then_lose_host(*_args, **_kwargs):
+        task = engine.state.tasks["dw-fix"]
+        assert task.integration_attempt is None
+        forged = {} if row == "bare" else {"operation_id": "5" * 32}
+        engine.journal.append(
+            "unit-merged",
+            story_key=task.story_key,
+            branch=task.branch,
+            target=engine.state.target_branch,
+            strategy="merge",
+            source=task.commit_sha,
+            **forged,
+        )
+        raise SystemExit("host loss before the receipt is armed")
+
+    monkeypatch.setattr(verify, "require_ref_reflog", forge_then_lose_host)
+    with pytest.raises(SystemExit, match="before the receipt is armed"):
+        engine.run()
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is None
+    assert durable.commit_sha and durable.dw_ids
+    assert verify.rev_parse_head(project.repo_root) == pre_merge_head
+    monkeypatch.setattr(verify, "require_ref_reflog", require_reflog)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert [session.role for session in original_adapter.sessions] == ["triage", "dev"]
+    landed = verify.rev_parse_head(project.repo_root)
+    assert landed != pre_merge_head
+    assert verify.is_ancestor(project.repo_root, durable.commit_sha, landed)
+    final = resumed.state.tasks["dw-fix"]
+    assert final.integration_attempt is None
+    assert final.artifact_publication_complete
+    assert destination.read_bytes() == accepted
+    assert not Path(final.worktree_path).exists()
+
+
 def test_a_forged_unit_merged_row_cannot_retire_a_receipt_before_validation(project, monkeypatch):
     """A session's `unit-merged` row does not stand in for the receipt's own result.
 
@@ -30248,6 +30316,14 @@ def test_isolated_publication_crash_replays_frozen_bytes_before_sweep(
         project.rebased(Path(saved.worktree_path)).implementation_artifacts / "spec-dw-fix.md"
     ).write_text("unverified later edit")
     monkeypatch.setattr(artifact_publication, "atomic_write_bytes_confined", write)
+
+    def merged_once(*_args, **_kwargs):
+        raise AssertionError("a retired receipt's integration was merged again on resume")
+
+    # the receipt was retired with its row and the target's reflog transition
+    # under its operation: the resume reads that as merged and replays only
+    # the publication (#796 review)
+    monkeypatch.setattr(verify, "merge_branch", merged_once)
     resumed, adapter = resume_sweep(project, engine, [])
     summary = resumed.run()
     assert not summary.paused and not summary.crashed

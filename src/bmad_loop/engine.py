@@ -25,7 +25,15 @@ from pathlib import Path
 from stat import S_ISREG
 from typing import TYPE_CHECKING, Callable, Literal, NamedTuple, NoReturn, Protocol, Sequence
 
-from . import deferredwork, devcontract, envvars, gates, operatoractions, verify
+from . import (
+    artifact_publication,
+    deferredwork,
+    devcontract,
+    envvars,
+    gates,
+    operatoractions,
+    verify,
+)
 from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec, SpecSnapshot
 from .bmadconfig import ProjectPaths
 from .escalation import (
@@ -1774,6 +1782,16 @@ class Engine:
                     verify.discard_integration_state(self.run_dir, completed_attempt)
                 else:
                     merged = False
+            elif task.dw_ids and merged and self._integration_receipt_required(task):
+                # No live receipt: a successful integration retired it after
+                # its row and the ref-update it made under the receipt's
+                # operation identity; a host lost BEFORE the receipt was armed
+                # leaves neither. A session's bare row under the key is not
+                # that integration's (#796 review): only a row naming an
+                # operation the target reflog holds is, and anything else
+                # replays the merge. The released legacy payload integrates
+                # without a receipt and keeps its bare row.
+                merged = self._retired_receipt_completion_recorded(task, merged_operations)
             if not merged:
                 source = task.commit_sha or ""
                 started_key = (*merged_key, source)
@@ -1857,6 +1875,56 @@ class Engine:
             # The failed integration unwound before _run_story returned, so the
             # loop never reached its normal post-integration continuation.
             self._after_story(task)
+
+    def _integration_receipt_required(self, task: StoryTask) -> bool:
+        """Whether ``task`` integrates under a target receipt (modern authority).
+
+        Malformed authority reads as receipt-required: the replay's merge
+        raises the same refusal and pauses with it.
+        """
+        try:
+            return artifact_publication.requires_target_integration_receipt(task)
+        except artifact_publication.PublicationError:
+            return True
+
+    def _retired_receipt_completion_recorded(
+        self, task: StoryTask, merged_operations: set[tuple[str, str, str, str]]
+    ) -> bool:
+        """Whether a ``unit-merged`` row of ``task`` names an integration the target holds.
+
+        With no live receipt, the completion is a row naming an operation
+        identity whose ``bmad-loop-integrate`` transition the target's reflog
+        holds — or, for an integration that made no ref update (an
+        artifact-only bundle's squash stages nothing; a fast-forward of a
+        source the target already holds), a target that already holds the
+        source or its tree, which is all such a replay could find to merge.
+        Evidence git cannot read cleanly is ``False`` here; the replay that
+        follows reads it again and pauses with its own reason.
+        """
+        if not self.state.target_branch:
+            return False
+        key = (task.story_key, task.branch, self.state.target_branch)
+        operations = sorted(
+            operation for (*row_key, operation) in merged_operations if tuple(row_key) == key
+        )
+        repo = self.paths.repo_root
+        target_ref = f"refs/heads/{self.state.target_branch}"
+        try:
+            for operation in operations:
+                if not re.fullmatch(r"[0-9a-f]{32}", operation):
+                    continue
+                if verify.integration_ref_update(repo, target_ref, operation) is not None:
+                    return True
+            source = task.commit_sha
+            if not source:
+                return False
+            if verify.is_ancestor(repo, source, target_ref):
+                return True
+            return verify.revision_tree_oid(repo, source) == verify.revision_tree_oid(
+                repo, target_ref
+            )
+        except (verify.GitError, OSError):
+            return False
 
     def _receipt_completion_recorded(
         self, task: StoryTask, merged_operations: set[tuple[str, str, str, str]]
