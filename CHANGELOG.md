@@ -485,7 +485,8 @@ breaking changes may land in a minor release.
   behind (`?? path/`), which is accepted only as the exact captured checkout
   and otherwise refused, with the refusal's restore undoing a hook's writes
   into a captured submodule checkout rather than pausing unrestored. A gitlink
-  the unit adds is read the same way as a captured one — index at the gitlink,
+  the unit adds is read the same way as a captured one — index at the gitlink
+  (skip-worktree accepted on a sparse target's out-of-cone gitlink),
   a populated checkout this repository's, clean (ignored entries included, the
   path having been proved absent), at the gitlink — since an
   incoming `.gitmodules` with `ignore = all` hides a hook's `submodule update

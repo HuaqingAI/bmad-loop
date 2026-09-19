@@ -731,6 +731,30 @@ def _indexed_submodules(repo: Path) -> list[str]:
     return paths
 
 
+# `ls-files --debug` flag words a stage-0 gitlink may carry: none, or
+# skip-worktree alone (CE_SKIP_WORKTREE | CE_EXTENDED), which a cone-mode
+# sparse checkout sets on every entry outside the cone — gitlinks included —
+# and which hides nothing from the readings here, since a checkout is read
+# from disk rather than through the index (#796 review). Intent-to-add,
+# assume-unchanged, or anything else is not a gitlink's shape.
+_GITLINK_INDEX_FLAGS = frozenset({"0", "40004000"})
+
+
+def _gitlink_index_matches(current: dict[str, object], oid: str) -> bool:
+    """Whether ``current`` (an `_index_state` reading) is exactly the gitlink ``oid``."""
+    entries = current.get("entries")
+    if current.get("intent_to_add") or not isinstance(entries, list) or len(entries) != 1:
+        return False
+    entry = entries[0]
+    return (
+        isinstance(entry, dict)
+        and entry.get("mode") == "160000"
+        and entry.get("oid") == oid
+        and entry.get("stage") == 0
+        and entry.get("flags") in _GITLINK_INDEX_FLAGS
+    )
+
+
 def _submodule_checkout_owned(root: Path, checkout: Path) -> bool:
     """Whether a populated checkout is this repository's own submodule checkout.
 
@@ -782,12 +806,7 @@ def _validated_submodule_checkout(
                 "persisted target submodule is not anchored to the old revision"
             )
     else:
-        current_index = _index_state(repo, rel)
-        expected_index = {
-            "entries": [{"mode": "160000", "oid": gitlink, "stage": 0, "flags": "0"}],
-            "intent_to_add": False,
-        }
-        if current_index != expected_index:
+        if not _gitlink_index_matches(_index_state(repo, rel), gitlink):
             raise IntegrationEvidenceError(
                 "persisted target submodule is no longer the captured indexed gitlink"
             )
@@ -2285,11 +2304,7 @@ def validate_integrated_submodule_state(
             continue
         if kind != b"commit":
             raise IntegrationEvidenceError("integrated target submodule evidence is malformed")
-        expected_index = {
-            "entries": [{"mode": "160000", "oid": oid, "stage": 0, "flags": "0"}],
-            "intent_to_add": False,
-        }
-        if _index_state(repo, rel) != expected_index:
+        if not _gitlink_index_matches(_index_state(repo, rel), oid):
             raise IntegrationEvidenceError("target hook changed an integrated submodule gitlink")
         checkout = repo / rel
         # an unpopulated gitlink is an empty directory: git's shape, nothing to read

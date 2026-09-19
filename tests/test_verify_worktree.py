@@ -3571,3 +3571,58 @@ def test_integrated_new_submodule_refuses_an_ignored_file_written_into_it(projec
         verify.validate_integrated_submodule_state(
             repo, submodules, prospective_paths=incoming, revision=integrated
         )
+
+
+def test_integrated_gitlink_outside_a_sparse_cone_is_accepted(project, tmp_path):
+    """A target on a cone-mode sparse checkout holds a gitlink outside the
+    cone as a stage-0 `160000` entry with the skip-worktree flag
+    (`40004000`) and no checkout. The reading hard-coded the entry's flags
+    to `0`, so every integration adding or moving such a gitlink was
+    refused as hook drift (Codex, #796 review). The flag hides nothing from
+    this reading — the checkout is read from disk, not through the index —
+    so skip-worktree is accepted alongside `0`; any other flag is not.
+    Ablation: require `0` again and this reds on the raise."""
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ())
+    origin = tmp_path / "new-origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    commit(origin, "payload.txt", "new submodule\n", "new submodule")
+    gitlink = verify.rev_parse_head(origin)
+    (repo / "keep").mkdir()
+    (repo / "keep" / "k.txt").write_text("in the cone\n")
+    git(repo, "add", "--", "keep/k.txt")
+    git(repo, "update-index", "--add", "--cacheinfo", f"160000,{gitlink},other/mod")
+    git(repo, "commit", "-q", "-m", "integrated: gitlink outside the cone")
+    integrated = verify.rev_parse_head(repo)
+    git(repo, "sparse-checkout", "set", "--cone", "keep")
+    assert git(repo, "ls-files", "-t", "--", "other/mod") == "S other/mod"
+    assert not (repo / "other").exists()
+
+    retained = verify.validate_integrated_submodule_state(
+        repo, submodules, prospective_paths=("other/mod",), revision=integrated
+    )
+
+    assert retained == ()
+    git(repo, "sparse-checkout", "disable")
+
+
+def test_integrated_gitlink_with_a_foreign_index_flag_is_refused(project, tmp_path):
+    """Skip-worktree is the one flag word a gitlink may carry besides none;
+    any other bit a hook sets on the entry is still drift."""
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ())
+    _integrate_new_submodule(repo, tmp_path, ignore_all=False)
+    integrated = verify.rev_parse_head(repo)
+    git(repo, "update-index", "--assume-unchanged", "--", "newmod")
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="submodule gitlink"):
+        verify.validate_integrated_submodule_state(
+            repo, submodules, prospective_paths=("newmod",), revision=integrated
+        )
