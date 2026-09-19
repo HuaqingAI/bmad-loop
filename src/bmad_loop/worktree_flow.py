@@ -2432,15 +2432,23 @@ class WorktreeFlow:
             raise verify.IntegrationEvidenceError(
                 "persisted target integration receipt is missing or malformed"
             )
-        # `index_flags`: optional — a receipt armed before it was recorded
-        # reads without the outside-incoming flag reading
-        allowed = set(required) | {"old_revision", "new_revision", "outcome", "index_flags"}
+        # `index_flags`, `ignored`: optional — a receipt armed before either
+        # was recorded reads without that reading
+        allowed = set(required) | {
+            "old_revision",
+            "new_revision",
+            "outcome",
+            "index_flags",
+            "ignored",
+        }
         if set(raw) - allowed or (outcome is not None and old is None):
             raise verify.IntegrationEvidenceError(
                 "persisted target integration receipt is missing or malformed"
             )
         if "index_flags" in raw:
             verify.validate_index_flags_evidence(raw["index_flags"])
+        if "ignored" in raw:
+            verify.validate_ignored_entries_evidence(raw["ignored"])
         verify.validate_integration_state_schema(
             self.run_dir,
             raw["snapshots"],
@@ -2474,9 +2482,15 @@ class WorktreeFlow:
         # `update-index --assume-unchanged` on a clean tracked file there is
         # invisible to every other reading (#796 review); captured after the
         # snapshots, inside the same ref-revision bracket
+        # and the whole tree's ignored entries — a hook's gitignored write
+        # beside an incoming path in a directory the target already held
+        # populated is listed by no other reading (#796 review)
         try:
             index_flags = verify.capture_index_flags(
                 self.paths.repo_root, exclude=[str(entry["path"]) for entry in snapshots]
+            )
+            ignored = verify.capture_ignored_entries(
+                self.paths.repo_root, self.run_dir, operation_identity
             )
         except BaseException:
             verify.discard_integration_state(
@@ -2500,6 +2514,7 @@ class WorktreeFlow:
             "snapshots": snapshots,
             "submodules": submodules,
             "index_flags": index_flags,
+            "ignored": ignored,
             "phase": "armed",
             "cleanup_plan": None,
         }
@@ -3640,6 +3655,23 @@ class WorktreeFlow:
                         "target hook wrote into a directory the integration created: "
                         + ", ".join(residue)
                     )
+                # And wherever else: an ignored entry the receipt's whole-tree
+                # listing did not record — a hook's write beside an incoming
+                # path in a directory the target already held populated, which
+                # no reading above lists (#796 review). Left in place by the
+                # restore, like unstaged dirt, and named.
+                if attempt.get("ignored") is not None:
+                    added = verify.integrated_ignored_additions(
+                        repo,
+                        self.run_dir,
+                        attempt["ignored"],
+                        tolerated=cleanup_plan.get("tolerated", ()),
+                    )
+                    if added:
+                        raise verify.IntegrationEvidenceError(
+                            "target hook wrote ignored entries after integration "
+                            "(left in place): " + ", ".join(added)
+                        )
                 if verify.ref_revision(repo, target_ref) != expected_revision:
                     raise verify.IntegrationEvidenceError(
                         "target moved during artifact integration validation"

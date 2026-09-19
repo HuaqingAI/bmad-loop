@@ -27454,6 +27454,89 @@ def test_bundle_replacing_a_tracked_file_with_a_directory_integrates(project, st
         ("ff", "post-merge"),
     ],
 )
+def test_target_hook_writing_an_ignored_file_beside_an_incoming_path_is_refused(
+    project, strategy, hook_name
+):
+    """A TARGET hook's gitignored write into a directory the target already
+    held populated (`dir/keep` tracked, `dir/added` incoming, the hook writes
+    `dir/cache.tmp`) was listed by no reading: the diff readings cover tracked
+    paths, the whole-tree stray reading takes `status` without `--ignored`,
+    and the introduced-directory walk roots only where the receipt proved
+    nothing (or an empty directory, or a non-directory) stood — a populated
+    parent gave it no root. The run recorded `unit-merged` and retired the
+    receipt over unverified hook output (Codex, #796 review). The receipt now
+    records the whole tree's ignored entries when it is armed, and after the
+    hooks any ignored entry it did not record is refused by path — wherever
+    it stands, a populated incoming parent included.
+
+    The restore reverts the commit and leaves the hook's file in place, named
+    for the operator, like unstaged and untracked dirt: the receipt never read
+    ignored bytes and cannot say whose they are.
+
+    Ablation: return `()` from `integrated_ignored_additions` and every row
+    reds on `summary.paused` — the run finished, ids `done`, over the hook's
+    file."""
+    effect, _expected = _ignored_publication_bundle(project)
+    (project.project / ".gitignore").write_text(
+        (project.project / ".gitignore").read_text() + "*.tmp\n"
+    )
+    (project.project / "dir").mkdir()
+    (project.project / "dir" / "keep").write_text("already here\n")
+    git(project.project, "add", "--", ".gitignore", "dir/keep")
+    git(project.project, "commit", "-q", "-m", "ignore hook output; dir is populated")
+    target_head = verify.rev_parse_head(project.repo_root)
+    hook = project.project / ".git" / "hooks" / hook_name
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        "  printf 'target hook mutation' > dir/cache.tmp\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+
+    def adds_beside_the_kept_file(spec):
+        result = effect(spec)
+        (spec.cwd / "dir" / "added").write_text("incoming\n")  # committed by the run
+        return result
+
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), adds_beside_the_kept_file],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert "unit-merged" not in journal_kinds(engine)
+    assert not durable.artifact_publication_complete
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert "wrote ignored entries after integration (left in place): dir/cache.tmp" in (
+        refusal["error"]
+    )
+    assert "target hook mutation" not in refusal["error"]  # path-only evidence
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert not (project.project / "dir" / "added").exists()
+    assert (project.project / "dir" / "keep").read_text() == "already here\n"
+    # named, and left in place: the receipt never read ignored bytes
+    assert (project.project / "dir" / "cache.tmp").read_text() == "target hook mutation"
+    assert git(project.project, "status", "--porcelain", "-uall") == ""
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt.get("outcome") == "refused-restored"
+    assert Path(durable.worktree_path).is_dir()
+    assert verify.branch_exists(project.repo_root, durable.branch)
+
+
+@pytest.mark.parametrize(
+    ("strategy", "hook_name"),
+    [
+        ("merge", "pre-merge-commit"),
+        ("squash", "pre-commit"),
+        ("ff", "post-merge"),
+    ],
+)
 def test_target_hook_writing_an_ignored_file_into_a_new_directory_is_refused(
     project, strategy, hook_name
 ):

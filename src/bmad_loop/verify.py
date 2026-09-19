@@ -2657,6 +2657,130 @@ def capture_index_flags(repo: Path, *, exclude: Iterable[str]) -> dict[str, obje
     }
 
 
+_IGNORED_ENTRIES_SIDECAR = "ignored.lst"
+
+
+def _owned_integration_snapshot_root(run_dir: Path, operation_identity: str) -> Path:
+    """The existing capture root of ``operation_identity``, confined to the run."""
+    if not re.fullmatch(r"[0-9a-f]{32}", operation_identity):
+        raise IntegrationEvidenceError("persisted target integration operation is malformed")
+    run_root = run_dir.resolve(strict=True)
+    parent = run_dir / _INTEGRATION_SNAPSHOT_DIR
+    root = parent / operation_identity
+    try:
+        resolved = root.resolve(strict=True)
+    except OSError as exc:
+        raise IntegrationEvidenceError("target integration snapshot root is missing") from exc
+    if (
+        parent.is_symlink()
+        or root.is_symlink()
+        or not resolved.is_relative_to(run_root)
+        or resolved.parent != parent.resolve(strict=True)
+    ):
+        raise IntegrationEvidenceError("target integration snapshot directory was redirected")
+    return root
+
+
+def ignored_entries(repo: Path) -> tuple[str, ...]:
+    """Every ignored untracked entry of the whole tree, the run's own records left out.
+
+    One whole-tree ``ls-files --others --ignored --exclude-standard`` (no
+    ``--directory``: a file inside an ignored directory is an entry of its
+    own, so a hook's write there is named too). Submodule checkouts are their
+    own reading's; nested repositories list as one entry. The automator
+    directory's run records — this receipt's own sidecars among them — are
+    left out exactly as `automator_dirty_paths` leaves them.
+    """
+    proc = git_bytes(repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard")
+    if proc.returncode != 0:
+        raise IntegrationEvidenceError("target ignored-entry evidence is unavailable")
+    prefix = f"{AUTOMATOR_DIR_REL}/"
+    entries: list[str] = []
+    for raw in proc.stdout.split(b"\0"):
+        if not raw:
+            continue
+        path = os.fsdecode(raw)
+        if path.startswith(prefix):
+            below = path.removeprefix(prefix)
+            if below.startswith(_AUTOMATOR_RECORD_PREFIXES) or below in _AUTOMATOR_RECORD_FILES:
+                continue
+        entries.append(path)
+    return tuple(sorted(set(entries)))
+
+
+def capture_ignored_entries(
+    repo: Path, run_dir: Path, operation_identity: str
+) -> dict[str, object]:
+    """The receipt's evidence for the ignored entries of the whole tree.
+
+    A target hook's gitignored write beside an incoming path in a directory
+    the target already held populated is listed by no other reading: the diff
+    readings cover tracked paths, the stray reading takes ``status`` without
+    ``--ignored``, and the introduced-directory walk roots only where the
+    receipt proved nothing, an empty directory, or a non-directory stood
+    (#796 review). The whole tree's ignored entries (`ignored_entries`) are
+    sealed into a NUL-delimited sidecar under the operation's capture root —
+    the listing can be wide, and the receipt in ``state.json`` records only
+    its location, size and digest — so that after the hooks every ignored
+    entry not on it can be NAMED (`integrated_ignored_additions`).
+    """
+    root = _owned_integration_snapshot_root(run_dir, operation_identity)
+    data = b"\0".join(os.fsencode(path) for path in ignored_entries(repo))
+    size, digest = _snapshot_bytes(data, root / _IGNORED_ENTRIES_SIDECAR)
+    return {
+        "sidecar": (root / _IGNORED_ENTRIES_SIDECAR).relative_to(run_dir).as_posix(),
+        "size": size,
+        "sha256": digest,
+    }
+
+
+def validate_ignored_entries_evidence(value: object) -> dict[str, object]:
+    """Validate a persisted `capture_ignored_entries` record; the same dict back."""
+    if not isinstance(value, dict) or set(value) != {"sidecar", "size", "sha256"}:
+        raise IntegrationEvidenceError("persisted target ignored-entry evidence is malformed")
+    sidecar, size, digest = value["sidecar"], value["size"], value["sha256"]
+    if (
+        not isinstance(sidecar, str)
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+    ):
+        raise IntegrationEvidenceError("persisted target ignored-entry evidence is malformed")
+    _portable_integration_path(sidecar)
+    return value
+
+
+def _recorded_ignored_entries(run_dir: Path, evidence: dict[str, object]) -> frozenset[str]:
+    sidecar = _sidecar_path(run_dir, evidence["sidecar"])
+    data = sidecar.read_bytes()
+    if len(data) != evidence["size"] or hashlib.sha256(data).hexdigest() != evidence["sha256"]:
+        raise IntegrationEvidenceError("persisted target ignored-entry evidence changed")
+    return frozenset(os.fsdecode(raw) for raw in data.split(b"\0") if raw)
+
+
+def integrated_ignored_additions(
+    repo: Path, run_dir: Path, evidence: object, *, tolerated: Iterable[str] = ()
+) -> tuple[str, ...]:
+    """Ignored entries the tree holds after the hooks that the receipt did not record.
+
+    The listing `capture_ignored_entries` sealed, read back against its
+    digest, minus the same reading now: what is left is an ignored entry
+    that arrived during the attempt — a target hook's write, wherever it
+    stands — or a ``tolerated`` stray an incoming ``.gitignore`` change
+    turned ignored, which the pre-merge guard already read and is left out.
+    Removals are not read: the receipt never held ignored bytes, and an entry
+    the cleanup removed or the commit now tracks leaves the listing by
+    design. The restore leaves what this names in place, like unstaged and
+    untracked dirt. Path-only evidence, sorted.
+    """
+    validated = validate_ignored_entries_evidence(evidence)
+    recorded = _recorded_ignored_entries(run_dir, validated)
+    excluded = {_portable_integration_path(path) for path in tolerated}
+    return tuple(sorted(path for path in ignored_entries(repo) if path not in recorded | excluded))
+
+
 def validate_index_flags_evidence(value: object) -> dict[str, object]:
     """Validate a persisted `capture_index_flags` record; the same dict back."""
     if not isinstance(value, dict) or set(value) != {"digest", "marked"}:

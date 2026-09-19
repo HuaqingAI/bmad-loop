@@ -493,8 +493,14 @@ breaking changes may land in a minor release.
   refused by the receipt's digest of every other index entry's flag word
   and named from its map of the marked ones (a rename's source is incoming
   too — `diff --name-only` had named the destination alone — so a renaming
-  bundle is not refused over the entry its merge deletes); the restore reverts what
-  the hook staged and leaves unstaged and untracked entries in place, named
+  bundle is not refused over the entry its merge deletes), and a hook's
+  gitignored write anywhere — beside an incoming path in a directory the
+  target already held populated, which no reading listed — is refused by
+  the receipt's sealed listing of the whole tree's ignored entries (a
+  sidecar under the operation's capture root; removals not read, a
+  tolerated stray an incoming `.gitignore` change turned ignored left out)
+  and named; the restore reverts what
+  the hook staged and leaves unstaged, untracked and ignored entries in place, named
   for the operator; and a directory the unit creates, where the receipt
   proved nothing was — or proved an empty untracked directory, which git
   never tracks and no reading lists — or where the receipt captured a

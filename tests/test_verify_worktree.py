@@ -4059,6 +4059,81 @@ def test_integrated_paths_drift_accepts_an_incoming_entry_type_change(project, s
     assert verify.integrated_paths_drift(repo, integrated, incoming) == ()
 
 
+def test_ignored_entries_receipt_names_an_entry_added_after_the_hooks(project, tmp_path):
+    """A target hook's gitignored write into a directory the target already
+    held populated (`dir/keep` tracked, `dir/added` incoming, the hook writes
+    `dir/cache.tmp`) is listed by no reading: the diff readings cover tracked
+    paths, the stray reading takes `status` without `--ignored`, and the
+    introduced-directory walk has no root at a populated parent (Codex, #796
+    review). The receipt now seals the whole tree's ignored entries into a
+    sidecar when it is armed, and after the hooks every ignored entry not on
+    that listing is named — beside the incoming path, inside a directory
+    that was already wholly ignored, anywhere. What it does not name:
+    an ignored entry that left the listing (the receipt never held its
+    bytes), an ignored path the commit now tracks, a tolerated stray an
+    incoming `.gitignore` change turned ignored, and the run's own records
+    under the automator directory, this receipt's sidecars among them.
+
+    Ablation: return `()` from `integrated_ignored_additions` and the
+    additions assertion reds; drop the tolerated exclusion and the turned-
+    ignored stray is named; drop the record exclusion and the receipt's own
+    sidecar is named."""
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    (repo / ".gitignore").write_text("*.tmp\nbuild/\n.bmad-loop/runs/\n")
+    (repo / "dir").mkdir()
+    (repo / "dir" / "keep").write_text("already here\n")
+    (repo / "dir" / "stale.tmp").write_text("ignored before\n")
+    (repo / "dir" / "becomes-tracked.tmp").write_text("ignored, then committed\n")
+    (repo / "build").mkdir()
+    (repo / "build" / "old.o").write_text("ignored before\n")
+    git(repo, "add", "--", ".gitignore", "dir/keep")
+    git(repo, "commit", "-q", "-m", "populated dir; ignored entries")
+    (repo / "stray.log").write_text("untracked, tolerated by the guard\n")
+    snapshots, _submodules = verify.capture_integration_state(
+        repo, run_dir, "d" * 32, ("dir/added", "dir/becomes-tracked.tmp")
+    )
+    assert {entry["path"] for entry in snapshots} == {"dir/added", "dir/becomes-tracked.tmp"}
+
+    evidence = verify.capture_ignored_entries(repo, run_dir, "d" * 32)
+
+    assert set(evidence) == {"sidecar", "size", "sha256"}
+    sidecar = run_dir / str(evidence["sidecar"])
+    assert sidecar.parent == run_dir / "integration-snapshots" / ("d" * 32)
+    recorded = sidecar.read_bytes().split(b"\0")
+    assert recorded == [b"build/old.o", b"dir/becomes-tracked.tmp", b"dir/stale.tmp"]
+    assert verify.integrated_ignored_additions(repo, run_dir, evidence) == ()
+
+    # the integrated shape: the commit tracks one ignored path and adds
+    # beside the kept file; its `.gitignore` turns the tolerated stray ignored
+    (repo / "dir" / "added").write_text("incoming\n")
+    (repo / ".gitignore").write_text("*.tmp\nbuild/\n.bmad-loop/runs/\n*.log\n")
+    git(repo, "add", "-f", "--", "dir/added", "dir/becomes-tracked.tmp", ".gitignore")
+    git(repo, "commit", "-q", "-m", "integrated")
+    (repo / "dir" / "stale.tmp").unlink()  # a removal is not read
+    assert (
+        verify.integrated_ignored_additions(repo, run_dir, evidence, tolerated=("stray.log",)) == ()
+    )
+    assert verify.integrated_ignored_additions(repo, run_dir, evidence) == ("stray.log",)
+
+    (repo / "dir" / "cache.tmp").write_text("target hook output\n")
+    (repo / "build" / "new.o").write_text("target hook output\n")
+    (repo / "elsewhere.tmp").write_text("target hook output\n")
+    assert git(repo, "status", "--porcelain", "-uall") == ""
+
+    assert verify.integrated_ignored_additions(
+        repo, run_dir, evidence, tolerated=("stray.log",)
+    ) == ("build/new.o", "dir/cache.tmp", "elsewhere.tmp")
+
+    # the sealed listing is read back against its digest
+    sidecar.write_bytes(b"build/old.o")
+    with pytest.raises(verify.IntegrationEvidenceError, match="changed"):
+        verify.integrated_ignored_additions(repo, run_dir, evidence)
+    with pytest.raises(verify.IntegrationEvidenceError, match="malformed"):
+        verify.integrated_ignored_additions(repo, run_dir, {"sidecar": "x", "size": 1})
+
+
 def _integrate_new_directory(repo, run_dir):
     """Arm a receipt over `newdir/tracked` while `newdir` is absent, then commit
     the integrated shape: the directory created by the commit, holding exactly
