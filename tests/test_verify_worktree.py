@@ -4729,17 +4729,91 @@ def test_integrated_stray_paths_reports_a_change_outside_every_receipt_set(proje
     assert verify.integrated_stray_paths(repo, tolerated=(), incoming=("src.txt",)) == expected
 
 
+@pytest.mark.parametrize(
+    "shape", ["edited-hook-script", "staged-hook-script", "new-policy", "new-profile"]
+)
+def test_integrated_stray_paths_reads_the_automator_directory(project, shape):
+    """`dirty_paths` excludes the whole `.bmad-loop/` subtree — the
+    orchestrator's own working directory — so a target hook editing or
+    staging a clean tracked file there (the hook relay script, a committed
+    `policy.toml`, a profile overlay), or writing a new one, was outside the
+    stray reading and the run recorded `unit-merged` over it (Codex, #796
+    review). The stray reading now takes the automator directory too,
+    leaving out only the run's own records (`runs/`, `archive/`, `cache/`,
+    `decisions.json`, `operator/`, `operator-actions.json`).
+
+    Ablation: drop `automator_dirty_paths` from the reading and every row
+    reds."""
+    repo = project.project
+    (repo / ".bmad-loop").mkdir(exist_ok=True)
+    (repo / ".bmad-loop" / "bmad_loop_hook.py").write_text("# relay\n")
+    git(repo, "add", "--", ".bmad-loop/bmad_loop_hook.py")
+    git(repo, "commit", "-q", "-m", "hook relay script")
+    if shape == "edited-hook-script":
+        (repo / ".bmad-loop" / "bmad_loop_hook.py").write_text("# rewritten by a hook\n")
+        expected = (".bmad-loop/bmad_loop_hook.py",)
+    elif shape == "staged-hook-script":
+        (repo / ".bmad-loop" / "bmad_loop_hook.py").write_text("# rewritten by a hook\n")
+        git(repo, "add", "--", ".bmad-loop/bmad_loop_hook.py")
+        expected = (".bmad-loop/bmad_loop_hook.py",)
+    elif shape == "new-policy":
+        (repo / ".bmad-loop" / "policy.toml").write_text("[engine]\n")
+        expected = (".bmad-loop/policy.toml",)
+    else:
+        (repo / ".bmad-loop" / "profiles").mkdir()
+        (repo / ".bmad-loop" / "profiles" / "claude.toml").write_text("adapter = 'x'\n")
+        expected = (".bmad-loop/profiles/claude.toml",)
+    assert verify.dirty_paths(repo) == {}
+
+    assert verify.integrated_stray_paths(repo, tolerated=(), incoming=("src.txt",)) == expected
+
+
+@pytest.mark.parametrize("staged", [False, True], ids=["unstaged", "staged"])
+def test_incoming_collision_guard_reads_the_automator_directory(project, tmp_path, staged):
+    """The pre-merge guard read the same `.bmad-loop`-less dirt, so an
+    operator's uncommitted edit to a tracked file there was neither
+    tolerated (journaled, and the receipt's to leave alone after the hooks)
+    nor — staged — blocking, though a fast-forwardable squash folds a staged
+    stray into the unit's commit wherever it lives (#618). It reads the
+    automator directory now: unstaged is tolerated, staged blocks."""
+    repo = project.project
+    (repo / ".bmad-loop").mkdir(exist_ok=True)
+    (repo / ".bmad-loop" / "bmad_loop_hook.py").write_text("# relay\n")
+    git(repo, "add", "--", ".bmad-loop/bmad_loop_hook.py")
+    git(repo, "commit", "-q", "-m", "hook relay script")
+    _branch_with(repo, tmp_path, adds={"feature.txt": "branch\n"})
+    (repo / ".bmad-loop" / "bmad_loop_hook.py").write_text("# operator's edit\n")
+    if staged:
+        git(repo, "add", "--", ".bmad-loop/bmad_loop_hook.py")
+        with pytest.raises(verify.GitError, match="staged changes.*bmad_loop_hook.py"):
+            verify.plan_incoming_collisions(repo, "main", "feat")
+        return
+    calls: list[list[str]] = []
+
+    plan = verify.plan_incoming_collisions(repo, "main", "feat", on_tolerated=calls.append)
+
+    assert plan.tolerated == (".bmad-loop/bmad_loop_hook.py",)
+    assert calls == [[".bmad-loop/bmad_loop_hook.py"]]
+    assert (
+        verify.integrated_stray_paths(repo, tolerated=plan.tolerated, incoming=("feature.txt",))
+        == ()
+    )
+
+
 def test_integrated_stray_paths_leaves_the_receipt_sets_to_their_own_readings(project, tmp_path):
     """Tolerated strays are the snapshot's (proved unchanged there), the
     incoming set is the diff readings', a retained leftover checkout — and
-    everything under it — is the submodule reading's, and the orchestrator's
-    own `.bmad-loop/` is never merged content; none of them is a stray."""
+    everything under it — is the submodule reading's, and the run's own
+    records under `.bmad-loop/` are its own; none of them is a stray."""
     repo = project.project
     _origin, checkout, _old_submodule = _add_test_submodule(repo, tmp_path)
     (repo / "stray.txt").write_text("operator dirt tolerated before the merge\n")
     (repo / "src.txt").write_text("incoming, owned by the diff readings\n")
-    (repo / ".bmad-loop").mkdir(exist_ok=True)
-    (repo / ".bmad-loop" / "policy.toml").write_text("[engine]\n")
+    for record in ("runs/r1/state.json", "archive/r0/state.json", "cache/x", "operator/a.json"):
+        (repo / ".bmad-loop" / record).parent.mkdir(parents=True, exist_ok=True)
+        (repo / ".bmad-loop" / record).write_text("{}\n")
+    (repo / ".bmad-loop" / "decisions.json").write_text("{}\n")
+    (repo / ".bmad-loop" / "operator-actions.json").write_text("{}\n")
     _integrate_submodule_deletion(repo, leftover=True)
     assert sorted(verify.dirty_paths(repo)) == ["module/", "src.txt", "stray.txt"]
 

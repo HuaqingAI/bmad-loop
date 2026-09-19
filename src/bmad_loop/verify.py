@@ -2471,6 +2471,31 @@ def integrated_index_flags_drift(
     return tuple(sorted(drift))
 
 
+# The run's own records under `.bmad-loop/`: per-run and archived state,
+# engine plugins' caches, the decision store, operator-action records. Never
+# a hook's to write and never merged content — everything else there (the
+# hook relay script, a committed `policy.toml`, profile overlays, user
+# plugins) is the operator's tracked configuration and is read like any
+# other path (#796 review).
+_AUTOMATOR_RECORD_PREFIXES = ("runs/", "archive/", "cache/", "operator/")
+_AUTOMATOR_RECORD_FILES = frozenset({"decisions.json", "operator-actions.json"})
+
+
+def automator_dirty_paths(repo: Path) -> dict[str, str]:
+    """`dirty_paths` for the automator directory alone, the run's own records left out."""
+    rc, out = _git_raw(repo, "status", "--porcelain", "-z", "-uall", "--", AUTOMATOR_DIR_REL)
+    if rc != 0:
+        raise GitError(f"git status failed in {repo}")
+    prefix = f"{AUTOMATOR_DIR_REL}/"
+    result: dict[str, str] = {}
+    for path, xy in _porcelain_entries(out):
+        below = path.removeprefix(prefix)
+        if below.startswith(_AUTOMATOR_RECORD_PREFIXES) or below in _AUTOMATOR_RECORD_FILES:
+            continue
+        result[path] = xy
+    return result
+
+
 def integrated_stray_paths(
     repo: Path,
     *,
@@ -2488,8 +2513,9 @@ def integrated_stray_paths(
     unseen and the run recorded ``unit-merged`` over it (#796 review). The
     integrated target may hold exactly one kind of dirt: the strays the guard
     tolerated before the merge, which the snapshot proves unchanged. This is
-    the whole-tree ``status`` reading (`dirty_paths`: ``-uall``, the
-    orchestrator's own ``.bmad-loop/`` excluded) minus what other readings
+    the whole-tree ``status`` reading (`dirty_paths`: ``-uall``) — with the
+    automator directory read the same way, the run's own records left out
+    (`automator_dirty_paths`; #796 review) — minus what other readings
     own — the ``tolerated`` set, the ``incoming`` set (the diff readings' and
     the absent-path probe's), and every ``retained_checkouts`` leftover with
     everything under it (the submodule reading's). Path-only evidence, in
@@ -2505,7 +2531,7 @@ def integrated_stray_paths(
         f"{_portable_integration_path(path)}/" for path in dict.fromkeys(retained_checkouts)
     )
     strays: list[str] = []
-    for path in dirty_paths(repo):
+    for path in (*dirty_paths(repo), *automator_dirty_paths(repo)):
         if path in excluded or path.rstrip("/") in excluded:
             continue
         if any(path == prefix or path.startswith(prefix) for prefix in prefixes):
@@ -5248,7 +5274,11 @@ def plan_incoming_collisions(
     proceeded over operator dirt leaves the same kind of trace as one that cleaned a
     leak. Not called when there are no such paths.
     """
-    dirty = dirty_paths(repo)
+    # the automator directory is read too, the run's own records left out:
+    # a stray there is tolerated or blocking on the same terms as any other,
+    # and the tolerated set is what the post-hook stray reading leaves alone
+    # (#796 review)
+    dirty = {**dirty_paths(repo), **automator_dirty_paths(repo)}
     if not dirty:
         return IncomingCollisionPlan((), (), ())
     incoming = branch_incoming_paths(repo, target, branch)

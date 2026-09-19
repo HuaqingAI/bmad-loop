@@ -484,7 +484,11 @@ breaking changes may land in a minor release.
   is any change a target hook leaves outside every receipt-owned set — a clean
   tracked file edited, staged, deleted or renamed, a new file written beside it
   — which a whole-tree reading names (after the hooks the target may hold only
-  the strays the guard tolerated before the merge); the restore reverts what
+  the strays the guard tolerated before the merge), the orchestrator's own
+  `.bmad-loop/` included — the hook relay script, a committed `policy.toml`,
+  a profile overlay — with only the run's own records left out, and the
+  pre-merge guard tolerating or blocking a stray there on the same terms as
+  any other; the restore reverts what
   the hook staged and leaves unstaged and untracked entries in place, named
   for the operator; and a directory the unit creates, where the receipt
   proved nothing was — or where the receipt captured a tracked file, a
