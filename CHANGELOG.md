@@ -480,7 +480,13 @@ breaking changes may land in a minor release.
   target hook's rewrite of an ordinary incoming source file, staged, left in the
   checkout, or sealed into the squash leg's own commit, is refused and restored
   rather than recorded as `unit-merged`; so is an incoming path the unit deletes
-  that a target hook recreates unstaged, which no index reading can see. A unit
+  that a target hook recreates unstaged, which no index reading can see; and so
+  is any change a target hook leaves outside every receipt-owned set — a clean
+  tracked file edited, staged, deleted or renamed, a new file written beside it
+  — which a whole-tree reading names (after the hooks the target may hold only
+  the strays the guard tolerated before the merge); the restore reverts what
+  the hook staged and leaves unstaged and untracked entries in place, named
+  for the operator. A unit
   that deletes a populated target submodule integrates: git leaves the checkout
   behind (`?? path/`), which is accepted only as the exact captured checkout
   and otherwise refused, with the refusal's restore undoing a hook's writes

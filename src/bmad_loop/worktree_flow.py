@@ -3551,6 +3551,26 @@ class WorktreeFlow:
                         "target hook changed receipt-owned index, worktree, ignored, "
                         "or submodule state"
                     )
+                # The fourth place: a clean tracked file outside every set
+                # above has no baseline in the receipt, so the whole-tree
+                # reading closes it — after the hooks the target may hold
+                # exactly the strays the guard tolerated before the merge,
+                # and nothing else (#796 review). The plan is read from the
+                # receipt, not the local variable: a replay that finds the
+                # ref already moved plans no collisions of its own.
+                cleanup_plan = attempt.get("cleanup_plan") or {}
+                strays = verify.integrated_stray_paths(
+                    repo,
+                    tolerated=cleanup_plan.get("tolerated", ()),
+                    incoming=prospective_paths,
+                    retained_checkouts=retained_checkouts,
+                )
+                if strays:
+                    raise verify.IntegrationEvidenceError(
+                        "target hook changed paths outside the incoming set after "
+                        "integration (staged changes restored; unstaged and untracked "
+                        "entries left in place): " + ", ".join(strays)
+                    )
                 if verify.ref_revision(repo, target_ref) != expected_revision:
                     raise verify.IntegrationEvidenceError(
                         "target moved during artifact integration validation"

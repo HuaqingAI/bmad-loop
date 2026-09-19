@@ -3717,3 +3717,65 @@ def test_integrated_submodule_replaced_by_a_directory_is_left_to_the_diff_readin
     assert (
         verify.integrated_paths_drift(repo, integrated, incoming, retained_checkouts=retained) == ()
     )
+
+
+@pytest.mark.parametrize("shape", ["edited", "staged", "deleted", "untracked", "renamed"])
+def test_integrated_stray_paths_reports_a_change_outside_every_receipt_set(project, shape):
+    """The receipt snapshots the incoming set, the paths that were dirty
+    before the merge, and the declared artifacts — a clean tracked file
+    outside all of them has no baseline, and no post-hook reading looked at
+    it: a target hook editing, staging, deleting, or renaming it, or writing a
+    new file beside it, left the run recording `unit-merged` over unverified
+    hook output (Codex, #796 review). The whole-tree `status` reading takes
+    the pre-merge tolerated strays as the only dirt the target may hold after
+    the hooks — the merge committed, the incoming set is the diff readings' —
+    and reports every other entry by path.
+
+    Ablation: return `()` and every row reds."""
+    repo = project.project
+    (repo / "notes.txt").write_text("clean before the merge\n")
+    git(repo, "add", "--", "notes.txt")
+    git(repo, "commit", "-q", "-m", "notes.txt is clean")
+    if shape == "edited":
+        (repo / "notes.txt").write_text("target hook output\n")
+        expected = ("notes.txt",)
+    elif shape == "staged":
+        (repo / "notes.txt").write_text("target hook output\n")
+        git(repo, "add", "--", "notes.txt")
+        expected = ("notes.txt",)
+    elif shape == "deleted":
+        (repo / "notes.txt").unlink()
+        expected = ("notes.txt",)
+    elif shape == "untracked":
+        (repo / "hook.log").write_text("target hook output\n")
+        expected = ("hook.log",)
+    else:
+        git(repo, "mv", "--", "notes.txt", "moved.txt")
+        expected = ("moved.txt",)
+
+    assert verify.integrated_stray_paths(repo, tolerated=(), incoming=("src.txt",)) == expected
+
+
+def test_integrated_stray_paths_leaves_the_receipt_sets_to_their_own_readings(project, tmp_path):
+    """Tolerated strays are the snapshot's (proved unchanged there), the
+    incoming set is the diff readings', a retained leftover checkout — and
+    everything under it — is the submodule reading's, and the orchestrator's
+    own `.bmad-loop/` is never merged content; none of them is a stray."""
+    repo = project.project
+    _origin, checkout, _old_submodule = _add_test_submodule(repo, tmp_path)
+    (repo / "stray.txt").write_text("operator dirt tolerated before the merge\n")
+    (repo / "src.txt").write_text("incoming, owned by the diff readings\n")
+    (repo / ".bmad-loop").mkdir(exist_ok=True)
+    (repo / ".bmad-loop" / "policy.toml").write_text("[engine]\n")
+    _integrate_submodule_deletion(repo, leftover=True)
+    assert sorted(verify.dirty_paths(repo)) == ["module/", "src.txt", "stray.txt"]
+
+    assert (
+        verify.integrated_stray_paths(
+            repo, tolerated=("stray.txt",), incoming=("src.txt",), retained_checkouts=("module",)
+        )
+        == ()
+    )
+    assert verify.integrated_stray_paths(
+        repo, tolerated=(), incoming=(), retained_checkouts=()
+    ) == ("module/", "src.txt", "stray.txt")

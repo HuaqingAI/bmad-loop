@@ -2181,6 +2181,49 @@ def integrated_paths_drift(
     return tuple(dict.fromkeys(drift))
 
 
+def integrated_stray_paths(
+    repo: Path,
+    *,
+    tolerated: Iterable[str],
+    incoming: Iterable[str],
+    retained_checkouts: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """Paths dirty after the target's hooks that no receipt reading owns.
+
+    The receipt snapshots the incoming set, the paths that were dirty before
+    the merge (cleaned or tolerated), and the declared artifacts; a clean
+    tracked file outside all of them has no baseline, and the readings above
+    are each scoped to their own set — so a TARGET hook editing, staging,
+    deleting or renaming such a file, or writing a new one beside it, went
+    unseen and the run recorded ``unit-merged`` over it (#796 review). The
+    integrated target may hold exactly one kind of dirt: the strays the guard
+    tolerated before the merge, which the snapshot proves unchanged. This is
+    the whole-tree ``status`` reading (`dirty_paths`: ``-uall``, the
+    orchestrator's own ``.bmad-loop/`` excluded) minus what other readings
+    own — the ``tolerated`` set, the ``incoming`` set (the diff readings' and
+    the absent-path probe's), and every ``retained_checkouts`` leftover with
+    everything under it (the submodule reading's). Path-only evidence, in
+    sorted order. Ceilings: ignored entries are not read here either, and
+    the reading cannot tell a hook from a writer that raced the merge — a
+    per-worktree Editor leaking into the main checkout in that window — and
+    names both; the restore reverts what a hook STAGED (the post-hook index
+    delta is in its inventory) and leaves unstaged and untracked entries
+    where they are, for the operator the pause names them to.
+    """
+    excluded = {_portable_integration_path(path) for path in (*tolerated, *incoming)}
+    prefixes = tuple(
+        f"{_portable_integration_path(path)}/" for path in dict.fromkeys(retained_checkouts)
+    )
+    strays: list[str] = []
+    for path in dirty_paths(repo):
+        if path in excluded or path.rstrip("/") in excluded:
+            continue
+        if any(path == prefix or path.startswith(prefix) for prefix in prefixes):
+            continue
+        strays.append(path)
+    return tuple(sorted(strays))
+
+
 def revision_tree_oid(repo: Path, revision: str) -> str:
     """The tree object id ``revision`` seals (``rev-parse <revision>^{tree}``)."""
     rc, tree, detail = _git_out(repo, "rev-parse", f"{revision}^{{tree}}")
@@ -2284,8 +2327,9 @@ def validate_integrated_submodule_state(
     ``?? path/``), so a leftover is not a hook's doing. It is accepted only
     as the exact captured checkout — owned, clean, at the captured HEAD —
     and every leftover so accepted is returned for `integrated_paths_drift`
-    to leave to this reading. A checkout git could remove is simply absent;
-    a file or foreign directory in its place is drift.
+    and `integrated_stray_paths` to leave to this reading. A checkout git
+    could remove is simply absent; a file or foreign directory in its place
+    is drift.
     """
     if not isinstance(submodules, list):
         raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
@@ -4650,8 +4694,13 @@ def dirty_paths(repo: Path) -> dict[str, str]:
     )
     if rc != 0:
         raise GitError(f"git status failed in {repo}")
+    return dict(_porcelain_entries(out))
+
+
+def _porcelain_entries(out: str) -> list[tuple[str, str]]:
+    """``(path, XY)`` per record of a NUL-delimited ``status --porcelain -z`` read."""
     tokens = out.split("\0")
-    result: dict[str, str] = {}
+    result: list[tuple[str, str]] = []
     i = 0
     while i < len(tokens):
         tok = tokens[i]
@@ -4663,9 +4712,14 @@ def dirty_paths(repo: Path) -> dict[str, str]:
         # destination (`path` above) is what's on disk, so consume and skip it.
         if "R" in xy or "C" in xy:
             i += 1
-        result[path] = xy
+        result.append((path, xy))
         i += 1
     return result
+
+
+def _porcelain_paths(out: str) -> list[str]:
+    """Every path a NUL-delimited ``status --porcelain -z`` read names, on disk."""
+    return [path for path, _xy in _porcelain_entries(out)]
 
 
 def branch_incoming_paths(repo: Path, target: str, branch: str) -> set[str]:

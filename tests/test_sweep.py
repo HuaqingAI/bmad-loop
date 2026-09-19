@@ -27320,6 +27320,98 @@ def test_target_hook_rewriting_an_incoming_source_path_is_refused_and_restored(
         ("ff", "post-merge"),
     ],
 )
+@pytest.mark.parametrize("shape", ["worktree", "staged", "untracked"])
+def test_target_hook_changing_a_path_outside_the_incoming_set_is_refused(
+    project, strategy, hook_name, shape
+):
+    """The receipt snapshots the incoming set, the paths that were dirty
+    before the merge, and the declared artifacts, and every post-hook reading
+    is scoped to one of those sets — so a TARGET hook editing or staging a
+    clean tracked file outside all of them (`notes.txt`), or writing a new
+    file beside it, had no baseline anywhere: the run recorded `unit-merged`
+    and retired its rollback receipt with the hook's output sitting in the
+    target checkout or index, unattributed, for the next merge's guard to
+    tolerate as operator dirt (Codex, #796 review). The whole-tree `status`
+    reading now closes that: after the hooks the target may hold exactly the
+    strays the guard tolerated before the merge, and every other entry is
+    named and refused through the receipt route.
+
+    What the restore does with the named paths is the receipt's existing
+    scope, stated in the refusal rather than widened: a `staged` change is in
+    the post-hook index delta the restore already reverts, index and checkout
+    alike; a `worktree` edit and an `untracked` file are left where they are
+    — the run cannot tell a hook's write from an operator's in that window,
+    and a restore that reverted an operator's would be the worse fault — and
+    the pause names them for the operator.
+
+    Ablation: return `()` from `integrated_stray_paths` and every row reds on
+    `summary.paused` — the run finished, ids `done`, over unverified hook
+    output."""
+    effect, _expected = _ignored_publication_bundle(project)
+    (project.project / "notes.txt").write_text("clean before the merge\n")
+    git(project.project, "add", "--", "notes.txt")
+    git(project.project, "commit", "-q", "-m", "notes.txt is clean")
+    target_head = verify.rev_parse_head(project.repo_root)
+    target_file = "hook.log" if shape == "untracked" else "notes.txt"
+    hook = project.project / ".git" / "hooks" / hook_name
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        f"  printf 'target hook mutation' > {target_file}\n"
+        + (f"  git add -- {target_file}\n" if shape == "staged" else "")
+        + "fi\n"
+    )
+    hook.chmod(0o755)
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert git(project.project, "diff", "--cached", "--name-only") == ""
+    if shape == "staged":
+        assert (project.project / "notes.txt").read_text() == "clean before the merge\n"
+        assert verify.dirty_paths(project.project) == {}
+    else:
+        # named, and left in place: the restore does not guess whose it is
+        assert (project.project / target_file).read_text() == "target hook mutation"
+        assert verify.dirty_paths(project.project) == {
+            target_file: "??" if shape == "untracked" else " M"
+        }
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt.get("outcome") == "refused-restored"
+    assert "unit-merged" not in journal_kinds(engine)
+    assert not durable.artifact_publication_complete
+    [refusal] = _records(engine, "artifact-publication-refused")
+    if strategy == "squash" and shape == "staged":
+        # staged under `pre-commit`, so sealed IN the squash commit: the
+        # tree reading refuses it first, and the restore reverts the commit
+        assert "changed the squash result" in refusal["error"]
+    else:
+        assert refusal["error"].endswith(
+            "outside the incoming set after integration (staged changes restored; "
+            f"unstaged and untracked entries left in place): {target_file}"
+        )
+    assert "target hook mutation" not in refusal["error"]  # path-only evidence
+    assert Path(durable.worktree_path).is_dir()
+    assert verify.branch_exists(project.repo_root, durable.branch)
+    assert durable.commit_sha not in (None, durable.baseline_commit)
+
+
+@pytest.mark.parametrize(
+    ("strategy", "hook_name"),
+    [
+        ("merge", "pre-merge-commit"),
+        ("squash", "pre-commit"),
+        ("ff", "post-merge"),
+    ],
+)
 def test_target_hook_recreating_a_deleted_incoming_path_is_refused_and_restored(
     project, strategy, hook_name
 ):
