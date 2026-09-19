@@ -3704,6 +3704,78 @@ def test_integrated_index_flags_drift_reports_a_hook_s_flag_on_an_incoming_path(
     ) == (path,)
 
 
+@pytest.mark.parametrize(
+    "flip", ["set-assume-unchanged", "set-skip-worktree", "clear-assume-unchanged"]
+)
+def test_integrated_index_flags_outside_drift_names_a_hook_s_flip(project, tmp_path, flip):
+    """A target hook running `update-index --assume-unchanged` on a clean
+    tracked file OUTSIDE the incoming set changes no blob and leaves
+    `status --porcelain` empty while `ls-files --debug` reports `8000`; the
+    incoming-path reading is scoped to its paths and the stray reading takes
+    status, so the run recorded `unit-merged` over the mutation (Codex, #796
+    review). The receipt now carries `index_flags`: a digest over the flag
+    word of every stage-0 file entry outside the snapshot set, and the map
+    of those carrying a word no fresh entry may — enough to prove the rest
+    of the index unchanged after the hooks and to name a flipped path
+    without persisting the whole index. Set or cleared, the flip is named.
+
+    Ablation: return `()` from the reading and every row reds."""
+    repo = project.project
+    (repo / "notes.txt").write_text("clean and outside the incoming set\n")
+    git(repo, "add", "--", "notes.txt")
+    git(repo, "commit", "-q", "-m", "notes.txt")
+    if flip == "clear-assume-unchanged":
+        git(repo, "update-index", "--assume-unchanged", "--", "notes.txt")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    snapshots, _submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ("src.txt",))
+    evidence = verify.capture_index_flags(repo, exclude=[entry["path"] for entry in snapshots])
+    assert evidence["marked"] == ({"notes.txt": "8000"} if flip == "clear-assume-unchanged" else {})
+    (repo / "src.txt").write_text("incoming\n")
+    git(repo, "add", "--", "src.txt")
+    git(repo, "commit", "-q", "-m", "integrated")
+    exclude = [entry["path"] for entry in snapshots]
+    assert verify.integrated_index_flags_outside_drift(repo, evidence, exclude=exclude) == ()
+    if flip == "set-assume-unchanged":
+        git(repo, "update-index", "--assume-unchanged", "--", "notes.txt")
+    elif flip == "set-skip-worktree":
+        git(repo, "update-index", "--skip-worktree", "--", "notes.txt")
+    else:
+        git(repo, "update-index", "--no-assume-unchanged", "--", "notes.txt")
+    assert git(repo, "status", "--porcelain", "-uall") == ""
+    assert verify.integrated_stray_paths(repo, tolerated=(), incoming=("src.txt",)) == ()
+
+    assert verify.integrated_index_flags_outside_drift(repo, evidence, exclude=exclude) == (
+        "notes.txt",
+    )
+
+
+def test_integrated_index_flags_outside_drift_accepts_a_sparse_target(project, tmp_path):
+    """On a sparse target every out-of-cone entry carries skip-worktree, git's
+    own word: the digest proves them unchanged, the map holds none of them,
+    and the evidence validates as a receipt field."""
+    repo = project.project
+    (repo / "keep").mkdir()
+    (repo / "keep" / "k.txt").write_text("in the cone\n")
+    (repo / "other").mkdir()
+    (repo / "other" / "o.txt").write_text("out of the cone\n")
+    git(repo, "add", "--", "keep/k.txt", "other/o.txt")
+    git(repo, "commit", "-q", "-m", "two dirs")
+    git(repo, "sparse-checkout", "set", "--cone", "keep")
+    assert git(repo, "ls-files", "-t", "--", "other/o.txt") == "S other/o.txt"
+    evidence = verify.capture_index_flags(repo, exclude=["src.txt"])
+    assert evidence["marked"] == {}
+    assert verify.validate_index_flags_evidence(evidence) == evidence
+    (repo / "src.txt").write_text("incoming\n")
+    git(repo, "add", "--", "src.txt")
+    git(repo, "commit", "-q", "-m", "integrated")
+
+    assert verify.integrated_index_flags_outside_drift(repo, evidence, exclude=["src.txt"]) == ()
+    with pytest.raises(verify.IntegrationEvidenceError, match="malformed"):
+        verify.validate_index_flags_evidence({**evidence, "marked": {"x": "zz"}})
+    git(repo, "sparse-checkout", "disable")
+
+
 @pytest.mark.parametrize("shape", ["captured-word-rewritten", "sparse-out-of-cone"])
 def test_integrated_index_flags_drift_accepts_git_s_own_words(project, tmp_path, shape):
     """The integration writes every incoming entry anew — a file's

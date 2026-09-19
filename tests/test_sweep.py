@@ -28259,6 +28259,60 @@ def test_target_hook_marking_an_incoming_path_assume_unchanged_is_refused(
     assert "changed index flags on incoming paths" in refusal["error"]
 
 
+@pytest.mark.parametrize(
+    ("strategy", "hook_name"),
+    [("merge", "pre-merge-commit"), ("squash", "pre-commit"), ("ff", "post-merge")],
+)
+def test_target_hook_marking_a_path_outside_the_incoming_set_is_refused(
+    project, strategy, hook_name
+):
+    """A target hook running `update-index --assume-unchanged` on a clean
+    tracked file OUTSIDE the incoming set: no blob changes, status stays
+    empty, the incoming-path reading is scoped to its paths — and the run
+    recorded `unit-merged` over an index that hides later edits to that file
+    from git (Codex, #796 review). The receipt's `index_flags` digest proves
+    the rest of the index unchanged after the hooks and its map names the
+    flipped path; the refusal restores the integration and leaves the flip
+    in place for the operator, named, like unstaged dirt.
+
+    Ablation: return `()` from `integrated_index_flags_outside_drift` and
+    every leg reds on `summary.paused`."""
+    (project.project / "notes.txt").write_text("clean and outside the bundle\n")
+    git(project.project, "add", "--", "notes.txt")
+    git(project.project, "commit", "-q", "-m", "notes.txt")
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    target_head = verify.rev_parse_head(project.repo_root)
+    hook = project.project / ".git" / "hooks" / hook_name
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        "  git update-index --assume-unchanged -- notes.txt\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    engine, _adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert git(project.project, "status", "--porcelain", "--untracked-files=no") == ""
+    assert git(project.project, "ls-files", "-v", "--", "notes.txt") == "h notes.txt"
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt.get("outcome") == "refused-restored"
+    assert durable.integration_attempt["index_flags"]["marked"] == {}
+    assert "unit-merged" not in journal_kinds(engine)
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert refusal["error"].endswith(
+        "outside the incoming set after integration (left in place): notes.txt"
+    )
+
+
 @pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
 def test_bundle_integrates_into_a_target_with_an_assume_unchanged_submodule(
     project, tmp_path, strategy

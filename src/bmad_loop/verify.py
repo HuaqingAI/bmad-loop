@@ -2487,31 +2487,129 @@ def integrated_index_flags_drift(
             if item["stage"] == 0:
                 captured[str(entry["path"])] = str(item["flags"])
     fresh = _fresh_index_flag_words(repo)
+    drift: list[str] = []
+    for path, word in _index_file_flag_words(repo):
+        if path not in selected:
+            continue
+        accepted = fresh if path not in captured else fresh | {captured[path]}
+        if word not in accepted:
+            drift.append(path)
+    return tuple(sorted(drift))
+
+
+def _index_file_flag_words(repo: Path) -> list[tuple[str, str]]:
+    """``(path, flag word)`` of every stage-0 file entry in ``repo``'s index.
+
+    One whole-tree ``ls-files --stage`` + ``--debug`` pair — the receipt's own
+    index reading (`_index_state`), whole-tree for the same argv reason as the
+    diff readings. Gitlinks are the submodule reading's, unmerged stages the
+    diff readings'; neither is listed.
+    """
     staged = git_bytes(repo, "ls-files", "--stage", "-z")
     debug = git_bytes(repo, "ls-files", "--debug", "-z")
     if staged.returncode != 0 or debug.returncode != 0:
-        raise IntegrationEvidenceError("target post-hook index flag evidence is unavailable")
+        raise IntegrationEvidenceError("target index flag evidence is unavailable")
     flags = re.findall(rb"(?:^|[\t ])flags: ([0-9a-fA-F]+)(?:\n|$)", debug.stdout)
     records = [record for record in staged.stdout.split(b"\0") if record]
     if len(flags) != len(records):
-        raise IntegrationEvidenceError("target post-hook index flag evidence is malformed")
-    drift: list[str] = []
+        raise IntegrationEvidenceError("target index flag evidence is malformed")
+    words: list[tuple[str, str]] = []
     for record, raw_flags in zip(records, flags, strict=True):
         try:
             metadata, raw_path = record.split(b"\t", 1)
             mode, _oid, stage = metadata.split(b" ", 2)
         except ValueError as exc:
-            raise IntegrationEvidenceError(
-                "target post-hook index flag evidence is malformed"
-            ) from exc
-        path = os.fsdecode(raw_path)
-        if path not in selected or stage != b"0" or mode == b"160000":
+            raise IntegrationEvidenceError("target index flag evidence is malformed") from exc
+        if stage != b"0" or mode == b"160000":
             continue
-        word = os.fsdecode(raw_flags).lower()
-        accepted = fresh if path not in captured else fresh | {captured[path]}
-        if word not in accepted:
-            drift.append(path)
-    return tuple(sorted(drift))
+        words.append((os.fsdecode(raw_path), os.fsdecode(raw_flags).lower()))
+    return words
+
+
+def _index_flags_digest(words: Iterable[tuple[str, str]]) -> str:
+    digest = hashlib.sha256()
+    for path, word in sorted(words):
+        digest.update(os.fsencode(path))
+        digest.update(b"\0")
+        digest.update(word.encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def capture_index_flags(repo: Path, *, exclude: Iterable[str]) -> dict[str, object]:
+    """The receipt's evidence for the flag words of the index OUTSIDE the snapshot set.
+
+    A target hook's ``update-index --assume-unchanged`` on a clean tracked file
+    outside the incoming set changes no blob and leaves ``status`` empty, so no
+    other reading sees it (#796 review). ``digest`` is over ``(path, word)`` of
+    every stage-0 file entry not in ``exclude`` (the snapshot paths: those are
+    the incoming reading's), which proves the rest of the index unchanged
+    after the hooks without persisting it; ``marked`` maps the entries among
+    them carrying a word no fresh entry may (neither none nor skip-worktree),
+    so a flip can be NAMED — a typical index holds none, and a sparse target's
+    out-of-cone entries, all skip-worktree, stay out of it.
+    """
+    excluded = {_portable_integration_path(path) for path in exclude}
+    words = [(path, word) for path, word in _index_file_flag_words(repo) if path not in excluded]
+    return {
+        "digest": _index_flags_digest(words),
+        "marked": {
+            path: word for path, word in words if word not in {"0", _SPARSE_INDEX_FLAG_WORD}
+        },
+    }
+
+
+def validate_index_flags_evidence(value: object) -> dict[str, object]:
+    """Validate a persisted `capture_index_flags` record; the same dict back."""
+    if not isinstance(value, dict) or set(value) != {"digest", "marked"}:
+        raise IntegrationEvidenceError("persisted target index flag evidence is malformed")
+    digest = value["digest"]
+    marked = value["marked"]
+    if (
+        not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        or not isinstance(marked, dict)
+        or any(
+            not isinstance(word, str) or not re.fullmatch(r"[0-9a-f]{1,8}", word)
+            for word in marked.values()
+        )
+    ):
+        raise IntegrationEvidenceError("persisted target index flag evidence is malformed")
+    for path in marked:
+        _portable_integration_path(path)
+    return value
+
+
+def integrated_index_flags_outside_drift(
+    repo: Path, evidence: object, *, exclude: Iterable[str]
+) -> tuple[str, ...]:
+    """Paths outside the snapshot set whose index flag word a hook changed.
+
+    The digest of `capture_index_flags`, recomputed over the same set, proves
+    the rest of the index unchanged; on a mismatch each entry is read against
+    its captured word (``marked``) or, unmarked, against what a fresh entry
+    may carry on this target. Read after the stray reading, which owns an
+    entry a hook added or removed, so what is left to a mismatch is a word
+    flip — and a flip no entry can be named for (skip-worktree toggled on a
+    sparse target, where both words are fresh) is reported as such rather
+    than passed. Path-only evidence, sorted.
+    """
+    validated = validate_index_flags_evidence(evidence)
+    marked = validated["marked"]
+    assert isinstance(marked, dict)
+    excluded = {_portable_integration_path(path) for path in exclude}
+    words = [(path, word) for path, word in _index_file_flag_words(repo) if path not in excluded]
+    if _index_flags_digest(words) == validated["digest"]:
+        return ()
+    fresh = _fresh_index_flag_words(repo)
+    drift = sorted(
+        path for path, word in words if word != marked.get(path, word if word in fresh else None)
+    )
+    if not drift:
+        raise IntegrationEvidenceError(
+            "target hook changed index flag words outside the incoming set; no path named"
+        )
+    return tuple(drift)
 
 
 # The run's own records under `.bmad-loop/`: per-run and archived state,

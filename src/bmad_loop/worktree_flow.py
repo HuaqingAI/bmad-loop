@@ -2432,11 +2432,15 @@ class WorktreeFlow:
             raise verify.IntegrationEvidenceError(
                 "persisted target integration receipt is missing or malformed"
             )
-        allowed = set(required) | {"old_revision", "new_revision", "outcome"}
+        # `index_flags`: optional — a receipt armed before it was recorded
+        # reads without the outside-incoming flag reading
+        allowed = set(required) | {"old_revision", "new_revision", "outcome", "index_flags"}
         if set(raw) - allowed or (outcome is not None and old is None):
             raise verify.IntegrationEvidenceError(
                 "persisted target integration receipt is missing or malformed"
             )
+        if "index_flags" in raw:
+            verify.validate_index_flags_evidence(raw["index_flags"])
         verify.validate_integration_state_schema(
             self.run_dir,
             raw["snapshots"],
@@ -2466,6 +2470,19 @@ class WorktreeFlow:
             snapshot_paths,
             payload_max_bytes=self.policy.limits.artifact_payload_max_mb * 1_048_576,
         )
+        # The flag words of the index OUTSIDE the snapshot set — a hook's
+        # `update-index --assume-unchanged` on a clean tracked file there is
+        # invisible to every other reading (#796 review); captured after the
+        # snapshots, inside the same ref-revision bracket
+        try:
+            index_flags = verify.capture_index_flags(
+                self.paths.repo_root, exclude=[str(entry["path"]) for entry in snapshots]
+            )
+        except BaseException:
+            verify.discard_integration_state(
+                self.run_dir, {"operation_identity": operation_identity}
+            )
+            raise
         if verify.ref_revision(self.paths.repo_root, target_ref) != pre_target_revision:
             verify.discard_integration_state(
                 self.run_dir, {"operation_identity": operation_identity}
@@ -2482,6 +2499,7 @@ class WorktreeFlow:
             "pre_target_revision": pre_target_revision,
             "snapshots": snapshots,
             "submodules": submodules,
+            "index_flags": index_flags,
             "phase": "armed",
             "cleanup_plan": None,
         }
@@ -3588,6 +3606,22 @@ class WorktreeFlow:
                         "integration (staged changes restored; unstaged and untracked "
                         "entries left in place): " + ", ".join(strays)
                     )
+                # What status cannot list: an index flag word a hook flipped on
+                # a clean tracked file outside the incoming set, proved unchanged
+                # by the receipt's digest and named from its map (#796 review).
+                # After the stray reading, which owns an entry added or removed.
+                # Left in place by the restore, like unstaged dirt, and named.
+                if attempt.get("index_flags") is not None:
+                    flipped = verify.integrated_index_flags_outside_drift(
+                        repo,
+                        attempt["index_flags"],
+                        exclude=[str(entry["path"]) for entry in attempt["snapshots"]],
+                    )
+                    if flipped:
+                        raise verify.IntegrationEvidenceError(
+                            "target hook changed index flags outside the incoming set "
+                            "after integration (left in place): " + ", ".join(flipped)
+                        )
                 # And the one place none of those list: a directory the commit
                 # created where the receipt proved nothing was — or proved a
                 # file, a symlink, or an unpopulated gitlink — walked on disk
