@@ -2700,21 +2700,26 @@ def _owned_integration_snapshot_root(run_dir: Path, operation_identity: str) -> 
     return root
 
 
-def ignored_entries(repo: Path) -> tuple[str, ...]:
-    """Every ignored untracked entry of the whole tree, the run's own records left out.
+def ignored_entries(repo: Path) -> dict[str, str]:
+    """Every ignored untracked entry of the whole tree with its ``lstat`` identity.
 
     One whole-tree ``ls-files --others --ignored --exclude-standard`` (no
     ``--directory``: a file inside an ignored directory is an entry of its
     own, so a hook's write there is named too). Submodule checkouts are their
     own reading's; nested repositories list as one entry. The automator
     directory's run records — this receipt's own sidecars among them — are
-    left out exactly as `automator_dirty_paths` leaves them.
+    left out exactly as `automator_dirty_paths` leaves them. The identity is
+    the entry's ``lstat`` — size, mtime, ctime, inode, device, mode — never
+    its bytes: a hook overwriting or truncating an ignored file that was
+    already there leaves the path set unchanged and ``status`` and ``diff``
+    silent, and the identity is what names it (#796 review). An entry gone
+    between the listing and its ``lstat`` is a removal, not read.
     """
     proc = git_bytes(repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard")
     if proc.returncode != 0:
         raise IntegrationEvidenceError("target ignored-entry evidence is unavailable")
     prefix = f"{AUTOMATOR_DIR_REL}/"
-    entries: list[str] = []
+    entries: dict[str, str] = {}
     for raw in proc.stdout.split(b"\0"):
         if not raw:
             continue
@@ -2723,8 +2728,22 @@ def ignored_entries(repo: Path) -> tuple[str, ...]:
             below = path.removeprefix(prefix)
             if below.startswith(_AUTOMATOR_RECORD_PREFIXES) or below in _AUTOMATOR_RECORD_FILES:
                 continue
-        entries.append(path)
-    return tuple(sorted(set(entries)))
+        try:
+            entry = os.lstat(os.fsencode(repo / path))
+        except FileNotFoundError:
+            continue
+        entries[path] = ":".join(
+            str(value)
+            for value in (
+                entry.st_size,
+                entry.st_mtime_ns,
+                entry.st_ctime_ns,
+                entry.st_ino,
+                entry.st_dev,
+                entry.st_mode,
+            )
+        )
+    return dict(sorted(entries.items()))
 
 
 def capture_ignored_entries(
@@ -2737,14 +2756,19 @@ def capture_ignored_entries(
     readings cover tracked paths, the stray reading takes ``status`` without
     ``--ignored``, and the introduced-directory walk roots only where the
     receipt proved nothing, an empty directory, or a non-directory stood
-    (#796 review). The whole tree's ignored entries (`ignored_entries`) are
-    sealed into a NUL-delimited sidecar under the operation's capture root —
-    the listing can be wide, and the receipt in ``state.json`` records only
-    its location, size and digest — so that after the hooks every ignored
-    entry not on it can be NAMED (`integrated_ignored_additions`).
+    (#796 review). The whole tree's ignored entries with their identities
+    (`ignored_entries`) are sealed into a NUL-delimited sidecar of
+    ``path, identity`` pairs under the operation's capture root — the listing
+    can be wide, and the receipt in ``state.json`` records only its location,
+    size and digest — so that after the hooks every ignored entry not on it,
+    or on it under another identity, can be NAMED
+    (`integrated_ignored_additions`).
     """
     root = _owned_integration_snapshot_root(run_dir, operation_identity)
-    data = b"\0".join(os.fsencode(path) for path in ignored_entries(repo))
+    data = b"\0".join(
+        os.fsencode(path) + b"\0" + identity.encode("ascii")
+        for path, identity in ignored_entries(repo).items()
+    )
     size, digest = _snapshot_bytes(data, root / _IGNORED_ENTRIES_SIDECAR)
     return {
         "sidecar": (root / _IGNORED_ENTRIES_SIDECAR).relative_to(run_dir).as_posix(),
@@ -2771,33 +2795,51 @@ def validate_ignored_entries_evidence(value: object) -> dict[str, object]:
     return value
 
 
-def _recorded_ignored_entries(run_dir: Path, evidence: dict[str, object]) -> frozenset[str]:
+def _recorded_ignored_entries(run_dir: Path, evidence: dict[str, object]) -> dict[str, str]:
     sidecar = _sidecar_path(run_dir, evidence["sidecar"])
     data = sidecar.read_bytes()
     if len(data) != evidence["size"] or hashlib.sha256(data).hexdigest() != evidence["sha256"]:
         raise IntegrationEvidenceError("persisted target ignored-entry evidence changed")
-    return frozenset(os.fsdecode(raw) for raw in data.split(b"\0") if raw)
+    fields = data.split(b"\0") if data else []
+    if len(fields) % 2:
+        raise IntegrationEvidenceError("persisted target ignored-entry evidence is malformed")
+    recorded: dict[str, str] = {}
+    for raw_path, raw_identity in zip(fields[::2], fields[1::2], strict=True):
+        identity = raw_identity.decode("ascii", errors="strict")
+        if not raw_path or not re.fullmatch(r"-?\d+(:-?\d+){5}", identity):
+            raise IntegrationEvidenceError("persisted target ignored-entry evidence is malformed")
+        recorded[os.fsdecode(raw_path)] = identity
+    return recorded
 
 
 def integrated_ignored_additions(
     repo: Path, run_dir: Path, evidence: object, *, tolerated: Iterable[str] = ()
 ) -> tuple[str, ...]:
-    """Ignored entries the tree holds after the hooks that the receipt did not record.
+    """Ignored entries after the hooks the receipt did not record, or recorded otherwise.
 
     The listing `capture_ignored_entries` sealed, read back against its
-    digest, minus the same reading now: what is left is an ignored entry
-    that arrived during the attempt — a target hook's write, wherever it
-    stands — or a ``tolerated`` stray an incoming ``.gitignore`` change
-    turned ignored, which the pre-merge guard already read and is left out.
-    Removals are not read: the receipt never held ignored bytes, and an entry
-    the cleanup removed or the commit now tracks leaves the listing by
-    design. The restore leaves what this names in place, like unstaged and
-    untracked dirt. Path-only evidence, sorted.
+    digest, against the same reading now: an entry it does not hold arrived
+    during the attempt, and one it holds under another identity was written
+    during it — a target hook's write, wherever it stands, an ignored file
+    it overwrote or truncated in place included (#796 review). A
+    ``tolerated`` stray an incoming ``.gitignore`` change turned ignored,
+    which the pre-merge guard already read, is left out. Removals are not
+    read: the receipt never held ignored bytes, and an entry the cleanup
+    removed or the commit now tracks leaves the listing by design. The
+    restore leaves what this names in place, like unstaged and untracked
+    dirt. Path-only evidence, sorted. Ceiling: the identity is ``lstat``'s,
+    so a writer that puts size, times and inode back is not read.
     """
     validated = validate_ignored_entries_evidence(evidence)
     recorded = _recorded_ignored_entries(run_dir, validated)
     excluded = {_portable_integration_path(path) for path in tolerated}
-    return tuple(sorted(path for path in ignored_entries(repo) if path not in recorded | excluded))
+    return tuple(
+        sorted(
+            path
+            for path, identity in ignored_entries(repo).items()
+            if path not in excluded and recorded.get(path) != identity
+        )
+    )
 
 
 def validate_index_flags_evidence(value: object) -> dict[str, object]:

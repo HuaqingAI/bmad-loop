@@ -6,6 +6,7 @@ helpers carry no engine wiring yet — they are the plumbing Phase 3 builds on.
 """
 
 import functools
+import hashlib
 import os
 import shutil
 import subprocess
@@ -4157,16 +4158,20 @@ def test_ignored_entries_receipt_names_an_entry_added_after_the_hooks(project, t
     review). The receipt now seals the whole tree's ignored entries into a
     sidecar when it is armed, and after the hooks every ignored entry not on
     that listing is named — beside the incoming path, inside a directory
-    that was already wholly ignored, anywhere. What it does not name:
+    that was already wholly ignored, anywhere — and, each entry sealed with
+    its `lstat` identity, one it did record that a hook then overwrote,
+    truncated or touched in place, which leaves the path set unchanged and
+    `status` and `diff` silent (Codex, #796 review). What it does not name:
     an ignored entry that left the listing (the receipt never held its
     bytes), an ignored path the commit now tracks, a tolerated stray an
     incoming `.gitignore` change turned ignored, and the run's own records
     under the automator directory, this receipt's sidecars among them.
 
     Ablation: return `()` from `integrated_ignored_additions` and the
-    additions assertion reds; drop the tolerated exclusion and the turned-
-    ignored stray is named; drop the record exclusion and the receipt's own
-    sidecar is named."""
+    additions assertion reds; compare paths alone and the rewritten,
+    truncated and touched entries go unnamed; drop the tolerated exclusion
+    and the turned-ignored stray is named; drop the record exclusion and the
+    receipt's own sidecar is named."""
     repo = project.project
     run_dir = repo / ".bmad-loop" / "runs" / "r1"
     run_dir.mkdir(parents=True)
@@ -4175,6 +4180,9 @@ def test_ignored_entries_receipt_names_an_entry_added_after_the_hooks(project, t
     (repo / "dir" / "keep").write_text("already here\n")
     (repo / "dir" / "stale.tmp").write_text("ignored before\n")
     (repo / "dir" / "becomes-tracked.tmp").write_text("ignored, then committed\n")
+    (repo / "dir" / "rewritten.tmp").write_text("ignored before\n")
+    (repo / "dir" / "truncated.tmp").write_text("ignored before\n")
+    (repo / "dir" / "touched.tmp").write_text("ignored before\n")
     (repo / "build").mkdir()
     (repo / "build" / "old.o").write_text("ignored before\n")
     git(repo, "add", "--", ".gitignore", "dir/keep")
@@ -4191,7 +4199,29 @@ def test_ignored_entries_receipt_names_an_entry_added_after_the_hooks(project, t
     sidecar = run_dir / str(evidence["sidecar"])
     assert sidecar.parent == run_dir / "integration-snapshots" / ("d" * 32)
     recorded = sidecar.read_bytes().split(b"\0")
-    assert recorded == [b"build/old.o", b"dir/becomes-tracked.tmp", b"dir/stale.tmp"]
+    assert recorded[::2] == [
+        b"build/old.o",
+        b"dir/becomes-tracked.tmp",
+        b"dir/rewritten.tmp",
+        b"dir/stale.tmp",
+        b"dir/touched.tmp",
+        b"dir/truncated.tmp",
+    ]
+    stat = (repo / "dir" / "stale.tmp").lstat()
+    assert (
+        recorded[7]
+        == ":".join(
+            str(value)
+            for value in (
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+                stat.st_ino,
+                stat.st_dev,
+                stat.st_mode,
+            )
+        ).encode()
+    )
     assert verify.integrated_ignored_additions(repo, run_dir, evidence) == ()
 
     # the integrated shape: the commit tracks one ignored path and adds
@@ -4209,16 +4239,33 @@ def test_ignored_entries_receipt_names_an_entry_added_after_the_hooks(project, t
     (repo / "dir" / "cache.tmp").write_text("target hook output\n")
     (repo / "build" / "new.o").write_text("target hook output\n")
     (repo / "elsewhere.tmp").write_text("target hook output\n")
+    (repo / "dir" / "rewritten.tmp").write_text("target hook output\n")
+    (repo / "dir" / "truncated.tmp").write_bytes(b"")
+    os.utime(repo / "dir" / "touched.tmp")
     assert git(repo, "status", "--porcelain", "-uall") == ""
 
     assert verify.integrated_ignored_additions(
         repo, run_dir, evidence, tolerated=("stray.log",)
-    ) == ("build/new.o", "dir/cache.tmp", "elsewhere.tmp")
+    ) == (
+        "build/new.o",
+        "dir/cache.tmp",
+        "dir/rewritten.tmp",
+        "dir/touched.tmp",
+        "dir/truncated.tmp",
+        "elsewhere.tmp",
+    )
 
-    # the sealed listing is read back against its digest
+    # the sealed listing is read back against its digest, and its shape
     sidecar.write_bytes(b"build/old.o")
     with pytest.raises(verify.IntegrationEvidenceError, match="changed"):
         verify.integrated_ignored_additions(repo, run_dir, evidence)
+    odd = {
+        "sidecar": evidence["sidecar"],
+        "size": 11,
+        "sha256": hashlib.sha256(b"build/old.o").hexdigest(),
+    }
+    with pytest.raises(verify.IntegrationEvidenceError, match="malformed"):
+        verify.integrated_ignored_additions(repo, run_dir, odd)
     with pytest.raises(verify.IntegrationEvidenceError, match="malformed"):
         verify.integrated_ignored_additions(repo, run_dir, {"sidecar": "x", "size": 1})
 

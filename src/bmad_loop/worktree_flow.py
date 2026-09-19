@@ -3656,10 +3656,12 @@ class WorktreeFlow:
                         + ", ".join(residue)
                     )
                 # And wherever else: an ignored entry the receipt's whole-tree
-                # listing did not record — a hook's write beside an incoming
-                # path in a directory the target already held populated, which
-                # no reading above lists (#796 review). Left in place by the
-                # restore, like unstaged dirt, and named.
+                # listing did not record, or recorded under another identity —
+                # a hook's write beside an incoming path in a directory the
+                # target already held populated, or over an ignored file that
+                # was already there, which no reading above lists (#796
+                # review). Left in place by the restore, like unstaged dirt,
+                # and named.
                 if attempt.get("ignored") is not None:
                     added = verify.integrated_ignored_additions(
                         repo,
@@ -3669,8 +3671,8 @@ class WorktreeFlow:
                     )
                     if added:
                         raise verify.IntegrationEvidenceError(
-                            "target hook wrote ignored entries after integration "
-                            "(left in place): " + ", ".join(added)
+                            "target hook wrote or changed ignored entries after "
+                            "integration (left in place): " + ", ".join(added)
                         )
                 if verify.ref_revision(repo, target_ref) != expected_revision:
                     raise verify.IntegrationEvidenceError(

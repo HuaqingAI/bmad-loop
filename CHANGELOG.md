@@ -495,11 +495,13 @@ breaking changes may land in a minor release.
   too — `diff --name-only` had named the destination alone — so a renaming
   bundle is not refused over the entry its merge deletes), and a hook's
   gitignored write anywhere — beside an incoming path in a directory the
-  target already held populated, which no reading listed — is refused by
-  the receipt's sealed listing of the whole tree's ignored entries (a
-  sidecar under the operation's capture root; removals not read, a
-  tolerated stray an incoming `.gitignore` change turned ignored left out)
-  and named; the restore reverts what
+  target already held populated, which no reading listed, or over an
+  ignored file that was already there, which leaves the path set unchanged
+  and `status` and `diff` silent — is refused by the receipt's sealed
+  listing of the whole tree's ignored entries, each with its `lstat`
+  identity (a sidecar under the operation's capture root; bytes never
+  read, removals not read, a tolerated stray an incoming `.gitignore`
+  change turned ignored left out) and named; the restore reverts what
   the hook staged and leaves unstaged, untracked and ignored entries in place, named
   for the operator; and a directory the unit creates, where the receipt
   proved nothing was — or proved an empty untracked directory, which git
