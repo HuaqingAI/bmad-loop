@@ -521,7 +521,11 @@ breaking changes may land in a minor release.
   again on every resume — and its refusal restores the old shape through the
   parent path alone, git refusing the pair; a target cloned without
   `--recurse-submodules`, every gitlink an empty directory, integrates too —
-  the capture probed each one for its superproject and called it foreign.
+  the capture probed each one for its superproject and called it foreign —
+  and the receipt records such a gitlink unpopulated, so a checkout a target
+  hook's `submodule update --init` makes there is the refusal's to remove
+  (a repository of any other kind there refuses the restore) rather than
+  the next capture's baseline.
 
 - Recover sweep migration publication faults without persisting unearned `DONE`
   state (DW-296/DW-297). Persist accepted baseline/rewrite records, clear a

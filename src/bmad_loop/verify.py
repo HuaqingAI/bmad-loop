@@ -776,6 +776,19 @@ def _submodule_checkout_owned(root: Path, checkout: Path) -> bool:
         return False
     if superproject:
         return Path(superproject).resolve(strict=True) == root
+    return _submodule_git_dir_in_modules(root, checkout)
+
+
+def _submodule_git_dir_in_modules(root: Path, checkout: Path) -> bool:
+    """Whether ``checkout``'s git dir lives under ``root``'s ``<git-dir>/modules``.
+
+    The proof `submodule update --init` leaves and a fresh ``git init`` at the
+    path does not. While the index carries the gitlink git names ``root`` as
+    the superproject of either (#796 review), so a receipt that proved the
+    gitlink unpopulated — nothing there to have been anyone's — reads
+    ownership by this proof alone: only what git cloned as this repository's
+    submodule is the restore's to remove.
+    """
     rc, git_dir, _detail = _git_out(checkout, "rev-parse", "--absolute-git-dir")
     if rc != 0 or not git_dir:
         return False
@@ -798,7 +811,9 @@ def _validated_submodule_checkout(
     rel, checkout = _confined_repo_operand(repo, entry.get("path"))
     expected = entry.get("head")
     gitlink = entry.get("gitlink")
-    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected):
+    if expected is not None and (
+        not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected)
+    ):
         raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
     if not isinstance(gitlink, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", gitlink):
         raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
@@ -816,11 +831,33 @@ def _validated_submodule_checkout(
             raise IntegrationEvidenceError(
                 "persisted target submodule is no longer the captured indexed gitlink"
             )
-    if allow_missing and not checkout.is_dir():
-        if checkout.is_symlink():
+    if checkout.is_symlink():
+        raise IntegrationEvidenceError(
+            "persisted target submodule checkout escaped its indexed location"
+        )
+    if expected is None:
+        # captured unpopulated: an empty directory, or none, is the captured
+        # shape; a populated one is attempt-era — owned, it is the restore's
+        # to remove (`allow_missing`, the restore's own reading); foreign, or
+        # in any reading asked to verify, it is changed receipt-owned state
+        if not checkout.is_dir():
+            return checkout
+        root = repo.resolve(strict=True)
+        if checkout.resolve(strict=True) != root.joinpath(*rel.split("/")):
             raise IntegrationEvidenceError(
                 "persisted target submodule checkout escaped its indexed location"
             )
+        if not any(checkout.iterdir()):
+            return checkout
+        # git names the superproject for any repository at an indexed
+        # gitlink, a fresh `git init` included; the clone's git dir under
+        # `.git/modules` is what marks it this repository's submodule
+        if not _submodule_git_dir_in_modules(root, checkout):
+            raise IntegrationEvidenceError("persisted target submodule checkout changed ownership")
+        if verify_head or not allow_missing:
+            raise IntegrationEvidenceError("target submodule checkout was not restored")
+        return checkout
+    if allow_missing and not checkout.is_dir():
         return checkout
     if not checkout.is_dir():
         raise IntegrationEvidenceError("persisted target submodule checkout is unavailable")
@@ -846,6 +883,17 @@ def _restore_submodule_checkouts(
 ) -> None:
     for entry in entries:
         rel = str(entry["path"])
+        if entry.get("head") is None:
+            # captured unpopulated: whatever a hook checked out there is
+            # attempt-era whole (the receipt proved the directory empty), and
+            # git's own shape is the empty directory (#796 review). Ownership
+            # was proved before the first mutation; `.git/modules` keeps the
+            # clone, exactly as `submodule deinit` would leave it.
+            checkout = _validated_submodule_checkout(
+                repo, entry, verify_head=False, revision=old_revision, allow_missing=True
+            )
+            _empty_submodule_directory(repo, checkout)
+            continue
         rc, detail = _git(repo, "submodule", "update", "--init", "--checkout", "--", rel)
         if rc != 0:
             raise IntegrationRestoreError(
@@ -877,6 +925,22 @@ def _restore_submodule_checkouts(
             raise IntegrationRestoreError(
                 f"target submodule checkout restoration is not clean for {rel}"
             )
+
+
+def _empty_submodule_directory(repo: Path, checkout: Path) -> None:
+    """Leave exactly an empty directory at a captured-unpopulated gitlink."""
+    if DIR_FD_ANCHORED_WRITES:
+        parent_fd = _open_restore_parent(repo, checkout.parent)
+        try:
+            _remove_tree_at(parent_fd, checkout.name)
+            os.mkdir(checkout.name, 0o755, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        return
+    if checkout.is_dir() and not checkout.is_symlink():
+        shutil.rmtree(checkout)
+    checkout.mkdir(parents=True)
 
 
 def _capture_integration_state_into(
@@ -996,13 +1060,30 @@ def _capture_integration_state_into(
     submodules: list[dict[str, object]] = []
     for rel in _indexed_submodules(repo):
         _validated, checkout = _confined_repo_operand(repo, rel)
-        # an unpopulated gitlink — a clone without `--recurse-submodules` —
-        # is an empty directory with no `.git`: git's shape, nothing to
-        # capture, and a probe from inside it would find the superproject
-        # itself and call the submodule foreign (#796 review)
-        if not checkout.is_dir() or not any(checkout.iterdir()):
+        if not checkout.is_dir():
             continue
         repo_root = repo.resolve(strict=True)
+        # an unpopulated gitlink — a clone without `--recurse-submodules` —
+        # is an empty directory with no `.git`: git's shape, recorded as such
+        # (`head` None) so a checkout a hook makes there is the receipt's to
+        # remove; a probe from inside it would find the superproject itself
+        # and call the submodule foreign (#796 review)
+        if not any(checkout.iterdir()):
+            if checkout.resolve(strict=True) != repo_root.joinpath(*rel.split("/")):
+                raise IntegrationEvidenceError(
+                    "target submodule checkout escaped its indexed location"
+                )
+            index = _index_state(repo, rel)
+            entries = index["entries"]
+            if (
+                not isinstance(entries, list)
+                or len(entries) != 1
+                or entries[0].get("mode") != "160000"
+                or entries[0].get("stage") != 0
+            ):
+                raise IntegrationEvidenceError("target submodule index evidence is malformed")
+            submodules.append({"path": rel, "head": None, "gitlink": entries[0]["oid"]})
+            continue
         if checkout.resolve(strict=True) != repo_root.joinpath(*rel.split("/")):
             raise IntegrationEvidenceError("target submodule checkout escaped its indexed location")
         rc, superproject, _detail = _git_out(
@@ -1154,10 +1235,13 @@ def validate_integration_state_schema(
         rel = _portable_integration_path(raw.get("path"))
         head = raw.get("head")
         gitlink = raw.get("gitlink")
+        # `head` None: the gitlink was unpopulated at capture — an empty
+        # directory, git's shape for a clone without `--recurse-submodules`
+        # — and the receipt owns that emptiness (#796 review)
         if (
             rel in seen
-            or not isinstance(head, str)
-            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head)
+            or (head is not None and not isinstance(head, str))
+            or (isinstance(head, str) and not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head))
             or not isinstance(gitlink, str)
             or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", gitlink)
         ):
@@ -2499,10 +2583,20 @@ def validate_integrated_submodule_state(
     if not prospective:
         return ()
     captured: dict[str, dict[str, object]] = {}
+    unpopulated: set[str] = set()
     for raw in submodules:
         if not isinstance(raw, dict) or raw.get("path") not in prospective:
             continue
-        captured[_portable_integration_path(raw.get("path"))] = raw
+        rel = _portable_integration_path(raw.get("path"))
+        # captured unpopulated: the receipt proved an empty directory, so a
+        # checkout there after the hooks is attempt-era in full and reads
+        # as one the commit introduced — ignored entries counted, no
+        # captured HEAD to allow; and where the commit holds no gitlink any
+        # more, anything standing there is a hook's (#796 review)
+        if raw.get("head") is None:
+            unpopulated.add(rel)
+            continue
+        captured[rel] = raw
     inventory = _revision_inventory(repo, revision)
     held_paths = _inventory_held_paths(inventory)
     retained: list[str] = []
@@ -2511,6 +2605,13 @@ def validate_integrated_submodule_state(
         raw = captured.get(rel)
         if held is None:
             if raw is None:
+                checkout = repo / rel
+                if rel in unpopulated and checkout.is_dir() and any(checkout.iterdir()):
+                    if rel in held_paths and not (checkout / ".git").exists():
+                        continue  # the commit's own directory in its place
+                    raise IntegrationEvidenceError(
+                        "target hook changed an integrated submodule checkout"
+                    )
                 continue
             checkout = repo / rel
             allowed_heads = {str(raw.get("head")), str(raw.get("gitlink"))}

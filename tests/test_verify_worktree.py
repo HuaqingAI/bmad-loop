@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from conftest import git, make_git_noisy, refuse_to_resolve
@@ -1006,31 +1007,199 @@ def test_receipt_captures_and_restores_a_tracked_entry_type_change(project, tmp_
     )
 
 
-def test_receipt_capture_skips_an_uninitialized_submodule(project, tmp_path):
+def _uninitialized_submodule(repo, tmp_path):
+    """A populated submodule deinitialised: gitlink in the index, `.gitmodules`
+    in place, and an empty directory with no `.git` at the path — the shape a
+    clone without `--recurse-submodules` leaves every gitlink in."""
+    origin, checkout, old = _add_test_submodule(repo, tmp_path)
+    git(repo, "submodule", "deinit", "-q", "-f", "--", "module")
+    assert checkout.is_dir() and not any(checkout.iterdir())
+    return origin, checkout, old
+
+
+def test_receipt_captures_an_uninitialized_submodule_as_unpopulated(project, tmp_path):
     """A target cloned without `--recurse-submodules` holds every gitlink as an
     empty directory with no `.git` of its own. The capture probed each one for
     its superproject, git discovered the enclosing repository instead (whose
     superproject is nothing), and every modern bundle integration into such a
     target refused with "changed ownership" over a submodule the unit never
     touched (Codex, #796 review). An empty directory at an indexed gitlink is
-    an unpopulated checkout — git's own shape — with nothing to capture; a
-    populated directory that is not this repository's checkout still is not.
+    an unpopulated checkout, and the receipt records it as such (`head`
+    None) rather than skipping it: skipped, the fact that nothing stood there
+    was lost, and a checkout a target hook made there survived a refusal's
+    restore to become the next capture's baseline (Codex, #796 review). A
+    populated directory that is not this repository's checkout still is not
+    a submodule.
 
-    Ablation: drop the emptiness test and the uninitialized row reds on the
-    raise."""
+    Ablation: skip the empty directory and this reds on the entry."""
     repo = project.project
-    _origin, checkout, _old = _add_test_submodule(repo, tmp_path)
-    git(repo, "submodule", "deinit", "-q", "-f", "--", "module")
-    assert checkout.is_dir() and not any(checkout.iterdir())
+    _origin, checkout, old = _uninitialized_submodule(repo, tmp_path)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
 
     snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ())
 
-    assert (snapshots, submodules) == ([], [])
+    assert snapshots == []
+    assert submodules == [{"path": "module", "head": None, "gitlink": old}]
     (checkout / "stray.txt").write_text("not a checkout\n")
     with pytest.raises(verify.IntegrationEvidenceError, match="changed ownership"):
         verify.capture_integration_state(repo, run_dir, "d" * 32, ())
+
+
+@pytest.mark.parametrize("dirty", [False, True])
+def test_receipt_removes_a_checkout_a_hook_made_at_an_unpopulated_gitlink(project, tmp_path, dirty):
+    """The unit updates an unpopulated gitlink and a target hook runs
+    `submodule update --init`: the checkout it makes is attempt-era in full —
+    the receipt proved the directory empty — and a refusal's restore removes
+    it whole, dirty or not, leaving git's own empty directory; `git restore`
+    moves only the superproject's gitlink and, under `ignore = all`, the
+    completeness diff would never have seen the leftover (Codex, #796
+    review). The pre-restore reading calls the populated directory changed
+    receipt-owned state, which is what routes the refusal.
+
+    Ablation: skip unpopulated entries in the restore and both rows red on the
+    checkout still standing."""
+    repo = project.project
+    origin, checkout, old_submodule = _uninitialized_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ("module",))
+    old = verify.rev_parse_head(repo)
+    commit(origin, "payload.txt", "submodule new\n", "advance submodule")
+    new_submodule = verify.rev_parse_head(origin)
+    git(repo, "update-index", "--cacheinfo", f"160000,{new_submodule},module")
+    git(repo, "commit", "-q", "-m", "integrated: update module gitlink")
+    new = verify.rev_parse_head(repo)
+    git(
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "-q",
+        "--",
+        "module",
+    )
+    assert verify.rev_parse_head(checkout) == new_submodule
+    if dirty:
+        (checkout / "hook.txt").write_text("target hook output\n")
+    assert not verify.integration_nonref_state_unchanged(
+        repo, run_dir, snapshots, submodules, operation_identity="c" * 32
+    )
+
+    verify.restore_integration_ref(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity="c" * 32,
+    )
+
+    assert verify.rev_parse_head(repo) == old
+    assert checkout.is_dir() and not any(checkout.iterdir())
+    assert git(repo, "ls-files", "--stage", "--", "module").startswith(f"160000 {old_submodule}")
+    assert git(repo, "status", "--porcelain", "-uall") == ""
+    assert verify.integration_restoration_complete(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity="c" * 32,
+    )
+
+
+def test_receipt_never_removes_a_foreign_directory_at_an_unpopulated_gitlink(project, tmp_path):
+    """Ownership is the removal authority here as at a proved-absent path: a
+    fresh repository of its own at the unpopulated gitlink is not this
+    repository's checkout, and the restore refuses before mutating anything."""
+    repo = project.project
+    _origin, checkout, _old_submodule = _uninitialized_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ("module",))
+    old = verify.rev_parse_head(repo)
+    commit(repo, "other.txt", "integrated\n", "integrated: unrelated")
+    new = verify.rev_parse_head(repo)
+    git(checkout, "init", "-q")
+    git(checkout, "config", "user.email", "test@example.com")
+    git(checkout, "config", "user.name", "Test")
+    commit(checkout, "payload.txt", "foreign\n", "hook-made repository")
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="changed ownership"):
+        verify.restore_integration_ref(
+            repo,
+            "refs/heads/main",
+            old_revision=old,
+            new_revision=new,
+            run_dir=run_dir,
+            snapshots=snapshots,
+            submodules=submodules,
+            operation_identity="c" * 32,
+        )
+
+    assert verify.rev_parse_head(repo) == new
+    assert (checkout / "payload.txt").read_text() == "foreign\n"
+
+
+@pytest.mark.parametrize("state", ["clean", "ignored-file", "moved-head"])
+def test_integrated_unpopulated_gitlink_a_hook_populated_reads_as_introduced(
+    project, tmp_path, state
+):
+    """An incoming gitlink the receipt recorded unpopulated stands where the
+    receipt proved an empty directory, so a checkout there after the hooks is
+    attempt-era in full and is read as an introduced one: owned, at the
+    gitlink, clean with ignored entries counted."""
+    repo = project.project
+    origin, checkout, _old_submodule = _uninitialized_submodule(repo, tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ("module",))
+    commit(origin, "payload.txt", "submodule new\n", "advance submodule")
+    new_submodule = verify.rev_parse_head(origin)
+    git(repo, "update-index", "--cacheinfo", f"160000,{new_submodule},module")
+    git(repo, "commit", "-q", "-m", "integrated: update module gitlink")
+    integrated = verify.rev_parse_head(repo)
+    git(
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "-q",
+        "--",
+        "module",
+    )
+    if state == "ignored-file":
+        exclude = Path(git(checkout, "rev-parse", "--git-path", "info/exclude"))
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text("*.tmp\n")
+        (checkout / "hook.tmp").write_text("target hook output\n")
+        assert git(checkout, "status", "--porcelain", "-uall") == ""
+    elif state == "moved-head":
+        commit(origin, "payload.txt", "submodule newer\n", "advance again")
+        git(checkout, "fetch", "-q", "origin")
+        git(checkout, "checkout", "-q", "--detach", verify.rev_parse_head(origin))
+
+    if state == "clean":
+        assert (
+            verify.validate_integrated_submodule_state(
+                repo, submodules, prospective_paths=("module",), revision=integrated
+            )
+            == ()
+        )
+    else:
+        with pytest.raises(verify.IntegrationEvidenceError, match="submodule checkout"):
+            verify.validate_integrated_submodule_state(
+                repo, submodules, prospective_paths=("module",), revision=integrated
+            )
 
 
 def test_receipt_detects_index_only_submodule_gitlink_drift(project, tmp_path):
