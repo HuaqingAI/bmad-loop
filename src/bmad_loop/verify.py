@@ -1818,32 +1818,27 @@ def _remove_tree_at(parent_fd: int, name: str) -> None:
 
 
 def _expected_absent_directory_is_owned(repo: Path, target: Path) -> bool:
+    """Whether a directory at a receipt-proved-absent path is the attempt's to remove.
+
+    The receipt proved nothing was there, so what stands there now arrived
+    during the attempt — but the restore removes only what it can attribute
+    to the attempt: an empty directory, or a submodule checkout of this
+    repository (its git dir under ``.git/modules``, or naming this repository
+    as its superproject), the shape a merge that introduces a gitlink and a
+    target hook's ``submodule update --init`` leave. Whatever such a checkout
+    holds is attempt-era with it — a hook's write into the new checkout (#796
+    review) included — so cleanliness is not required. A directory of any
+    other kind may be fresh operator state and is never removed.
+    """
     try:
         if not any(target.iterdir()):
             return True
     except OSError:
         return False
-    rc, superproject, _detail = _git_out(target, "rev-parse", "--show-superproject-working-tree")
     try:
-        owned = (
-            rc == 0
-            and bool(superproject)
-            and Path(superproject).resolve(strict=True) == repo.resolve(strict=True)
-        )
-        if not owned:
-            git_rc, git_dir, _git_detail = _git_out(target, "rev-parse", "--git-dir")
-            git_path = Path(git_dir)
-            resolved_git = (git_path if git_path.is_absolute() else target / git_path).resolve(
-                strict=True
-            )
-            modules = (repo / ".git" / "modules").resolve(strict=True)
-            owned = git_rc == 0 and resolved_git.is_relative_to(modules)
-        if not owned:
-            return False
+        return _submodule_checkout_owned(repo.resolve(strict=True), target)
     except OSError:
         return False
-    status = git_bytes(target, "status", "--porcelain", "-z", "-uall")
-    return status.returncode == 0 and not status.stdout
 
 
 def _restore_receipt_snapshots_unanchored(
@@ -2228,33 +2223,45 @@ def validate_integrated_submodule_state(
 ) -> tuple[str, ...]:
     """Validate legitimate incoming gitlink changes without ignoring checkout drift.
 
-    The integrated commit is the authority for each captured submodule the
-    incoming set names. Where it still holds a gitlink, the post-hook index
-    must carry exactly that gitlink and a populated checkout must be the
-    receipt's or the commit's. Where it holds a blob instead, the index and
-    checkout readings against the commit are the authority and there is
-    nothing to adjudicate here. Where it holds nothing — the incoming commit
-    deleted the submodule — git itself leaves the populated checkout behind
-    (``warning: unable to rmdir``, then ``?? path/``), so a leftover is not a
-    hook's doing: it is accepted only as the exact captured checkout, owned,
-    clean, at the captured HEAD, and every leftover so accepted is returned
-    for `integrated_paths_drift` to leave to this reading (#796 review). A
-    checkout git could remove is simply absent; a file or foreign directory
-    in its place is drift.
+    The integrated commit is the authority for every incoming path it holds
+    as a gitlink, captured by the receipt or introduced by the commit: the
+    post-hook index must carry exactly that gitlink and a populated checkout
+    must be this repository's, clean, and at the gitlink (or, for a captured
+    one, at the captured HEAD). Read here rather than left to the diff
+    readings because an incoming ``.gitmodules`` can set
+    ``submodule.<name>.ignore = all``, under which ``git diff`` — worktree
+    and ``--cached`` alike — reports nothing about that submodule: not a
+    hook's ``submodule update --init`` with files written into the new
+    checkout, not a moved HEAD, not even a rewritten gitlink (#796 review).
+
+    For a captured submodule the commit no longer holds as a gitlink: a blob
+    in its place is the diff readings' business; nothing at all means the
+    incoming commit deleted the submodule, and git itself leaves the
+    populated checkout behind (``warning: unable to rmdir``, then
+    ``?? path/``), so a leftover is not a hook's doing. It is accepted only
+    as the exact captured checkout — owned, clean, at the captured HEAD —
+    and every leftover so accepted is returned for `integrated_paths_drift`
+    to leave to this reading. A checkout git could remove is simply absent;
+    a file or foreign directory in its place is drift.
     """
     if not isinstance(submodules, list):
         raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
     prospective = set(preflight_integration_paths(prospective_paths))
-    inventory: dict[str, tuple[bytes, bytes, str]] | None = None
-    retained: list[str] = []
+    if not prospective:
+        return ()
+    captured: dict[str, dict[str, object]] = {}
     for raw in submodules:
         if not isinstance(raw, dict) or raw.get("path") not in prospective:
             continue
-        rel = _portable_integration_path(raw.get("path"))
-        if inventory is None:
-            inventory = _revision_inventory(repo, revision)
+        captured[_portable_integration_path(raw.get("path"))] = raw
+    inventory = _revision_inventory(repo, revision)
+    retained: list[str] = []
+    for rel in sorted(prospective):
         held = inventory.get(rel)
+        raw = captured.get(rel)
         if held is None:
+            if raw is None:
+                continue
             checkout = repo / rel
             if not checkout.is_dir():
                 continue
@@ -2275,11 +2282,11 @@ def validate_integrated_submodule_state(
         if _index_state(repo, rel) != expected_index:
             raise IntegrationEvidenceError("target hook changed an integrated submodule gitlink")
         checkout = repo / rel
-        if not checkout.is_dir():
+        # an unpopulated gitlink is an empty directory: git's shape, nothing to read
+        if not checkout.is_dir() or not any(checkout.iterdir()):
             continue
-        _integrated_submodule_checkout_unchanged(
-            repo, rel, checkout, allowed_heads={str(raw.get("head")), oid}
-        )
+        allowed_heads = {oid} if raw is None else {str(raw.get("head")), oid}
+        _integrated_submodule_checkout_unchanged(repo, rel, checkout, allowed_heads=allowed_heads)
     return tuple(retained)
 
 

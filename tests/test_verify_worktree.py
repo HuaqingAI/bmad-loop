@@ -979,7 +979,13 @@ def test_receipt_restores_deleted_or_replaced_old_submodule_from_old_revision(
     assert git(repo, "status", "--porcelain") == ""
 
 
-def test_receipt_removes_newly_introduced_submodule_checkout(project, tmp_path):
+@pytest.mark.parametrize("dirty", [False, True])
+def test_receipt_removes_newly_introduced_submodule_checkout(project, tmp_path, dirty):
+    """The receipt proved `new-module` absent, so a submodule checkout of
+    this repository standing there after the attempt is attempt-era in
+    full — a target hook's write into it included (`dirty`; Codex, #796
+    review) — and the restore removes it. Ablation: require the checkout
+    clean again and the `dirty` row reds on "contains unowned state"."""
     repo = project.project
     origin = tmp_path / "new-sub-origin"
     origin.mkdir()
@@ -1006,6 +1012,8 @@ def test_receipt_removes_newly_introduced_submodule_checkout(project, tmp_path):
     )
     git(repo, "commit", "-q", "-m", "introduce submodule")
     new = verify.rev_parse_head(repo)
+    if dirty:
+        (repo / "new-module" / "hook.txt").write_text("target hook output\n")
 
     verify.restore_integration_ref(
         repo,
@@ -1020,6 +1028,38 @@ def test_receipt_removes_newly_introduced_submodule_checkout(project, tmp_path):
 
     assert not (repo / "new-module").exists()
     assert git(repo, "ls-files", "--", "new-module") == ""
+
+
+def test_receipt_never_removes_a_foreign_directory_at_an_absent_path(project, tmp_path):
+    """Ownership, not emptiness, is the removal authority: a directory at a
+    receipt-proved-absent path that is no submodule checkout of this
+    repository — a plain directory with files, or a fresh repository of its
+    own — may be fresh operator state and refuses the restore."""
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    operation = "4" * 32
+    snapshots, submodules = verify.capture_integration_state(repo, run_dir, operation, ("fresh",))
+    old = verify.rev_parse_head(repo)
+    commit(repo, "src.txt", "integrated\n", "integrated")
+    new = verify.rev_parse_head(repo)
+    fresh = repo / "fresh"
+    fresh.mkdir()
+    (fresh / "operator.txt").write_text("operator state\n")
+
+    with pytest.raises(verify.IntegrationRestoreError, match="unowned state"):
+        verify.restore_integration_ref(
+            repo,
+            "refs/heads/main",
+            old_revision=old,
+            new_revision=new,
+            run_dir=run_dir,
+            snapshots=snapshots,
+            submodules=submodules,
+            operation_identity=operation,
+        )
+
+    assert (fresh / "operator.txt").read_text() == "operator state\n"
 
 
 def test_receipt_refuses_redirected_submodule_before_external_mutation(project, tmp_path):
@@ -3412,3 +3452,87 @@ def test_integrated_submodule_replaced_by_a_file_is_held_by_the_diff_readings(pr
     assert (
         verify.integrated_paths_drift(repo, integrated, incoming, retained_checkouts=retained) == ()
     )
+
+
+def _integrate_new_submodule(repo, tmp_path, *, ignore_all):
+    """Commit the integrated shape of an incoming commit that ADDS a submodule
+    — gitlink plus `.gitmodules` entry — with the checkout populated at the
+    gitlink, as a target hook's `submodule update --init` would leave it."""
+    origin = tmp_path / "new-origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    commit(origin, "payload.txt", "new submodule\n", "new submodule baseline")
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(origin), "newmod")
+    if ignore_all:
+        git(repo, "config", "-f", ".gitmodules", "submodule.newmod.ignore", "all")
+        git(repo, "add", "--", ".gitmodules")
+    git(repo, "commit", "-q", "-m", "integrated: add newmod")
+    return origin, repo / "newmod", verify.rev_parse_head(origin)
+
+
+@pytest.mark.parametrize("drift", ["nested-file", "moved-head", "gitlink"])
+def test_integrated_new_submodule_checkout_is_validated(project, tmp_path, drift):
+    """The integrated-submodule reading iterated the receipt's captured
+    submodules only, so a gitlink the incoming commit ADDS got no checkout
+    validation at all — and with the incoming `.gitmodules` setting
+    `submodule.<name>.ignore = all`, both diff readings of
+    `integrated_paths_drift` omit everything inside that checkout: a target
+    hook could `submodule update --init` the new submodule, write nested
+    files or move its HEAD, and the run recorded `unit-merged` and retired
+    its receipt over it (Codex, #796 review). Every incoming path the
+    integrated commit holds as a gitlink is now read the same way, captured
+    or new: the post-hook index carries exactly that gitlink, and a
+    populated checkout is this repository's, clean, and at the gitlink.
+
+    Ablation: drop the new-gitlink iteration and the `nested-file` and
+    `moved-head` rows red on the missing raise; the `gitlink` row reds
+    too, the index rewrite unseen under `ignore = all`."""
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ())
+    assert submodules == []
+    origin, checkout, new_head = _integrate_new_submodule(repo, tmp_path, ignore_all=True)
+    integrated = verify.rev_parse_head(repo)
+    incoming = ("newmod", ".gitmodules")
+    if drift == "nested-file":
+        (checkout / "hook.txt").write_text("target hook output\n")
+    elif drift == "moved-head":
+        commit(origin, "payload.txt", "moved\n", "advance")
+        git(checkout, "fetch", "-q", "origin")
+        git(checkout, "checkout", "-q", "--detach", verify.rev_parse_head(origin))
+    else:
+        git(repo, "update-index", "--cacheinfo", f"160000,{'1' * 40},newmod")
+    # the blind spot: under `ignore = all` the diff readings see none of it
+    assert verify.integrated_paths_drift(repo, integrated, incoming) == ()
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="integrated submodule"):
+        verify.validate_integrated_submodule_state(
+            repo, submodules, prospective_paths=incoming, revision=integrated
+        )
+
+
+@pytest.mark.parametrize("populated", [True, False])
+def test_integrated_new_submodule_at_the_gitlink_is_accepted(project, tmp_path, populated):
+    """A new gitlink's checkout populated exactly at the gitlink and clean is
+    what the integrated commit says; an unpopulated one (the ordinary merge
+    result — git does not check submodules out) has nothing to read."""
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ())
+    _origin, checkout, _new_head = _integrate_new_submodule(repo, tmp_path, ignore_all=False)
+    if not populated:
+        shutil.rmtree(checkout)
+        checkout.mkdir()  # git leaves the empty directory for an unpopulated gitlink
+    integrated = verify.rev_parse_head(repo)
+    incoming = ("newmod", ".gitmodules")
+
+    retained = verify.validate_integrated_submodule_state(
+        repo, submodules, prospective_paths=incoming, revision=integrated
+    )
+
+    assert retained == ()
+    assert verify.integrated_paths_drift(repo, integrated, incoming) == ()

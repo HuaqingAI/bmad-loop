@@ -28043,6 +28043,83 @@ def test_target_hook_writing_into_a_deleted_submodule_leftover_is_refused(
     assert refusal["error"].endswith("changed an integrated submodule checkout")
 
 
+@pytest.mark.parametrize(
+    ("strategy", "hook_name"),
+    [("merge", "pre-merge-commit"), ("squash", "pre-commit"), ("ff", "post-merge")],
+)
+def test_target_hook_populating_an_incoming_new_submodule_is_refused(
+    project, tmp_path, strategy, hook_name
+):
+    """The integrated-submodule reading iterated the receipt's captured
+    submodules only, so a gitlink the bundle ADDS got no checkout validation
+    — and with the bundle's `.gitmodules` setting `ignore = all`, both diff
+    readings of the incoming-path check omit everything inside that
+    checkout. A target hook could `submodule update --init` the new
+    submodule and write into it, and the run recorded `unit-merged` and
+    retired its receipt over content the integrated commit does not hold
+    (Codex, #796 review). Every incoming gitlink the integrated commit holds
+    is now read, captured or new: refused through the receipt route on
+    every leg, the exact pre-attempt target restored — the hook-made
+    checkout gone from the path the receipt captured absent.
+
+    Ablation: drop the new-gitlink iteration and every leg reds on
+    `summary.paused` — the run finished, `unit-merged` journaled, the hook's
+    file inside `newmod/` and HEAD holding the bundle's gitlink."""
+    origin = tmp_path / "new-origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    (origin / "payload.txt").write_text("new submodule\n")
+    git(origin, "add", "-A")
+    git(origin, "commit", "-q", "-m", "new submodule")
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    target_head = verify.rev_parse_head(project.repo_root)
+
+    def adding_effect(spec):
+        git(
+            spec.cwd,
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            str(origin),
+            "newmod",
+        )
+        git(spec.cwd, "config", "-f", ".gitmodules", "submodule.newmod.ignore", "all")
+        return effect(spec)
+
+    hook = project.project / ".git" / "hooks" / hook_name
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        "  git -c protocol.file.allow=always submodule update -q --init -- newmod\n"
+        "  printf 'target hook output' > newmod/hook.txt\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    engine, _adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), adding_effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert git(project.project, "status", "--porcelain", "--untracked-files=no") == ""
+    assert git(project.project, "ls-files", "--stage", "--", "newmod") == ""
+    assert not (project.project / "newmod").exists()
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt.get("outcome") == "refused-restored"
+    assert "unit-merged" not in journal_kinds(engine)
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert refusal["error"].endswith("changed an integrated submodule checkout")
+
+
 def test_missing_ref_update_evidence_never_authorizes_target_reset(project, monkeypatch):
     effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
     engine, _ = make_sweep(
