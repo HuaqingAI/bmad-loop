@@ -476,9 +476,12 @@ breaking changes may land in a minor release.
   into aggregate-limited streamed sidecars, preserve exact index/worktree and
   cleanup-phase state, and refuse drift with verified, retained-source recovery
   when ref, index, worktree, ignored-path, topology, or submodule evidence is unsafe
-  (DW-302/DW-303). The accepted artifact paths are resolved before the receipt is
-  armed, so a resolver refusal pauses ahead of any target mutation instead of
-  snapshotting short of them.
+  (DW-302/DW-303). The incoming paths are held to the integrated commit too — a
+  target hook's rewrite of an ordinary incoming source file, staged, left in the
+  checkout, or sealed into the squash leg's own commit, is refused and restored
+  rather than recorded as `unit-merged` — and the accepted artifact paths are
+  resolved before the receipt is armed, so a resolver refusal pauses ahead of any
+  target mutation instead of snapshotting short of them.
 
 - Recover sweep migration publication faults without persisting unearned `DONE`
   state (DW-296/DW-297). Persist accepted baseline/rewrite records, clear a

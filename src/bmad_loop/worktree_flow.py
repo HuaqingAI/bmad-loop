@@ -3224,9 +3224,13 @@ class WorktreeFlow:
                 self._pause_integration_evidence(
                     task, exc, prefix="target integration evidence is unsafe"
                 )
+        # The tree the squash leg staged before its own commit sealed it; the
+        # receipt block below proves the sealed commit against it. None on the
+        # other legs and on a replay that found the result already landed.
+        squash_staged_tree: str | None = None
         try:
             if not landed:
-                verify.merge_branch(
+                squash_staged_tree = verify.merge_branch(
                     repo,
                     merge_ref,
                     strategy=merge_strategy,
@@ -3483,6 +3487,26 @@ class WorktreeFlow:
                         )
                     expected_revision = update.new_revision
                 artifact_publication.validate_integrated(task, self.paths, expected_revision)
+                # Three readings, one per place a TARGET hook can put its output.
+                # Outside the incoming set the snapshot is the authority (below);
+                # on it the integrated commit is — the merge changed those paths
+                # by design — so the post-hook index and checkout must hold each
+                # one as that commit has it; and the squash leg's commit, which
+                # re-reads the index after `pre-commit`, must have sealed the tree
+                # git resolved, since a rewrite landed THERE matches index and
+                # checkout alike (#796 review). Path-only evidence throughout.
+                if squash_staged_tree is not None:
+                    if verify.revision_tree_oid(repo, expected_revision) != squash_staged_tree:
+                        raise verify.IntegrationEvidenceError(
+                            "target commit hook changed the squash result after the merge "
+                            "resolved it"
+                        )
+                drifted = verify.integrated_paths_drift(repo, expected_revision, prospective_paths)
+                if drifted:
+                    raise verify.IntegrationEvidenceError(
+                        "target hook changed incoming paths after integration: "
+                        + ", ".join(sorted(drifted))
+                    )
                 if not verify.integration_nonref_state_unchanged(
                     repo,
                     self.run_dir,

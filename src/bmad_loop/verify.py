@@ -2022,6 +2022,49 @@ def integration_nonref_state_unchanged(
     return True
 
 
+def integrated_paths_drift(repo: Path, revision: str, paths: Iterable[str]) -> tuple[str, ...]:
+    """Incoming ``paths`` whose post-hook index or worktree differ from ``revision``.
+
+    The receipt's post-integration check excludes the incoming set from its
+    "unchanged since the snapshot" reading — the merge changed those paths by
+    design — so nothing there sees a TARGET hook rewrite or stage one of them
+    after git resolved the merge (#796 review). The integrated commit is the
+    authority for exactly those paths: after every leg the index and the
+    checkout must hold each one as ``revision`` has it. Two whole-tree
+    ``diff --name-only`` readings (worktree and ``--cached``), the same shape
+    as the restore's own inventory, intersected here with the incoming set —
+    ``git diff`` takes no stdin pathspec, and a whole-tree read is what keeps
+    a wide incoming set off argv. Path-only evidence; an unreadable probe
+    raises rather than answering.
+    """
+    selected = {_portable_integration_path(path) for path in paths}
+    if not selected:
+        return ()
+    drift: list[str] = []
+    for cached in ((), ("--cached",)):
+        proc = git_bytes(repo, "diff", *cached, "--name-only", "--no-renames", "-z", revision)
+        if proc.returncode != 0:
+            raise IntegrationEvidenceError(
+                "target post-hook state on the incoming paths could not be read"
+            )
+        drift.extend(
+            path
+            for path in (os.fsdecode(raw) for raw in proc.stdout.split(b"\0") if raw)
+            if path in selected
+        )
+    return tuple(dict.fromkeys(drift))
+
+
+def revision_tree_oid(repo: Path, revision: str) -> str:
+    """The tree object id ``revision`` seals (``rev-parse <revision>^{tree}``)."""
+    rc, tree, detail = _git_out(repo, "rev-parse", f"{revision}^{{tree}}")
+    if rc != 0:
+        raise IntegrationEvidenceError(
+            f"git rev-parse {revision}^{{tree}} failed in {repo}: {detail}"
+        )
+    return tree
+
+
 def integration_cleanup_state_recoverable(
     repo: Path,
     run_dir: Path,
@@ -4952,13 +4995,23 @@ def merge_branch(
     message: str | None = None,
     allow_empty_squash: bool = False,
     reflog_action: str | None = None,
-) -> None:
+) -> str | None:
     """Merge `branch` into the branch currently checked out in `repo`.
 
     strategy: "ff" (fast-forward only), "merge" (always a merge commit), or
     "squash" (collapse to one commit). Raises MergeConflictError on conflict and
     MergePreflightError when an ff-only merge can't fast-forward, restoring the
     tree to its pre-merge state.
+
+    Returns the tree the squash leg STAGED before its own ``git commit`` sealed
+    it (``write-tree``, read after ``merge --squash`` resolved and before any
+    hook ran) — ``None`` on the other legs and on a no-op replay. That commit
+    re-reads the index after ``pre-commit``, so a target hook can rewrite and
+    re-add an incoming path into the commit itself, where no index or checkout
+    probe can tell hook output from the resolved merge (#796 review); the
+    receipt-owned caller proves the sealed commit's tree against this value
+    instead. The `--no-ff` merge commit is written from the tree git already
+    resolved, and `ff` creates no commit, so neither leg has the exposure.
     Expects the target checkout to be clean; the worktree pipeline reconciles
     Editor-induced dirt first via `clean_incoming_collisions`.
 
@@ -5090,7 +5143,7 @@ def merge_branch(
             if unread is not None:
                 raise MergeResidueUnreadError(f"{detail}; AND the residue probe failed: {unread}")
             raise MergePreflightError(detail)
-        return
+        return None
     if strategy == "merge":
         msg = message or f"Merge branch '{branch}'"
         pre_dirty_paths, pre_untracked = _residue_snapshot(repo)
@@ -5181,7 +5234,7 @@ def merge_branch(
             if index_unread is not None or head_unread is not None or unread is not None:
                 raise MergeResidueUnreadError(detail)
             raise MergePreflightError(detail)
-        return
+        return None
     if strategy == "squash":
         # `--squash` has no `--abort`, so the restore is a path-scoped
         # `checkout HEAD --` over whatever the residue deltas attribute to git.
@@ -5257,7 +5310,18 @@ def merge_branch(
                     f" `git status`: {unread}"
                 ) from unread
             if not staged:
-                return
+                return None
+        rc, staged_tree, detail = _git_out(repo, "write-tree")
+        if rc != 0:
+            # Same window as the no-op reading above: the squash SUCCEEDED and its
+            # result is staged, so the read failing must not be dressed as a commit
+            # refusal by pressing on, nor escape to the unclassified arm.
+            raise MergeResidueUnreadError(
+                f"git merge --squash {branch} succeeded in {repo}, but the staged"
+                f" result's tree could not be read (index state unverified): nothing"
+                f" was committed and nothing was reset — the staged squash result is"
+                f" left in place; run `git status`: {detail}"
+            )
         msg = message or f"Squash-merge branch '{branch}'"
         rc, out = run_git("commit", "-m", msg)
         if rc != 0:
@@ -5292,7 +5356,7 @@ def merge_branch(
                 if not restored:
                     detail += "; the squash result is left staged"
             raise MergeCommitRefusedError(detail, restored=restored, staged=not restored)
-        return
+        return staged_tree
     raise GitError(f"unknown merge strategy: {strategy!r}")
 
 

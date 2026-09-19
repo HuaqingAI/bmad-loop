@@ -27161,6 +27161,87 @@ def test_unresolvable_artifact_paths_pause_before_the_integration_is_armed(
 
 
 @pytest.mark.parametrize(
+    ("strategy", "hook_name", "staged"),
+    [
+        ("merge", "pre-merge-commit", True),
+        ("merge", "pre-merge-commit", False),
+        ("squash", "pre-commit", True),
+        ("squash", "pre-commit", False),
+        ("ff", "post-merge", False),
+    ],
+    ids=["merge-staged", "merge-worktree", "squash-committed", "squash-worktree", "ff-worktree"],
+)
+def test_target_hook_rewriting_an_incoming_source_path_is_refused_and_restored(
+    project, strategy, hook_name, staged
+):
+    """The receipt's post-integration reading excludes the incoming set from its
+    "unchanged since the snapshot" check — the merge changed those paths by
+    design — so a TARGET hook rewriting an ordinary incoming source file (not a
+    declared artifact, which `validate_integrated` covers) went unseen: the run
+    recorded `unit-merged` and retired the rollback receipt over hook output
+    (#796 review). The integrated commit is now the authority for exactly those
+    paths, on every leg: the post-hook index and checkout must hold each one as
+    that commit has it. The squash leg has one more place a hook can put its
+    output — its own `git commit` re-reads the index after `pre-commit`, so a
+    rewrite `git add`ed there lands IN the commit, where index and checkout both
+    agree with it — and that leg proves the sealed commit's tree against the
+    tree `merge --squash` staged (`write-tree`, read before the commit).
+
+    Each row lands its rewrite in one of those places: staged into the merge
+    commit's index (`merge-staged`), into the squash commit itself
+    (`squash-committed`), or left in the checkout (`*-worktree`). Every row is
+    refused through the receipt route — exact pre-attempt target restored,
+    `refused-restored` durable, source retained — never `unit-merged`.
+
+    Ablation, per place: drop the `integrated_paths_drift` reading and the four
+    index/checkout rows red on `summary.paused` — the run finished, ids `done`,
+    over the hook's bytes; drop the `revision_tree_oid` comparison and
+    `squash-committed` reds alone the same way, the hook's bytes sealed in the
+    target's HEAD."""
+    effect, _expected = _ignored_publication_bundle(project)
+    target_head = verify.rev_parse_head(project.repo_root)
+    source_before = (project.project / "src.txt").read_bytes()
+    hook = project.project / ".git" / "hooks" / hook_name
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        "  printf 'target hook mutation' > src.txt\n"
+        + ("  git add -- src.txt\n" if staged else "")
+        + "fi\n"
+    )
+    hook.chmod(0o755)
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    # the exact pre-attempt target is back: ref, index and checkout alike
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert (project.project / "src.txt").read_bytes() == source_before
+    assert git(project.project, "status", "--porcelain", "--untracked-files=no") == ""
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt.get("outcome") == "refused-restored"
+    assert "unit-merged" not in journal_kinds(engine)
+    assert not durable.artifact_publication_complete
+    [refusal] = _records(engine, "artifact-publication-refused")
+    if strategy == "squash" and staged:
+        assert "changed the squash result" in refusal["error"]
+    else:
+        assert refusal["error"].endswith("incoming paths after integration: src.txt")
+    assert "target hook mutation" not in refusal["error"]  # path-only evidence
+    # the unit is retained for recovery with its accepted commit intact
+    assert Path(durable.worktree_path).is_dir()
+    assert verify.branch_exists(project.repo_root, durable.branch)
+    assert durable.commit_sha not in (None, durable.baseline_commit)
+
+
+@pytest.mark.parametrize(
     ("strategy", "hook_name"),
     [
         ("merge", "pre-merge-commit"),
