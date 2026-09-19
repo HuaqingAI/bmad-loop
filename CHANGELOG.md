@@ -546,7 +546,17 @@ breaking changes may land in a minor release.
   again on every resume — and its refusal restores the old shape through the
   parent path alone, git refusing the pair (a symlink it turns into a
   directory — a dangling one too, whose leaf beneath is absent by topology
-  rather than "an unavailable parent" — and a leaf it puts deeper beneath the file, restore the same
+  rather than "an unavailable parent", and one that resolves, into the
+  repository or out of it, to a directory holding the leaf's own name,
+  which the capture dereferenced and refused as a redirected parent or an
+  escaped path: git tracks no path through a symlink, so a leaf beneath a
+  link the incoming set replaces is absent by topology wherever the link
+  points, the link captured and put back as bytes under its own path and
+  every receipt reading confining the leaf by the link's parent rather than
+  reading through it — the checked-path restore refusing a parent swapped
+  for a link before its first write — and the reverse transition, a tracked
+  directory the commit turns into such a link, no longer read as a deleted
+  leaf recreated — and a leaf it puts deeper beneath the file, restore the same
   way: the restore refused the put-back symlink as a redirection and crashed
   opening the restored file as the deeper leaf's parent); a target cloned without
   `--recurse-submodules`, every gitlink an empty directory, integrates too —

@@ -936,6 +936,8 @@ def test_receipt_restores_populated_submodule_checkout(project, tmp_path):
         "file-to-deep-directory",
         "symlink-to-directory",
         "dangling-symlink-to-directory",
+        "resolving-symlink-to-directory",
+        "escaping-symlink-to-directory",
         "directory-to-file",
     ],
 )
@@ -966,7 +968,19 @@ def test_receipt_captures_and_restores_a_tracked_entry_type_change(
     `strict=True` and refused "unavailable parent" before the merge (Codex,
     #796 review): nothing can be reached through a dangling link, so the leaf
     beneath it is absent by topology and the link's own parent is what
-    confines it.
+    confines it. A link that RESOLVES to a directory already holding the
+    leaf's name (`a -> dir`, `dir/b` tracked, incoming `a/b`) is the same
+    transition, yet the capture dereferenced it — `a/b` read as the existing
+    `dir/b` — and the snapshot stream refused `a` as a redirected parent
+    (Codex, #796 review): git tracks no path through a symlink, so a leaf
+    beneath a link the incoming set replaces is absent by topology wherever
+    the link points, and stays absent by topology once the link is back —
+    the completeness reading must not reach through it either. Wherever it
+    points includes outside the repository: the confinement reading used to
+    follow a resolving link and refuse the leaf as "escaped the repository",
+    yet nothing is read or written through the link — it is captured and
+    put back as bytes under its own path — so the link's own parent is what
+    confines the leaf beneath it.
 
     Ablation: catch `FileNotFoundError` alone in the capture and the
     `file-to-directory` row reds on the raise; drop the topology skip from
@@ -980,8 +994,22 @@ def test_receipt_captures_and_restores_a_tracked_entry_type_change(
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     leaf = "a/b/c" if shape == "file-to-deep-directory" else "a/b"
-    if shape in {"symlink-to-directory", "dangling-symlink-to-directory"}:
-        os.symlink("src.txt" if shape == "symlink-to-directory" else "missing", repo / "a")
+    outside = tmp_path / "outside"
+    link_targets = {
+        "symlink-to-directory": "src.txt",
+        "dangling-symlink-to-directory": "missing",
+        "resolving-symlink-to-directory": "dir",
+        "escaping-symlink-to-directory": str(outside),
+    }
+    if shape in link_targets:
+        if shape == "resolving-symlink-to-directory":
+            (repo / "dir").mkdir()
+            (repo / "dir" / "b").write_text("reachable through the link\n")
+            git(repo, "add", "--", "dir/b")
+        elif shape == "escaping-symlink-to-directory":
+            outside.mkdir()
+            (outside / "b").write_text("outside the repository\n")
+        os.symlink(link_targets[shape], repo / "a")
         git(repo, "add", "--", "a")
         git(repo, "commit", "-q", "-m", "a is a symlink")
         incoming = ("a", leaf)
@@ -1035,10 +1063,12 @@ def test_receipt_captures_and_restores_a_tracked_entry_type_change(
 
     assert verify.rev_parse_head(repo) == old
     assert git(repo, "status", "--porcelain", "-uall") == ""
-    if shape.endswith("symlink-to-directory"):
-        assert os.readlink(repo / "a") == (
-            "src.txt" if shape == "symlink-to-directory" else "missing"
-        )
+    if shape in link_targets:
+        assert os.readlink(repo / "a") == link_targets[shape]
+        if shape == "resolving-symlink-to-directory":
+            assert (repo / "dir" / "b").read_text() == "reachable through the link\n"
+        elif shape == "escaping-symlink-to-directory":
+            assert (outside / "b").read_text() == "outside the repository\n"
     elif shape != "directory-to-file":
         assert (repo / "a").read_text() == "a file\n"
     else:
@@ -1053,6 +1083,28 @@ def test_receipt_captures_and_restores_a_tracked_entry_type_change(
         submodules=submodules,
         operation_identity="c" * 32,
     )
+
+
+def test_receipt_refuses_a_leaf_beneath_a_symlink_the_integration_keeps(project, tmp_path):
+    """A leaf beneath a symlink is absent by topology only when the same
+    incoming set names the link: the commit that adds `a/b` replaces `a`, and
+    git refuses `a/b` against a tracked `a` it keeps. A snapshot set naming
+    `a/b` beneath a link it does not name is not the merge's shape, and the
+    capture refuses it ahead of any mutation rather than reading through the
+    link (Codex, #796 review).
+
+    Ablation: drop the refusal and the capture records the leaf absent."""
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (repo / "dir").mkdir()
+    (repo / "dir" / "b").write_text("reachable through the link\n")
+    os.symlink("dir", repo / "a")
+    git(repo, "add", "--", "dir/b", "a")
+    git(repo, "commit", "-q", "-m", "a is a symlink")
+
+    with pytest.raises(verify.IntegrationEvidenceError, match="beneath a symlink"):
+        verify.capture_integration_state(repo, run_dir, "c" * 32, ("a/b",))
 
 
 def _uninitialized_submodule(repo, tmp_path):
@@ -1536,6 +1588,15 @@ def test_receipt_refuses_redirected_submodule_before_external_mutation(project, 
 def test_receipt_restore_parent_redirect_never_writes_outside_or_moves_ref(
     project, tmp_path, monkeypatch
 ):
+    """A parent swapped for a symlink out of the repository AFTER the anchored
+    restore's ancestry preflight: the descriptor-relative writes land in the
+    directory that was walked, never through the link, and the reading that
+    follows refuses before the ref can be reset. That reading is the
+    completeness reading, which never reaches through a symlink on the way
+    to an entry — the confinement reading used to follow the link and refuse
+    the operand as "escaped the repository", which was a dereference (Codex,
+    #796 review); now it confines by the link's parent and the completeness
+    reading answers "not restored" without reading a byte beyond it."""
     repo = project.project
     owned = repo / "nested" / "owned.bin"
     owned.parent.mkdir()
@@ -1571,7 +1632,9 @@ def test_receipt_restore_parent_redirect_never_writes_outside_or_moves_ref(
 
     monkeypatch.setattr(verify, "_copy_sidecar_to_target", redirect_after_preflight)
 
-    with pytest.raises(verify.IntegrationEvidenceError, match="escaped"):
+    with pytest.raises(
+        verify.IntegrationRestoreError, match="changed before the target ref could be restored"
+    ):
         verify.restore_integration_ref(
             repo,
             "refs/heads/main",
@@ -1587,6 +1650,57 @@ def test_receipt_restore_parent_redirect_never_writes_outside_or_moves_ref(
     assert outside.read_bytes() == b"outside sentinel"
     (repo / "nested").unlink()
     swapped[0].rename(repo / "nested")
+
+
+def test_checked_path_restore_refuses_a_parent_swapped_for_a_symlink(
+    project, tmp_path, monkeypatch
+):
+    """The checked-path restore (no descriptor-relative syscalls: Windows) writes
+    by path, so a parent swapped for a symlink between capture and restore
+    would have every write land through the link. The confinement reading
+    never follows a link — it confines the operand by the link's parent
+    (Codex, #796 review) — so the restore's own ancestry preflight is the
+    reading that sees one, and it refuses before the first mutation: nothing
+    behind the link is written, and a leaf the receipt captured absent
+    beneath its own captured link is left to topology as before.
+
+    Ablation: drop the preflight and the restore writes the sidecar bytes
+    through the link into the external directory."""
+    monkeypatch.setattr(verify, "DIR_FD_ANCHORED_WRITES", False)
+    repo = project.project
+    owned = repo / "nested" / "owned.bin"
+    owned.parent.mkdir()
+    owned.write_bytes(b"operator bytes")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "redirect baseline")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "4" * 32, ("nested/owned.bin",)
+    )
+    revision = verify.rev_parse_head(repo)
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "owned.bin").write_bytes(b"outside sentinel")
+    parked = repo / "nested-parked"
+    (repo / "nested").rename(parked)
+    (repo / "nested").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(verify.IntegrationRestoreError, match="redirected"):
+        verify.restore_integration_nonref_state(
+            repo,
+            "refs/heads/main",
+            revision=revision,
+            run_dir=run_dir,
+            snapshots=snapshots,
+            submodules=submodules,
+            operation_identity="4" * 32,
+        )
+
+    assert (external / "owned.bin").read_bytes() == b"outside sentinel"
+    assert sorted(path.name for path in external.iterdir()) == ["owned.bin"]
+    (repo / "nested").unlink()
+    parked.rename(repo / "nested")
 
 
 @pytest.mark.parametrize("tracked", [False, True])
@@ -3700,6 +3814,48 @@ def test_integrated_paths_drift_accepts_an_absent_deleted_incoming_path(project)
     integrated = verify.rev_parse_head(repo)
 
     assert verify.integrated_paths_drift(repo, integrated, ("gone.bin", "src.txt")) == ()
+
+
+def test_integrated_paths_drift_reads_a_deleted_leaf_beneath_the_commit_s_symlink_as_absent(
+    project,
+):
+    """The reverse of the symlink-to-directory transition: the commit deletes
+    `a/b` and holds `a` as a symlink to a directory that has a `b` of its own
+    (`a -> dir`, `dir/b` tracked). The absent-path probe `exists()`ed `a/b`
+    through the new link, read `dir/b` as a recreated `a/b`, and refused a
+    merge git applied cleanly (Codex, #796 review). Git tracks no path
+    through a symlink, so the leaf beneath one the commit holds is absent by
+    topology; the link itself is an incoming path the diff readings hold to
+    the commit. A link the commit does NOT hold there is a hook's, and the
+    leaf beneath it stays drift.
+
+    Ablation: probe `exists()` again without the topology reading and the
+    clean row reds on `("a/b",)`; accept any link and the hook row reds on
+    the empty tuple."""
+    repo = project.project
+    (repo / "dir").mkdir()
+    (repo / "dir" / "b").write_text("dir's own b\n")
+    (repo / "a").mkdir()
+    (repo / "a" / "b").write_text("incoming deletes me\n")
+    git(repo, "add", "--", "dir/b", "a/b")
+    git(repo, "commit", "-q", "-m", "a is a directory")
+    git(repo, "rm", "-q", "--", "a/b")
+    os.symlink("dir", repo / "a")
+    git(repo, "add", "--", "a")
+    git(repo, "commit", "-q", "-m", "integrated: a becomes a symlink")
+    integrated = verify.rev_parse_head(repo)
+    assert (repo / "a" / "b").exists()
+
+    assert verify.integrated_paths_drift(repo, integrated, ("a", "a/b")) == ()
+
+    # the same leaf beneath a link the commit does not hold: a hook's
+    git(repo, "rm", "-q", "--", "a")
+    git(repo, "commit", "-q", "-m", "integrated: a is gone")
+    integrated = verify.rev_parse_head(repo)
+    assert verify.integrated_paths_drift(repo, integrated, ("a", "a/b")) == ()
+    os.symlink("dir", repo / "a")
+
+    assert verify.integrated_paths_drift(repo, integrated, ("a", "a/b")) == ("a", "a/b")
 
 
 @pytest.mark.parametrize("flag", ["assume-unchanged", "skip-worktree"])

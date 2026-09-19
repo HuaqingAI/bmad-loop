@@ -471,24 +471,42 @@ def _portable_integration_path(value: object) -> str:
     return value
 
 
+def _symlink_ancestor(repo: Path, candidate: Path) -> Path | None:
+    """The topmost symlink strictly above ``candidate`` on the way down from ``repo``.
+
+    Read top-down with ``lstat`` semantics, so a component beneath a link is
+    never dereferenced to answer: git tracks no path through a symlink, and
+    whatever stands at ``candidate`` through one is another path's.
+    """
+    probe = repo
+    for part in candidate.relative_to(repo).parts[:-1]:
+        probe = probe / part
+        if probe.is_symlink():
+            return probe
+        if not probe.exists():
+            return None
+    return None
+
+
 def _confined_repo_operand(repo: Path, rel: object) -> tuple[str, Path]:
     validated = _portable_integration_path(rel)
     root = repo.resolve(strict=True)
     candidate = repo / validated
     if has_parent_ref(candidate.relative_to(repo)):
         raise IntegrationEvidenceError("persisted target integration path is malformed")
-    probe = candidate.parent if candidate.is_symlink() else candidate
-    while not probe.exists() and not probe.is_symlink() and probe != repo:
+    # a symlink on the way (a tracked `a -> dir`, or a dangling `a -> missing`,
+    # the incoming commit replaces with a directory holding `a/b`) is never
+    # followed: git tracks no path through one, so the operand beneath it is
+    # absent by topology wherever the link points — a resolving link's
+    # destination may well hold the leaf's name — and the link's own parent
+    # is what confines it (#796 review). The operand itself, when a link, is
+    # confined by its parent the same way.
+    link = _symlink_ancestor(repo, candidate)
+    probe = link.parent if link is not None else candidate
+    if link is None and candidate.is_symlink():
+        probe = candidate.parent
+    while not probe.exists() and probe != repo:
         probe = probe.parent
-    # a DANGLING symlink on the way (a tracked `a -> missing` the incoming
-    # commit replaces with a directory holding `a/b`): nothing can be reached
-    # through it, so the operand beneath is absent by topology and the link's
-    # own parent is what confines it; a link that resolves is followed, and
-    # one leading out of the repository is refused below (#796 review)
-    while probe != repo and probe.is_symlink() and not probe.exists():
-        probe = probe.parent
-        while not probe.exists() and not probe.is_symlink() and probe != repo:
-            probe = probe.parent
     try:
         resolved = probe.resolve(strict=True)
     except OSError as exc:
@@ -1025,9 +1043,39 @@ def _capture_integration_state_into(
     snapshots: list[dict[str, object]] = []
     total_bytes = 0
     indexed_submodules = set(_indexed_submodules(repo))
-    for rel in dict.fromkeys(paths):
+    selected = list(dict.fromkeys(paths))
+    incoming = {_portable_integration_path(rel) for rel in selected}
+    for rel in selected:
         validated, candidate = _confined_repo_operand(repo, rel)
         tracked = path_tracked(repo, validated)
+        # a symlink on the way: git tracks no path through one, so the leaf
+        # beneath is absent by topology — a dangling link reaches nothing,
+        # and a link that resolves (`a -> dir` with `dir/b` standing where
+        # `a/b` reads) reaches another path's entry, which `lstat` through
+        # the link would have captured as this one and the snapshot stream
+        # refused as redirected (#796 review). The link itself is captured
+        # under its own path, since the commit that adds `a/b` replaces it;
+        # a link the incoming set does not name cannot be the merge's — git
+        # refuses `a/b` against a tracked `a` it keeps — and is refused here
+        # ahead of any mutation rather than read through.
+        link = _symlink_ancestor(repo, candidate)
+        if link is not None:
+            if link.relative_to(repo).as_posix() not in incoming:
+                raise IntegrationEvidenceError(
+                    "target integration path lies beneath a symlink the integration "
+                    "does not replace"
+                )
+            snapshots.append(
+                {
+                    "path": validated,
+                    "state": "absent",
+                    "tracked": tracked,
+                    "index": _index_state(repo, validated),
+                    "absent_parents": [],
+                    "empty_parents": [],
+                }
+            )
+            continue
         absent_parents: list[str] = []
         parent = candidate.parent
         while parent != repo and not parent.exists() and not parent.is_symlink():
@@ -1119,6 +1167,8 @@ def _capture_integration_state_into(
                 f"artifact payload limit ({payload_max_bytes} bytes)"
             )
         _observed_rel, observed_candidate = _confined_repo_operand(repo, validated)
+        if _symlink_ancestor(repo, observed_candidate) is not None:
+            raise IntegrationEvidenceError("target changed during integration snapshot capture")
         try:
             observed_mode = observed_candidate.lstat().st_mode
         except FileNotFoundError as exc:
@@ -2082,13 +2132,18 @@ def _absent_beneath_a_file(repo: Path, target: Path, captured_links: Collection[
     same way, the transition was symlink-to-directory, and the leaf beneath
     it is absent by topology too (#796 review).
     """
-    ancestor = target.parent
-    while ancestor != repo:
+    # top-down, so the TOPMOST link or file decides and no component beneath
+    # one is ever read through it: `is_symlink()` on `a/b` with `a -> dir`
+    # answers for `dir/b`, another path's entry (#796 review)
+    ancestor = repo
+    for part in target.relative_to(repo).parts[:-1]:
+        ancestor = ancestor / part
         if ancestor.is_symlink():
             return ancestor.relative_to(repo).as_posix() in captured_links
-        if ancestor.exists() and not ancestor.is_dir():
+        if not ancestor.exists():
+            return False
+        if not ancestor.is_dir():
             return True
-        ancestor = ancestor.parent
     return False
 
 
@@ -2127,6 +2182,15 @@ def _restore_receipt_snapshots_unanchored(
     """Checked path fallback for hosts without descriptor-relative syscalls."""
     prepared = [(entry, _confined_repo_operand(repo, entry["path"])[1]) for entry in snapshots]
     links = _captured_links(snapshots)
+    # the anchored restore's ancestry preflight, by path: a symlink on the
+    # way to any destination this restore would write or remove through is
+    # refused before the first mutation — the confinement reading never
+    # follows a link, so this is the reading that sees one (#796 review)
+    for entry, target in prepared:
+        if entry["state"] == "absent" and _absent_beneath_a_file(repo, target, links):
+            continue
+        if _symlink_ancestor(repo, target) is not None:
+            raise IntegrationRestoreError("target restoration parent is redirected")
     for entry, target in prepared:
         if entry["state"] == "absent":
             if _absent_beneath_a_file(repo, target, links):
@@ -2276,9 +2340,20 @@ def _restore_receipt_snapshots(
 def _receipt_snapshots_complete(
     repo: Path, run_dir: Path, snapshots: list[dict[str, object]]
 ) -> bool:
+    links = _captured_links(snapshots)
     for entry in snapshots:
         rel, target = _confined_repo_operand(repo, entry["path"])
         if _index_state(repo, rel) != _validated_index_state(entry["index"]):
+            return False
+        # a symlink on the way is read under its own entry, never through:
+        # beneath a captured one the absent leaf is absent by topology (so
+        # is one beneath a file), and `exists()` or a digest read through a
+        # link that resolves would answer for another path's entry (#796
+        # review); beneath any other link nothing is restored
+        beneath = _absent_beneath_a_file(repo, target, links)
+        if entry["state"] == "absent" and beneath:
+            continue
+        if _symlink_ancestor(repo, target) is not None:
             return False
         if entry["state"] == "absent":
             if target.exists() or target.is_symlink():
@@ -2449,9 +2524,23 @@ def integrated_paths_drift(
             for path in (os.fsdecode(raw) for raw in proc.stdout.split(b"\0") if raw)
             if path in selected
         )
-    held = _inventory_held_paths(_revision_inventory(repo, revision))
+    inventory = _revision_inventory(repo, revision)
+    held = _inventory_held_paths(inventory)
     for path in sorted(selected - held - retained):
         _validated, candidate = _confined_repo_operand(repo, path)
+        # beneath a symlink the commit holds (`a/b` deleted, `a -> dir`
+        # added, `dir/b` standing where `a/b` reads) the leaf is absent by
+        # topology: git tracks no path through a link, and `exists()` through
+        # this one reads another path's entry (#796 review). The link is an
+        # incoming path the diff readings above hold to the commit; a link
+        # the commit does not hold is a hook's, and the leaf is drift.
+        link = _symlink_ancestor(repo, candidate)
+        if link is not None:
+            row = inventory.get(link.relative_to(repo).as_posix())
+            if row is not None and row[0] == b"120000":
+                continue
+            drift.append(path)
+            continue
         if candidate.exists() or candidate.is_symlink():
             drift.append(path)
     return tuple(dict.fromkeys(drift))
@@ -2763,7 +2852,7 @@ def integrated_introduced_directories_drift(
         if any(root.startswith(f"{other}/") for other in roots):
             continue
         _validated, top = _confined_repo_operand(repo, root)
-        if top.is_symlink():
+        if top.is_symlink() or _symlink_ancestor(repo, top) is not None:
             drift.append(root)
             continue
         if not top.is_dir():
@@ -2829,7 +2918,12 @@ def integration_cleanup_state_recoverable(
             continue
         if rel in untracked_set:
             _validated, candidate = _confined_repo_operand(repo, rel)
-            if candidate.exists() or candidate.is_symlink() or _index_state(repo, rel)["entries"]:
+            if (
+                _symlink_ancestor(repo, candidate) is not None
+                or candidate.exists()
+                or candidate.is_symlink()
+                or _index_state(repo, rel)["entries"]
+            ):
                 return False
             continue
         worktree = git_bytes(repo, "diff", "--quiet", revision, "--", rel)
