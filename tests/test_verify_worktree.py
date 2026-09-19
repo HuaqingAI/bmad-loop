@@ -3199,3 +3199,44 @@ def test_integrated_paths_drift_accepts_an_absent_deleted_incoming_path(project)
     integrated = verify.rev_parse_head(repo)
 
     assert verify.integrated_paths_drift(repo, integrated, ("gone.bin", "src.txt")) == ()
+
+
+@pytest.mark.parametrize("shape", ["file-to-directory", "directory-to-file"])
+def test_integrated_paths_drift_accepts_an_incoming_entry_type_change(project, shape):
+    """The absent-path probe reads the integrated commit's inventory as
+    `ls-tree -r`, which lists blobs and gitlinks, never the trees above them —
+    so an incoming path the commit turned INTO a directory (`a` deleted,
+    `a/b` added) was "absent" from that inventory while a directory
+    legitimately stood there, and the probe refused the integration as hook
+    drift (found off the Codex #796 review of the probe, 10be932b). A path
+    that is a tree prefix of something the commit holds IS held; the reverse
+    change (`d/x` deleted, `d` now a file) needs no such reading, a file at
+    `d` making `d/x` unreachable on disk.
+
+    Ablation: drop the prefix expansion and the `file-to-directory` row reds
+    with `('a',)` reported as drift."""
+    repo = project.project
+    if shape == "file-to-directory":
+        (repo / "a").write_text("a file\n")
+        git(repo, "add", "--", "a")
+        git(repo, "commit", "-q", "-m", "a is a file")
+        git(repo, "rm", "-q", "--", "a")
+        (repo / "a").mkdir()
+        (repo / "a" / "b").write_text("a directory\n")
+        git(repo, "add", "--", "a/b")
+        git(repo, "commit", "-q", "-m", "integrated: a becomes a directory")
+        incoming = ("a", "a/b")
+    else:
+        (repo / "d").mkdir()
+        (repo / "d" / "x").write_text("a directory\n")
+        git(repo, "add", "--", "d/x")
+        git(repo, "commit", "-q", "-m", "d is a directory")
+        git(repo, "rm", "-q", "--", "d/x")
+        (repo / "d").write_text("a file\n")
+        git(repo, "add", "--", "d")
+        git(repo, "commit", "-q", "-m", "integrated: d becomes a file")
+        incoming = ("d/x", "d")
+    integrated = verify.rev_parse_head(repo)
+    assert git(repo, "status", "--porcelain") == ""
+
+    assert verify.integrated_paths_drift(repo, integrated, incoming) == ()
