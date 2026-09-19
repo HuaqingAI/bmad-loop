@@ -480,6 +480,15 @@ def _confined_repo_operand(repo: Path, rel: object) -> tuple[str, Path]:
     probe = candidate.parent if candidate.is_symlink() else candidate
     while not probe.exists() and not probe.is_symlink() and probe != repo:
         probe = probe.parent
+    # a DANGLING symlink on the way (a tracked `a -> missing` the incoming
+    # commit replaces with a directory holding `a/b`): nothing can be reached
+    # through it, so the operand beneath is absent by topology and the link's
+    # own parent is what confines it; a link that resolves is followed, and
+    # one leading out of the repository is refused below (#796 review)
+    while probe != repo and probe.is_symlink() and not probe.exists():
+        probe = probe.parent
+        while not probe.exists() and not probe.is_symlink() and probe != repo:
+            probe = probe.parent
     try:
         resolved = probe.resolve(strict=True)
     except OSError as exc:

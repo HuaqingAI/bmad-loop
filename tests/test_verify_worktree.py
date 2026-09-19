@@ -931,7 +931,13 @@ def test_receipt_restores_populated_submodule_checkout(project, tmp_path):
 @pytest.mark.parametrize("anchored", [True, False], ids=["anchored", "checked-path"])
 @pytest.mark.parametrize(
     "shape",
-    ["file-to-directory", "file-to-deep-directory", "symlink-to-directory", "directory-to-file"],
+    [
+        "file-to-directory",
+        "file-to-deep-directory",
+        "symlink-to-directory",
+        "dangling-symlink-to-directory",
+        "directory-to-file",
+    ],
 )
 def test_receipt_captures_and_restores_a_tracked_entry_type_change(
     project, tmp_path, monkeypatch, shape, anchored
@@ -954,7 +960,13 @@ def test_receipt_captures_and_restores_a_tracked_entry_type_change(
     on `NotADirectoryError`. A symlink in the file's place (`a -> src.txt`,
     then `a/b`) is captured as `symlink` and put back the same way — and the
     restore's redirection probe, which refuses any symlink on the way to a
-    snapshot, must know that this one is the receipt's own restored shape.
+    snapshot, must know that this one is the receipt's own restored shape. A
+    DANGLING symlink there (`a -> missing`) is a valid tracked entry git
+    replaces the same way, yet capturing `a/b` resolved the ancestor
+    `strict=True` and refused "unavailable parent" before the merge (Codex,
+    #796 review): nothing can be reached through a dangling link, so the leaf
+    beneath it is absent by topology and the link's own parent is what
+    confines it.
 
     Ablation: catch `FileNotFoundError` alone in the capture and the
     `file-to-directory` row reds on the raise; drop the topology skip from
@@ -968,8 +980,8 @@ def test_receipt_captures_and_restores_a_tracked_entry_type_change(
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     leaf = "a/b/c" if shape == "file-to-deep-directory" else "a/b"
-    if shape == "symlink-to-directory":
-        os.symlink("src.txt", repo / "a")
+    if shape in {"symlink-to-directory", "dangling-symlink-to-directory"}:
+        os.symlink("src.txt" if shape == "symlink-to-directory" else "missing", repo / "a")
         git(repo, "add", "--", "a")
         git(repo, "commit", "-q", "-m", "a is a symlink")
         incoming = ("a", leaf)
@@ -991,7 +1003,7 @@ def test_receipt_captures_and_restores_a_tracked_entry_type_change(
     by_path = {entry["path"]: entry for entry in snapshots}
     if shape != "directory-to-file":
         assert by_path["a"]["state"] == (
-            "symlink" if shape == "symlink-to-directory" else "regular"
+            "symlink" if shape.endswith("symlink-to-directory") else "regular"
         )
         assert by_path[leaf]["state"] == "absent"
         assert by_path[leaf]["absent_parents"] == (
@@ -1023,8 +1035,10 @@ def test_receipt_captures_and_restores_a_tracked_entry_type_change(
 
     assert verify.rev_parse_head(repo) == old
     assert git(repo, "status", "--porcelain", "-uall") == ""
-    if shape == "symlink-to-directory":
-        assert os.readlink(repo / "a") == "src.txt"
+    if shape.endswith("symlink-to-directory"):
+        assert os.readlink(repo / "a") == (
+            "src.txt" if shape == "symlink-to-directory" else "missing"
+        )
     elif shape != "directory-to-file":
         assert (repo / "a").read_text() == "a file\n"
     else:
