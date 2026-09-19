@@ -1243,11 +1243,18 @@ def _capture_integration_state_into(
             raise IntegrationEvidenceError(
                 "populated target submodule must be clean before integration"
             )
+        # the checkout's own ignored entries, sealed like the tree's
+        # (`capture_ignored_entries`): that reading never descends into a
+        # submodule, and the post-hook checkout reading takes `status`
+        # without `--ignored`, so a hook's write the checkout's own
+        # `.gitignore` covers was listed by nothing (#796 review)
+        name = hashlib.sha256(os.fsencode(rel)).hexdigest() + _SUBMODULE_IGNORED_SUFFIX
         submodules.append(
             {
                 "path": rel,
                 "head": rev_parse_head(checkout),
                 **_captured_gitlink_entry(_index_state(repo, rel)),
+                "ignored": _seal_ignored_entries(checkout, run_dir, root / name),
             }
         )
     return snapshots, submodules
@@ -1414,14 +1421,25 @@ def validate_integration_state_schema(
     seen.clear()
     for raw in submodules:
         # `flags`: the gitlink's captured index flag word; a receipt written
-        # before it was recorded reads with the fresh-gitlink words
-        if not isinstance(raw, dict) or set(raw) - {"flags"} != {"path", "head", "gitlink"}:
+        # before it was recorded reads with the fresh-gitlink words.
+        # `ignored`: a populated checkout's sealed ignored-entry listing
+        # (`capture_integration_state`); a receipt written before it was
+        # recorded reads without that reading
+        if not isinstance(raw, dict) or set(raw) - {"flags", "ignored"} != {
+            "path",
+            "head",
+            "gitlink",
+        }:
             raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
         rel = _portable_integration_path(raw.get("path"))
         head = raw.get("head")
         gitlink = raw.get("gitlink")
         if "flags" in raw and raw["flags"] not in _GITLINK_INDEX_FLAGS:
             raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
+        if "ignored" in raw:
+            if head is None:
+                raise IntegrationEvidenceError("persisted target submodule evidence is malformed")
+            validate_ignored_entries_evidence(raw["ignored"])
         # `head` None: the gitlink was unpopulated at capture — an empty
         # directory, git's shape for a clone without `--recurse-submodules`
         # — and the receipt owns that emptiness (#796 review)
@@ -2685,6 +2703,7 @@ def capture_index_flags(repo: Path, *, exclude: Iterable[str]) -> dict[str, obje
 
 
 _IGNORED_ENTRIES_SIDECAR = "ignored.lst"
+_SUBMODULE_IGNORED_SUFFIX = ".ignored"
 
 
 def _owned_integration_snapshot_root(run_dir: Path, operation_identity: str) -> Path:
@@ -2709,13 +2728,19 @@ def _owned_integration_snapshot_root(run_dir: Path, operation_identity: str) -> 
 
 
 def ignored_entries(repo: Path) -> dict[str, str]:
-    """Every ignored untracked entry of the whole tree with its ``lstat`` identity.
+    """Every entry of the whole tree git lists nowhere, with its ``lstat`` identity.
 
-    One whole-tree ``ls-files --others --ignored --exclude-standard`` (no
-    ``--directory``: a file inside an ignored directory is an entry of its
-    own, so a hook's write there is named too). Submodule checkouts are their
-    own reading's; nested repositories list as one entry. The automator
-    directory's run records — this receipt's own sidecars among them — are
+    Two readings. One whole-tree ``ls-files --others --ignored
+    --exclude-standard`` (no ``--directory``: a file inside an ignored
+    directory is an entry of its own, so a hook's write there is named too).
+    Submodule checkouts are their own reading's; nested repositories list as
+    one entry. And the walk `_nested_git_entries` makes for what that listing
+    cannot hold: a ``.git`` entry — directory, gitfile or symlink — under any
+    directory but the top, which git names in no ``status`` or ``ls-files``
+    reading at all, ignored or not, so a hook's ``git init`` in a populated
+    tracked directory, or a repository it puts in an ignored one, is listed
+    by nothing else (#796 review). The automator directory's run records —
+    this receipt's own sidecars and the run's worktrees among them — are
     left out exactly as `automator_dirty_paths` leaves them. The identity is
     the entry's ``lstat`` — size, mtime, ctime, inode, device, mode — never
     its bytes: a hook overwriting or truncating an ignored file that was
@@ -2726,20 +2751,58 @@ def ignored_entries(repo: Path) -> dict[str, str]:
     proc = git_bytes(repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard")
     if proc.returncode != 0:
         raise IntegrationEvidenceError("target ignored-entry evidence is unavailable")
-    prefix = f"{AUTOMATOR_DIR_REL}/"
     entries: dict[str, str] = {}
     for raw in proc.stdout.split(b"\0"):
         if not raw:
             continue
         path = os.fsdecode(raw)
-        if path.startswith(prefix):
-            below = path.removeprefix(prefix)
-            if below.startswith(_AUTOMATOR_RECORD_PREFIXES) or below in _AUTOMATOR_RECORD_FILES:
-                continue
+        if _automator_record_path(path):
+            continue
         identity = _lstat_identity(repo, path)
         if identity is not None:
             entries[path] = identity
+    entries.update(_nested_git_entries(repo))
     return dict(sorted(entries.items()))
+
+
+def _automator_record_path(path: str) -> bool:
+    """Whether ``path`` is one of the run's own records under the automator directory."""
+    prefix = f"{AUTOMATOR_DIR_REL}/"
+    if not path.startswith(prefix):
+        return False
+    below = path.removeprefix(prefix)
+    return below.startswith(_AUTOMATOR_RECORD_PREFIXES) or below in _AUTOMATOR_RECORD_FILES
+
+
+def _nested_git_entries(repo: Path) -> dict[str, str]:
+    """Every ``.git`` entry below the top of ``repo``'s tree, with its ``lstat`` identity.
+
+    Walked on disk, symlinks never followed, because git lists none of them:
+    ``.git`` is administrative, not a path, and ``status --ignored`` and
+    ``ls-files --others --ignored`` alike say nothing about ``dir/.git/config``
+    under a populated tracked ``dir`` — nor about a new ``dir/x`` holding
+    nothing but a ``.git`` (#796 review). Each repository boundary is one
+    entry: a directory holding a ``.git`` is not descended into — a populated
+    submodule checkout, a nested repository in an ignored directory — since
+    what is inside is that repository's own reading's. The run's records
+    under the automator directory, its worktrees among them, are left out.
+    """
+    entries: dict[str, str] = {}
+    for dirpath, dirnames, filenames in os.walk(repo, followlinks=False):
+        base = Path(dirpath).relative_to(repo).as_posix()
+        if base == ".":
+            if ".git" in dirnames:
+                dirnames.remove(".git")
+            continue
+        if _automator_record_path(f"{base}/"):
+            dirnames[:] = []
+            continue
+        if ".git" in dirnames or ".git" in filenames:
+            identity = _lstat_identity(repo, f"{base}/.git")
+            if identity is not None:
+                entries[f"{base}/.git"] = identity
+            dirnames[:] = []
+    return entries
 
 
 def _lstat_identity(repo: Path, path: str) -> str | None:
@@ -2781,13 +2844,18 @@ def capture_ignored_entries(
     (`integrated_ignored_additions`).
     """
     root = _owned_integration_snapshot_root(run_dir, operation_identity)
+    return _seal_ignored_entries(repo, run_dir, root / _IGNORED_ENTRIES_SIDECAR)
+
+
+def _seal_ignored_entries(repo: Path, run_dir: Path, sidecar: Path) -> dict[str, object]:
+    """Seal `ignored_entries` of ``repo`` into ``sidecar``; the receipt's record of it."""
     data = b"\0".join(
         os.fsencode(path) + b"\0" + identity.encode("ascii")
         for path, identity in ignored_entries(repo).items()
     )
-    size, digest = _snapshot_bytes(data, root / _IGNORED_ENTRIES_SIDECAR)
+    size, digest = _snapshot_bytes(data, sidecar)
     return {
-        "sidecar": (root / _IGNORED_ENTRIES_SIDECAR).relative_to(run_dir).as_posix(),
+        "sidecar": sidecar.relative_to(run_dir).as_posix(),
         "size": size,
         "sha256": digest,
     }
@@ -2829,7 +2897,12 @@ def _recorded_ignored_entries(run_dir: Path, evidence: dict[str, object]) -> dic
 
 
 def integrated_ignored_additions(
-    repo: Path, run_dir: Path, evidence: object, *, tolerated: Iterable[str] = ()
+    repo: Path,
+    run_dir: Path,
+    evidence: object,
+    *,
+    tolerated: Iterable[str] = (),
+    introduced_checkouts: Iterable[str] = (),
 ) -> tuple[str, ...]:
     """Ignored entries after the hooks the receipt did not record, or recorded otherwise.
 
@@ -2837,23 +2910,99 @@ def integrated_ignored_additions(
     digest, against the same reading now: an entry it does not hold arrived
     during the attempt, and one it holds under another identity was written
     during it — a target hook's write, wherever it stands, an ignored file
-    it overwrote or truncated in place included (#796 review). A
-    ``tolerated`` stray an incoming ``.gitignore`` change turned ignored,
-    which the pre-merge guard already read, is left out. Removals are not
-    read: the receipt never held ignored bytes, and an entry the cleanup
-    removed or the commit now tracks leaves the listing by design. The
-    restore leaves what this names in place, like unstaged and untracked
-    dirt. Path-only evidence, sorted. Ceiling: the identity is ``lstat``'s,
-    so a writer that puts size, times and inode back is not read.
+    it overwrote or truncated in place included, and a nested ``.git`` it
+    made, which git lists nowhere (#796 review). A ``tolerated`` stray an
+    incoming ``.gitignore`` change turned ignored, which the pre-merge guard
+    already read, is left out; so is the ``.git`` of each
+    ``introduced_checkouts`` gitlink path (`integrated_introduced_gitlinks`),
+    a checkout the submodule reading accepted where the receipt recorded
+    none. Removals are not read: the receipt never held ignored bytes, and
+    an entry the cleanup removed or the commit now tracks leaves the listing
+    by design. The restore leaves what this names in place, like unstaged
+    and untracked dirt. Path-only evidence, sorted. Ceiling: the identity
+    is ``lstat``'s, so a writer that puts size, times and inode back is not
+    read.
     """
     validated = validate_ignored_entries_evidence(evidence)
     recorded = _recorded_ignored_entries(run_dir, validated)
     excluded = {_portable_integration_path(path) for path in tolerated}
+    excluded.update(f"{_portable_integration_path(path)}/.git" for path in introduced_checkouts)
     return tuple(
         sorted(
             path
             for path, identity in ignored_entries(repo).items()
             if path not in excluded and recorded.get(path) != identity
+        )
+    )
+
+
+def integrated_submodule_ignored_additions(
+    repo: Path, run_dir: Path, submodules: object, *, revision: str
+) -> tuple[str, ...]:
+    """Ignored entries in a captured checkout the receipt did not record, or recorded otherwise.
+
+    `integrated_ignored_additions` for each populated submodule the receipt
+    captured, against the listing `capture_integration_state` sealed beside
+    its HEAD (``ignored``; an older receipt's entry has none and reads as it
+    did): the tree's listing never descends into a submodule, and the
+    checkout readings take ``status`` without ``--ignored`` for a captured
+    checkout, so a target hook writing a file the checkout's own
+    ``.gitignore`` covers — into a submodule the incoming commit rewrites
+    or leaves alone, or into the leftover git could not remove — was listed
+    by nothing (#796 review). Read wherever the captured checkout still
+    stands at its lexical location as a repository; a path in its place
+    that is not one is the other readings' — the commit's own directory,
+    or a file. Inside the leftover a tracked directory replaced, the paths
+    ``revision`` holds under it are the commit's, not a hook's, however the
+    leftover's rules read them. Named under the submodule path, sorted;
+    left in place by the restore, like the tree's own ignored dirt.
+    """
+    _snapshots, validated = validate_integration_state_schema(run_dir, [], submodules)
+    inventory: dict[str, tuple[bytes, bytes, str]] | None = None
+    root = repo.resolve(strict=True)
+    named: list[str] = []
+    for entry in validated:
+        evidence = entry.get("ignored")
+        if evidence is None:
+            continue
+        rel, checkout = _confined_repo_operand(repo, entry["path"])
+        if checkout.is_symlink() or not checkout.is_dir() or not (checkout / ".git").exists():
+            continue
+        if checkout.resolve(strict=True) != root.joinpath(*rel.split("/")):
+            raise IntegrationEvidenceError("integrated target submodule checkout was redirected")
+        if inventory is None:
+            inventory = _revision_inventory(repo, revision)
+        prefix = f"{rel}/"
+        held_below = [path.removeprefix(prefix) for path in inventory if path.startswith(prefix)]
+        named.extend(
+            f"{rel}/{path}"
+            for path in integrated_ignored_additions(
+                checkout, run_dir, evidence, tolerated=held_below
+            )
+        )
+    return tuple(sorted(named))
+
+
+def integrated_introduced_gitlinks(
+    repo: Path, run_dir: Path, submodules: object, *, revision: str
+) -> tuple[str, ...]:
+    """Every gitlink ``revision`` holds that the receipt did not capture populated.
+
+    The tree's ignored-entry reading lists every nested ``.git``, and a
+    checkout a hook made at a gitlink the commit introduced — or at one the
+    receipt captured unpopulated — stands where the receipt recorded none;
+    `validate_integrated_submodule_state` is its reading (owned, clean with
+    ``--ignored``, at the gitlink) and accepts it, so its ``.git`` is
+    tolerated there (`integrated_ignored_additions`), not named twice.
+    Sorted.
+    """
+    _snapshots, validated = validate_integration_state_schema(run_dir, [], submodules)
+    populated = {str(entry["path"]) for entry in validated if entry.get("head") is not None}
+    return tuple(
+        sorted(
+            path
+            for path, (mode, _kind, _oid) in _revision_inventory(repo, revision).items()
+            if mode == b"160000" and path not in populated
         )
     )
 
@@ -3282,9 +3431,10 @@ def validate_integrated_submodule_state(
     commit's files written INTO it: its ``.git`` and old payload sit beside
     the new tracked files, which the superproject's diff readings own, so the
     leftover is read through its own status and may hold nothing but paths
-    the integrated tree holds under it (#796 review). Ceiling, for either
-    leftover: the receipt never read a captured checkout's ignored entries,
-    so a hook's write the leftover's own ``.gitignore`` covers is not seen.
+    the integrated tree holds under it (#796 review). A captured checkout's
+    ignored entries — a hook's write its own ``.gitignore`` covers, in a
+    checkout or either leftover — are `integrated_submodule_ignored_additions`'s
+    reading, against the listing the receipt sealed beside its HEAD.
     """
     if not isinstance(submodules, list):
         raise IntegrationEvidenceError("persisted target submodule evidence is malformed")

@@ -501,7 +501,19 @@ breaking changes may land in a minor release.
   listing of the whole tree's ignored entries, each with its `lstat`
   identity (a sidecar under the operation's capture root; bytes never
   read, removals not read, a tolerated stray an incoming `.gitignore`
-  change turned ignored left out) and named; the restore reverts what
+  change turned ignored left out) and named — a listing that also walks
+  the tree for every nested `.git` entry, which git lists in no reading at
+  all, so a hook's `git init` beneath a populated tracked directory, or a
+  repository it puts in an ignored one, is refused the same way (each
+  repository boundary one entry; the `.git` of a checkout the submodule
+  reading accepts at a gitlink the unit introduced tolerated) — and a
+  hook's write a captured populated submodule's own `.gitignore` covers,
+  which that listing never descends to, the checkout reading never asked
+  for, and the superproject's `status` never reports, is refused by the
+  listing the receipt seals of each such checkout's ignored entries beside
+  its HEAD — into a submodule the unit leaves alone, one whose gitlink it
+  rewrites, or the leftover git could not remove, the unit's own paths
+  written into a replaced leftover left out; the restore reverts what
   the hook staged and leaves unstaged, untracked and ignored entries in place, named
   for the operator; and a directory the unit creates, where the receipt
   proved nothing was — or proved an empty untracked directory, which git

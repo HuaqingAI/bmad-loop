@@ -3664,21 +3664,44 @@ class WorktreeFlow:
                 # listing did not record, or recorded under another identity —
                 # a hook's write beside an incoming path in a directory the
                 # target already held populated, or over an ignored file that
-                # was already there, which no reading above lists (#796
-                # review). Left in place by the restore, like unstaged dirt,
-                # and named.
+                # was already there, which no reading above lists — and a
+                # nested `.git` anywhere, which git lists in no reading at
+                # all, a checkout the submodule reading accepted at a gitlink
+                # the commit introduced excepted (#796 review). Left in place
+                # by the restore, like unstaged dirt, and named.
                 if attempt.get("ignored") is not None:
                     added = verify.integrated_ignored_additions(
                         repo,
                         self.run_dir,
                         attempt["ignored"],
                         tolerated=cleanup_plan.get("tolerated", ()),
+                        introduced_checkouts=verify.integrated_introduced_gitlinks(
+                            repo,
+                            self.run_dir,
+                            attempt["submodules"],
+                            revision=expected_revision,
+                        ),
                     )
                     if added:
                         raise verify.IntegrationEvidenceError(
                             "target hook wrote or changed ignored entries after "
                             "integration (left in place): " + ", ".join(added)
                         )
+                # And inside a captured submodule checkout, which that listing
+                # never descends into and whose own reading takes `status`
+                # without `--ignored`: against the listing the receipt sealed
+                # beside its HEAD (#796 review). Left in place the same way.
+                added = verify.integrated_submodule_ignored_additions(
+                    repo,
+                    self.run_dir,
+                    attempt["submodules"],
+                    revision=expected_revision,
+                )
+                if added:
+                    raise verify.IntegrationEvidenceError(
+                        "target hook wrote or changed ignored entries in a captured "
+                        "submodule checkout after integration (left in place): " + ", ".join(added)
+                    )
                 if verify.ref_revision(repo, target_ref) != expected_revision:
                     raise verify.IntegrationEvidenceError(
                         "target moved during artifact integration validation"

@@ -956,6 +956,15 @@ def test_receipt_schema_reads_absent_parents_by_gits_slash_hierarchy(project, tm
     assert validated[0]["absent_parents"] == entry["absent_parents"]
 
 
+def _sealed_empty_listing(operation, rel):
+    """The receipt's `ignored` record of a captured checkout holding no ignored entry."""
+    return {
+        "sidecar": f"integration-snapshots/{operation}/{hashlib.sha256(rel.encode()).hexdigest()}.ignored",
+        "size": 0,
+        "sha256": hashlib.sha256(b"").hexdigest(),
+    }
+
+
 def _add_test_submodule(repo, tmp_path):
     origin = tmp_path / "sub-origin"
     origin.mkdir()
@@ -976,7 +985,13 @@ def test_receipt_restores_populated_submodule_checkout(project, tmp_path):
     run_dir.mkdir()
     snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ())
     assert submodules == [
-        {"path": "module", "head": old_submodule, "gitlink": old_submodule, "flags": "0"}
+        {
+            "path": "module",
+            "head": old_submodule,
+            "gitlink": old_submodule,
+            "flags": "0",
+            "ignored": _sealed_empty_listing("c" * 32, "module"),
+        }
     ]
     old = verify.rev_parse_head(repo)
     commit(origin, "payload.txt", "submodule new\n", "advance submodule")
@@ -4316,6 +4331,188 @@ def test_ignored_entries_receipt_names_an_entry_added_after_the_hooks(project, t
         verify.integrated_ignored_additions(repo, run_dir, {"sidecar": "x", "size": 1})
 
 
+def test_ignored_entries_receipt_names_a_nested_git_entry_git_lists_nowhere(project, tmp_path):
+    """A target hook's `dir/.git/config` beneath a populated tracked `dir` is
+    listed by nothing git offers: `.git` is administrative, so `status
+    --ignored` and `ls-files --others --ignored` alike say nothing about it,
+    and a fresh `dir/x` holding nothing but a `.git` is passed over the same
+    way; the introduced-directory walk roots only where the receipt proved
+    nothing stood, so a populated parent gave it no root (Codex, #796
+    review). The receipt's whole-tree listing now walks the tree for every
+    nested `.git` entry — directory, gitfile, symlink — and after the hooks
+    one it did not record is named, wherever it stands: under a populated
+    tracked directory, under an ignored one. What it does not name: a
+    nested repository that was already there (recorded at its identity, one
+    entry per repository boundary, nothing inside it read), the run's own
+    worktrees under the automator directory, and the `.git` of a checkout
+    the submodule reading accepts at a gitlink the commit introduced
+    (`integrated_introduced_gitlinks`, tolerated by the caller).
+
+    Ablation: return `{}` from `_nested_git_entries` and every named row
+    reds; drop the boundary stop and the pre-existing nested repository's
+    own entries are named; drop the introduced-gitlink tolerance and the
+    accepted checkout's `.git` is named."""
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    (repo / ".gitignore").write_text("build/\n.bmad-loop/runs/\n")
+    (repo / "dir").mkdir()
+    (repo / "dir" / "keep").write_text("already here\n")
+    (repo / "build" / "vendored" / "src").mkdir(parents=True)
+    git(repo / "build" / "vendored", "init", "-q")
+    (repo / "build" / "vendored" / "src" / "cache.o").write_text("inside a nested repository\n")
+    git(repo, "add", "--", ".gitignore", "dir/keep")
+    git(repo, "commit", "-q", "-m", "populated dir; a nested repository in an ignored dir")
+    (run_dir / "worktrees" / "unit").mkdir(parents=True)
+    (run_dir / "worktrees" / "unit" / ".git").write_text("gitdir: elsewhere\n")
+    _snapshots, submodules = verify.capture_integration_state(
+        repo, run_dir, "d" * 32, ("dir/added",)
+    )
+
+    evidence = verify.capture_ignored_entries(repo, run_dir, "d" * 32)
+
+    recorded = (run_dir / str(evidence["sidecar"])).read_bytes().split(b"\0")[::2]
+    assert recorded == [b"build/vendored/", b"build/vendored/.git"]
+    assert verify.integrated_ignored_additions(repo, run_dir, evidence) == ()
+
+    origin = tmp_path / "new-origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    commit(origin, "payload.txt", "new submodule\n", "new submodule")
+    (repo / "dir" / "added").write_text("incoming\n")
+    git(repo, "add", "--", "dir/added")
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(origin), "newmod")
+    git(repo, "commit", "-q", "-m", "integrated")
+    integrated = verify.rev_parse_head(repo)
+    introduced = verify.integrated_introduced_gitlinks(
+        repo, run_dir, submodules, revision=integrated
+    )
+    assert introduced == ("newmod",)
+    assert verify.integrated_ignored_additions(repo, run_dir, evidence) == ("newmod/.git",)
+    assert (
+        verify.integrated_ignored_additions(
+            repo, run_dir, evidence, introduced_checkouts=introduced
+        )
+        == ()
+    )
+
+    (repo / "dir" / ".git").mkdir()
+    (repo / "dir" / ".git" / "config").write_text("target hook output\n")
+    (repo / "dir" / "keep2").mkdir()  # only a `.git` in it: git passes the directory over
+    (repo / "dir" / "keep2" / ".git").write_text("gitdir: /elsewhere\n")
+    (repo / "build" / "tool").mkdir()
+    (repo / "build" / "tool" / ".git").symlink_to(repo / ".git")
+    (repo / "build" / "vendored" / "src" / ".git").mkdir()  # inside a recorded boundary
+    assert git(repo, "status", "--porcelain", "-uall", "--ignored", "--", "dir") == ""
+
+    assert verify.integrated_ignored_additions(
+        repo, run_dir, evidence, introduced_checkouts=introduced
+    ) == ("build/tool/.git", "dir/.git")
+    # `dir` holds a `.git` now, so the walk stops there — its `.git` is the
+    # one entry and everything beneath is that repository's own reading's;
+    # without it, `dir/keep2`, which git passes over, is read
+    (repo / "dir" / ".git" / "config").unlink()
+    (repo / "dir" / ".git").rmdir()
+    assert verify.integrated_ignored_additions(
+        repo, run_dir, evidence, introduced_checkouts=introduced
+    ) == ("build/tool/.git", "dir/keep2/.git")
+
+
+def test_integrated_submodule_ignored_additions_name_a_hooks_write_the_checkout_ignores(
+    project, tmp_path
+):
+    """A captured populated submodule's checkout is read with `status -uall`,
+    which lists no ignored entry, and the tree's whole-tree listing never
+    descends into a submodule — so a target hook writing a file the
+    checkout's own `.gitignore` covers, into a submodule the incoming commit
+    rewrites without moving its HEAD, left every reading empty and the run
+    recorded `unit-merged` over it (Codex, #796 review). The receipt now
+    seals each populated checkout's ignored entries beside its HEAD, and
+    after the hooks an entry that listing does not hold, or holds under
+    another identity, is named under the submodule path. What it does not
+    name: an ignored file that was already there, one that left, the
+    commit's own paths written into the leftover a tracked directory
+    replaced (whatever the leftover's rules say of them), and a checkout an
+    older receipt captured without the listing.
+
+    Ablation: return `()` from `integrated_submodule_ignored_additions` and
+    the named rows red; drop `held_below` from the tolerated set and the
+    replaced leftover's commit-held `.log` is named."""
+    repo = project.project
+    origin = tmp_path / "sub-origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    (origin / ".gitignore").write_text("*.log\n")
+    commit(origin, "payload.txt", "submodule old\n", "submodule baseline with an ignore rule")
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(origin), "module")
+    git(repo, "commit", "-q", "-m", "add populated submodule")
+    checkout = repo / "module"
+    (checkout / "old.log").write_text("ignored before\n")
+    (checkout / "gone.log").write_text("ignored before, removed during\n")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ("module",))
+    [captured] = submodules
+    sidecar = run_dir / str(captured["ignored"]["sidecar"])
+    assert sidecar.read_bytes().split(b"\0")[::2] == [b"gone.log", b"old.log"]
+    integrated = verify.rev_parse_head(repo)
+
+    assert (
+        verify.integrated_submodule_ignored_additions(
+            repo, run_dir, submodules, revision=integrated
+        )
+        == ()
+    )
+    (checkout / "gone.log").unlink()
+    (checkout / "hook.log").write_text("target hook output\n")
+    assert git(checkout, "status", "--porcelain", "-uall") == ""
+    assert git(repo, "status", "--porcelain", "-uall") == ""
+
+    assert verify.integrated_submodule_ignored_additions(
+        repo, run_dir, submodules, revision=integrated
+    ) == ("module/hook.log",)
+
+    (checkout / "hook.log").unlink()
+    with (checkout / "old.log").open("a") as stream:
+        stream.write("target hook output\n")
+    assert verify.integrated_submodule_ignored_additions(
+        repo, run_dir, submodules, revision=integrated
+    ) == ("module/old.log",)
+
+    # an older receipt's entry, no listing sealed: reads as it did
+    legacy = [{key: value for key, value in captured.items() if key != "ignored"}]
+    assert (
+        verify.integrated_submodule_ignored_additions(repo, run_dir, legacy, revision=integrated)
+        == ()
+    )
+
+    # the leftover a tracked directory replaced: the commit's own `.log`
+    # under it is the commit's, whatever the leftover's rules say
+    (checkout / "old.log").write_text("ignored before\n")
+    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ("module",))
+    git(repo, "rm", "-q", "--cached", "--", "module")
+    (checkout / "report.log").write_text("the commit's own\n")
+    # staged the way a merge stages it: `git add` skips a path under the
+    # old checkout's `.git`, the merge writes the index entry directly
+    blob = git(repo, "hash-object", "-w", "--", "module/report.log")
+    git(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},module/report.log")
+    git(repo, "commit", "-q", "-m", "integrated: a tracked directory in the submodule's place")
+    replaced = verify.rev_parse_head(repo)
+    assert (checkout / ".git").exists()
+    assert (
+        verify.integrated_submodule_ignored_additions(repo, run_dir, submodules, revision=replaced)
+        == ()
+    )
+    (checkout / "hook.log").write_text("target hook output\n")
+    assert verify.integrated_submodule_ignored_additions(
+        repo, run_dir, submodules, revision=replaced
+    ) == ("module/hook.log",)
+
+
 def _integrate_new_directory(repo, run_dir):
     """Arm a receipt over `newdir/tracked` while `newdir` is absent, then commit
     the integrated shape: the directory created by the commit, holding exactly
@@ -4719,7 +4916,13 @@ def test_integrated_submodule_deletion_accepts_the_leftover_checkout(project, tm
         repo, run_dir, "d" * 32, ("module", ".gitmodules")
     )
     assert submodules == [
-        {"path": "module", "head": old_submodule, "gitlink": old_submodule, "flags": "0"}
+        {
+            "path": "module",
+            "head": old_submodule,
+            "gitlink": old_submodule,
+            "flags": "0",
+            "ignored": _sealed_empty_listing("d" * 32, "module"),
+        }
     ]
     integrated = _integrate_submodule_deletion(repo, leftover=True)
     assert git(repo, "status", "--porcelain") == "?? module/"
@@ -5040,7 +5243,13 @@ def test_receipt_preserves_an_operator_s_assume_unchanged_gitlink(project, tmp_p
     prospective = ("module",) if touched == "updated" else ("src.txt",)
     snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, prospective)
     assert submodules == [
-        {"path": "module", "head": old_submodule, "gitlink": old_submodule, "flags": "8000"}
+        {
+            "path": "module",
+            "head": old_submodule,
+            "gitlink": old_submodule,
+            "flags": "8000",
+            "ignored": _sealed_empty_listing("c" * 32, "module"),
+        }
     ]
     old = verify.rev_parse_head(repo)
     if touched == "updated":
@@ -5190,7 +5399,13 @@ def test_integrated_submodule_deletion_in_a_linked_worktree_target(project, tmp_
         linked, run_dir, "f" * 32, ("module", ".gitmodules")
     )
     assert submodules == [
-        {"path": "module", "head": old_submodule, "gitlink": old_submodule, "flags": "0"}
+        {
+            "path": "module",
+            "head": old_submodule,
+            "gitlink": old_submodule,
+            "flags": "0",
+            "ignored": _sealed_empty_listing("f" * 32, "module"),
+        }
     ]
     integrated = _integrate_submodule_deletion(linked, leftover=True)
     assert git(linked, "status", "--porcelain") == "?? module/"
