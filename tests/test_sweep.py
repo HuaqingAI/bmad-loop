@@ -29218,6 +29218,13 @@ def test_crash_after_unit_merged_retires_receipt_without_reintegration(project, 
     durable = load_state(engine.run_dir).tasks["dw-fix"]
     assert durable.integration_attempt is not None
     landed = verify.rev_parse_head(project.project)
+
+    def validated_once(*_args, **_kwargs):
+        raise AssertionError("the recorded completion was re-validated on resume")
+
+    # The row names the receipt's operation and the reflog holds its transition,
+    # so the resume retires the receipt on record alone — no second reading.
+    monkeypatch.setattr(artifact_publication, "validate_integrated", validated_once)
     resumed, adapter = resume_sweep(project, engine, [])
 
     summary = resumed.run()
@@ -29231,6 +29238,145 @@ def test_crash_after_unit_merged_retires_receipt_without_reintegration(project, 
     assert destination.read_bytes() == accepted
     snapshots = resumed.run_dir / "integration-snapshots"
     assert not snapshots.exists() or not any(snapshots.iterdir())
+
+
+def test_a_unit_merged_row_under_the_receipt_identity_needs_the_reflog_transition(
+    project, monkeypatch
+):
+    """The row's operation identity is half the proof; the target's reflog is the other.
+
+    A row that names the live attempt's operation identity but has no
+    `bmad-loop-integrate:<identity>` transition behind it on the target's
+    reflog is a record of nothing git did: here the host was lost before git
+    ran at all. The resume does not retire the receipt on it; the replay runs
+    the merge under the receipt and the bundle lands (Codex, #796 review).
+
+    Ablation: accept the identity match without the reflog reading and the
+    resume retires the receipt, skips the merge, and publishes a bundle whose
+    commit never reached the target.
+    """
+    effect, destination, accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, original_adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    pre_merge_head = verify.rev_parse_head(project.repo_root)
+    merge = verify.merge_branch
+
+    def forge_then_lose_host(*_args, **_kwargs):
+        task = engine.state.tasks["dw-fix"]
+        assert task.integration_attempt is not None
+        engine.journal.append(
+            "unit-merged",
+            story_key=task.story_key,
+            branch=task.branch,
+            target=engine.state.target_branch,
+            strategy="merge",
+            source=task.commit_sha,
+            operation_id=task.integration_attempt["operation_identity"],
+        )
+        raise SystemExit("host loss before git")
+
+    monkeypatch.setattr(verify, "merge_branch", forge_then_lose_host)
+    with pytest.raises(SystemExit, match="host loss before git"):
+        engine.run()
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert verify.rev_parse_head(project.repo_root) == pre_merge_head
+    assert durable.commit_sha
+    monkeypatch.setattr(verify, "merge_branch", merge)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert [session.role for session in original_adapter.sessions] == ["triage", "dev"]
+    landed = verify.rev_parse_head(project.repo_root)
+    assert landed != pre_merge_head
+    assert verify.is_ancestor(project.repo_root, durable.commit_sha, landed)
+    final = resumed.state.tasks["dw-fix"]
+    assert final.integration_attempt is None
+    assert final.artifact_publication_complete
+    assert destination.read_bytes() == accepted
+    assert not Path(final.worktree_path).exists()
+
+
+def test_a_forged_unit_merged_row_cannot_retire_a_receipt_before_validation(project, monkeypatch):
+    """A session's `unit-merged` row does not stand in for the receipt's own result.
+
+    The coding session holds the writable run directory and can append a
+    `unit-merged` row for its own story, branch and target. When the real
+    integration then loses its host after the merge moved the target but before
+    validation ran, the resume used to read that row as the validated completion:
+    the receipt was retired without a git reading, the replay skipped the merge,
+    and publication ran over a target no reading had validated (Codex, #796
+    review). Completion is now bound to the receipt: the row has to name the
+    attempt's operation identity, and the target's reflog has to hold the
+    transition under that identity with the target still at its result;
+    anything else replays through the merge, which re-validates. Here that
+    re-validation refuses, so the target is restored under the receipt and the
+    run pauses — the forged row bought the session nothing.
+
+    Ablation: retire the receipt on the bare key match again and the resumed
+    validation never runs — the receipt is gone, the target keeps the
+    unvalidated result, and the bundle publishes.
+    """
+    effect, destination, accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, original_adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    pre_merge_head = verify.rev_parse_head(project.repo_root)
+    validate = artifact_publication.validate_integrated
+
+    def forge_then_lose_host(task, paths, revision):
+        # The row a session could write: the run's own key, no operation
+        # identity — the attempt is armed after the session ends.
+        engine.journal.append(
+            "unit-merged",
+            story_key=task.story_key,
+            branch=task.branch,
+            target=engine.state.target_branch,
+            strategy="merge",
+            source=task.commit_sha,
+        )
+        raise SystemExit("host loss before validation")
+
+    monkeypatch.setattr(artifact_publication, "validate_integrated", forge_then_lose_host)
+    with pytest.raises(SystemExit, match="host loss before validation"):
+        engine.run()
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert "outcome" not in durable.integration_attempt
+    merged_head = verify.rev_parse_head(project.repo_root)
+    assert merged_head != pre_merge_head
+    forged = [entry for entry in engine.journal.entries() if entry.get("kind") == "unit-merged"]
+    assert len(forged) == 1 and "operation_id" not in forged[0]
+    revalidated: list[str] = []
+
+    def refuse_on_replay(task, paths, revision):
+        revalidated.append(revision)
+        raise artifact_publication.PublicationError("replayed validation refuses the target")
+
+    monkeypatch.setattr(artifact_publication, "validate_integrated", refuse_on_replay)
+    resumed, adapter = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert revalidated == [merged_head]
+    assert summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert [session.role for session in original_adapter.sessions] == ["triage", "dev"]
+    final = load_state(resumed.run_dir).tasks["dw-fix"]
+    assert final.integration_attempt is not None
+    assert final.integration_attempt.get("outcome") == "refused-restored"
+    assert not final.artifact_publication_complete
+    assert verify.rev_parse_head(project.repo_root) == pre_merge_head
+    assert destination.read_bytes() == b"baseline"
+    monkeypatch.setattr(artifact_publication, "validate_integrated", validate)
 
 
 @pytest.mark.parametrize(

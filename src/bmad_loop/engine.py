@@ -1676,6 +1676,19 @@ class Engine:
             for entry in entries
             if entry.get("kind") == "unit-merged"
         }
+        # The receipt-bound arm writes its row with the attempt's operation
+        # identity; a row without one, or under another identity, is not that
+        # arm's completion whatever key it carries.
+        merged_operations = {
+            (
+                str(entry.get("story_key", "")),
+                str(entry.get("branch", "")),
+                str(entry.get("target", "")),
+                str(entry.get("operation_id", "")),
+            )
+            for entry in entries
+            if entry.get("kind") == "unit-merged" and entry.get("operation_id")
+        }
         started_units = {
             (
                 str(entry.get("story_key", "")),
@@ -1739,15 +1752,29 @@ class Engine:
                 or publication_pending
             ):
                 continue
-            if task.dw_ids and merged_key in merged_units and task.integration_attempt is not None:
-                # unit-merged is written only after target validation.  A crash
-                # between that append and the following atomic state save may
-                # leave rollback authority behind; retire it without touching Git.
-                completed_attempt = task.integration_attempt
-                task.integration_attempt = None
-                self._save()
-                verify.discard_integration_state(self.run_dir, completed_attempt)
-            if merged_key not in merged_units:
+            merged = merged_key in merged_units
+            if task.dw_ids and task.integration_attempt is not None:
+                # The receipt-bound arm writes unit-merged only after target
+                # validation, so a crash between that append and the following
+                # atomic state save may leave rollback authority behind; retire it
+                # without touching Git. But the row alone is not that proof: a
+                # session holds the writable run directory and can append one under
+                # its own key, and a host lost after the merge moved the target and
+                # before validation would then resume as validated — receipt gone,
+                # merge skipped, publication over an unread target (#796 review).
+                # Completion is the row that names this attempt's operation
+                # identity AND the target's reflog transition under that identity
+                # with the target still at its result. Anything else is not merged
+                # here: the replay below runs the merge, which finds the moved ref
+                # under its receipt and re-validates it, or pauses with evidence.
+                if self._receipt_completion_recorded(task, merged_operations):
+                    completed_attempt = task.integration_attempt
+                    task.integration_attempt = None
+                    self._save()
+                    verify.discard_integration_state(self.run_dir, completed_attempt)
+                else:
+                    merged = False
+            if not merged:
                 source = task.commit_sha or ""
                 started_key = (*merged_key, source)
                 attempt = task.integration_attempt if task.dw_ids else None
@@ -1774,11 +1801,11 @@ class Engine:
                         replay=True,
                         replay_strategy=replay_strategy,
                     )
-                    merged_units.add(merged_key)
+                    merged = True
                     replay_strategy = None
                 else:
                     replay_strategy = started_units.get(started_key)
-                if merged_key not in merged_units and (not source or replay_strategy is None):
+                if not merged and (not source or replay_strategy is None):
                     if not publication_pending:
                         continue
                     # Terminal bundle persisted before merge intent: integrate it
@@ -1786,11 +1813,11 @@ class Engine:
                     self._merge_local(
                         task, self._reopen_unit(task), replay=True, first_integration=True
                     )
-                    merged_units.add(merged_key)
+                    merged = True
                     replay_strategy = None
                 else:
                     replay_strategy = str(replay_strategy)
-                if merged_key not in merged_units:
+                if not merged:
                     # The write-ahead record is intent, never merge proof. Re-run the
                     # exact merge and latch completion only after git confirms it;
                     # merge/ff are naturally idempotent, while squash enables its
@@ -1810,7 +1837,6 @@ class Engine:
                         replay=True,
                         replay_strategy=replay_strategy,
                     )
-                    merged_units.add(merged_key)
             if publication_pending and not task.artifact_publication_complete:
                 if task.artifact_payload is None:
                     unit = self._reopen_unit(task)
@@ -1831,6 +1857,46 @@ class Engine:
             # The failed integration unwound before _run_story returned, so the
             # loop never reached its normal post-integration continuation.
             self._after_story(task)
+
+    def _receipt_completion_recorded(
+        self, task: StoryTask, merged_operations: set[tuple[str, str, str, str]]
+    ) -> bool:
+        """Whether ``task``'s live receipt has its validated completion on record.
+
+        True only when a ``unit-merged`` row names the attempt's operation
+        identity and the target's reflog holds the ``bmad-loop-integrate``
+        transition under that identity, from the receipt's pre-target revision
+        to the revision the target is at now. Evidence git cannot read cleanly
+        (an ambiguous or unavailable reflog) is ``False`` here rather than a
+        pause: the replay that follows reads the same evidence and pauses with
+        its own reason.
+        """
+        attempt = task.integration_attempt
+        if not isinstance(attempt, dict):
+            return False
+        operation = attempt.get("operation_identity")
+        target_ref = attempt.get("target_ref")
+        pre_target = attempt.get("pre_target_revision")
+        if not (
+            isinstance(operation, str)
+            and isinstance(target_ref, str)
+            and isinstance(pre_target, str)
+            and operation
+            and target_ref
+        ):
+            return False
+        if (task.story_key, task.branch, self.state.target_branch, operation) not in (
+            merged_operations
+        ):
+            return False
+        repo = self.paths.repo_root
+        try:
+            update = verify.integration_ref_update(repo, target_ref, operation)
+            if update is None or update.old_revision != pre_target:
+                return False
+            return verify.ref_revision(repo, target_ref) == update.new_revision
+        except (verify.GitError, OSError):
+            return False
 
     def _finish_inflight(self) -> None:
         """Complete or roll back tasks interrupted by a pause or crash."""

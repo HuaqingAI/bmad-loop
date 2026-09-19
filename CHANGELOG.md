@@ -554,7 +554,15 @@ breaking changes may land in a minor release.
   and the receipt records such a gitlink unpopulated, so a checkout a target
   hook's `submodule update --init` makes there is the refusal's to remove
   (a repository of any other kind there refuses the restore) rather than
-  the next capture's baseline.
+  the next capture's baseline. A resume retires a live receipt on its
+  recorded completion only when the `unit-merged` row names the receipt's
+  operation identity and the target's reflog holds the transition under it
+  with the target still at that result — a coding session holds the writable
+  run directory and can append a `unit-merged` row under its own key, which
+  used to read as validated completion after a host lost between the merge
+  and validation (receipt gone, merge skipped, publication over an unread
+  target); any other row replays the merge, which re-validates under the
+  receipt.
 
 - Recover sweep migration publication faults without persisting unearned `DONE`
   state (DW-296/DW-297). Persist accepted baseline/rewrite records, clear a
