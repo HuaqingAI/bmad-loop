@@ -28156,6 +28156,46 @@ def _seed_populated_target_submodule(project, tmp_path):
 
 
 @pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
+def test_bundle_renaming_a_tracked_file_integrates(project, strategy):
+    """A bundle that renames a tracked file: `git diff --name-only` ran rename
+    detection and named the destination alone, so the source stayed outside
+    the incoming set — never snapshotted, and once the receipt digested the
+    index outside that set (8b39ea8e), deleted by the merge into a mismatch
+    that could name no entry and refused every renaming bundle (Codex, #796
+    review). Both sides are incoming now and the rename integrates on every
+    strategy.
+
+    Ablation: drop `--no-renames` from `branch_incoming_paths` and every leg
+    reds on `summary.paused`."""
+    (project.project / "old.txt").write_text("content worth renaming\n" * 20)
+    git(project.project, "add", "--", "old.txt")
+    git(project.project, "commit", "-q", "-m", "old.txt")
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+
+    def renaming_effect(spec):
+        git(spec.cwd, "mv", "--", "old.txt", "new.txt")
+        return effect(spec)
+
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), renaming_effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+    assert "unit-merged" in journal_kinds(engine)
+    assert not _records(engine, "artifact-publication-refused")
+    head = verify.rev_parse_head(project.repo_root)
+    assert git(project.project, "ls-tree", "--name-only", head, "--", "old.txt") == ""
+    assert git(project.project, "ls-tree", "--name-only", head, "--", "new.txt") == "new.txt"
+    assert not (project.project / "old.txt").exists()
+    assert git(project.project, "status", "--porcelain", "--untracked-files=no") == ""
+
+
+@pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
 def test_bundle_deleting_a_populated_target_submodule_integrates(project, tmp_path, strategy):
     """A bundle that deletes the target's populated submodule could never
     integrate: git merges the deletion and leaves the populated checkout on

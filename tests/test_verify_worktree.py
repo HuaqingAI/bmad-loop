@@ -3007,6 +3007,30 @@ def test_dirty_paths_ignores_policy_file(project):
     assert verify.dirty_paths(repo) == {}  # policy.toml excluded like worktree_clean
 
 
+def test_branch_incoming_paths_names_both_sides_of_a_rename(project, tmp_path):
+    """`git diff --name-only` runs rename detection by default and reports a
+    rename as its destination alone, so a bundle moving `old` to `new` had
+    `old` outside the incoming set: never snapshotted, never cleaned or
+    tolerated by the guard, and — once the receipt digested the index outside
+    that set — deleted by the merge into a digest mismatch that named no
+    entry and refused every renaming bundle (Codex, #796 review). Both sides
+    are incoming, as the restore's own inventory already reads them.
+
+    Ablation: drop `--no-renames` and this reds on `old` missing."""
+    repo = project.project
+    (repo / "old.txt").write_text("content worth renaming\n" * 20)
+    git(repo, "add", "--", "old.txt")
+    git(repo, "commit", "-q", "-m", "old.txt")
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+    git(wt, "mv", "--", "old.txt", "new.txt")
+    git(wt, "commit", "-q", "-m", "rename")
+    verify.worktree_remove(repo, wt, force=True)
+    assert git(repo, "diff", "--name-only", "main", "feat") == "new.txt"
+
+    assert verify.branch_incoming_paths(repo, "main", "feat") == {"old.txt", "new.txt"}
+
+
 def test_branch_incoming_paths(project, tmp_path):
     repo = project.project
     wt = tmp_path / "wt"

@@ -491,7 +491,9 @@ breaking changes may land in a minor release.
   any other — and a hook's `update-index --assume-unchanged` on a clean
   tracked file outside the incoming set, which status never lists, is
   refused by the receipt's digest of every other index entry's flag word
-  and named from its map of the marked ones; the restore reverts what
+  and named from its map of the marked ones (a rename's source is incoming
+  too — `diff --name-only` had named the destination alone — so a renaming
+  bundle is not refused over the entry its merge deletes); the restore reverts what
   the hook staged and leaves unstaged and untracked entries in place, named
   for the operator; and a directory the unit creates, where the receipt
   proved nothing was — or proved an empty untracked directory, which git

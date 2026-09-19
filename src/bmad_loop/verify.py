@@ -5365,8 +5365,15 @@ def _porcelain_paths(out: str) -> list[str]:
 
 def branch_incoming_paths(repo: Path, target: str, branch: str) -> set[str]:
     """The set of repo-relative posix paths a merge of `branch` into `target`
-    would introduce or modify (`git diff --name-only target branch`)."""
-    rc, out = _git_raw(repo, "diff", "--name-only", "-z", target, branch)
+    would introduce, modify or delete (`git diff --name-only target branch`).
+
+    ``--no-renames``: rename detection is on by default and names a rename by
+    its destination alone, and the source — which the merge deletes — is as
+    incoming as anything else: snapshotted by the receipt, cleaned or
+    tolerated by the guard, excluded from the digest of the index outside the
+    incoming set, and read by the restore's own inventory the same way (#796
+    review)."""
+    rc, out = _git_raw(repo, "diff", "--name-only", "--no-renames", "-z", target, branch)
     if rc != 0:
         raise GitError(f"git diff --name-only {target} {branch} failed in {repo}")
     return {p for p in out.split("\0") if p}
