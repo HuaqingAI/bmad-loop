@@ -519,7 +519,10 @@ breaking changes may land in a minor release.
   (`a` deleted, `a/b` added) integrates — the capture read the leaf beneath
   the file as a fault rather than as absent, pausing before the merge and
   again on every resume — and its refusal restores the old shape through the
-  parent path alone, git refusing the pair; a target cloned without
+  parent path alone, git refusing the pair (a symlink it turns into a
+  directory, and a leaf it puts deeper beneath the file, restore the same
+  way: the restore refused the put-back symlink as a redirection and crashed
+  opening the restored file as the deeper leaf's parent); a target cloned without
   `--recurse-submodules`, every gitlink an empty directory, integrates too —
   the capture probed each one for its superproject and called it foreign —
   and the receipt records such a gitlink unpopulated, so a checkout a target

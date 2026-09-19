@@ -925,8 +925,14 @@ def test_receipt_restores_populated_submodule_checkout(project, tmp_path):
     assert git(repo, "status", "--porcelain") == ""
 
 
-@pytest.mark.parametrize("shape", ["file-to-directory", "directory-to-file"])
-def test_receipt_captures_and_restores_a_tracked_entry_type_change(project, tmp_path, shape):
+@pytest.mark.parametrize("anchored", [True, False], ids=["anchored", "checked-path"])
+@pytest.mark.parametrize(
+    "shape",
+    ["file-to-directory", "file-to-deep-directory", "symlink-to-directory", "directory-to-file"],
+)
+def test_receipt_captures_and_restores_a_tracked_entry_type_change(
+    project, tmp_path, monkeypatch, shape, anchored
+):
     """`branch_incoming_paths` names both sides of a tracked file/directory
     transition (`a` deleted, `a/b` added), and capturing `a/b` while `a` is
     still a file `lstat`s through a file: `NotADirectoryError`, which the
@@ -938,19 +944,37 @@ def test_receipt_captures_and_restores_a_tracked_entry_type_change(project, tmp_
     leave such an entry alone once `git restore` has put the file back: it is
     absent by topology, nothing to open, nothing to remove. The reverse
     transition (`d/x` deleted, `d` now a file) captures `d` as a tracked
-    directory (no snapshot of its own) and `d/x` as the reversible leaf.
+    directory (no snapshot of its own) and `d/x` as the reversible leaf. A
+    leaf deeper down (`a/b/c`) records `a/b` as a proved-absent parent, and
+    once the file is back that parent is absent by topology too: the
+    anchored restore's parent removal opened `a` as a directory and crashed
+    on `NotADirectoryError`. A symlink in the file's place (`a -> src.txt`,
+    then `a/b`) is captured as `symlink` and put back the same way — and the
+    restore's redirection probe, which refuses any symlink on the way to a
+    snapshot, must know that this one is the receipt's own restored shape.
 
     Ablation: catch `FileNotFoundError` alone in the capture and the
     `file-to-directory` row reds on the raise; drop the topology skip from
-    the restore and it reds on the restore's parent opening."""
+    the restore and it reds on the restore's parent opening; skip the
+    topology test in the absent-parents removal and the anchored deep row
+    reds on `NotADirectoryError`; ignore `captured_links` in
+    `_absent_beneath_a_file` and the symlink rows red on "redirected"."""
     repo = project.project
+    if not anchored:
+        monkeypatch.setattr(verify, "DIR_FD_ANCHORED_WRITES", False)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    if shape == "file-to-directory":
+    leaf = "a/b/c" if shape == "file-to-deep-directory" else "a/b"
+    if shape == "symlink-to-directory":
+        os.symlink("src.txt", repo / "a")
+        git(repo, "add", "--", "a")
+        git(repo, "commit", "-q", "-m", "a is a symlink")
+        incoming = ("a", leaf)
+    elif shape != "directory-to-file":
         (repo / "a").write_text("a file\n")
         git(repo, "add", "--", "a")
         git(repo, "commit", "-q", "-m", "a is a file")
-        incoming = ("a", "a/b")
+        incoming = ("a", leaf)
     else:
         (repo / "d").mkdir()
         (repo / "d" / "x").write_text("a directory\n")
@@ -962,13 +986,18 @@ def test_receipt_captures_and_restores_a_tracked_entry_type_change(project, tmp_
     snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, incoming)
 
     by_path = {entry["path"]: entry for entry in snapshots}
-    if shape == "file-to-directory":
-        assert by_path["a"]["state"] == "regular"
-        assert by_path["a/b"]["state"] == "absent" and by_path["a/b"]["absent_parents"] == []
+    if shape != "directory-to-file":
+        assert by_path["a"]["state"] == (
+            "symlink" if shape == "symlink-to-directory" else "regular"
+        )
+        assert by_path[leaf]["state"] == "absent"
+        assert by_path[leaf]["absent_parents"] == (
+            ["a/b"] if shape == "file-to-deep-directory" else []
+        )
         git(repo, "rm", "-q", "--", "a")
-        (repo / "a").mkdir()
-        (repo / "a" / "b").write_text("a directory\n")
-        git(repo, "add", "--", "a/b")
+        (repo / leaf).parent.mkdir(parents=True)
+        (repo / leaf).write_text("a directory\n")
+        git(repo, "add", "--", leaf)
         git(repo, "commit", "-q", "-m", "integrated: a becomes a directory")
     else:
         assert set(by_path) == {"d/x"} and by_path["d/x"]["state"] == "regular"
@@ -991,7 +1020,9 @@ def test_receipt_captures_and_restores_a_tracked_entry_type_change(project, tmp_
 
     assert verify.rev_parse_head(repo) == old
     assert git(repo, "status", "--porcelain", "-uall") == ""
-    if shape == "file-to-directory":
+    if shape == "symlink-to-directory":
+        assert os.readlink(repo / "a") == "src.txt"
+    elif shape != "directory-to-file":
         assert (repo / "a").read_text() == "a file\n"
     else:
         assert (repo / "d" / "x").read_text() == "a directory\n"

@@ -17,7 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from stat import S_ISLNK, S_ISREG
@@ -1953,24 +1953,33 @@ def _remove_tree_at(parent_fd: int, name: str) -> None:
     os.fsync(parent_fd)
 
 
-def _absent_beneath_a_file(repo: Path, target: Path) -> bool:
+def _absent_beneath_a_file(repo: Path, target: Path, captured_links: Collection[str] = ()) -> bool:
     """Whether an expected-absent ``target`` sits beneath an ancestor that is a file.
 
     The receipt captures the leaf beneath a tracked file/directory transition
     (``a/b`` while ``a`` is a file) as absent; once the file is back — ``git
     restore`` put it there ahead of the snapshot writes — the leaf is absent
     by topology, and there is no parent directory to open, create, or remove
-    (#796 review). A symlink on the way is the redirection probe's to refuse,
-    never a file here.
+    (#796 review); so is a proved-absent parent beneath it (``a/b`` for the
+    leaf ``a/b/c``). A symlink on the way is the redirection probe's to
+    refuse, never a file here — unless the receipt captured that very path
+    as a symlink (``captured_links``): then ``git restore`` put it back the
+    same way, the transition was symlink-to-directory, and the leaf beneath
+    it is absent by topology too (#796 review).
     """
     ancestor = target.parent
     while ancestor != repo:
         if ancestor.is_symlink():
-            return False
+            return ancestor.relative_to(repo).as_posix() in captured_links
         if ancestor.exists() and not ancestor.is_dir():
             return True
         ancestor = ancestor.parent
     return False
+
+
+def _captured_links(snapshots: Iterable[dict[str, object]]) -> frozenset[str]:
+    """Paths the receipt captured as symlinks: their own restored shape."""
+    return frozenset(str(entry["path"]) for entry in snapshots if entry["state"] == "symlink")
 
 
 def _expected_absent_directory_is_owned(repo: Path, target: Path) -> bool:
@@ -2002,9 +2011,10 @@ def _restore_receipt_snapshots_unanchored(
 ) -> None:
     """Checked path fallback for hosts without descriptor-relative syscalls."""
     prepared = [(entry, _confined_repo_operand(repo, entry["path"])[1]) for entry in snapshots]
+    links = _captured_links(snapshots)
     for entry, target in prepared:
         if entry["state"] == "absent":
-            if _absent_beneath_a_file(repo, target):
+            if _absent_beneath_a_file(repo, target, links):
                 continue
             if target.is_dir() and not target.is_symlink():
                 if not _expected_absent_directory_is_owned(repo, target):
@@ -2070,14 +2080,17 @@ def _restore_receipt_snapshots(
         ]
         # Validate every lexical destination and its currently existing ancestry
         # before creating a missing parent for any one destination.
-        for _entry, target in destinations:
+        links = _captured_links(snapshots)
+        for entry, target in destinations:
+            if entry["state"] == "absent" and _absent_beneath_a_file(repo, target, links):
+                continue
             probe = target.parent
             while not probe.exists() and not probe.is_symlink() and probe != repo:
                 probe = probe.parent
             if probe.is_symlink():
                 raise IntegrationRestoreError("target restoration parent is redirected")
         for entry, target in destinations:
-            if entry["state"] == "absent" and _absent_beneath_a_file(repo, target):
+            if entry["state"] == "absent" and _absent_beneath_a_file(repo, target, links):
                 continue
             prepared.append((entry, target, _open_restore_parent(repo, target.parent)))
         for entry, target, parent_fd in prepared:
@@ -2128,6 +2141,8 @@ def _restore_receipt_snapshots(
         )
         for rel in absent_parents:
             path = repo / rel
+            if _absent_beneath_a_file(repo, path, links):
+                continue  # absent by topology: the file above it is back
             parent_fd = _open_restore_parent(repo, path.parent)
             try:
                 try:
