@@ -900,7 +900,11 @@ def _capture_integration_state_into(
             parent = parent.parent
         try:
             mode = candidate.lstat().st_mode
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
+            # `NotADirectoryError`: an ancestor is a file — git names both
+            # sides of a tracked file/directory transition (`a` deleted,
+            # `a/b` added), and the leaf beneath the file is absent (#796
+            # review); the file itself is captured under its own path.
             index = _index_state(repo, validated)
             snapshots.append(
                 {
@@ -1615,7 +1619,26 @@ def _integration_restore_paths(
 
 
 def _restore_paths_from_stdin(repo: Path, old_revision: str, paths: Iterable[str]) -> None:
-    selected = list(dict.fromkeys(paths))
+    """Restore ``paths`` — index and worktree — to ``old_revision``.
+
+    A path beneath another listed path is dropped: git names both sides of a
+    tracked file/directory transition (``a`` deleted, ``a/b`` added), and
+    ``restore`` refuses the pair — ``pathspec 'a/b' did not match`` once ``a``
+    is a file in the source — while the pathspec ``a`` alone restores the
+    whole old shape, in either direction, since a pathspec covers its subtree
+    (#796 review). A listed ancestor is always a file, symlink, or gitlink on
+    one side (``diff --name-only`` names leaves, never trees), so nothing
+    beneath it is a separate restore.
+    """
+    ordered = list(dict.fromkeys(_portable_integration_path(path) for path in paths))
+    listed = set(ordered)
+    selected = [
+        path
+        for path in ordered
+        if not any(
+            "/".join(path.split("/")[:depth]) in listed for depth in range(1, path.count("/") + 1)
+        )
+    ]
     if not selected:
         return
     payload = b"".join(os.fsencode(_portable_integration_path(path)) + b"\0" for path in selected)
@@ -1842,6 +1865,26 @@ def _remove_tree_at(parent_fd: int, name: str) -> None:
     os.fsync(parent_fd)
 
 
+def _absent_beneath_a_file(repo: Path, target: Path) -> bool:
+    """Whether an expected-absent ``target`` sits beneath an ancestor that is a file.
+
+    The receipt captures the leaf beneath a tracked file/directory transition
+    (``a/b`` while ``a`` is a file) as absent; once the file is back — ``git
+    restore`` put it there ahead of the snapshot writes — the leaf is absent
+    by topology, and there is no parent directory to open, create, or remove
+    (#796 review). A symlink on the way is the redirection probe's to refuse,
+    never a file here.
+    """
+    ancestor = target.parent
+    while ancestor != repo:
+        if ancestor.is_symlink():
+            return False
+        if ancestor.exists() and not ancestor.is_dir():
+            return True
+        ancestor = ancestor.parent
+    return False
+
+
 def _expected_absent_directory_is_owned(repo: Path, target: Path) -> bool:
     """Whether a directory at a receipt-proved-absent path is the attempt's to remove.
 
@@ -1873,6 +1916,8 @@ def _restore_receipt_snapshots_unanchored(
     prepared = [(entry, _confined_repo_operand(repo, entry["path"])[1]) for entry in snapshots]
     for entry, target in prepared:
         if entry["state"] == "absent":
+            if _absent_beneath_a_file(repo, target):
+                continue
             if target.is_dir() and not target.is_symlink():
                 if not _expected_absent_directory_is_owned(repo, target):
                     raise IntegrationRestoreError(
@@ -1944,6 +1989,8 @@ def _restore_receipt_snapshots(
             if probe.is_symlink():
                 raise IntegrationRestoreError("target restoration parent is redirected")
         for entry, target in destinations:
+            if entry["state"] == "absent" and _absent_beneath_a_file(repo, target):
+                continue
             prepared.append((entry, target, _open_restore_parent(repo, target.parent)))
         for entry, target, parent_fd in prepared:
             state = entry["state"]

@@ -515,7 +515,11 @@ breaking changes may land in a minor release.
   operator's unstaged edit elsewhere during the merge window no longer fails a
   completed restore or blocks its replay; a refused no-ref-update attempt records
   its unchanged revision so the receipt stays replayable instead of reading as
-  malformed on resume.
+  malformed on resume. A unit that turns a tracked file into a directory
+  (`a` deleted, `a/b` added) integrates — the capture read the leaf beneath
+  the file as a fault rather than as absent, pausing before the merge and
+  again on every resume — and its refusal restores the old shape through the
+  parent path alone, git refusing the pair.
 
 - Recover sweep migration publication faults without persisting unearned `DONE`
   state (DW-296/DW-297). Persist accepted baseline/rewrite records, clear a

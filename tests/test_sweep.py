@@ -27404,6 +27404,48 @@ def test_target_hook_changing_a_path_outside_the_incoming_set_is_refused(
     assert durable.commit_sha not in (None, durable.baseline_commit)
 
 
+@pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
+def test_bundle_replacing_a_tracked_file_with_a_directory_integrates(project, strategy):
+    """A unit that turns a tracked file into a directory (`a` deleted, `a/b`
+    added) is a valid transition git names on both sides; the receipt's
+    capture `lstat`ed `a/b` through the file `a` and treated the
+    `NotADirectoryError` as a fault, so every receipt-backed integration of it
+    paused before the merge and paused again on every resume (Codex, #796
+    review). End to end, on every strategy: the merge lands, `unit-merged` is
+    recorded, the target holds the directory.
+
+    Ablation: catch `FileNotFoundError` alone in the capture and every row
+    reds on `summary.paused`."""
+    effect, _expected = _ignored_publication_bundle(project)
+    (project.project / "a").write_text("a file\n")
+    git(project.project, "add", "--", "a")
+    git(project.project, "commit", "-q", "-m", "a is a file")
+
+    def replaces_a_file(spec):
+        result = effect(spec)
+        (spec.cwd / "a").unlink()
+        (spec.cwd / "a").mkdir()
+        (spec.cwd / "a" / "b").write_text("a directory\n")  # committed by the run
+        return result
+
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), replaces_a_file],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert [session.role for session in adapter.sessions] == ["triage", "dev"]
+    assert "unit-merged" in journal_kinds(engine)
+    assert (project.project / "a" / "b").read_text() == "a directory\n"
+    assert git(project.project, "status", "--porcelain", "--untracked-files=no") == ""
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is None
+    assert durable.artifact_publication_complete
+
+
 @pytest.mark.parametrize(
     ("strategy", "hook_name"),
     [

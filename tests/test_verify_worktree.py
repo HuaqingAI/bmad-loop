@@ -924,6 +924,88 @@ def test_receipt_restores_populated_submodule_checkout(project, tmp_path):
     assert git(repo, "status", "--porcelain") == ""
 
 
+@pytest.mark.parametrize("shape", ["file-to-directory", "directory-to-file"])
+def test_receipt_captures_and_restores_a_tracked_entry_type_change(project, tmp_path, shape):
+    """`branch_incoming_paths` names both sides of a tracked file/directory
+    transition (`a` deleted, `a/b` added), and capturing `a/b` while `a` is
+    still a file `lstat`s through a file: `NotADirectoryError`, which the
+    capture treated as a fault rather than as absence, so every receipt-backed
+    integration of that valid transition paused before the merge and paused
+    again on every resume (Codex, #796 review). A leaf beneath a file is
+    absent — and the restore, which opens every snapshot's parent as a
+    directory before writing (and `mkdir`s it on the checked-path host), must
+    leave such an entry alone once `git restore` has put the file back: it is
+    absent by topology, nothing to open, nothing to remove. The reverse
+    transition (`d/x` deleted, `d` now a file) captures `d` as a tracked
+    directory (no snapshot of its own) and `d/x` as the reversible leaf.
+
+    Ablation: catch `FileNotFoundError` alone in the capture and the
+    `file-to-directory` row reds on the raise; drop the topology skip from
+    the restore and it reds on the restore's parent opening."""
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    if shape == "file-to-directory":
+        (repo / "a").write_text("a file\n")
+        git(repo, "add", "--", "a")
+        git(repo, "commit", "-q", "-m", "a is a file")
+        incoming = ("a", "a/b")
+    else:
+        (repo / "d").mkdir()
+        (repo / "d" / "x").write_text("a directory\n")
+        git(repo, "add", "--", "d/x")
+        git(repo, "commit", "-q", "-m", "d is a directory")
+        incoming = ("d/x", "d")
+    old = verify.rev_parse_head(repo)
+
+    snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, incoming)
+
+    by_path = {entry["path"]: entry for entry in snapshots}
+    if shape == "file-to-directory":
+        assert by_path["a"]["state"] == "regular"
+        assert by_path["a/b"]["state"] == "absent" and by_path["a/b"]["absent_parents"] == []
+        git(repo, "rm", "-q", "--", "a")
+        (repo / "a").mkdir()
+        (repo / "a" / "b").write_text("a directory\n")
+        git(repo, "add", "--", "a/b")
+        git(repo, "commit", "-q", "-m", "integrated: a becomes a directory")
+    else:
+        assert set(by_path) == {"d/x"} and by_path["d/x"]["state"] == "regular"
+        git(repo, "rm", "-q", "--", "d/x")
+        (repo / "d").write_text("a file\n")
+        git(repo, "add", "--", "d")
+        git(repo, "commit", "-q", "-m", "integrated: d becomes a file")
+    new = verify.rev_parse_head(repo)
+
+    verify.restore_integration_ref(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity="c" * 32,
+    )
+
+    assert verify.rev_parse_head(repo) == old
+    assert git(repo, "status", "--porcelain", "-uall") == ""
+    if shape == "file-to-directory":
+        assert (repo / "a").read_text() == "a file\n"
+    else:
+        assert (repo / "d" / "x").read_text() == "a directory\n"
+    assert verify.integration_restoration_complete(
+        repo,
+        "refs/heads/main",
+        old_revision=old,
+        new_revision=new,
+        run_dir=run_dir,
+        snapshots=snapshots,
+        submodules=submodules,
+        operation_identity="c" * 32,
+    )
+
+
 def test_receipt_detects_index_only_submodule_gitlink_drift(project, tmp_path):
     repo = project.project
     origin, checkout, old_submodule = _add_test_submodule(repo, tmp_path)
