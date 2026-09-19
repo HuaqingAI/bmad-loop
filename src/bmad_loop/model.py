@@ -212,6 +212,32 @@ def _rebased_on(path: str | None, root: Path) -> str | None:
     return str(root / path)
 
 
+def _baseline_artifacts_from(raw: object) -> dict[str, list[int] | None] | None:
+    """Rehydrate `StoryTask.baseline_artifacts` from state.json: a mapping of
+    path -> `[mtime_ns, size]` or `None`. Anything else — a pre-upgrade absent
+    key, or a shape a hand edit mangled — reads as "no snapshot", on which the
+    artifact-only receipt refuses rather than guesses."""
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, list[int] | None] = {}
+    for key, value in raw.items():
+        if value is None:
+            out[str(key)] = None
+        elif (
+            isinstance(value, list)
+            and len(value) == 2
+            # `bool` is an `int`; a `[true, 42]` is a mangled record, not a fingerprint
+            and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
+        ):
+            out[str(key)] = [value[0], value[1]]
+        else:
+            # Never `int(...)` a value here: a `["bad", 42]` or `[null, 42]` must
+            # read as "no snapshot", not raise out of `from_dict` and keep the
+            # whole run state — and `bmad-loop resume` — from loading.
+            return None
+    return out
+
+
 @dataclass
 class StoryTask:
     story_key: str
@@ -273,6 +299,15 @@ class StoryTask:
     # user already had on disk are never deleted. None = pre-upgrade run (no
     # snapshot); rollback then removes no untracked files at all.
     baseline_untracked: list[str] | None = None
+    # Attempt-start fingerprints (`[st_mtime_ns, st_size]`, or None when the entry
+    # was listed but could not be measured) of every IGNORED entry under
+    # `implementation_artifacts`, keyed by repo-relative posix path — the baseline
+    # the bundle path's artifact-only receipt (DW-273) measures ownership against,
+    # since ignored paths have no git baseline of their own. Stamped beside the
+    # pair above at every genuinely new attempt, cleared with them. None = no
+    # snapshot (a story task, a pre-upgrade run, or a capture that degraded), on
+    # which the receipt refuses.
+    baseline_artifacts: dict[str, list[int] | None] | None = None
     # Deferred-work bookkeeping is persisted before its readers land so an older
     # state.json remains resumable throughout the forward-port.  The nullable
     # snapshot text and its captured flag are deliberately separate: None means
@@ -502,6 +537,7 @@ class StoryTask:
             "migration_ledger_doubt_owned": self.migration_ledger_doubt_owned,
             "baseline_commit": self.baseline_commit,
             "baseline_untracked": self.baseline_untracked,
+            "baseline_artifacts": self.baseline_artifacts,
             "baseline_ledger_digest": self.baseline_ledger_digest,
             "pre_harvest_ledger": self.pre_harvest_ledger,
             "pre_harvest_ledger_captured": self.pre_harvest_ledger_captured,
@@ -634,6 +670,7 @@ class StoryTask:
         self.integration_attempt = None
         self.baseline_commit = None
         self.baseline_untracked = None
+        self.baseline_artifacts = None
 
     def rebase_spec_paths_on(self, root: Path) -> None:
         """Re-absolutize both spec-ownership paths against the tree that owns them.
@@ -723,6 +760,7 @@ class StoryTask:
                 if d.get("baseline_untracked") is not None
                 else None
             ),
+            baseline_artifacts=_baseline_artifacts_from(d.get("baseline_artifacts")),
             baseline_ledger_digest=(
                 str(d.get("baseline_ledger_digest"))
                 if d.get("baseline_ledger_digest") is not None
@@ -940,6 +978,16 @@ class RunState:
     # healthy — it could have armed an instance latch and lost it at the same
     # interruption this field closes.
     sweep_ledger_in_doubt: bool = False
+    # sweep runs only: a ledger write this run published whose commit has not yet
+    # landed. Latched BEFORE the already-resolved close and each decision effect
+    # write, cleared by the ledger-family `_commit_ledger` once git says the file
+    # is at HEAD, and settled at the top of a resume. The two sites gate their own
+    # commit on THIS invocation's write result (DW-183/DW-185), and a process that
+    # dies between the publish and the commit replays as an invocation that wrote
+    # nothing — so without the debt on disk the closure the journal already claims
+    # stays dirty ahead of the cycle's bundles. A pre-latch `state.json` loads
+    # False and resumes exactly as before.
+    sweep_ledger_commit_owed: bool = False
     # auto-sweep triggers already fired this run (e.g. "epic-1", "run-end");
     # guards re-fire on resume
     sweeps_triggered: list[str] = field(default_factory=list)
@@ -1035,6 +1083,7 @@ class RunState:
             "sweep_dropped_decisions": self.sweep_dropped_decisions,
             "sweep_unlanded_decisions": self.sweep_unlanded_decisions,
             "sweep_ledger_in_doubt": self.sweep_ledger_in_doubt,
+            "sweep_ledger_commit_owed": self.sweep_ledger_commit_owed,
             "sweeps_triggered": self.sweeps_triggered,
             "sweeps_refused": self.sweeps_refused,
             "target_branch": self.target_branch,
@@ -1073,6 +1122,7 @@ class RunState:
             sweep_dropped_decisions=[str(s) for s in d.get("sweep_dropped_decisions", [])],
             sweep_unlanded_decisions=[str(s) for s in d.get("sweep_unlanded_decisions", [])],
             sweep_ledger_in_doubt=bool(d.get("sweep_ledger_in_doubt", False)),
+            sweep_ledger_commit_owed=bool(d.get("sweep_ledger_commit_owed", False)),
             sweeps_triggered=[str(s) for s in d.get("sweeps_triggered", [])],
             sweeps_refused={str(k): str(v) for k, v in d.get("sweeps_refused", {}).items()},
             target_branch=str(d.get("target_branch", "")),

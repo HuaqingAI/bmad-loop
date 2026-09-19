@@ -191,6 +191,12 @@ def _prunable_ids(data: dict[str, dict], open_ids: set[str]) -> list[str]:
     return [k for k in data if k not in open_ids]
 
 
+def _droppable(data: dict[str, dict], dw_id: str, answer: object) -> bool:
+    """Whether `drop_pre_answer` removes `dw_id`: present, and still `answer`.
+    Pure and shared by its probe and its hold, for `_prunable_ids`'s reason."""
+    return dw_id in data and data[dw_id] == answer
+
+
 def prune_pre_answers(project: Path, open_ids: set[str]) -> list[str]:
     """Drop store entries whose DW id is no longer open (built or closed). No-op
     write when nothing is dropped. Returns the dropped ids.
@@ -230,29 +236,61 @@ def prune_pre_answers(project: Path, open_ids: set[str]) -> list[str]:
         return dropped
 
 
-def drop_pre_answer(project: Path, dw_id: str) -> bool:
-    """Remove ONE id's entry, returning whether an entry was actually there. The
-    single-id sibling of `prune_pre_answers` above, and public for the same reason
-    that one is: a sweep that has just dropped a stored answer as stale (DW-143)
-    must be able to retire the entry that fed it without reaching into
-    `_write_store`, which is this module's private writer.
+def drop_pre_answer(project: Path, dw_id: str, *, answer: object) -> bool:
+    """Remove ONE id's entry — but only while it still IS `answer` — returning
+    whether an entry was removed. The single-id sibling of `prune_pre_answers`
+    above, and public for the same reason that one is: a sweep that has just
+    dropped a stored answer as stale (DW-143) must be able to retire the entry that
+    fed it without reaching into `_write_store`, which is this module's private
+    writer.
+
+    `answer` is the value the caller is retiring, and the entry goes only when the
+    store still holds exactly that value. The caller's copy is what a sweep READ:
+    `_decisions_phase` seeds a project pre-answer into `<run>/decisions.json` and
+    from then on the run-local copy wins, so a human who re-answers the id out of
+    band while that run is paused (`pending_missed_decisions` screens against this
+    store alone, never against a run's file) leaves a NEWER entry here that the
+    resumed run has never evaluated. An unconditional removal keyed on the id
+    deleted that replacement — and committed the deletion — on the strength of a
+    stale copy it had superseded. Equality is the whole provenance test: a seeded
+    copy round-trips through JSON unchanged, so it compares equal to the entry it
+    came from and unequal to anything a human wrote afterwards, and an interactive
+    in-run answer never equals a store entry at all (different shape), so an id a
+    run answered itself never reaches this store through the drop.
+
+    The compare and the delete are ONE step under the hold: without it a
+    replacement recorded between the read and the write — by `bmad-loop decisions`
+    in another process — is precisely the value the compare exists to spare, and
+    the stale snapshot would overwrite it. Under the lock a replacement lands
+    either before the read (compares unequal, spared) or after the write
+    (untouched). Equality then IS the provenance test, with one deliberate
+    consequence: a re-answer that is byte-for-byte the stale entry (same option,
+    same day — `answered_at` is day-precise) is the same answer, stale by the same
+    evidence, and the next run would seed, drop and prune it anyway; retiring it
+    now costs the human one drop-and-notify cycle they were owed nothing by, not
+    an answer. A store revision would refuse that removal at the price of a store
+    schema change, for an entry whose fate is identical either way.
 
     Same read-modify-write shape, same no-op-when-nothing-changes discipline: an
-    absent id writes nothing at all, so a drop whose answer only ever lived in
-    `<run>/decisions.json` leaves the project store's bytes (and mtime) untouched.
-    A removal goes through `_write_store`, so an operator-locked store still raises
-    `PermissionError` rather than silently skipping — deleting a human-authored
-    answer is a store write, never a repair. The `PermissionError` is raised under
-    the hold and propagates through it; the lock is released on the way out.
+    absent id, or one holding a different value, writes nothing at all, so a drop
+    whose answer only ever lived in `<run>/decisions.json` leaves the project
+    store's bytes (and mtime) untouched. A removal goes through `_write_store`, so
+    an operator-locked store still raises `PermissionError` rather than silently
+    skipping — deleting a human-authored answer is a store write, never a repair.
+    The `PermissionError` is raised under the hold and propagates through it; the
+    lock is released on the way out.
 
     ONE locked read->edit->write (#286/#469, DW-161) with an ADVISORY pre-lock
-    probe (#736): an absent id is answered from the probe read, so the no-op keeps
-    taking no lock at all. That is load-bearing rather than an optimization — the
-    absent-id case is the ordinary one (a stale answer that only ever lived in
-    `<run>/decisions.json` has no store entry), `_prune_dropped_pre_answer`
-    swallows nothing, and without the probe those calls would newly raise
-    `runs.StateRootError` where no state root is derivable, or a Windows
-    acquisition timeout, on a call that used to return `False` in silence.
+    probe (#736): an absent or replaced id is answered from the probe read, so the
+    no-op keeps taking no lock at all. That is load-bearing rather than an
+    optimization — the absent-id case is the ordinary one (a stale answer that
+    only ever lived in `<run>/decisions.json` has no store entry),
+    `_prune_dropped_pre_answer` swallows nothing, and without the probe those
+    calls would newly raise `runs.StateRootError` where no state root is
+    derivable, or a Windows acquisition timeout, on a call that used to return
+    `False` in silence. Probe and hold both decide through :func:`_droppable`,
+    for the reason `_prunable_ids` gives: the probe may only skip the lock on the
+    exact question the hold would ask.
 
     The probe needs no `try:`, and for a different reason than
     `record_decision`'s has one. That probe guards a raw `read_text` so a fault
@@ -263,11 +301,11 @@ def drop_pre_answer(project: Path, dw_id: str) -> bool:
     helper: PRESERVED behavior, not a new degradation, and consistent with this
     module's refusal to repair the store on the way past."""
     path = store_path(project)
-    if dw_id not in load_pre_answers(project):
+    if not _droppable(load_pre_answers(project), dw_id, answer):
         return False  # ADVISORY probe (#736): nothing to write, so nothing to serialize
     with deferredwork.ledger_lock(path):
         data = load_pre_answers(project)
-        if dw_id not in data:
+        if not _droppable(data, dw_id, answer):
             return False
         del data[dw_id]
         _write_store(project, data)

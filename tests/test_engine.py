@@ -11138,6 +11138,39 @@ def test_dispatch_pauses_when_the_ledger_cannot_be_read(project, monkeypatch, fa
     assert [e["kind"] for e in engine.journal.entries()].count("story-gate-unreadable") == 1
 
 
+@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
+def test_dispatch_pauses_when_the_ledger_path_cannot_be_encoded(project, monkeypatch, fault):
+    """The `ValueError` class of the gate's `except`, driven on its own. `Path.stat`
+    raises a plain `ValueError` for an embedded NUL in the configured
+    `deferred_work` path and a `UnicodeEncodeError` (a `ValueError` subclass) for
+    a lone surrogate — neither an `OSError`, and both a path `is_file()` had
+    answered False for. Before DW-266 that False read as an empty ledger and the
+    gate failed OPEN; after it the probe raised past a tuple spelled
+    `(OSError, UnicodeDecodeError)` and the run CRASHED at dispatch (#794 review).
+    An observation arm attributes a non-encodable path as a fault, never as
+    absence (`deferredwork.probe_absence`'s contract), so the verdict is the
+    same `PAUSE_STORY_GATE` pause a refused `stat` takes, with the fault's text
+    in the reason. Injected through `fault_metadata_probe(..., "stat", error=)`
+    from `NUL_PATH_RESOLVE_FAULTS` so both classes are driven on every platform.
+    Ablation: narrow the gate's tuple back to `(OSError, UnicodeDecodeError)` and
+    both rows red with the injected fault escaping `engine.run()`; the
+    `PermissionError` rows above stay green."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_gated_ledger(project, {"DW-1": ("open", ["gate: 9-9"])})
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")])
+    fault_metadata_probe(monkeypatch, project.deferred_work, "stat", error=fault)
+
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert saved.paused_stage == PAUSE_STORY_GATE
+    assert adapter.sessions == []
+    assert "cannot be read" in saved.paused_reason and str(fault) in saved.paused_reason
+    unreadable = [e for e in engine.journal.entries() if e["kind"] == "story-gate-unreadable"]
+    assert len(unreadable) == 1 and unreadable[0]["error"] == str(fault)
+
+
 def test_dispatch_pauses_on_a_symlink_loop_at_the_ledgers_name(project):
     """A REAL OS refusal ahead of the gate, not an injected one: a symlink cycle at
     the ledger's name is a path that exists and cannot be read, and `is_file()`
@@ -16814,6 +16847,90 @@ def test_pending_salvage_refile_survives_interrupted_commit_handoff(
     # Both handoffs ran salvage's authoritative verification; the second did
     # not publish again because the successful refile was already persisted.
     salvages = [e for e in recovered.journal.entries() if e["kind"] == "review-timeout-salvage"]
+    assert len(salvages) == 2 and salvages[-1]["refiled"] is None
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+@pytest.mark.parametrize("interruption", ["notification", "commit-gate"])
+def test_first_salvage_latches_before_its_handoff_save(
+    project, monkeypatch, rollback, interruption
+):
+    """The row above replays a salvage the repair-pause arm had already latched;
+    this one is the FIRST, fault-free salvage (#794 review). Its handoff save —
+    refile published, recommendation cleared — was the last save before
+    `_commit`'s COMMITTING save, with `gates.notify` and the `pre_commit_gate`
+    workflow between them, and the latch was set only by the `LedgerReadError`
+    arm. A host death in that window therefore persisted REVIEW_VERIFY over a
+    timeout record with the latch False: `_pending_salvage_session` declined,
+    `_resumable_session` never matches a non-`completed` record, and resume took
+    restart recovery — under rollback it erased the refile just published and
+    re-drove dev AND review over finished, verify-green work; without it, it
+    paused for manual recovery. Latched, resume replays this timeout with zero
+    sessions, re-verifies the preserved product, and appends nothing twice.
+
+    Ablation: drop the `task.salvage_refile_pending = True` ahead of the salvage's
+    handoff save and every row reds on `resume-restart` (rollback rows also on
+    the two re-driven sessions; no-rollback rows on the pause)."""
+    from bmad_loop import gates
+
+    class PowerLoss(BaseException):
+        pass
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    ledger = project.deferred_work
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), SessionResult(status="timeout")],
+        policy=dataclasses.replace(_salvage_policy(), scm=ScmPolicy(rollback_on_failure=rollback)),
+    )
+    if interruption == "notification":
+
+        def notify_then_die(*args, **kwargs):
+            raise PowerLoss
+
+        monkeypatch.setattr(gates, "notify", notify_then_die)
+    else:
+        original_workflows = engine._run_workflows
+
+        def gate_then_die(stage, task, seq):
+            if stage != "pre_commit_gate":
+                return original_workflows(stage, task, seq)
+            raise PowerLoss
+
+        monkeypatch.setattr(engine, "_run_workflows", gate_then_die)
+
+    with pytest.raises(PowerLoss):
+        engine.run()
+
+    saved = load_state(engine.run_dir).tasks["1-1-a"]
+    assert saved.phase == Phase.REVIEW_VERIFY and saved.salvage_refile_pending
+    assert saved.followup_review_recommended is False and saved.commit_sha is None
+    assert ledger.read_text(encoding="utf-8").count("origin: review-timeout-salvage") == 1
+    product = (project.project / "src.txt").read_bytes()
+    monkeypatch.undo()
+    # the script is a trap: a replay drives no session, so a restart would consume it
+    resumed, adapter = resume_engine(
+        project, engine, [dev_effect(project, "1-1-a"), SessionResult(status="timeout")]
+    )
+
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert len(adapter.sessions) == 0
+    kinds = [e["kind"] for e in resumed.journal.entries()]
+    assert "resume-restart" not in kinds and "resume-verify" in kinds
+    assert (project.project / "src.txt").read_bytes() == product
+    final = load_state(resumed.run_dir).tasks["1-1-a"]
+    assert final.phase == Phase.DONE and not final.salvage_refile_pending
+    assert (final.attempt, final.review_cycle, final.generation) == (
+        saved.attempt,
+        saved.review_cycle,
+        saved.generation,
+    )
+    assert ledger.read_text(encoding="utf-8").count("origin: review-timeout-salvage") == 1
+    # Both handoffs ran salvage's authoritative verification; the replay did not
+    # publish again because the first run's refile was already persisted.
+    salvages = [e for e in resumed.journal.entries() if e["kind"] == "review-timeout-salvage"]
     assert len(salvages) == 2 and salvages[-1]["refiled"] is None
 
 

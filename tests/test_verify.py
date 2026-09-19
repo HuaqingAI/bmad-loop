@@ -2820,6 +2820,12 @@ def test_verify_commands_undecodable_failure_stays_fixable_retry(tmp_path):
 def make_bundle_task(paths, dw_ids=("DW-1", "DW-2")):
     task = StoryTask(story_key="dw-test-bundle", epic=0, dw_ids=list(dw_ids))
     task.baseline_commit = verify.rev_parse_head(paths.project)
+    # the attempt-start snapshot `SweepEngine._artifact_baseline` stamps beside
+    # the baseline, so the receipt (DW-273) can tell this attempt's residue from
+    # what was already there — `None` where the dir cannot be listed at all
+    task.baseline_artifacts = verify.artifact_dir_snapshot(
+        paths.repo_root, paths.implementation_artifacts
+    )
     return task
 
 
@@ -2926,6 +2932,127 @@ def test_verify_dev_bundle_accepts_an_asserted_artifact_only_receipt(project):
     assert out.artifact_only_accepted is True
     assert out.artifact_only_residue == 2
     assert task.spec_file == str(sp)
+
+
+def test_verify_dev_bundle_refuses_ignored_residue_that_predates_the_attempt(project):
+    """The ownership half of the receipt. Everything under the artifacts dir was
+    already there — with the same fingerprint — when the attempt's snapshot was
+    taken, so an asserted bundle that wrote nothing is refused with the verbatim
+    prefix and a cause naming the listing's size and that none of it is this
+    attempt's; nothing is accepted, no count is carried.
+
+    Ablation, MEASURED: make `_artifact_dir_owned_entries` return every listed
+    entry (drop the baseline comparison) and this passes the gate with
+    `artifact_only_residue == 2`."""
+    task, sp = artifact_only_bundle(project)
+    (project.implementation_artifacts / "erratum-note.md").write_text("note\n", encoding="utf-8")
+    # re-snapshot AFTER the residue: the attempt "starts" now and writes nothing
+    task.baseline_artifacts = verify.artifact_dir_snapshot(
+        project.repo_root, project.implementation_artifacts
+    )
+    assert task.baseline_artifacts is not None and len(task.baseline_artifacts) == 2
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "artifact-only receipt refused" in out.reason
+    assert "lists 2 ignored entries, none created or changed by this attempt" in out.reason
+    assert out.artifact_only_accepted is False
+    assert out.artifact_only_residue is None
+
+
+def test_verify_dev_bundle_credits_a_pre_existing_entry_the_attempt_changed(project):
+    """ "Created OR changed": an entry that was in the snapshot but now carries a
+    different fingerprint — rewritten with more bytes, so size differs whatever
+    the filesystem's mtime granularity — is this attempt's, and is the ONLY one
+    counted beside an untouched sibling.
+
+    Ablation: compare presence alone (`rel not in baseline`) and this refuses."""
+    task, sp = artifact_only_bundle(project)
+    sibling = project.implementation_artifacts / "erratum-note.md"
+    sibling.write_text("note\n", encoding="utf-8")
+    task.baseline_artifacts = verify.artifact_dir_snapshot(
+        project.repo_root, project.implementation_artifacts
+    )
+    # the attempt: append to the spec, leave the sibling alone
+    sp.write_text(sp.read_text(encoding="utf-8") + "\n## Erratum\n\nfixed\n", encoding="utf-8")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert out.ok
+    assert out.artifact_only_accepted is True
+    assert out.artifact_only_residue == 1
+
+
+def test_verify_dev_bundle_without_a_snapshot_refuses_the_receipt(project):
+    """No attempt-start snapshot on the task — a pre-upgrade run, a story task
+    handed to the bundle verifier, or a capture that degraded — is uncertainty,
+    and uncertainty keeps the gate strict: refused with a cause naming the missing
+    snapshot (not "outside the tree": the dir IS listable, and the cause says so
+    by not claiming otherwise).
+
+    Ablation: treat a `None` snapshot as `{}` and this accepts with a count of 1."""
+    task, sp = artifact_only_bundle(project)
+    task.baseline_artifacts = None
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "no attempt-start snapshot" in out.reason
+    assert "outside the code tree" not in out.reason
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_unmeasurable_snapshot_entry_is_never_credited(project):
+    """An entry the snapshot lists as `None` — present at attempt start but
+    `lstat` refused it — is not credited even though it measures now: a
+    fingerprint that could not be taken proves no change. The sibling the attempt
+    genuinely created still counts, alone.
+
+    Ablation: treat a `None` baseline fingerprint as "absent" and the count
+    reads 2."""
+    task, sp = artifact_only_bundle(project)
+    task.baseline_artifacts = verify.artifact_dir_snapshot(
+        project.repo_root, project.implementation_artifacts
+    )
+    assert task.baseline_artifacts is not None
+    [spec_rel] = list(task.baseline_artifacts)
+    task.baseline_artifacts[spec_rel] = None
+    (project.implementation_artifacts / "erratum-note.md").write_text("note\n", encoding="utf-8")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert out.ok
+    assert out.artifact_only_accepted is True
+    assert out.artifact_only_residue == 1
+
+
+def test_artifact_dir_snapshot_keys_are_paths_git_would_otherwise_quote(project):
+    """The listing is read as `-z` bytes and `os.fsdecode`d, so a non-ASCII
+    artifact name is a key the receipt can `lstat` — under `core.quotePath`'s
+    default the ordinary porcelain would have C-quoted it (`"\\303\\251..."`), a
+    record no fingerprint can be taken of. Pins the decode by the fingerprint:
+    the snapshot carries the file's real size.
+
+    Ablation: read `--porcelain` text lines instead of `-z` bytes and the key
+    is the quoted spelling, whose `lstat` fails and whose fingerprint is `None`."""
+    ignore_artifacts_before_baseline(project)
+    named = project.implementation_artifacts / "r\u00e9sum\u00e9-erratum.md"
+    named.parent.mkdir(parents=True, exist_ok=True)
+    named.write_bytes(b"12345")
+
+    snapshot = verify.artifact_dir_snapshot(project.repo_root, project.implementation_artifacts)
+
+    assert snapshot is not None
+    rel = named.relative_to(project.repo_root).as_posix()
+    assert list(snapshot) == [rel]
+    assert snapshot[rel] is not None and snapshot[rel][1] == 5
 
 
 def test_verify_dev_bundle_unasserted_artifact_only_tree_is_refused(project):
@@ -4270,6 +4397,39 @@ def test_verify_review_bundle_ledger_undecodable_degrades_to_retry(project):
     assert not out.ok and out.retryable and not out.fixable
     assert "deferred-work ledger unreadable" in out.reason
     assert "UnicodeDecodeError" in out.reason
+    assert "DW-1" not in out.reason  # not the "entries not marked done" verdict
+
+
+@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
+def test_verify_review_bundle_non_encodable_ledger_path_degrades_to_retry(
+    project, monkeypatch, fault
+):
+    """The `ValueError` class of this arm's `except`, driven at the PROBE rather
+    than the read. `Path.stat` raises a plain `ValueError` for an embedded NUL in
+    the configured `deferred_work` path and a `UnicodeEncodeError` (a `ValueError`
+    subclass) for a lone surrogate — neither an `OSError`, and both a path
+    `is_file()` had answered False for. Before DW-267 that False read as an empty
+    ledger and the verify retried, fixable, naming every id; after it the probe
+    raised past a tuple spelled `(OSError, UnicodeDecodeError)` and the verify
+    ABORTED (#794 review). An observation arm attributes a non-encodable path as a
+    fault, never as absence, so the outcome is the SAME shape as the two rows
+    above — retryable, not fixable, naming the fault's class. Injected through
+    `fault_metadata_probe(..., "stat", error=)` from `NUL_PATH_RESOLVE_FAULTS` so
+    both classes are driven on every platform.
+    Ablation: narrow the tuple back to `(OSError, UnicodeDecodeError)` and both
+    rows red with the injected fault escaping `verify_review_bundle`; the
+    `UnicodeDecodeError` row above stays green."""
+    task = make_bundle_task(project)
+    sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "done", task.baseline_commit)
+    task.spec_file = str(sp)
+    bundle_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
+    fault_metadata_probe(monkeypatch, project.deferred_work, "stat", error=fault)
+
+    out = verify.verify_review_bundle(task, project, Policy())
+    assert not out.ok and out.retryable and not out.fixable
+    assert "deferred-work ledger unreadable" in out.reason
+    assert type(fault).__name__ in out.reason and str(fault) in out.reason
     assert "DW-1" not in out.reason  # not the "entries not marked done" verdict
 
 
@@ -6377,6 +6537,90 @@ def test_finalize_commit_reports_head_probe_and_restore_failures(
     assert expected_restore_diagnostic in str(caught.value)
     assert isinstance(caught.value.__cause__, RuntimeError)
     assert str(caught.value.__cause__) == "HEAD identity probe failed"
+
+
+def test_finalize_commit_no_op_arm_validates_baseline_and_restores_chain_on_index_reset(project):
+    """The no-op arm sits INSIDE the validated window: "nothing staged" is read
+    off the index after the staged validator returned, so an index reset to
+    baseline in between (a concurrent writer) reads as a clean no-op while the
+    snapshot says a pending-tracked deliverable was staged. Before the fix
+    (#795 review) that returned `None` with HEAD soft-reset to baseline — the
+    accepted skill chain orphaned and the caller free to record baseline as the
+    commit. Now the committed-tree validator runs against baseline itself,
+    refuses, and the original chain AND index are restored; the deliverable is
+    still on disk, untracked, for the replay's `add -A`.
+
+    Ablation: drop the validator call from the no-op arm and this reds on
+    `pytest.raises` — `finalize_commit` returns None with HEAD at baseline."""
+    baseline = verify.rev_parse_head(project.project)
+    src = project.project / "src.txt"
+    src.write_text("skill commit bytes\n")
+    git(project.project, "add", "--", "src.txt")
+    git(project.project, "commit", "-q", "-m", "skill: implementation")
+    original_head = verify.rev_parse_head(project.project)
+    deliverable = project.project / "report.bin"
+    deliverable.write_bytes(b"pending-tracked deliverable")
+    rel = deliverable.relative_to(project.repo_root).as_posix()
+    accepted_oid = verify.git_normalized_blob_oid(project.repo_root, rel, deliverable)
+    validated = []
+
+    def snapshot_then_concurrent_reset():
+        snapshot = verify.staged_blob_oids(project.repo_root, (rel,))
+        git(project.project, "read-tree", baseline)  # the concurrent writer
+        return snapshot
+
+    def validate_commit(revision, staged_snapshot):
+        validated.append(revision)
+        if verify.revision_blob_oids(project.repo_root, revision, (rel,)) != staged_snapshot:
+            raise RuntimeError("committed deliverable drift")
+
+    with pytest.raises(RuntimeError, match="committed deliverable drift"):
+        verify.finalize_commit(
+            project.project,
+            baseline,
+            "story: via bmad-loop",
+            staged_validator=snapshot_then_concurrent_reset,
+            committed_validator=validate_commit,
+        )
+
+    assert validated == [baseline]  # validated against the tree "nothing" would leave
+    assert verify.rev_parse_head(project.project) == original_head
+    assert git(project.project, "show", "HEAD:src.txt") == "skill commit bytes"
+    assert deliverable.read_bytes() == b"pending-tracked deliverable"
+    assert (
+        verify.staged_blob_oids(project.repo_root, (rel,)) == {}
+    )  # index restored: untracked again
+    assert accepted_oid not in git(project.project, "ls-files", "-s")
+
+
+def test_finalize_commit_no_op_arm_returns_none_when_the_snapshot_is_already_in_baseline(project):
+    """The honest no-op: the deliverable's accepted bytes are in baseline already
+    and nothing else changed, so the validator agrees with baseline and the
+    pre-existing `None` contract stands — HEAD at baseline, no commit."""
+    deliverable = project.project / "report.bin"
+    deliverable.write_bytes(b"already landed")
+    git(project.project, "add", "--", "report.bin")
+    git(project.project, "commit", "-q", "-m", "baseline carries the deliverable")
+    baseline = verify.rev_parse_head(project.project)
+    rel = deliverable.relative_to(project.repo_root).as_posix()
+    validated = []
+
+    def validate_commit(revision, staged_snapshot):
+        validated.append(revision)
+        if verify.revision_blob_oids(project.repo_root, revision, (rel,)) != staged_snapshot:
+            raise RuntimeError("committed deliverable drift")
+
+    sha = verify.finalize_commit(
+        project.project,
+        baseline,
+        "story: via bmad-loop",
+        staged_validator=lambda: verify.staged_blob_oids(project.repo_root, (rel,)),
+        committed_validator=validate_commit,
+    )
+
+    assert sha is None
+    assert validated == [baseline]
+    assert verify.rev_parse_head(project.project) == baseline
 
 
 def test_staged_blob_oid_requires_an_exact_literal_stage_zero_blob(project):

@@ -65,24 +65,30 @@ STATUS_LINE_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 # The bundle leg's artifact-only assertion (DW-273): an `Artifact only: true` /
-# `artifact_only: true` / `Artifact-only: true` line (a non-empty run of space/
-# underscore/hyphen between the words, case-insensitive) inside the SAME marker.
-# It takes the same bulleted/bolded label and value shapes `STATUS_LINE_RE` tolerates
+# `artifact_only: true` / `Artifact-only: true` line (a run of AT LEAST ONE
+# space/underscore/hyphen between the words — `[ _-]+`, never `*`, so the fused
+# `Artifactonly: true` is no spelling of the contract and cannot relax the
+# bundle gate (#794 review) — case-insensitive) inside the SAME marker. It takes
+# the same bulleted/bolded label and value shapes `STATUS_LINE_RE` tolerates
 # (`**Artifact only:** **true**`, `- **Artifact only: true**`): every `**` is
 # optional and the closing one is consumed before the end-of-line anchor. Only
 # the literal value `true` ALONE on the line asserts — anchored to end of line so
 # prose such as
 # `Artifact only: true for the ledger, false for code` is no assertion; neither is
-# `false`, a bare label, or any other token. Every gap is HORIZONTAL whitespace of
-# any kind (`[^\S\r\n]` — space, tab, NBSP..., never CR/LF), so as with
-# `Status:`, the label and its value must share one line. `Artifact only:`
-# followed by `true` on the next line, or `Artifact only` with `: true` on the
-# next line, is a bare label and a stray token, not an assertion. Matches are
-# read through `_artifact_only_asserted`, which skips a match inside a fenced
-# block (a pasted example within the marker).
+# `false`, a bare label, or any other token. Every gap is `_HORIZONTAL_WS_RE`
+# (space, tab, NBSP... — never CR/LF nor the vertical separators `splitlines`
+# honours), so as with `Status:`, the label and its value must share one line.
+# `Artifact only:` followed by `true` on the next line, or `Artifact only` with
+# `: true` on the next line, is a bare label and a stray token, not an
+# assertion — and so is `Artifact only:\x0btrue`, which `[^\S\r\n]` admitted
+# while MULTILINE `$` anchors on LF alone (#795 review). Matches are read
+# through `_artifact_only_asserted`, which skips a match inside a fenced block
+# (a pasted example within the marker).
 ARTIFACT_ONLY_LINE_RE = re.compile(
-    r"^[^\S\r\n]*(?:[-*][^\S\r\n]*)?(?:\*\*)?artifact[ _-]+only(?:\*\*)?[^\S\r\n]*:"
-    r"(?:\*\*)?[^\S\r\n]*(?:\*\*)?[^\S\r\n]*true(?:\*\*)?[^\S\r\n]*$",
+    rf"^{_HORIZONTAL_WS_RE}*(?:[-*]{_HORIZONTAL_WS_RE}*)?"
+    rf"(?:\*\*)?artifact[ _-]+only(?:\*\*)?{_HORIZONTAL_WS_RE}*:"
+    rf"(?:\*\*)?{_HORIZONTAL_WS_RE}*(?:\*\*)?{_HORIZONTAL_WS_RE}*true"
+    rf"(?:\*\*)?{_HORIZONTAL_WS_RE}*$",
     re.IGNORECASE | re.MULTILINE,
 )
 

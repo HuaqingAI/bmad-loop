@@ -1770,6 +1770,66 @@ def test_unignored_untracked_declaration_must_be_tracked_by_preparation(
     assert task.artifact_payload is None
 
 
+def test_external_spec_tracked_declaration_swap_is_refused_by_preparation(project):
+    # A spec inside the project but outside implementation_artifacts is never
+    # itself a selected deliverable, so the ignored map alone ({} == {}) cannot
+    # see its declarations move; the tracked rel set has to be re-derived and
+    # compared whole (Codex P1 on #795).
+    root = project.implementation_artifacts
+    root.mkdir(parents=True, exist_ok=True)
+    accepted = root / "a.bin"
+    swapped = root / "b.bin"
+    accepted.write_bytes(b"accepted deliverable")
+    swapped.write_bytes(b"unaccepted deliverable")
+    spec = project.project / "docs" / "external-spec.md"
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec.write_text("---\nstatus: done\nartifact_deliverables: [a.bin]\n---\n")
+    git(project.repo_root, "add", "-A")
+    git(project.repo_root, "commit", "-q", "-m", "tracked publication inputs")
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"], spec_file=str(spec))
+    publication.capture(task, project)
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, project)
+    assert task.artifact_source_digests == {}
+    assert set(task.artifact_tracked_source_oids) == {"a.bin"}
+    bound = dict(task.artifact_tracked_source_oids)
+
+    spec.write_text("---\nstatus: done\nartifact_deliverables: [b.bin]\n---\n")
+
+    with pytest.raises(
+        publication.PublicationError,
+        match="tracked artifact deliverables changed since accepted verification: a\\.bin, b\\.bin",
+    ) as exc:
+        publication.prepare(task, project, project)
+
+    assert bound["a.bin"] not in str(exc.value)
+    assert task.artifact_payload is None
+    assert task.artifact_tracked_source_oids == bound
+
+    spec.write_text("---\nstatus: done\nartifact_deliverables: [a.bin]\n---\n")
+    publication.prepare(task, project, project)
+    assert task.artifact_payload == {}
+
+
+def test_preparation_never_reopens_a_tracked_deliverable_behind_the_sealed_commit(
+    publication_case, monkeypatch
+):
+    # The rel-set check must be read off the classification alone: a tracked
+    # deliverable removed from the working tree after `finalize_commit` sealed
+    # it is tolerated (the commit carries it), not a refusal (CodeRabbit on
+    # #795 round 4).
+    task, paths, source = publication_case
+    monkeypatch.setattr(publication.verify, "path_tracked", lambda *_: True)
+    publication.arm_binding(task, "dev:0")
+    publication.bind_armed(task, source)
+    assert set(task.artifact_tracked_source_oids) == {"report.bin", "spec.md"}
+    (source.implementation_artifacts / "report.bin").unlink()
+
+    publication.prepare(task, paths, source)
+
+    assert task.artifact_payload == {}
+
+
 def test_read_fault_retains_baseline_and_refuses_payload(publication_case, monkeypatch):
     task, paths, source = publication_case
     report = source.implementation_artifacts / "report.bin"

@@ -416,6 +416,13 @@ def capture(task: StoryTask, paths: ProjectPaths) -> None:
 class _SelectedSources(NamedTuple):
     contents: dict[str, bytes]
     tracked_oids: dict[str, str]
+    tracked_rels: frozenset[str]
+    """Every rel that rides Git: tracked, or pending-tracked when admitted.
+
+    Always populated, without opening the file — a caller that only needs the
+    SELECTION (``prepare``) must not touch a tracked working-tree file behind a
+    sealed commit, where deletion or replacement is tolerated.
+    """
 
 
 def _selected_sources(
@@ -477,10 +484,12 @@ def _selected_sources(
 
     inputs: list[tuple[str, Path, int]] = []
     tracked_oids: dict[str, str] = {}
+    tracked_rels: set[str] = set()
     for rel in sorted(selected):
         path = root / rel
         repo_rel = path.relative_to(source.repo_root).as_posix()
         if verify.path_tracked(source.repo_root, repo_rel):
+            tracked_rels.add(rel)
             if collect_tracked_identities:
                 if path == spec:
                     tracked_oids[rel] = verify.git_normalized_blob_oid_for_bytes(
@@ -500,6 +509,7 @@ def _selected_sources(
                 # Binding runs before the orchestrator's final `git add -A`.
                 # Preparation must later prove this path became tracked; a path
                 # an embedded repository kept untracked must not vanish silently.
+                tracked_rels.add(rel)
                 if collect_tracked_identities:
                     if path == spec:
                         tracked_oids[rel] = verify.git_normalized_blob_oid_for_bytes(
@@ -551,7 +561,7 @@ def _selected_sources(
         raw_payload[rel] = data
         actual_total += len(data)
 
-    return _SelectedSources(raw_payload, tracked_oids)
+    return _SelectedSources(raw_payload, tracked_oids, frozenset(tracked_rels))
 
 
 def arm_binding(task: StoryTask, acceptance_identity: str) -> bool:
@@ -821,7 +831,23 @@ def prepare(
     file_max_bytes: int = DEFAULT_FILE_MAX_BYTES,
     payload_max_bytes: int = DEFAULT_PAYLOAD_MAX_BYTES,
 ) -> None:
-    """Freeze ignored bytes only when they match final accepted verification."""
+    """Freeze ignored bytes only when they match final accepted verification.
+
+    The tracked selection is re-derived too and its rel SET must equal the
+    accepted one. The ignored map alone would let a spec that lives outside
+    ``implementation_artifacts`` — and so is never itself a selected deliverable
+    — swap one tracked declaration for another after acceptance (#795 review):
+    the staged and committed validators only ever consult the ACCEPTED tracked
+    rels, so the swapped-in path would ride the commit unproven. Preparation
+    runs after ``finalize_commit``'s ``git add -A``, so every pending-tracked
+    rel is tracked by now and the two rel sets are directly comparable. Only
+    the rels are compared, and no tracked file is opened to get them: the
+    accepted rels' blob identities were already proven on the validated index
+    and the committed tree, and the working tree behind a sealed commit is not
+    the authority — a writer landing there after staging, or removing the file
+    outright, is tolerated by design (it cannot enter the commit), not a
+    refusal.
+    """
     # A frozen payload is the durable publication intent, including legacy runs
     # that predate accepted-source binding. Never reread its source on replay.
     if task.artifact_payload is not None:
@@ -847,6 +873,12 @@ def prepare(
         )
         raise PublicationError(
             "artifact deliverables changed since accepted verification: " + ", ".join(differing)
+        )
+    if selected.tracked_rels != task.artifact_tracked_source_oids.keys():
+        differing = sorted(selected.tracked_rels ^ task.artifact_tracked_source_oids.keys())
+        raise PublicationError(
+            "tracked artifact deliverables changed since accepted verification: "
+            + ", ".join(differing)
         )
     task.artifact_payload = {
         rel: base64.b64encode(data).decode("ascii") for rel, data in selected.contents.items()

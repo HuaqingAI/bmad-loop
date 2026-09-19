@@ -1191,3 +1191,55 @@ def test_artifact_publication_state_round_trips_and_releases_with_mount():
     assert loaded.artifact_acceptance_identity is None
     assert loaded.artifact_destination is None and not loaded.artifact_publication_complete
     assert loaded.integration_attempt is None
+
+
+# ------------------------------------ the artifact-only receipt's snapshot (DW-273)
+
+
+def test_story_task_baseline_artifacts_round_trips_and_defaults_none():
+    """`baseline_artifacts` — path -> `[mtime_ns, size]` or `None` for an entry
+    listed but unmeasurable at attempt start — survives `to_dict`/`from_dict`
+    byte-for-byte, and a pre-upgrade record with no key reads as `None` (no
+    snapshot), on which the receipt refuses rather than guesses."""
+    task = StoryTask(story_key="dw-bundle", epic=0, dw_ids=["DW-1"])
+    assert task.baseline_artifacts is None
+    task.baseline_artifacts = {
+        "_bmad-output/impl/spec.md": [1_700_000_000_123_456_789, 42],
+        "_bmad-output/impl/gone.md": None,
+    }
+
+    rehydrated = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+
+    assert rehydrated.baseline_artifacts == task.baseline_artifacts
+    legacy = task.to_dict()
+    del legacy["baseline_artifacts"]
+    assert StoryTask.from_dict(legacy).baseline_artifacts is None
+
+
+@pytest.mark.parametrize(
+    "mangled",
+    [
+        "not a mapping",
+        ["_bmad-output/impl/spec.md"],
+        {"_bmad-output/impl/spec.md": [1]},
+        {"_bmad-output/impl/spec.md": "1700000000:42"},
+        {"_bmad-output/impl/spec.md": [1, 2, 3]},
+        {"_bmad-output/impl/spec.md": ["bad", 42]},
+        {"_bmad-output/impl/spec.md": [None, 42]},
+        {"_bmad-output/impl/spec.md": [1.5, 42]},
+        {"_bmad-output/impl/spec.md": [True, 42]},
+    ],
+)
+def test_story_task_baseline_artifacts_mangled_shape_reads_as_no_snapshot(mangled):
+    """A hand-edited state.json whose snapshot is not path -> 2-int list (or None)
+    is not partially trusted: the whole field reads as `None`, so the receipt
+    refuses for want of a snapshot instead of crediting entries against a
+    baseline half of which was dropped — and a non-integer element never RAISES
+    out of `from_dict`, which would keep the whole run state (and `bmad-loop
+    resume`) from loading over one mangled fingerprint.
+
+    Ablation: convert with `int(value[0])` and the `"bad"`/`None` rows raise."""
+    d = StoryTask(story_key="dw-bundle", epic=0).to_dict()
+    d["baseline_artifacts"] = mangled
+
+    assert StoryTask.from_dict(d).baseline_artifacts is None

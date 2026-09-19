@@ -1606,13 +1606,18 @@ def _validate_deferred_ledger(
     # False, so a refused ledger read as an empty one and `validate` reported a
     # clean deferred check with the finding below unreachable. Only absence
     # (`ENOENT`/`ENOTDIR`, a present non-regular file) is the empty text; a
-    # refused probe takes the same arm a refused `read_text` does.
+    # refused probe takes the same arm a refused `read_text` does. `ValueError`,
+    # not `UnicodeDecodeError` (its subclass): `Path.stat` raises a plain
+    # `ValueError` for an embedded NUL in the configured path and a
+    # `UnicodeEncodeError` for a lone surrogate, neither an `OSError`, which
+    # `is_file()` had answered False for — an observation arm attributes those
+    # as a fault, never as absence, so they are the same graded problem.
     try:
         try:
             text = ledger.read_text(encoding="utf-8") if S_ISREG(ledger.stat().st_mode) else ""
         except (FileNotFoundError, NotADirectoryError):
             text = ""
-    except (OSError, UnicodeDecodeError) as e:
+    except (OSError, ValueError) as e:
         # Split from the manifest read in the checks below, which is silent for a
         # good reason that does not apply here: nothing else in `validate` reads
         # the ledger, so returning quietly reported success for preflights that
@@ -4232,14 +4237,23 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             # so the fault never reached the `except` and a ledger sitting in
             # place, unreadable, was reported as GONE, the sentence that says every
             # `decision:` line already written went with it. The reader never
-            # raises: absence is its own `("", None)` answer, and a refused ledger
+            # raises: absence is its own `(None, None)` answer, and a refused ledger
             # is an attributed fault on every interpreter, which keeps the
             # "ledger state unavailable" wording.
+            #
+            # `observe_ledger`, not `read_for_observation`: this sentence says
+            # whether the FILE is there, and the text-only reader folds a present
+            # 0-byte ledger into the same `""` as a missing one, so testing the
+            # text reported a ledger that exists and holds no entry as GONE — the
+            # sentence that tells the operator every `decision:` line already
+            # written went with it (PR #794 review). `None` is absence; `""` is a
+            # present, empty ledger, which the recorder reached and found no entry
+            # in, the same news as any other missing entry.
             outcome = "no decision line was written"
-            text, fault = deferredwork.read_for_observation(paths.deferred_work)
+            text, fault = deferredwork.observe_ledger(paths.deferred_work)
             if fault is not None:
                 outcome += "; ledger state unavailable"
-            elif not text:
+            elif text is None:
                 outcome += ": the ledger file is gone"
             else:
                 outcome += ": the ledger holds no entry for this id"
