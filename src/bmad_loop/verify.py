@@ -731,33 +731,40 @@ def _indexed_submodules(repo: Path) -> list[str]:
     return paths
 
 
-# `ls-files --debug` flag words a stage-0 gitlink the integration introduces
-# may carry: none, or skip-worktree alone (CE_SKIP_WORKTREE | CE_EXTENDED),
-# which a cone-mode sparse checkout sets on every entry outside the cone —
-# gitlinks included — and which hides nothing from the readings here, since
-# a checkout is read from disk rather than through the index (#796 review).
-# Intent-to-add, assume-unchanged, or anything else is not a fresh gitlink's
-# shape: a hook set it.
-_FRESH_GITLINK_INDEX_FLAGS = frozenset({"0", "40004000"})
-# ...and the words a captured gitlink may carry: those, or either with the
+# `ls-files --debug` flag words a stage-0 index entry the integration writes
+# may carry — a gitlink or a file alike: none; or, on a sparse target only,
+# skip-worktree alone (CE_SKIP_WORKTREE | CE_EXTENDED, `40004000`), which git
+# sets on every entry it writes outside the sparse cone or patterns and
+# which hides nothing from the readings here, a checkout being read from disk
+# rather than through the index (#796 review). Off a sparse target that word
+# is a hook's `update-index --skip-worktree`; on one, git strips a hook's bit
+# from an in-pattern entry to `4000` (probed on git 2.55). Intent-to-add,
+# assume-unchanged, or anything else is not a fresh entry's shape: a hook
+# set it.
+_SPARSE_INDEX_FLAG_WORD = "40004000"
+# The words a captured gitlink may carry: those, or either with the
 # assume-unchanged bit (CE_VALID, `8000`) an operator set before the run —
 # `git update-index --assume-unchanged` on a submodule is released index
 # configuration, and it too hides nothing from a reading taken from disk.
 # The receipt records the word (`flags`) so a reading compares it exactly:
 # an operator's bit is preserved, a hook's flip is drift, and the restore
 # puts the word back where `git restore` cleared it (#796 review).
-_GITLINK_INDEX_FLAGS = _FRESH_GITLINK_INDEX_FLAGS | frozenset({"8000", "4000c000"})
+_GITLINK_INDEX_FLAGS = frozenset({"0", _SPARSE_INDEX_FLAG_WORD, "8000", "4000c000"})
+
+
+def _fresh_index_flag_words(repo: Path) -> frozenset[str]:
+    """The flag words an index entry the integration wrote may carry on ``repo``."""
+    rc, sparse, _detail = _git_out(repo, "config", "--type=bool", "core.sparseCheckout")
+    if rc == 0 and sparse == "true":
+        return frozenset({"0", _SPARSE_INDEX_FLAG_WORD})
+    return frozenset({"0"})
 
 
 def _gitlink_index_matches(
-    current: dict[str, object], oid: str, *, flags: Collection[object] | None = None
+    current: dict[str, object], oid: str, *, flags: Collection[object]
 ) -> bool:
-    """Whether ``current`` (an `_index_state` reading) is exactly the gitlink ``oid``.
-
-    ``flags`` are the flag words accepted on the entry; ``None`` (a receipt
-    written before the word was recorded, or a gitlink the integration
-    introduces) accepts any word a fresh gitlink may carry.
-    """
+    """Whether ``current`` (an `_index_state` reading) is exactly the gitlink
+    ``oid`` carrying one of the ``flags`` words."""
     entries = current.get("entries")
     if current.get("intent_to_add") or not isinstance(entries, list) or len(entries) != 1:
         return False
@@ -767,14 +774,8 @@ def _gitlink_index_matches(
         and entry.get("mode") == "160000"
         and entry.get("oid") == oid
         and entry.get("stage") == 0
-        and entry.get("flags") in (_FRESH_GITLINK_INDEX_FLAGS if flags is None else flags)
+        and entry.get("flags") in flags
     )
-
-
-def _captured_gitlink_flags(entry: dict[str, object]) -> tuple[str] | None:
-    """The one word a captured gitlink must carry, or ``None`` for a receipt without one."""
-    flags = entry.get("flags")
-    return None if flags is None else (str(flags),)
 
 
 def _submodule_checkout_owned(root: Path, checkout: Path) -> bool:
@@ -849,8 +850,15 @@ def _validated_submodule_checkout(
                 "persisted target submodule is not anchored to the old revision"
             )
     else:
+        # the captured word exactly; a receipt without one reads with the
+        # fresh words, as before it was recorded
+        captured_word = entry.get("flags")
         if not _gitlink_index_matches(
-            _index_state(repo, rel), gitlink, flags=_captured_gitlink_flags(entry)
+            _index_state(repo, rel),
+            gitlink,
+            flags=(
+                _fresh_index_flag_words(repo) if captured_word is None else (str(captured_word),)
+            ),
         ):
             raise IntegrationEvidenceError(
                 "persisted target submodule is no longer the captured indexed gitlink"
@@ -2397,6 +2405,72 @@ def integrated_paths_drift(
     return tuple(dict.fromkeys(drift))
 
 
+def integrated_index_flags_drift(
+    repo: Path,
+    run_dir: Path,
+    snapshots: object,
+    paths: Iterable[str],
+    *,
+    operation_identity: str | None = None,
+) -> tuple[str, ...]:
+    """Incoming ``paths`` whose post-hook index entry carries a flag word a hook set.
+
+    ``update-index --assume-unchanged`` or ``--skip-worktree`` on an incoming
+    path changes no blob: both diff readings stay empty, ``status`` shows
+    nothing, and the integration retired its receipt over an index that hides
+    later edits from git (#796 review). One whole-tree ``ls-files --stage`` +
+    ``--debug`` reading (the receipt's own index reading, whole-tree for the
+    same argv reason as the diffs) is filtered to the incoming set, and each
+    stage-0 file entry there may carry only what a fresh entry may on this
+    target (`_fresh_index_flag_words`) or the word the receipt captured for
+    the path — a fast-forward or squash keeps an operator's assume-unchanged
+    bit on the entry it updates, where ``git merge`` writes it anew (git
+    2.55). Gitlinks are the submodule reading's, unmerged stages the diff
+    readings'. Path-only evidence, sorted.
+    """
+    selected = {_portable_integration_path(path) for path in paths}
+    if not selected:
+        return ()
+    validated, _submodules = validate_integration_state_schema(
+        run_dir, snapshots, [], operation_identity
+    )
+    captured: dict[str, str] = {}
+    for entry in validated:
+        index = entry["index"]
+        assert isinstance(index, dict)
+        entries = index["entries"]
+        assert isinstance(entries, list)
+        for item in entries:
+            if item["stage"] == 0:
+                captured[str(entry["path"])] = str(item["flags"])
+    fresh = _fresh_index_flag_words(repo)
+    staged = git_bytes(repo, "ls-files", "--stage", "-z")
+    debug = git_bytes(repo, "ls-files", "--debug", "-z")
+    if staged.returncode != 0 or debug.returncode != 0:
+        raise IntegrationEvidenceError("target post-hook index flag evidence is unavailable")
+    flags = re.findall(rb"(?:^|[\t ])flags: ([0-9a-fA-F]+)(?:\n|$)", debug.stdout)
+    records = [record for record in staged.stdout.split(b"\0") if record]
+    if len(flags) != len(records):
+        raise IntegrationEvidenceError("target post-hook index flag evidence is malformed")
+    drift: list[str] = []
+    for record, raw_flags in zip(records, flags, strict=True):
+        try:
+            metadata, raw_path = record.split(b"\t", 1)
+            mode, _oid, stage = metadata.split(b" ", 2)
+        except ValueError as exc:
+            raise IntegrationEvidenceError(
+                "target post-hook index flag evidence is malformed"
+            ) from exc
+        path = os.fsdecode(raw_path)
+        if path not in selected or stage != b"0" or mode == b"160000":
+            continue
+        word = os.fsdecode(raw_flags).lower()
+        accepted = fresh if path not in captured else fresh | {captured[path]}
+        if word not in accepted:
+            drift.append(path)
+    return tuple(sorted(drift))
+
+
 def integrated_stray_paths(
     repo: Path,
     *,
@@ -2704,6 +2778,7 @@ def validate_integrated_submodule_state(
         captured[rel] = raw
     inventory = _revision_inventory(repo, revision)
     held_paths = _inventory_held_paths(inventory)
+    fresh_words = _fresh_index_flag_words(repo)
     retained: list[str] = []
     for rel in sorted(prospective):
         held = inventory.get(rel)
@@ -2757,7 +2832,7 @@ def validate_integrated_submodule_state(
         # word that is neither is a hook's (#796 review)
         captured_word = captured_flags.get(rel)
         accepted_words = (
-            None if captured_word is None else _FRESH_GITLINK_INDEX_FLAGS | {str(captured_word)}
+            fresh_words if captured_word is None else fresh_words | {str(captured_word)}
         )
         if not _gitlink_index_matches(_index_state(repo, rel), oid, flags=accepted_words):
             raise IntegrationEvidenceError("target hook changed an integrated submodule gitlink")

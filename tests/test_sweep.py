@@ -28202,6 +28202,63 @@ def test_bundle_deleting_a_populated_target_submodule_integrates(project, tmp_pa
     assert durable.integration_attempt is None  # retired with the integration
 
 
+@pytest.mark.parametrize(
+    ("strategy", "hook_name"),
+    [("merge", "pre-merge-commit"), ("squash", "pre-commit"), ("ff", "post-merge")],
+)
+def test_target_hook_marking_an_incoming_path_assume_unchanged_is_refused(
+    project, strategy, hook_name
+):
+    """A target hook running `update-index --assume-unchanged` on an
+    incoming path after the merge changes no blob: both diff readings stay
+    empty, status shows nothing, and the run recorded `unit-merged` over an
+    index that hides later edits from git (Codex, #796 review). The
+    post-hook flag word of every incoming entry is read, and a word a fresh
+    entry cannot carry refuses through the receipt route: restored, the bit
+    gone with the rest of the attempt.
+
+    Ablation: return `()` from `integrated_index_flags_drift` and every leg
+    reds on `summary.paused`."""
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    target_head = verify.rev_parse_head(project.repo_root)
+    hook = project.project / ".git" / "hooks" / hook_name
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        "  git update-index --assume-unchanged -- "
+        "_bmad-output/implementation-artifacts/report.bin\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    engine, _adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert git(project.project, "status", "--porcelain", "--untracked-files=no") == ""
+    assert (
+        git(
+            project.project,
+            "ls-files",
+            "-v",
+            "--",
+            "_bmad-output/implementation-artifacts/report.bin",
+        )
+        == "H _bmad-output/implementation-artifacts/report.bin"
+    )
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt.get("outcome") == "refused-restored"
+    assert "unit-merged" not in journal_kinds(engine)
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert "changed index flags on incoming paths" in refusal["error"]
+
+
 @pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
 def test_bundle_integrates_into_a_target_with_an_assume_unchanged_submodule(
     project, tmp_path, strategy

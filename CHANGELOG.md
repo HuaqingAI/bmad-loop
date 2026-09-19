@@ -506,7 +506,11 @@ breaking changes may land in a minor release.
   remove, and that leftover is accepted only owned, at the captured HEAD, and
   holding nothing beyond what the integrated tree holds under it. A gitlink
   the unit adds is read the same way as a captured one — index at the gitlink
-  (skip-worktree accepted on a sparse target's out-of-cone gitlink; an
+  (skip-worktree accepted on a sparse target's out-of-cone gitlink — on a
+  sparse target only, git stripping a hook's bit from an in-pattern entry
+  and a hook alone setting it elsewhere — and a hook's `update-index
+  --assume-unchanged` or `--skip-worktree` on an incoming file, which no
+  diff reading sees, refused by its index flag word; an
   operator's assume-unchanged bit on a captured gitlink is recorded and
   preserved — every modern integration into a target holding one paused,
   even of a bundle that never touched the submodule — a hook's flip of the

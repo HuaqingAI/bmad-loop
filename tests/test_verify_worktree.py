@@ -3664,6 +3664,94 @@ def test_integrated_paths_drift_accepts_an_absent_deleted_incoming_path(project)
     assert verify.integrated_paths_drift(repo, integrated, ("gone.bin", "src.txt")) == ()
 
 
+@pytest.mark.parametrize("flag", ["assume-unchanged", "skip-worktree"])
+@pytest.mark.parametrize("path", ["src.txt", "newdir/tracked"], ids=["modified", "added"])
+def test_integrated_index_flags_drift_reports_a_hook_s_flag_on_an_incoming_path(
+    project, tmp_path, flag, path
+):
+    """A target hook running `update-index --assume-unchanged` (or
+    `--skip-worktree`) on an incoming path changes no blob, so both diff
+    readings stay empty while `ls-files --debug` reports `flags: 8000` (or
+    `40004000`) — an index that hides later edits from git, retired with
+    `unit-merged` over it (Codex, #796 review). The post-hook index flag
+    word of every incoming path is read against what a fresh entry may
+    carry — none; skip-worktree only on a sparse target, where git itself
+    strips it from an in-pattern path — or the word the receipt captured
+    for the path.
+
+    Ablation: return `()` and every row reds."""
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    snapshots, _submodules = verify.capture_integration_state(
+        repo, run_dir, "e" * 32, ("src.txt", "newdir/tracked")
+    )
+    (repo / "newdir").mkdir()
+    (repo / "newdir" / "tracked").write_text("incoming\n")
+    (repo / "src.txt").write_text("incoming\n")
+    git(repo, "add", "--", "newdir/tracked", "src.txt")
+    git(repo, "commit", "-q", "-m", "integrated")
+    integrated = verify.rev_parse_head(repo)
+    git(repo, "update-index", f"--{flag}", "--", path)
+    assert verify.integrated_paths_drift(repo, integrated, ("src.txt", "newdir/tracked")) == ()
+    assert (
+        verify.integrated_stray_paths(repo, tolerated=(), incoming=("src.txt", "newdir/tracked"))
+        == ()
+    )
+
+    assert verify.integrated_index_flags_drift(
+        repo, run_dir, snapshots, ("src.txt", "newdir/tracked"), operation_identity="e" * 32
+    ) == (path,)
+
+
+@pytest.mark.parametrize("shape", ["captured-word-rewritten", "sparse-out-of-cone"])
+def test_integrated_index_flags_drift_accepts_git_s_own_words(project, tmp_path, shape):
+    """The integration writes every incoming entry anew — a file's
+    assume-unchanged bit does not survive even a fast-forward (git 2.55) —
+    so an incoming path the receipt captured with `8000` reads clean at a
+    fresh `0`; and on a sparse target it may carry skip-worktree outside
+    the cone, which git sets on every such entry it writes."""
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    if shape == "captured-word-rewritten":
+        git(repo, "update-index", "--assume-unchanged", "--", "src.txt")
+        snapshots, _submodules = verify.capture_integration_state(
+            repo, run_dir, "e" * 32, ("src.txt",)
+        )
+        [entry] = snapshots
+        assert entry["index"]["entries"][0]["flags"] == "8000"
+        git(repo, "update-index", "--no-assume-unchanged", "--", "src.txt")
+        (repo / "src.txt").write_text("integrated\n")
+        git(repo, "add", "--", "src.txt")
+        git(repo, "commit", "-q", "-m", "integrated")
+        assert git(repo, "ls-files", "-v", "--", "src.txt") == "H src.txt"
+        incoming = ("src.txt",)
+    else:
+        (repo / "keep").mkdir()
+        (repo / "keep" / "k.txt").write_text("in the cone\n")
+        git(repo, "add", "--", "keep/k.txt")
+        git(repo, "commit", "-q", "-m", "keep")
+        _branch_with(repo, tmp_path, adds={"other/o.txt": "out of the cone\n"})
+        git(repo, "sparse-checkout", "set", "--cone", "keep")
+        snapshots, _submodules = verify.capture_integration_state(
+            repo, run_dir, "e" * 32, ("other/o.txt",)
+        )
+        git(repo, "merge", "-q", "--ff-only", "feat")
+        assert git(repo, "ls-files", "-t", "--", "other/o.txt") == "S other/o.txt"
+        assert not (repo / "other").exists()
+        incoming = ("other/o.txt",)
+
+    assert (
+        verify.integrated_index_flags_drift(
+            repo, run_dir, snapshots, incoming, operation_identity="e" * 32
+        )
+        == ()
+    )
+    if shape == "sparse-out-of-cone":
+        git(repo, "sparse-checkout", "disable")
+
+
 @pytest.mark.parametrize("shape", ["file-to-directory", "directory-to-file"])
 def test_integrated_paths_drift_accepts_an_incoming_entry_type_change(project, shape):
     """The absent-path probe reads the integrated commit's inventory as

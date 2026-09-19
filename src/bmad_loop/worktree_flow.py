@@ -3539,6 +3539,23 @@ class WorktreeFlow:
                         "target hook changed incoming paths after integration: "
                         + ", ".join(sorted(drifted))
                     )
+                # The diff readings compare blobs; an index flag a hook set on an
+                # incoming path (`update-index --assume-unchanged`, which hides
+                # later edits from git) changes none, so the post-hook flag word
+                # of every incoming entry is read against what a fresh entry may
+                # carry or what the receipt captured (#796 review).
+                flagged = verify.integrated_index_flags_drift(
+                    repo,
+                    self.run_dir,
+                    attempt["snapshots"],
+                    prospective_paths,
+                    operation_identity=attempt["operation_identity"],
+                )
+                if flagged:
+                    raise verify.IntegrationEvidenceError(
+                        "target hook changed index flags on incoming paths after "
+                        "integration: " + ", ".join(flagged)
+                    )
                 if not verify.integration_nonref_state_unchanged(
                     repo,
                     self.run_dir,
