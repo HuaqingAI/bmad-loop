@@ -28904,6 +28904,113 @@ def test_target_hook_writing_an_ignored_file_into_a_captured_submodule_is_refuse
     )
 
 
+def test_target_hook_writing_into_a_captured_submodules_automator_directory_is_refused(
+    project, tmp_path
+):
+    """The tree's ignored listing leaves the run's own records under the
+    target's `.bmad-loop/` out — the receipt's sidecars stand there. Reused
+    for a captured submodule checkout, that exemption dropped a
+    `.bmad-loop/cache/hook.log` the checkout's own rules ignore, which both
+    `status` readings miss too, so a target hook's write there finished the
+    run `unit-merged` with its receipt retired (Codex, #796 review). The
+    checkout holds no record of the run: its `.bmad-loop/` is sealed and
+    read like any other ignored path there, and the write is refused by
+    path — the target restored, the file left in place and named.
+
+    Ablation: drop `own_records=False` from the submodule reading and this
+    reds on `summary.paused` — the run finished over the hook's file."""
+    origin = tmp_path / "sub-origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    (origin / ".gitignore").write_text(".bmad-loop/\n")
+    (origin / "payload.txt").write_text("submodule\n")
+    git(origin, "add", "-A")
+    git(origin, "commit", "-q", "-m", "submodule ignoring .bmad-loop/")
+    git(
+        project.project,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(origin),
+        "module",
+    )
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "add populated submodule")
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    target_head = verify.rev_parse_head(project.repo_root)
+    hook = project.project / ".git" / "hooks" / "pre-merge-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        "  mkdir -p module/.bmad-loop/cache\n"
+        "  printf 'target hook output' > module/.bmad-loop/cache/hook.log\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    engine, _adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    assert git(project.project, "status", "--porcelain", "--untracked-files=no") == ""
+    assert git(project.project / "module", "status", "--porcelain", "-uall") == ""
+    hook_output = project.project / "module" / ".bmad-loop" / "cache" / "hook.log"
+    assert hook_output.read_text() == "target hook output"
+    assert "unit-merged" not in journal_kinds(engine)
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert refusal["error"].endswith(
+        "in a captured submodule checkout after integration (left in place): "
+        "module/.bmad-loop/cache/hook.log"
+    )
+
+
+@pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
+def test_untracked_nested_repository_in_the_target_is_tolerated_by_the_receipt(project, strategy):
+    """A tool the operator cloned into the target checkout — an untracked
+    nested repository — is the one entry `status -uall` still collapses,
+    spelled `vendor/`. The guard tolerated it, and that spelling then met the
+    receipt's path validator, which refuses an empty segment: every modern
+    integration paused before the merge as malformed, and again at each
+    resume, over a repository the merge never touches (Codex, #796 review).
+    Tolerated as `vendor` and passed over by the capture, the bundle now
+    lands on every strategy, the repository untouched and journalled as
+    tolerated, its `.git` sealed in the receipt's ignored listing.
+
+    Ablation: drop the `rstrip` in `plan_incoming_collisions` and every leg
+    reds on `summary.paused` with the receipt's malformed-path refusal."""
+    effect, destination, accepted = _git_bound_publication_bundle(project, "tracked")
+    vendor = project.project / "vendor"
+    vendor.mkdir()
+    git(vendor, "init", "-q")
+    (vendor / "tool.py").write_text("operator's clone\n")
+    assert "?? vendor/" in git(project.project, "status", "--porcelain", "-uall").splitlines()
+    engine, _adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(merge_strategy=strategy),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert destination.read_bytes() == accepted
+    assert "unit-merged" in journal_kinds(engine)
+    [tolerated] = _records(engine, "merge-target-tolerated")
+    assert "vendor" in tolerated["paths"] and "vendor/" not in tolerated["paths"]
+    assert (vendor / "tool.py").read_text() == "operator's clone\n"
+    assert (vendor / ".git").is_dir()
+    assert "?? vendor/" in git(project.project, "status", "--porcelain", "-uall").splitlines()
+
+
 @pytest.mark.parametrize(
     ("strategy", "hook_name"),
     [("merge", "pre-merge-commit"), ("squash", "pre-commit"), ("ff", "post-merge")],

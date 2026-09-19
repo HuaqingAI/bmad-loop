@@ -1141,6 +1141,13 @@ def _capture_integration_state_into(
             proc = git_bytes(repo, "ls-files", "-z", "--", validated)
             if proc.returncode == 0 and proc.stdout:
                 continue
+            # an untracked nested repository — the one entry `status -uall`
+            # collapses, which the guard tolerates as `vendor` — holds an
+            # operator's repository, not a file of the target's: nothing
+            # here to snapshot, and its `.git` entry is the ignored listing's
+            # (`_nested_git_entries`), at its identity (#796 review)
+            if not tracked and os.path.lexists(candidate / ".git"):
+                continue
             raise IntegrationEvidenceError("target integration snapshot operand is not a file")
         index = _index_state(repo, validated)
         name = hashlib.sha256(os.fsencode(validated)).hexdigest() + ".bin"
@@ -1247,14 +1254,16 @@ def _capture_integration_state_into(
         # (`capture_ignored_entries`): that reading never descends into a
         # submodule, and the post-hook checkout reading takes `status`
         # without `--ignored`, so a hook's write the checkout's own
-        # `.gitignore` covers was listed by nothing (#796 review)
+        # `.gitignore` covers was listed by nothing (#796 review). The
+        # run's records live in the target alone: a `.bmad-loop/` the
+        # checkout ignores is any other ignored path there
         name = hashlib.sha256(os.fsencode(rel)).hexdigest() + _SUBMODULE_IGNORED_SUFFIX
         submodules.append(
             {
                 "path": rel,
                 "head": rev_parse_head(checkout),
                 **_captured_gitlink_entry(_index_state(repo, rel)),
-                "ignored": _seal_ignored_entries(checkout, run_dir, root / name),
+                "ignored": _seal_ignored_entries(checkout, run_dir, root / name, own_records=False),
             }
         )
     return snapshots, submodules
@@ -2727,7 +2736,7 @@ def _owned_integration_snapshot_root(run_dir: Path, operation_identity: str) -> 
     return root
 
 
-def ignored_entries(repo: Path) -> dict[str, str]:
+def ignored_entries(repo: Path, *, own_records: bool = True) -> dict[str, str]:
     """Every entry of the whole tree git lists nowhere, with its ``lstat`` identity.
 
     Two readings. One whole-tree ``ls-files --others --ignored
@@ -2741,7 +2750,11 @@ def ignored_entries(repo: Path) -> dict[str, str]:
     tracked directory, or a repository it puts in an ignored one, is listed
     by nothing else (#796 review). The automator directory's run records —
     this receipt's own sidecars and the run's worktrees among them — are
-    left out exactly as `automator_dirty_paths` leaves them. The identity is
+    left out exactly as `automator_dirty_paths` leaves them, when
+    ``own_records``: that is the target's reading. A captured submodule
+    checkout holds no record of the run, so a ``.bmad-loop/cache/x`` its
+    own rules ignore is any other ignored path there, and a target hook's
+    write to it is read like one (#796 review). The identity is
     the entry's ``lstat`` — size, mtime, ctime, inode, device, mode — never
     its bytes: a hook overwriting or truncating an ignored file that was
     already there leaves the path set unchanged and ``status`` and ``diff``
@@ -2756,12 +2769,12 @@ def ignored_entries(repo: Path) -> dict[str, str]:
         if not raw:
             continue
         path = os.fsdecode(raw)
-        if _automator_record_path(path):
+        if own_records and _automator_record_path(path):
             continue
         identity = _lstat_identity(repo, path)
         if identity is not None:
             entries[path] = identity
-    entries.update(_nested_git_entries(repo))
+    entries.update(_nested_git_entries(repo, own_records=own_records))
     return dict(sorted(entries.items()))
 
 
@@ -2774,7 +2787,7 @@ def _automator_record_path(path: str) -> bool:
     return below.startswith(_AUTOMATOR_RECORD_PREFIXES) or below in _AUTOMATOR_RECORD_FILES
 
 
-def _nested_git_entries(repo: Path) -> dict[str, str]:
+def _nested_git_entries(repo: Path, *, own_records: bool = True) -> dict[str, str]:
     """Every ``.git`` entry below the top of ``repo``'s tree, with its ``lstat`` identity.
 
     Walked on disk, symlinks never followed, because git lists none of them:
@@ -2785,7 +2798,8 @@ def _nested_git_entries(repo: Path) -> dict[str, str]:
     entry: a directory holding a ``.git`` is not descended into — a populated
     submodule checkout, a nested repository in an ignored directory — since
     what is inside is that repository's own reading's. The run's records
-    under the automator directory, its worktrees among them, are left out.
+    under the automator directory, its worktrees among them, are left out
+    when ``own_records`` (`ignored_entries`).
     """
     entries: dict[str, str] = {}
     for dirpath, dirnames, filenames in os.walk(repo, followlinks=False):
@@ -2794,7 +2808,7 @@ def _nested_git_entries(repo: Path) -> dict[str, str]:
             if ".git" in dirnames:
                 dirnames.remove(".git")
             continue
-        if _automator_record_path(f"{base}/"):
+        if own_records and _automator_record_path(f"{base}/"):
             dirnames[:] = []
             continue
         if ".git" in dirnames or ".git" in filenames:
@@ -2847,11 +2861,13 @@ def capture_ignored_entries(
     return _seal_ignored_entries(repo, run_dir, root / _IGNORED_ENTRIES_SIDECAR)
 
 
-def _seal_ignored_entries(repo: Path, run_dir: Path, sidecar: Path) -> dict[str, object]:
+def _seal_ignored_entries(
+    repo: Path, run_dir: Path, sidecar: Path, *, own_records: bool = True
+) -> dict[str, object]:
     """Seal `ignored_entries` of ``repo`` into ``sidecar``; the receipt's record of it."""
     data = b"\0".join(
         os.fsencode(path) + b"\0" + identity.encode("ascii")
-        for path, identity in ignored_entries(repo).items()
+        for path, identity in ignored_entries(repo, own_records=own_records).items()
     )
     size, digest = _snapshot_bytes(data, sidecar)
     return {
@@ -2903,6 +2919,7 @@ def integrated_ignored_additions(
     *,
     tolerated: Iterable[str] = (),
     introduced_checkouts: Iterable[str] = (),
+    own_records: bool = True,
 ) -> tuple[str, ...]:
     """Ignored entries after the hooks the receipt did not record, or recorded otherwise.
 
@@ -2919,7 +2936,11 @@ def integrated_ignored_additions(
     none. Removals are not read: the receipt never held ignored bytes, and
     an entry the cleanup removed or the commit now tracks leaves the listing
     by design. The restore leaves what this names in place, like unstaged
-    and untracked dirt. Path-only evidence, sorted. Ceiling: the identity
+    and untracked dirt. Path-only evidence, sorted. ``own_records`` as
+    `ignored_entries` takes it, and as the listing was sealed: the target's
+    reading leaves the run's own records out; a captured checkout's
+    (`integrated_submodule_ignored_additions`) holds none and reads a
+    ``.bmad-loop/`` there like any ignored path. Ceiling: the identity
     is ``lstat``'s, so a writer that puts size, times and inode back is not
     read.
     """
@@ -2930,8 +2951,12 @@ def integrated_ignored_additions(
     return tuple(
         sorted(
             path
-            for path, identity in ignored_entries(repo).items()
-            if path not in excluded and recorded.get(path) != identity
+            for path, identity in ignored_entries(repo, own_records=own_records).items()
+            # `vendor/`: a tolerated nested repository (`plan_incoming_collisions`,
+            # tolerated as `vendor`) an incoming `.gitignore` change turned ignored
+            if path not in excluded
+            and path.rstrip("/") not in excluded
+            and recorded.get(path) != identity
         )
     )
 
@@ -2954,8 +2979,11 @@ def integrated_submodule_ignored_additions(
     that is not one is the other readings' — the commit's own directory,
     or a file. Inside the leftover a tracked directory replaced, the paths
     ``revision`` holds under it are the commit's, not a hook's, however the
-    leftover's rules read them. Named under the submodule path, sorted;
-    left in place by the restore, like the tree's own ignored dirt.
+    leftover's rules read them. The run's records are the target's: a
+    ``.bmad-loop/cache/x`` the checkout's own rules ignore is read like any
+    other ignored path there, as it was sealed (#796 review). Named under
+    the submodule path, sorted; left in place by the restore, like the
+    tree's own ignored dirt.
     """
     _snapshots, validated = validate_integration_state_schema(run_dir, [], submodules)
     inventory: dict[str, tuple[bytes, bytes, str]] | None = None
@@ -2977,7 +3005,7 @@ def integrated_submodule_ignored_additions(
         named.extend(
             f"{rel}/{path}"
             for path in integrated_ignored_additions(
-                checkout, run_dir, evidence, tolerated=held_below
+                checkout, run_dir, evidence, tolerated=held_below, own_records=False
             )
         )
     return tuple(sorted(named))
@@ -3134,6 +3162,7 @@ def integrated_stray_paths(
         recorded = _recorded_ignored_entries(run_dir, validate_ignored_entries_evidence(ignored))
     strays: list[str] = []
     for path, xy in (*dirty_paths(repo).items(), *automator_dirty_paths(repo).items()):
+        # `vendor/`: an untracked nested repository, tolerated as `vendor`
         if path in excluded or path.rstrip("/") in excluded:
             continue
         if any(path == prefix or path.startswith(prefix) for prefix in prefixes):
@@ -5837,7 +5866,9 @@ def dirty_paths(repo: Path) -> dict[str, str]:
     and rename forms parse without C-quoting; for a rename the *destination* path
     (the one now on disk) is what's recorded. `-uall` lists individual untracked
     files (not a collapsed parent dir) so each entry can be matched 1:1 against a
-    branch's incoming paths."""
+    branch's incoming paths — but one entry per untracked nested repository,
+    spelled with a trailing slash (`vendor/`), which git never descends into;
+    `plan_incoming_collisions` tolerates it as `vendor`."""
     rc, out = _git_raw(
         repo, "status", "--porcelain", "-z", "-uall", "--", ".", f":(exclude){AUTOMATOR_DIR_REL}"
     )
@@ -5987,7 +6018,20 @@ def plan_incoming_collisions(
     # `blocking`, not a second independent predicate. Recomputing one here is how the
     # two lists drift: an unstaged tracked stray answering neither test would proceed
     # with no journal trace at all, which is the silent half of #618.
-    tolerated = list(stray)
+    #
+    # One entry `-uall` still collapses: an untracked nested repository, which
+    # `status` spells `vendor/`. It stays `vendor/` in `dirty` — no incoming
+    # file path is spelled so, which is what keeps it out of `cleaned`: it is
+    # an operator's repository, never an Editor leak, and a shape clash with
+    # an incoming `vendor` is git's pre-flight to refuse — and is tolerated as
+    # `vendor`, a path every receipt reading admits (`_portable_integration_path`
+    # refuses the empty segment, and the journalled plan is validated the same
+    # way at replay), so a target holding one no longer paused every modern
+    # integration before the merge as malformed, and again at each resume
+    # (#796 review). The receipt has no file to snapshot for it
+    # (`capture_integration_state` passes it over); its `.git` entry is the
+    # ignored listing's (`_nested_git_entries`), at its identity.
+    tolerated = [path.rstrip("/") for path in stray]
     if tolerated and on_tolerated is not None:
         on_tolerated(tolerated)
     cleaned = tuple(sorted(path for path in dirty if path in incoming))

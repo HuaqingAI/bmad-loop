@@ -513,7 +513,14 @@ breaking changes may land in a minor release.
   listing the receipt seals of each such checkout's ignored entries beside
   its HEAD — into a submodule the unit leaves alone, one whose gitlink it
   rewrites, or the leftover git could not remove, the unit's own paths
-  written into a replaced leftover left out; the restore reverts what
+  written into a replaced leftover left out, and a `.bmad-loop/` the
+  checkout's own rules ignore read like any other path there (the run's
+  records are the target's alone, left out of the target's listing only);
+  an untracked nested repository in the target — the one entry `status`
+  still collapses, `vendor/` — is tolerated as `vendor` and passed over by
+  the capture, its `.git` sealed at its identity, where its spelling had
+  paused every receipt-bearing integration before the merge as malformed
+  and again at each resume; the restore reverts what
   the hook staged and leaves unstaged, untracked and ignored entries in place, named
   for the operator; and a directory the unit creates, where the receipt
   proved nothing was — or proved an empty untracked directory, which git

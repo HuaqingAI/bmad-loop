@@ -4513,6 +4513,144 @@ def test_integrated_submodule_ignored_additions_name_a_hooks_write_the_checkout_
     ) == ("module/hook.log",)
 
 
+def test_integrated_submodule_ignored_additions_read_the_automator_directory_like_any_other(
+    project, tmp_path
+):
+    """The run's records live under the target's `.bmad-loop/` alone, and the
+    tree's ignored listing leaves them out (`runs/`, `cache/`, ...) because
+    the receipt's own sidecars and the run's worktrees stand there. Reused
+    for a captured submodule checkout, that exemption dropped a
+    `.bmad-loop/cache/hook.log` the checkout's own rules ignore — a target
+    hook's write both `status` readings miss — so the run recorded
+    `unit-merged` and retired its receipt over it (Codex, #796 review). A
+    captured checkout holds no record of the run: its `.bmad-loop/` is any
+    other ignored path there, sealed and read like one, while the target's
+    own records stay out of the target's listing.
+
+    Ablation: drop the `own_records=False` from either the seal or the
+    reading and the named row reds — the entry is neither sealed nor read."""
+    repo = project.project
+    origin = tmp_path / "sub-origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    (origin / ".gitignore").write_text(".bmad-loop/\n")
+    commit(origin, "payload.txt", "submodule\n", "submodule baseline ignoring .bmad-loop/")
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(origin), "module")
+    git(repo, "commit", "-q", "-m", "add populated submodule")
+    checkout = repo / "module"
+    (checkout / ".bmad-loop" / "runs").mkdir(parents=True)
+    (checkout / ".bmad-loop" / "runs" / "old").write_text("ignored before\n")
+    run_dir = repo / ".bmad-loop" / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    (repo / ".gitignore").write_text(".bmad-loop/\n")
+    git(repo, "add", "--", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore the automator directory")
+    _snapshots, submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, ("module",))
+    [captured] = submodules
+    sidecar = run_dir / str(captured["ignored"]["sidecar"])
+    assert sidecar.read_bytes().split(b"\0")[::2] == [b".bmad-loop/runs/old"]
+    # the target's own listing still leaves the run's records out: the
+    # checkout's `.git` boundary is its one entry
+    evidence = verify.capture_ignored_entries(repo, run_dir, "c" * 32)
+    assert (run_dir / str(evidence["sidecar"])).read_bytes().split(b"\0")[::2] == [b"module/.git"]
+    integrated = verify.rev_parse_head(repo)
+    assert (
+        verify.integrated_submodule_ignored_additions(
+            repo, run_dir, submodules, revision=integrated
+        )
+        == ()
+    )
+
+    (checkout / ".bmad-loop" / "cache").mkdir()
+    (checkout / ".bmad-loop" / "cache" / "hook.log").write_text("target hook output\n")
+    assert git(checkout, "status", "--porcelain", "-uall") == ""
+    assert git(repo, "status", "--porcelain", "-uall") == ""
+
+    assert verify.integrated_submodule_ignored_additions(
+        repo, run_dir, submodules, revision=integrated
+    ) == ("module/.bmad-loop/cache/hook.log",)
+    assert verify.integrated_ignored_additions(repo, run_dir, evidence) == ()
+
+
+@pytest.mark.parametrize("incoming", ["b.txt", "vendor"], ids=["beside", "shape-clash"])
+def test_tolerated_nested_repository_passes_every_receipt_reading(project, incoming):
+    """An untracked nested repository in the target — a tool the operator
+    cloned into the checkout — is the one entry `status -uall` still
+    collapses, spelled `vendor/`. The guard classified it tolerated, and
+    that spelling then reached the receipt's path validator, which refuses
+    an empty segment: every modern integration paused before the merge as
+    malformed, and again at each resume (Codex, #796 review). The plan now
+    tolerates it as `vendor`; the capture passes it over (an operator's
+    repository, no file of the target's to snapshot); the ignored listing
+    seals its `.git` at its identity; and after the hooks the stray reading
+    and the ignored reading both leave it alone — a `.gitignore` the commit
+    brings that turns it ignored included — while a hook that replaces its
+    `.git` is named. It is never cleaned: an incoming *file* `vendor` is a
+    shape clash for git's pre-flight, not an Editor leak.
+
+    Ablation: drop the `rstrip` in `plan_incoming_collisions` and both rows
+    raise malformed at the capture; drop the nested-repository arm in the
+    capture and both raise "not a file"; drop the `rstrip` in
+    `integrated_ignored_additions` and the turned-ignored row is named."""
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    (repo / ".gitignore").write_text(".bmad-loop/\n")
+    git(repo, "add", "--", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore the automator directory")
+    git(repo, "checkout", "-q", "-b", "unit")
+    (repo / incoming).write_text("incoming\n")
+    git(repo, "add", "--", incoming)
+    git(repo, "commit", "-q", "-m", "unit")
+    git(repo, "checkout", "-q", "main")
+    vendor = repo / "vendor"
+    vendor.mkdir()
+    git(vendor, "init", "-q")
+    (vendor / "tool.py").write_text("operator's clone\n")
+    assert git(repo, "status", "--porcelain", "-uall") == "?? vendor/"
+
+    plan = verify.plan_incoming_collisions(repo, "main", "unit")
+
+    assert plan == verify.IncomingCollisionPlan(cleaned=(), tolerated=("vendor",), untracked=())
+    verify.preflight_integration_paths(plan.tolerated)
+    snapshots, _submodules = verify.capture_integration_state(
+        repo, run_dir, "d" * 32, (incoming, *plan.tolerated)
+    )
+    # the nested repository is passed over — under the clash it IS the incoming operand
+    assert [entry["path"] for entry in snapshots] == ([] if incoming == "vendor" else [incoming])
+    evidence = verify.capture_ignored_entries(repo, run_dir, "d" * 32)
+    assert (run_dir / str(evidence["sidecar"])).read_bytes().split(b"\0")[::2] == [b"vendor/.git"]
+    assert verify.integrated_stray_paths(repo, tolerated=plan.tolerated, incoming=(incoming,)) == ()
+    assert (
+        verify.integrated_ignored_additions(repo, run_dir, evidence, tolerated=plan.tolerated) == ()
+    )
+    if incoming == "vendor":
+        # the shape clash is git's to refuse at its pre-flight; nothing was cleaned
+        proc = verify.git_bytes(repo, "merge", "--no-ff", "-q", "unit")
+        assert proc.returncode != 0
+        assert (vendor / "tool.py").read_text() == "operator's clone\n"
+        return
+
+    # the integrated shape: the commit's `.gitignore` turns the repository ignored
+    (repo / ".gitignore").write_text(".bmad-loop/\nvendor/\n")
+    git(repo, "add", "--", ".gitignore")
+    git(repo, "commit", "-q", "-m", "integrated: vendor/ ignored")
+    assert git(repo, "status", "--porcelain", "-uall") == ""
+    assert (
+        verify.integrated_ignored_additions(repo, run_dir, evidence, tolerated=plan.tolerated) == ()
+    )
+    assert verify.integrated_ignored_additions(repo, run_dir, evidence) == ("vendor/",)
+
+    # a hook that re-initialises the repository is read at its `.git`'s identity
+    shutil.rmtree(vendor / ".git")
+    git(vendor, "init", "-q")
+    assert verify.integrated_ignored_additions(
+        repo, run_dir, evidence, tolerated=plan.tolerated
+    ) == ("vendor/.git",)
+
+
 def _integrate_new_directory(repo, run_dir):
     """Arm a receipt over `newdir/tracked` while `newdir` is absent, then commit
     the integrated shape: the directory created by the commit, holding exactly
