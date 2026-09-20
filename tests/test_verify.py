@@ -8571,6 +8571,106 @@ def test_commit_path_bound_rejects_post_staging_symlink_substitution(project, mo
     assert path.is_symlink()
 
 
+def test_commit_path_bound_publishes_the_live_bytes_under_any_line_ending(project):
+    # `atomic_write_text` renders the accepted rewrite with the host's line
+    # ending, so on Windows the live ledger is CRLF while the accepted text is
+    # LF. Under `core.autocrlf=false` a candidate built from the text's own
+    # encoding commits LF over a CRLF checkout and DONE is earned beside a
+    # dirty ledger; the candidate must carry the bytes actually validated.
+    repo = project.project
+    path = repo / "src.txt"
+    baseline = path.read_text(encoding="utf-8")
+    accepted = "accepted migration ledger\n"
+    live = b"accepted migration ledger\r\n"
+    path.write_bytes(live)
+    git(repo, "config", "core.autocrlf", "false")
+
+    sha = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert sha == verify.rev_parse_head(repo)
+    assert verify.git_bytes(repo, "show", f"{sha}:src.txt").stdout == live
+    assert git(repo, "status", "--porcelain", "--", "src.txt") == ""
+    assert path.read_bytes() == live
+
+
+def test_commit_path_bound_refuses_the_same_text_under_other_line_endings(project, monkeypatch):
+    # A rival rendering of the accepted text — CRLF where the observation read
+    # LF — decodes identically under the universal-newline reading, so only a
+    # raw-byte comparison tells the live file from the candidate's bytes.
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    rival = accepted.replace("\n", "\r\n").encode("utf-8")
+    real_git = verify._git
+
+    def rerender_after_staging(git_repo, *args, **kwargs):
+        if args[:1] == ("commit",) and git_repo != repo:
+            path.write_bytes(rival)
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", rerender_after_staging)
+    with pytest.raises(verify.GitError, match="target changed during validation"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.read_bytes() == rival
+
+
+def test_commit_path_bound_refuses_an_in_place_rewrite_inside_the_final_validation(
+    project, monkeypatch
+):
+    # The rival lands on the SAME inode between the final pre-publication read
+    # and its trailing stat: the bytes read are still the accepted ones and the
+    # device/inode pair is unchanged, so only the size/mtime/ctime bracket can
+    # refuse it before the transaction commits over rival live content.
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    rival = b"rival bytes written in place over the same inode\n"
+    armed = False
+    real_validate = verify._validate_bound_candidate
+    real_read_bytes = Path.read_bytes
+
+    def arm_after_candidate_validation(*args, **kwargs):
+        nonlocal armed
+        real_validate(*args, **kwargs)
+        armed = True
+
+    def rewrite_in_place_after_reading(self):
+        nonlocal armed
+        data = real_read_bytes(self)
+        if armed and self == path:
+            armed = False
+            with open(path, "r+b") as handle:
+                handle.write(rival)
+                handle.truncate()
+        return data
+
+    monkeypatch.setattr(verify, "_validate_bound_candidate", arm_after_candidate_validation)
+    monkeypatch.setattr(Path, "read_bytes", rewrite_in_place_after_reading)
+    with pytest.raises(verify.GitError, match="target changed during validation"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.read_bytes() == rival
+
+
 def test_commit_path_bound_refuses_detached_head_before_candidate_hooks(project):
     repo, path, baseline, accepted = _bound_publish_inputs(project)
     original = verify.rev_parse_head(repo)

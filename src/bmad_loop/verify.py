@@ -9872,35 +9872,74 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     return rev_parse_head(repo)
 
 
+@dataclass(frozen=True)
+class _BoundLiveLedger:
+    """One raw observation of the live ledger: its bytes beside the stat fields an
+    in-place rewrite of the same inode moves."""
+
+    data: bytes
+    dev: int
+    ino: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+def _bound_live_ledger_stat(st: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
 def _bound_live_ledger_identity(
     live_path: Path,
     target: Path,
     accepted_text: str,
     *,
-    identity: tuple[int, int] | None = None,
-) -> tuple[int, int]:
-    """Prove the live ledger is the accepted regular target without disclosing it."""
+    observed: _BoundLiveLedger | None = None,
+) -> _BoundLiveLedger:
+    """Prove the live ledger is the accepted regular target without disclosing it.
+
+    The first observation reads the target's RAW bytes and accepts them only when
+    they decode, under the universal-newline reading every ledger reader uses
+    (`deferredwork.read_for_write`), to `accepted_text`: the sweep validated that
+    text, and on Windows `atomic_write_text` renders it with CRLF, so a byte-exact
+    comparison against `accepted_text.encode()` would refuse every Windows host
+    while a text comparison would let the bytes on disk and the bytes committed
+    drift apart. Those observed bytes are what the candidate carries. Every later
+    call re-reads and holds the target to that exact observation — bytes, inode,
+    size, mtime and ctime — so a rewrite in place, the same inode carrying rival
+    bytes (or the same text under other line endings), is refused rather than
+    published beside a candidate built from the earlier reading. The read itself
+    is bracketed by two stats of those fields, so a write that lands during it is
+    refused too, not read half-old and half-new.
+    """
     try:
         resolved = live_path.resolve(strict=True)
         before = target.lstat()
         if resolved != target or not S_ISREG(before.st_mode):
             raise GitError("accepted publication target changed shape")
-        observed = live_path.read_text(encoding="utf-8")
+        data = live_path.read_bytes()
         after = target.lstat()
         if (
             not S_ISREG(after.st_mode)
-            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            or _bound_live_ledger_stat(before) != _bound_live_ledger_stat(after)
             or live_path.resolve(strict=True) != target
-            or observed != accepted_text
         ):
             raise GitError("accepted publication target changed during validation")
+        if observed is None:
+            decoded = io.IncrementalNewlineDecoder(None, translate=True).decode(
+                data.decode("utf-8"), final=True
+            )
+            if decoded != accepted_text:
+                raise GitError("accepted publication target changed during validation")
     except GitError:
         raise
     except (OSError, RuntimeError, UnicodeDecodeError, ValueError) as exc:
         raise GitError("accepted publication target could not be validated") from exc
-    current = (after.st_dev, after.st_ino)
-    if identity is not None and current != identity:
-        raise GitError("accepted publication target identity changed")
+    current = _BoundLiveLedger(data, *_bound_live_ledger_stat(after))
+    if observed is not None and current != observed:
+        if (current.dev, current.ino) != (observed.dev, observed.ino):
+            raise GitError("accepted publication target identity changed")
+        raise GitError("accepted publication target changed during validation")
     return current
 
 
@@ -10288,10 +10327,14 @@ def commit_path_bound(
     """Publish one accepted ledger transition through a validated candidate.
 
     The candidate is committed in a detached temporary worktree, so ordinary Git
-    hooks run without moving the authoritative checkout.  Its parent, exact path
-    delta, Git-clean-filtered blob, live decoded text, and path identity are all
-    validated before a prepared transaction publishes it to the originally
-    captured terminal direct branch.  Once that transaction commits, target-only
+    hooks run without moving the authoritative checkout.  It carries the live
+    target's own bytes, observed once they are proven to decode to
+    `accepted_text`, so the blob it commits is the one `git add` of the validated
+    file would stage under any line-ending configuration and the checkout reads
+    clean after publication.  Its parent, exact path delta, Git-clean-filtered
+    blob, live bytes and stat identity, and path identity are all validated
+    before a prepared transaction publishes it to the originally captured
+    terminal direct branch.  Once that transaction commits, target-only
     real-index reconciliation is replayable housekeeping: no later fault rolls the
     truthful commit back.
 
@@ -10314,14 +10357,14 @@ def commit_path_bound(
         raise GitError("exact-path publication target could not be resolved safely") from exc
 
     lexical = live_path if live_path is not None else path
-    accepted_bytes = accepted_text.encode("utf-8")
+    observed = _bound_live_ledger_identity(lexical, target, accepted_text)
+    accepted_bytes = observed.data
     baseline_bytes = baseline_text.encode("utf-8")
     try:
         accepted_oid = git_normalized_blob_oid_for_bytes(repo_root, rel, accepted_bytes)
         baseline_oid = git_normalized_blob_oid_for_bytes(repo_root, rel, baseline_bytes)
     except GitError as exc:
         raise GitError("publication target content could not be normalized by Git") from exc
-    identity = _bound_live_ledger_identity(lexical, target, accepted_text)
     captured = _bound_checkout_identity(repo_root)
 
     head_entry = _bound_tree_entry(repo_root, captured.oid, rel)
@@ -10353,7 +10396,7 @@ def commit_path_bound(
         raise GitError("real index holds foreign content at the publication target")
 
     if accepted is not None:
-        _bound_live_ledger_identity(lexical, target, accepted_text, identity=identity)
+        _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
         _synchronize_bound_index(repo_root, captured, rel, observed_index_entry)
         return accepted
 
@@ -10365,7 +10408,7 @@ def commit_path_bound(
     except GitError as exc:
         raise GitError("publication target cleanliness could not be validated") from exc
     if clean and (head_blob == accepted_oid or ignored_untracked):
-        _bound_live_ledger_identity(lexical, target, accepted_text, identity=identity)
+        _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
         return None
 
     active_error: BaseException | None = None
@@ -10401,7 +10444,7 @@ def commit_path_bound(
             staged_entry = _bound_index_entry(candidate_root, rel)
             if staged_entry != _BoundGitEntry(expected_mode, "blob", accepted_oid):
                 raise GitError("exact-path candidate staging changed accepted content")
-            _bound_live_ledger_identity(lexical, target, accepted_text, identity=identity)
+            _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
             if _bound_checkout_identity(repo_root) != captured:
                 raise GitError("checkout changed before exact-path candidate hooks")
             rc, _out = _git(candidate_root, "commit", "-m", message)
@@ -10419,7 +10462,7 @@ def commit_path_bound(
                 accepted_oid,
                 baseline_oid,
             )
-            _bound_live_ledger_identity(lexical, target, accepted_text, identity=identity)
+            _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
             _publish_bound_candidate(
                 repo_root,
                 captured,
@@ -10443,7 +10486,7 @@ def commit_path_bound(
                 raise GitError(f"git detached candidate cleanup failed in {repo_root}")
 
     assert candidate is not None
-    _bound_live_ledger_identity(lexical, target, accepted_text, identity=identity)
+    _bound_live_ledger_identity(lexical, target, accepted_text, observed=observed)
     expected_checkout = _BoundCheckoutIdentity(
         captured.immediate_ref,
         captured.terminal_ref,
