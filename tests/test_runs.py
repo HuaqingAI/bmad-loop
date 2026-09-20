@@ -15,7 +15,14 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
-from conftest import assert_run_state_lock_held, escalated_run, git, refuse_to_resolve
+from conftest import (
+    assert_run_state_lock_held,
+    escalated_run,
+    git,
+    patch_publish_rename,
+    real_publish_rename,
+    refuse_to_resolve,
+)
 
 from bmad_loop import envvars, platform_util, runs, verify
 from bmad_loop.adapters import tmux_base
@@ -48,11 +55,32 @@ def _make_state_run(project, run_id, **state_kwargs):
     return run_dir
 
 
+# Every `_dead_pid()` child, kept for the interpreter's lifetime: Windows recycles a
+# pid the moment the last handle to the exited process closes, and `Popen` holds
+# that handle only as long as the object lives. Dropping it let another xdist
+# worker's child take the "dead" pid and `psutil.pid_exists` call the engine alive
+# (test_prunable_sessions_claims_an_untagged_session_on_a_run_id_collision, Windows
+# py3.14). A held handle pins the pid to the exited process, which psutil reports as
+# not running. On POSIX the reaped child is gone either way; the list is harmless.
+_DEAD_CHILDREN: list[subprocess.Popen[bytes]] = []
+
+
 def _dead_pid() -> int:
     # A process that exits immediately, cross-platform (POSIX `true` isn't on
     # Windows). The interpreter is always present and on every host.
     proc = subprocess.Popen([sys.executable, "-c", ""])
     proc.wait()
+    _DEAD_CHILDREN.append(proc)
+    # `wait()` returns when the process object is signaled; on Windows the pid
+    # can still be enumerated for a moment after that, and a test probing it
+    # right away read the dead engine as running (test_discover_runs_classification,
+    # Windows py3.11). Hand back the pid only once the probe every consumer uses
+    # agrees it is dead — bounded, and loud rather than flaky if it never does.
+    deadline = time.monotonic() + 10.0
+    while platform_util.pid_alive(proc.pid):
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"exited child {proc.pid} still reads alive after 10s")
+        time.sleep(0.01)
     return proc.pid
 
 
@@ -1269,12 +1297,14 @@ def test_write_stop_request_survives_an_interleaved_concurrent_writer(tmp_path, 
     seam still covers the ablation the old dual patch existed for, and covers it
     better — `atomic_replace` is itself a wrapper around `os.replace`, so
     reverting `_write_stop_request` to the hand-rolled `tmp + atomic_replace`
-    routes through this same patch and must still redden this test.
+    routes through this same patch and must still redden this test. Through
+    `patch_publish_rename`, which also covers the Windows anchored arm's
+    `win32_at.replace_at` — there `os.replace` is never called at all.
 
     Filtered to the stop-request name so an unrelated replace during the test is
     not collateral."""
     run_dir = _make_state_run(tmp_path, "r1")
-    real_replace = os.replace
+    real_replace = real_publish_rename
     nested: list[str] = []
 
     def _interleave(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
@@ -1283,7 +1313,7 @@ def test_write_stop_request_survives_an_interleaved_concurrent_writer(tmp_path, 
             runs._write_stop_request(run_dir, "graceful")
         return real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
-    monkeypatch.setattr(os, "replace", _interleave)
+    patch_publish_rename(monkeypatch, _interleave)
 
     runs._write_stop_request(run_dir, "hard")  # writer A — must not raise
 

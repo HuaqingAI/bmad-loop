@@ -245,9 +245,16 @@ _JOURNAL_ALIAS_FIELDS = {
 # spec basename, so that known shape is aliased without making the same claim about a
 # future kind that reuses the generic name.
 _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
-    "unit-merge-started": {"target": "branch"},
-    "unit-merged": {"target": "branch"},
-    "resume-unit-merge": {"target": "branch"},
+    "unit-merge-started": {
+        "target": "branch",
+        "operation_id": "operation",
+        "pre_target_revision": "commit",
+    },
+    "unit-merged": {
+        "target": "branch",
+        "operation_id": "operation",
+    },
+    "resume-unit-merge": {"target": "branch", "operation_id": "operation"},
     "sentinel-cleared": {"sentinel": "spec"},
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
@@ -469,8 +476,8 @@ _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
 # field because some other table happened to cover it would mislead the next reader.
 _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     "preference-escalation": frozenset({"type", "severity", "detail"}),
-    # The five kinds `render_markdown` lifts out of the scrubbed collection and
-    # prints as a JSON block in the DEFAULT dump (DW-191/192/201). Their names ARE
+    # The six kinds `render_markdown` lifts out of the scrubbed collection and
+    # prints as a JSON block in the DEFAULT dump (DW-191/192/201/246). Their names ARE
     # authored here, so the premise above does not hold for them — an unclaimed
     # key on one of these is a field a future producer added without routing.
     # Declared anyway, because Markdown is the render an operator pastes into an
@@ -485,6 +492,9 @@ _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     "sweep-ledger-commit-clean": frozenset({"message", "file"}),
     "sweep-ledger-commit-refused": frozenset({"message", "file", "refuse_cause", "error"}),
     "sweep-ledger-commit-unavailable": frozenset({"message", "repo", "error", "file"}),
+    # DW-246/250. `dw_ids` is a `_JOURNAL_KEYLIST_FIELDS` name and aliases before
+    # this table is consulted; named for the same completeness as `commit` above.
+    "sweep-ledger-commit-withheld": frozenset({"message", "file", "reason", "dw_ids"}),
     "sweep-repeat-done": frozenset({"cycles", "reason", "stop_cause"}),
 }
 
@@ -1034,6 +1044,12 @@ def _scrub_entry(
             v = _alias_input(v, ns)
             epic = epic_by_key.get(str(v)) if ns == "story" else None
             out[k] = pseudo.alias(v, ns=ns, epic=epic)
+        elif kind == "artifact-publication-refused" and k == "publication_cause":
+            out[k] = v if v in ("file-limit", "payload-limit") else None
+        elif kind == "artifact-publication-refused" and k in ("measured_bytes", "limit_bytes"):
+            out[k] = v if type(v) is int and v >= 0 else None
+        elif kind == "artifact-publication-refused" and k == "measurement_is_lower_bound":
+            out[k] = v if type(v) is bool else None
         elif declared is not None and k not in declared and k not in SELF_MINTED_FIELDS:
             # A kind with a declared schema (`_JOURNAL_KIND_SCHEMAS`) replaces the
             # `scrub_json` fallback with a fail-closed one, because on such a kind an
@@ -1411,6 +1427,9 @@ def render_markdown(
                 "sweep-ledger-commit-clean",
                 "sweep-ledger-commit-refused",
                 "sweep-ledger-commit-unavailable",
+                # DW-246: a publish the run declined over its own ledger doubt;
+                # `file` names which file, `reason` collapses to presence.
+                "sweep-ledger-commit-withheld",
                 "sweep-repeat-done",
             }
         ]

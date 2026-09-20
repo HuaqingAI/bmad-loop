@@ -17,11 +17,15 @@ import yaml
 from conftest import (
     _OK,
     MISSING_TOOL_CMD,
+    NUL_PATH_RESOLVE_FAULTS,
     PROJECT_MARKER_CMD,
+    READABLE_LEDGER,
     REPO_ROOT_MARKER_CMD,
+    UNDECODABLE_LEDGER,
     UNRESOLVABLE,
     assert_run_state_lock_held,
     escalated_run,
+    fault_metadata_probe,
     fault_read_text,
     git,
     ignore_before_commit,
@@ -219,6 +223,69 @@ def test_sweep_dry_run_refuses_an_undecodable_ledger(project, capsys):
     assert str(project.deferred_work) in err
     assert "UnicodeDecodeError" in err
     assert "open," not in out  # never a fabricated listing
+
+
+def _fault_ledger(monkeypatch, ledger: Path, fault: str) -> None:
+    """The three-way ledger fault the DW-265/266/267 rows share: `read_text`
+    refuses the read; `metadata-3.13` refuses the `stat` presence probe alone,
+    which `is_file()` re-raised on Python 3.11–3.13; `metadata-3.14` ALSO pins
+    `Path.is_file` False for the ledger, the shape Python 3.14 gives a refused
+    ledger, where `is_file()` suppresses every OS error and answers False."""
+    if fault == "read_text":
+        fault_read_text(monkeypatch, ledger)
+        return
+    if fault == "metadata-3.14":
+        real = Path.is_file
+        monkeypatch.setattr(
+            Path,
+            "is_file",
+            lambda self, *a, **kw: False if self == ledger else real(self, *a, **kw),
+        )
+    fault_metadata_probe(monkeypatch, ledger, "stat")
+
+
+@pytest.mark.parametrize("fault", ["metadata-3.14", "metadata-3.13"])
+def test_sweep_dry_run_refuses_a_ledger_whose_metadata_probe_is_refused(
+    project, capsys, monkeypatch, fault
+):
+    """DW-265. The listing's `is_file()` pre-gate stood BEFORE the DW-254 reader
+    that attributes faults, so a refused ledger never reached it: on Python 3.14
+    `is_file()` suppresses every OS error and answers False, and the command
+    printed "no deferred-work ledger" and exited 0 for a ledger with open
+    entries; on 3.11–3.13 the probe raised a `PermissionError` traceback out of
+    the CLI. Absence is now taken from the reader's own `("", None)` answer, so
+    the refusal is the attributed fault the undecodable row above already gets.
+    Ablation: restore the `if not ledger.is_file(): print(...); return 0`
+    pre-gate and the `metadata-3.14` row reds exiting 0 with "no deferred-work
+    ledger" on stdout; the `metadata-3.13` row reds raising `PermissionError`."""
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    _fault_ledger(monkeypatch, project.deferred_work, fault)
+
+    assert cli._sweep_dry_run(project, pol) == cli.ExitCode.FAILURE
+    out, err = capsys.readouterr()
+    assert str(project.deferred_work) in err
+    assert "PermissionError" in err
+    assert "open," not in out  # never a fabricated listing
+    assert "no deferred-work ledger" not in out  # and never a refusal read as absence
+
+
+def test_sweep_dry_run_reports_an_empty_ledger_as_absent(project, capsys):
+    """The one visible edge of taking absence from the reader (DW-265): a 0-byte
+    ledger answers the same `("", None)` a missing one does, so it is reported as
+    "no deferred-work ledger at" rather than "0 open, 0 closed". Deliberate — it
+    holds nothing to list either way — and pinned here so the wording is a
+    decision rather than an accident."""
+    _write_policy(project.project)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(b"")
+
+    assert cli._sweep_dry_run(project, pol) == 0
+    out = capsys.readouterr().out
+    assert f"no deferred-work ledger at {project.deferred_work}" in out
+    assert "open," not in out
 
 
 def test_dry_run_is_silent_when_preflight_would_pass(project, capsys):
@@ -945,8 +1012,8 @@ def test_decisions_reports_a_close_the_ledger_never_took(project, capsys, monkey
 
 def test_decisions_names_an_absent_ledger_rather_than_a_missing_entry(project, capsys, monkeypatch):
     """The other of `record_decision`'s two False states, and why the outcome line
-    re-probes `is_file()` to say which fired: a retired id is one entry, where a
-    ledger that is gone took every `decision:` line the walk already wrote with it.
+    asks the observation reader to say which fired: a retired id is one entry, where
+    a ledger that is gone took every `decision:` line the walk already wrote with it.
 
     Ablation: collapse the two-state probe to the single "holds no entry" sentence
     and this reddens while the sibling above still passes."""
@@ -972,7 +1039,67 @@ def test_decisions_names_an_absent_ledger_rather_than_a_missing_entry(project, c
     assert "DW-1: no decision line was written: the ledger file is gone" in out
 
 
-def test_decisions_names_a_written_answer_it_could_not_publish(project, capsys, monkeypatch):
+def test_decisions_names_a_missing_entry_for_a_present_empty_ledger(project, capsys, monkeypatch):
+    """The edge between the two siblings above, and the reason the outcome line
+    asks the presence-aware reader (`observe_ledger`) rather than testing the
+    text-only reader's `""` for truth: a ledger truncated to 0 bytes mid-prompt is
+    a file the recorder REACHED and found no entry in — the missing-entry news —
+    where the text-only reader answers the same `""` it answers for absence, and
+    the outcome line then told the operator the file was gone, with every
+    `decision:` line already written (PR #794 review; the edge the DW-281/282
+    CHANGELOG entry recorded as accepted).
+
+    Ablation: switch the site back to `read_for_observation` + `elif not text:`
+    and this reds with "the ledger file is gone" while both siblings still pass."""
+    from conftest import write_ledger
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    _make_run_with_rich_decision(project)
+
+    class _StubPrompter:
+        def ask(self, decision):
+            project.deferred_work.write_text("")  # present, 0 bytes: reached, nothing in it
+            return decision.option("2")  # choose close
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert "closed now" not in out
+    assert "the ledger file is gone" not in out
+    assert "DW-1: no decision line was written: the ledger holds no entry for this id" in out
+
+
+@pytest.mark.parametrize(
+    "refusals,note",
+    [
+        # Both operands refused — the shape DW-209/213 shipped with.
+        (
+            {"ledger": ("target-absent", None), "store": ("target-absent", None)},
+            "not committed to git: deferred-work.md (target-absent), "
+            "decisions.json (target-absent)",
+        ),
+        # DW-211/228's token, which ONLY the store family can produce (the ledger
+        # leg reads through `read_for_write` and has no wrong-type answer), so the
+        # ledger publishes and the line names the one file that did not.
+        (
+            {"store": ("target-not-a-file", None)},
+            "not committed to git: decisions.json (target-not-a-file)",
+        ),
+        # DW-237's token, which ONLY the ledger family can produce (the store leg
+        # asks nothing about bytes): the decode fault rides after the cause.
+        (
+            {"ledger": ("target-undecodable", "deferred-work.md is not valid UTF-8: bad byte")},
+            "not committed to git: deferred-work.md "
+            "(target-undecodable: deferred-work.md is not valid UTF-8: bad byte)",
+        ),
+    ],
+)
+def test_decisions_names_a_written_answer_it_could_not_publish(
+    project, capsys, monkeypatch, refusals, note
+):
     """DW-209/213 on this surface. The commit's operand list is already gated on
     what the call WROTE, so a publishable-target refusal means an answer that
     really landed on disk is missing from git history — worth telling the human
@@ -1000,30 +1127,100 @@ def test_decisions_names_a_written_answer_it_could_not_publish(project, capsys, 
             asked.append(decision.id)
             return decision.option("1")  # build
 
-    # The race the guard exists for: both written operands go unpublishable
-    # between the write and the staging.
-    monkeypatch.setattr(verify, "unpublishable_target", lambda _t, _f: ("target-absent", None))
+    # The race the guard exists for: a written operand goes unpublishable between
+    # the write and the staging. Which operands is per row.
+    monkeypatch.setattr(verify, "unpublishable_target", lambda _t, family: refusals.get(family))
     monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
 
     assert cli.main(["decisions", "--project", str(project.project)]) == 0
 
     assert asked == ["DW-1", "DW-2"]
     out = capsys.readouterr().out
-    assert (
-        "DW-1: queued — the next sweep will build it; "
-        "not committed to git: deferred-work.md (target-absent), "
-        "decisions.json (target-absent)" in out
-    )
+    assert f"DW-1: queued — the next sweep will build it; {note}" in out
     assert "DW-2: queued" in out
 
 
-def test_decisions_continues_when_the_non_write_diagnostic_probe_fails(
-    project, capsys, monkeypatch
-):
-    """A later observation failure must not abort a completed non-write.
+def test_decisions_names_a_written_answer_git_could_not_commit(project, capsys, monkeypatch):
+    """DW-226 on this surface — the OTHER unpublished lane. The ledger is
+    GITIGNORED, so `commit_paths`' literal pathspec makes `git add` exit 1 for it;
+    the pre-answer store beside it is publishable. As one commit over both operands
+    that `GitError` took the store down too and `except verify.GitError: pass` told
+    nobody; now each operand commits alone and the failure is named under its own
+    `commit-unavailable` token.
 
-    Ablation: remove the diagnostic probe's OSError handler and the command
-    returns failure before asking DW-2.
+    Reported ON TOP of the ordinary outcome, exactly as a refusal is: the record
+    succeeded, so `queued — the next sweep will build it` still stands, exit 0 is
+    unchanged (a failed publish is a degrade, not a failure), and the walk still
+    advances to DW-2.
+
+    Ablation: drop the `result.publish_note()` append in `cmd_decisions` and this
+    reds on the `not committed to git` assertion while every other one still
+    passes; restore the single `commit_paths(project, ...)` call and it reds on the
+    store reaching HEAD."""
+    install_bmad_config(project)
+    ignore_before_commit(project, "_bmad-output/implementation-artifacts/deferred-work.md")
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    # premise: git really does refuse this operand, which is what makes the row
+    # grade the failure lane rather than a happy publish
+    ledger_rel = project.deferred_work.relative_to(project.project).as_posix()
+    assert git(project.project, "check-ignore", ledger_rel).strip() == ledger_rel
+    _make_run_with_two_decisions(project)
+    asked = []
+
+    class _StubPrompter:
+        def ask(self, decision):
+            asked.append(decision.id)
+            return decision.option("1")  # build
+
+    monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
+
+    assert cli.main(["decisions", "--project", str(project.project)]) == 0
+
+    assert asked == ["DW-1", "DW-2"]  # the walk advanced past the failed publish
+    out = capsys.readouterr().out
+    assert "DW-1: queued — the next sweep will build it; not committed to git: " in out
+    assert "deferred-work.md (commit-unavailable: " in out
+    assert "DW-2: queued" in out
+    # the publishable sibling still reached history, on its own
+    assert "chore(decisions): pre-answer DW-1" in git(project.project, "log", "--oneline")
+    assert git(project.project, "show", "--name-only", "--format=", "HEAD").split() == [
+        ".bmad-loop/decisions.json"
+    ]
+
+
+@pytest.mark.parametrize("shape", ["metadata-3.14", "metadata-3.13"])
+def test_decisions_continues_when_the_non_write_diagnostic_probe_fails(
+    project, capsys, monkeypatch, shape
+):
+    """A later observation failure must not abort a completed non-write, and must
+    be REPORTED as unavailable rather than as absence (DW-282).
+
+    The outcome line's diagnostic was `is_file()` inside `try/except OSError`. On
+    Python 3.14 that probe suppresses every OS error and answers False, so the
+    fault never reached the `except` and a ledger sitting in place, unreadable,
+    was reported as "the ledger file is gone" — the sentence that says every
+    `decision:` line already written went with it. The line now asks the
+    observation reader, whose probe is `stat`: a refused ledger is an attributed
+    fault on every interpreter and keeps the "ledger state unavailable" wording.
+
+    The fault is installed only after `apply_pre_answer` reports the non-write,
+    and it restores itself on the first ledger hit, so DW-2 sees the recovered FS
+    (a permanent `fault_metadata_probe` would refuse DW-2's own `record_decision`).
+    `metadata-3.14` additionally pins `Path.is_file` False for the ledger, the
+    shape 3.14 gives a refused ledger; `metadata-3.13` refuses `stat` alone.
+
+    In green both rows exercise the same reader path — nothing calls `is_file` on
+    the ledger any more — so the pin matters only under the ablation.
+
+    Ablation, RUN on 3.13: restore the `is_file()` probe inside `try/except
+    OSError` and the `metadata-3.14` row reds — DW-1's line reads "the ledger file
+    is gone", `probe_faults == []`, and the never-hit `stat` fault then refuses
+    DW-2's own recorder, so `main` answers 1 (`error: could not record DW-2`); the
+    3.13 row stays green there because `is_file()` re-raises the refused `stat` on
+    3.11–3.13. On a real 3.14 BOTH rows red: `is_file()` bypasses the `Path.stat`
+    monkeypatch and answers True, DW-1 prints "holds no entry", and the never-hit
+    `stat` fault again refuses DW-2's recorder, `main` answering 1. Drop the fault
+    handling altogether and DW-2 is never asked.
     """
     from conftest import write_ledger
 
@@ -1042,21 +1239,31 @@ def test_decisions_continues_when_the_non_write_diagnostic_probe_fails(
             return decision.option("1")
 
     apply = decisions.apply_pre_answer
+    stat = Path.stat
     is_file = Path.is_file
     probe_faults = []
 
-    def failing_probe(path):
+    def failing_probe(path, *args, **kwargs):
         if path == project.deferred_work:
             # Only the diagnostic fails; later decisions see the recovered FS.
+            monkeypatch.setattr(Path, "stat", stat)
             monkeypatch.setattr(Path, "is_file", is_file)
             probe_faults.append(path)
             raise PermissionError("ledger observation denied")
-        return is_file(path)
+        return stat(path, *args, **kwargs)
 
     def record_then_fail_probe(*args, **kwargs):
         result = apply(*args, **kwargs)
         if not result.recorded:
-            monkeypatch.setattr(Path, "is_file", failing_probe)
+            if shape == "metadata-3.14":
+                monkeypatch.setattr(
+                    Path,
+                    "is_file",
+                    lambda self, *a, **kw: (
+                        False if self == project.deferred_work else is_file(self, *a, **kw)
+                    ),
+                )
+            monkeypatch.setattr(Path, "stat", failing_probe)
         return result
 
     monkeypatch.setattr("bmad_loop.sweep.DecisionPrompter", lambda *a, **k: _StubPrompter())
@@ -1300,19 +1507,29 @@ def test_status_drops_the_decision_line_for_an_unreadable_ledger(
     nothing pinned it in either direction.
 
     Both legs of the guard are graded. `undecodable` was already degraded by DW-146's
-    `read_for_observation` conversion. `metadata` is the leg moving `is_file()` inside
-    that helper's try created: an `EACCES`-class fault on the probe used to escape the
-    helper entirely and reach `main`'s backstop as exit 1, so this row is the only
-    thing that would notice it silently becoming exit 0.
+    `read_for_observation` conversion. `metadata` is the leg the helper's probe
+    guard created: an `EACCES`-class fault on the probe used to escape the helper
+    entirely and reach `main`'s backstop as exit 1, so this row is the only thing
+    that would notice it silently becoming exit 0. Since DW-254 that probe is
+    `stat` + `S_ISREG`, so the fault is injected on `stat` with `is_file` pinned
+    False (the simulated-3.14 shape) — injected on `is_file`, as it was before
+    DW-254, it would never fire and the row would grade nothing.
 
-    Ablation: hoisting `read_for_observation`'s `is_file()` back above its `try`
-    reddens the `metadata` row alone, on the exit code (1, from `main`'s backstop) —
-    the leg isolated to this build. Reverting
+    What this row CANNOT tell apart, stated so nobody expects it to: a refused
+    ledger degraded to `("", None)` (the pre-DW-254 3.14 reading) and one
+    degraded to an attributed fault both leave `pending_missed_decisions` with no
+    open ids and no decision line, so restoring the helper's `is_file()` probe
+    leaves this row green — that switch is pinned at the helper by
+    `test_read_for_observation_degrades_on_a_metadata_fault`. This row pins the
+    surface: status exits 0 and drops the line, never exit 1.
+
+    Ablation: hoisting `read_for_observation`'s `stat` probe above its `try`
+    reddens the `metadata` row alone, on the exit code (1, from `main`'s backstop)
+    — the leg isolated to this build. Reverting
     `decisions.pending_missed_decisions`' read to
-    `ledger.read_text(encoding="utf-8") if ledger.is_file() else ""` reddens BOTH
-    rows, since that bare read re-exposes the codec error and the bare `is_file()`
-    beside it re-exposes the metadata fault; verified in both directions."""
-    from conftest import write_ledger, write_sprint
+    `ledger.read_text(encoding="utf-8") if ledger.is_file() else ""` reddens the
+    `undecodable` row, since that bare read re-exposes the codec error."""
+    from conftest import fault_metadata_probe, write_ledger, write_sprint
 
     install_bmad_config(project)
     write_sprint(project, {})
@@ -1322,13 +1539,12 @@ def test_status_drops_the_decision_line_for_an_unreadable_ledger(
         project.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
     else:
         ledger, real = project.deferred_work, Path.is_file
-
-        def boom(self, *a, **kw):
-            if self == ledger:
-                raise PermissionError(13, "Permission denied")
-            return real(self, *a, **kw)
-
-        monkeypatch.setattr(Path, "is_file", boom)
+        monkeypatch.setattr(
+            Path,
+            "is_file",
+            lambda self, *a, **kw: False if self == ledger else real(self, *a, **kw),
+        )
+        fault_metadata_probe(monkeypatch, ledger, "stat")
 
     assert cli.main(["status", "--project", str(project.project)]) == 0
 
@@ -3533,11 +3749,18 @@ def _write_bmad_config(project, impl="{project-root}/artifacts"):
     )
 
 
-def _escalated_run(project, run_id="r1", *, story="s1", spec_file=None, worktree_path=""):
+def _escalated_run(
+    project, run_id="r1", *, story="s1", spec_file=None, worktree_path="", run_type="story"
+):
     """conftest's builder with this module's shape: only the run_dir comes back (the
     CLI tests drive the real `resolve` command and re-load state from disk)."""
     return escalated_run(
-        project, run_id, story_key=story, spec_file=spec_file, worktree_path=worktree_path
+        project,
+        run_id,
+        story_key=story,
+        spec_file=spec_file,
+        worktree_path=worktree_path,
+        run_type=run_type,
     ).run_dir
 
 
@@ -5402,6 +5625,44 @@ def test_resolve_restore_patch_unresolvable_rejected(tmp_path, monkeypatch, caps
     assert called == []  # never resumed
     task = load_state(run_dir).tasks["s1"]
     assert task.phase == Phase.ESCALATED and task.restore_patch is None  # not re-armed
+
+
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+def test_resolve_restore_patch_value_error_family_is_typed_before_rearm(
+    tmp_path, monkeypatch, capsys, resolve_fault
+):
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: blocked\n---\n", encoding="utf-8")
+    _write_bmad_config(tmp_path)
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    called: list = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: called.append(rd) or 0)
+    patch = tmp_path / "whatever.patch"
+    refuse_to_resolve(monkeypatch, patch, error=resolve_fault)
+
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--no-interactive",
+            "--restore-patch",
+            str(patch),
+            "--resume",
+        ]
+    )
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert f"cannot canonicalize the restore patch path {str(patch)!r}" in err
+    assert str(resolve_fault) in err
+    assert called == []
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.ESCALATED and task.restore_patch is None
 
 
 def test_resolve_restore_patch_unresolvable_from_resolution_json_rejected(
@@ -7459,6 +7720,556 @@ def test_resume_refuses_live_run(tmp_path, monkeypatch, capsys):
     assert "double-drive" in capsys.readouterr().err
 
 
+# --------------------------------------------------- DW-204 readable-ledger gate
+#
+# `resume` on a SWEEP run used to arm the run (pid, policy re-stamp, run-resume
+# row) and only then meet a ledger it could not read, while every repair steer in
+# the product points at `bmad-loop sweep`. These rows pin the refusal and its
+# precedence, the scope on either side of it (rows that fail loudly if the gate is
+# ever widened past "sweep run, ledger cannot be read"), the two declines the gate
+# makes so that `_prepare_resume_locked` keeps its own messages verbatim, the
+# accepted probe-to-lock race, and — since DW-234 reversed the frozen exclusion —
+# the OSError refusal with its own permissions-or-storage repair.
+
+
+def _resume_gate_run(
+    project,
+    monkeypatch,
+    *,
+    run_type,
+    ledger_bytes,
+    run_id="r1",
+    liveness="dead",
+    stub_resume=True,
+    config=True,
+    **state_kwargs,
+):
+    """A dead-engine run under a real BMAD config, plus the ledger on disk (or not).
+
+    Returns the box `cli._resume_paused_run` fills in, so a row can assert on
+    "control reached the resume path" positively rather than by absence.
+    `stub_resume=False` leaves the real helper in place instead, for any row that
+    needs the real locked path to run: to let that helper produce its own refusal
+    after the gate DECLINED, to watch the gate DISPLACE that refusal, or to let it
+    own the outcome on a ledger that went bad after the gate passed;
+    `config=False` omits _bmad/bmm/config.yaml, the shape that makes the gate's own
+    `load_paths` raise."""
+    from bmad_loop import runs
+
+    if config:
+        install_bmad_config(project)
+    if ledger_bytes is not None:
+        project.implementation_artifacts.mkdir(parents=True, exist_ok=True)
+        project.deferred_work.write_bytes(ledger_bytes)
+    _make_run_with_state(
+        project.project,
+        run_id,
+        run_type=run_type,
+        paused_reason="escalation",
+        # A stage a SWEEP actually parks at. The story pipeline's own stages
+        # (spec-approval and friends) are unreachable here, and a fixture that
+        # spelled one would be describing a run this gate can never see.
+        paused_stage="escalation",
+        **state_kwargs,
+    )
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: liveness)
+    reached = []
+    if stub_resume:
+        monkeypatch.setattr(
+            cli, "_resume_paused_run", lambda *_a, **_k: (reached.append(True), 0)[1]
+        )
+    return reached
+
+
+def _assert_ledger_refusal(err, project):
+    """Every load-bearing clause of the refusal, not just the headline.
+
+    The PATH, because `implementation_artifacts` is configurable to any absolute
+    path and the ledger may be symlinked out of the project, so "the ledger" names
+    nothing an operator can open. The commit-or-stash + clean-worktree clause,
+    because `cmd_sweep` enforces that precondition and this fault leaves the
+    ledger dirty. The resumability clause, because this gate fires only on runs
+    that are still resumable, and following the sweep steer alone abandons the
+    paused run's in-flight bundle state."""
+    assert str(project.deferred_work) in err
+    assert "`bmad-loop sweep`" in err
+    assert "commit or stash" in err
+    assert str(project.repo_root) in err
+    assert "worktree to be clean" in err
+    assert "stays resumable" in err
+
+
+def test_resume_refuses_sweep_run_on_undecodable_ledger(project, monkeypatch, capsys):
+    reached = _resume_gate_run(
+        project, monkeypatch, run_type="sweep", ledger_bytes=UNDECODABLE_LEDGER
+    )
+    rc = cli.main(["resume", "--project", str(project.project), "r1"])
+    assert rc == cli.ExitCode.FAILURE
+    err = capsys.readouterr().err
+    _assert_ledger_refusal(err, project)
+    assert "invalid start byte" in err  # the decode fault, attributed
+    assert "Repair the ledger by hand" in err  # the bytes-fault repair, not the OS one
+    assert reached == []  # never armed the run
+
+
+def test_resume_sweep_ledger_refusal_follows_the_unknown_warning(project, monkeypatch, capsys):
+    # The gate sits AFTER the 'unknown' liveness warning on purpose: resume is the
+    # recovery path for an unverifiable pid, so that warning must still reach the
+    # operator even when the ledger refusal is what ends the command.
+    reached = _resume_gate_run(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        ledger_bytes=UNDECODABLE_LEDGER,
+        liveness="unknown",
+    )
+    assert cli.main(["resume", "--project", str(project.project), "r1"]) == cli.ExitCode.FAILURE
+    err = capsys.readouterr().err
+    assert "unverifiable pid" in err
+    _assert_ledger_refusal(err, project)
+    assert reached == []
+
+
+def test_resume_story_run_ignores_undecodable_ledger(project, monkeypatch):
+    # Same corrupt ledger, `run_type` "story" (the default). The gate is scoped to
+    # sweeps by the recorded decision, and since DW-231 that decline is SAFE rather
+    # than merely decided: the base Engine routes its own `read_for_write` sites —
+    # observation reads degrade, the two publish reads pause the run with a repair
+    # notice — so a story run over these bytes no longer arms and crashes.
+    reached = _resume_gate_run(
+        project, monkeypatch, run_type="story", ledger_bytes=UNDECODABLE_LEDGER
+    )
+    assert cli.main(["resume", "--project", str(project.project), "r1"]) == 0
+    assert reached == [True]
+
+
+def test_resume_sweep_run_ignores_absent_ledger(project, monkeypatch):
+    # Absence is not a fault: `read_for_write` answers None, and a resumed sweep
+    # with nothing open ends cleanly at `sweep-nothing-open`.
+    reached = _resume_gate_run(project, monkeypatch, run_type="sweep", ledger_bytes=None)
+    assert not project.deferred_work.exists()
+    assert cli.main(["resume", "--project", str(project.project), "r1"]) == 0
+    assert reached == [True]
+
+
+def test_resume_sweep_run_proceeds_on_a_readable_ledger(project, monkeypatch):
+    # The gate's happy path, and the row that keeps it from becoming a blanket
+    # refusal for sweep runs: a ledger that decodes is not the fault it screens
+    # for. Absence (the row above) cannot stand in for this — that arm returns
+    # None without ever decoding anything.
+    reached = _resume_gate_run(project, monkeypatch, run_type="sweep", ledger_bytes=READABLE_LEDGER)
+    assert cli.main(["resume", "--project", str(project.project), "r1"]) == 0
+    assert reached == [True]
+
+
+def test_resume_live_refusal_wins_over_the_ledger_gate(project, monkeypatch, capsys):
+    # A provably-live engine is the stronger fact: double-driving corrupts the run
+    # itself, while an unreadable ledger only wastes an arm. Order matters for the
+    # operator too — repairing the ledger would not make THIS resume safe. The
+    # 'unknown' row above pins the other side of the same ordering.
+    reached = _resume_gate_run(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        ledger_bytes=UNDECODABLE_LEDGER,
+        liveness="alive",
+    )
+    assert cli.main(["resume", "--project", str(project.project), "r1"]) == 1
+    err = capsys.readouterr().err
+    assert "double-drive" in err
+    assert "`bmad-loop sweep`" not in err  # the ledger was never probed
+    assert reached == []
+
+
+def test_resume_ledger_gate_declines_when_it_cannot_answer(project, monkeypatch):
+    """Both of the gate's own inputs, each failing on its own.
+
+    The gate declines so the fault's own owner answers for it. A missing BMAD
+    config and an unreadable state.json both already have owners further down
+    (`_prepare_resume_locked`, `main`'s tail), so the gate must hand control on
+    rather than answering for them with a ledger message that is not the fault —
+    it could not even locate a ledger to report. Ablation: return a refusal from
+    the `except Exception` arm instead of None and both halves fail."""
+    reached = _resume_gate_run(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        ledger_bytes=UNDECODABLE_LEDGER,
+        config=False,  # `bmadconfig.load_paths` raises BmadConfigError
+    )
+    assert cli.main(["resume", "--project", str(project.project), "r1"]) == 0
+    assert reached == [True]
+
+    install_bmad_config(project)  # now the config loads and state.json is the fault
+    (project.project / ".bmad-loop" / "runs" / "r1" / "state.json").write_text(
+        "{not json", encoding="utf-8"
+    )
+    reached.clear()
+    assert cli.main(["resume", "--project", str(project.project), "r1"]) == 0
+    assert reached == [True]
+
+
+def test_resume_finished_sweep_keeps_already_finished_over_ledger_refusal(
+    project, monkeypatch, capsys
+):
+    # A sweep ended BY a ledger fault is persisted finished (`Engine._run_inner`
+    # sets it on `SweepEngine._loop`'s return), so this is the likeliest corrupt
+    # ledger of all — and `already finished` is the true answer. The gate declines
+    # rather than telling the operator to repair a ledger for a run that could not
+    # be resumed either way.
+    _resume_gate_run(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        ledger_bytes=UNDECODABLE_LEDGER,
+        finished=True,
+        stub_resume=False,
+    )
+    assert cli.main(["resume", "--project", str(project.project), "r1"]) == 1
+    err = capsys.readouterr().err
+    assert "already finished" in err
+    assert "`bmad-loop sweep`" not in err
+
+
+def test_resume_control_alias_sweep_keeps_its_own_refusal_over_ledger(project, monkeypatch, capsys):
+    # `ctl-<16 hex>` aliases the control session's own name, so such a run can
+    # never be driven at all. That refusal names the way out (recover by hand, then
+    # `bmad-loop delete`) and must not be replaced by a ledger-repair steer that
+    # would not help.
+    run_id = "ctl-0123456789abcdef"
+    _resume_gate_run(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        ledger_bytes=UNDECODABLE_LEDGER,
+        run_id=run_id,
+        stub_resume=False,
+    )
+    assert cli.main(["resume", "--project", str(project.project), run_id]) == 1
+    err = capsys.readouterr().err
+    assert "bmad-loop delete" in err
+    assert "`bmad-loop sweep`" not in err
+
+
+@pytest.mark.parametrize("operation", ["stat", "read_text"])
+def test_resume_sweep_os_refused_ledger_is_refused_with_the_storage_repair(
+    project, monkeypatch, capsys, operation
+):
+    """The DW-234 row, replacing `..._os_refused_ledger_propagates_to_mains_tail`.
+
+    An OS-refused ledger read used to reach `main`'s tail as a routeless
+    `error: [Errno 13] …` — the `except OSError` arm was written, struck by the
+    DW-204 resolution on scope grounds, and pinned OUT by the row this replaces.
+    DW-234 carries the accepted decision to add it back: the gate now refuses with
+    the permissions-or-storage repair `sweep._notify_ledger_repair` gives the sweep
+    run for the same fault, plus every clause `_assert_ledger_refusal` pins.
+
+    The errno text and the path still surface (they are the fault), and the run is
+    never armed. Selective metadata/text faults exercise the real reader and
+    its `LedgerReadFault` wrapper. Ablation: remove that subclass from the OS
+    catch in `runs.unreadable_sweep_ledger`; both rows take the decode repair
+    wording instead of the permissions/storage route.
+
+    The ledger on disk is DECODABLE, so the refused read is the only fault in play.
+    Monkeypatched rather than chmod'd: a real mode bit does not hold as root and
+    does not exist on Windows, so the row would silently stop testing anything."""
+    reached = _resume_gate_run(project, monkeypatch, run_type="sweep", ledger_bytes=READABLE_LEDGER)
+    if operation == "stat":
+        fault_metadata_probe(monkeypatch, project.deferred_work, "stat")
+    else:
+        fault_read_text(monkeypatch, project.deferred_work)
+    rc = cli.main(["resume", "--project", str(project.project), "r1"])
+    assert rc == cli.ExitCode.FAILURE
+    err = capsys.readouterr().err
+    _assert_ledger_refusal(err, project)
+    assert "PermissionError: [Errno 13]" in err  # the OS fault, attributed by class
+    assert "permissions or storage" in err  # the OS repair, not the bytes one
+    assert "Repair the ledger by hand" not in err  # the decode refusal's wording stays its own
+    assert "error: [Errno 13]" not in err  # no longer `main`'s routeless tail
+    assert reached == []  # never armed the run
+
+
+def test_resume_sweep_ledger_refusal_displaces_the_base_skills_refusal(
+    project, monkeypatch, capsys
+):
+    """The ledger refusal PRECEDES `_require_base_skills` — deliberately, and here
+    testably.
+
+    `stub_resume=False` puts the real `_resume_paused_run` back, and the `project`
+    fixture is deliberately never given `install_base_skills`, so
+    `_prepare_resume_locked` would refuse with `FAIL: ...` + `bmad-loop validate`.
+    The entry gate gets there first: it is the cheapest refusal of the set to
+    produce and the most actionable, and the one it displaces is reachable again on
+    the retry after the repair. Ablation: delete the gate block from `cmd_resume`
+    and this row fails — the base-skills `FAIL:` lines print and the ledger refusal
+    does not."""
+    _resume_gate_run(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        ledger_bytes=UNDECODABLE_LEDGER,
+        stub_resume=False,
+    )
+    assert cli.main(["resume", "--project", str(project.project), "r1"]) == cli.ExitCode.FAILURE
+    err = capsys.readouterr().err
+    _assert_ledger_refusal(err, project)
+    assert "FAIL:" not in err  # the refusal it displaced
+
+
+def test_resume_sweep_ledger_gone_bad_after_the_probe_still_reaches_the_lock(
+    project, monkeypatch, capsys
+):
+    """The probe is a best-effort ENTRY SNAPSHOT; the probe-to-lock race is accepted.
+
+    The ledger is readable when `cmd_resume` probes and undecodable by the time
+    `_resume_paused_run` holds `state_lock` and `_prepare_resume_locked` re-reads
+    config and state. The gate passes, the locked path owns the outcome (here the
+    base-skills refusal), and nothing probes the ledger a second time — which is
+    exactly pre-DW-204 behavior for this window, so the snapshot can only improve
+    on it.
+
+    Ablation is an ADDITION, not a deletion: deleting the `cmd_resume` gate block
+    leaves this row green, because the gate never fires in it — that is the
+    control. What reddens it is an under-lock `read_for_write` re-probe added to
+    `_prepare_resume_locked` AT OR ABOVE its `_require_base_skills` gate, which is
+    what keeps such a re-probe out: it would land on resolve's re-arm path, after
+    its interactive session has run and its escalation is spent. The row's reach
+    stops exactly there, and the limit is worth knowing before trusting it: a
+    re-probe sited BELOW the base-skills gate leaves this row GREEN, because that
+    refusal returns first and the second probe is never reached. Verified both
+    ways."""
+    _resume_gate_run(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        ledger_bytes=READABLE_LEDGER,
+        stub_resume=False,
+    )
+    real_lock = cli.state_lock
+
+    def _corrupt_then_lock(run_dir):
+        # The seam: `_resume_paused_run` calls `state_lock` on a bare imported name.
+        project.deferred_work.write_bytes(UNDECODABLE_LEDGER)
+        return real_lock(run_dir)
+
+    monkeypatch.setattr(cli, "state_lock", _corrupt_then_lock)
+    assert cli.main(["resume", "--project", str(project.project), "r1"]) == 1
+    err = capsys.readouterr().err
+    assert "FAIL:" in err  # the locked path owns the outcome
+    assert str(project.deferred_work) not in err  # no second probe, no ledger refusal
+    assert "`bmad-loop sweep`" not in err
+    assert "stays resumable" not in err
+
+
+# ------------------------------------------------- DW-229: the same gate at `resolve`
+#
+# `resolve` reaches `_resume_paused_run` — and therefore the DW-204 gate above — only
+# AFTER its interactive session has run and `runs.rearm_escalation` has spent the
+# escalation, so a refusal there is a refusal after the side effects. These rows pin
+# the probe at resolve's OWN entry: the refusal itself, the post-state that makes it
+# worth having (still ESCALATED, same generation, same paused_stage), and the same
+# scope/precedence/decline boundaries the resume rows pin, re-asserted here because
+# the two call sites can drift apart in exactly those places.
+
+
+def _resolve_gate_run(
+    project,
+    monkeypatch,
+    *,
+    run_type,
+    ledger_bytes,
+    run_id="r1",
+    liveness="dead",
+    config=True,
+):
+    """An escalated run of `run_type` under a real BMAD config, plus the ledger bytes.
+
+    Returns `(run_dir, rearms)`: the recorder proves the escalation was NOT spent,
+    positively rather than by absence of an error. `_resume_paused_run` is stubbed
+    too — a row that gets past the gate must not go on to drive a real resume."""
+    from bmad_loop import runs
+
+    if config:
+        install_bmad_config(project)
+    if ledger_bytes is not None:
+        project.implementation_artifacts.mkdir(parents=True, exist_ok=True)
+        project.deferred_work.write_bytes(ledger_bytes)
+    run_dir = _escalated_run(project.project, run_id, run_type=run_type)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: liveness)
+    rearms: list = []
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda rd, key, **k: rearms.append(key) or _rearm_outcome(key),
+    )
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    return run_dir, rearms
+
+
+def _assert_escalation_intact(run_dir, before):
+    """The post-state that makes the refusal worth having: an escalation refused
+    is an escalation still resolvable. Generation, not just phase — a re-arm that
+    somehow ran and was rolled back would leave the phase right and the counter
+    bumped."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import PAUSE_ESCALATION, Phase
+
+    after = load_state(run_dir)
+    assert after.tasks["s1"].phase == Phase.ESCALATED
+    assert after.tasks["s1"].generation == before.tasks["s1"].generation
+    assert after.paused_stage == PAUSE_ESCALATION
+
+
+@pytest.mark.parametrize("interactive", [True, False], ids=["interactive", "noninteractive"])
+def test_resolve_refuses_sweep_run_on_undecodable_ledger(project, monkeypatch, capsys, interactive):
+    """The DW-229 row. Ablation: delete the probe block from `cmd_resolve` and the
+    re-arm recorder fills instead of returning the ledger refusal. The interactive
+    case also records a session. Persisted-state assertions complement the call
+    recorders; the re-arm stub itself does not mutate state."""
+    from bmad_loop.journal import load_state
+
+    run_dir, rearms = _resolve_gate_run(
+        project, monkeypatch, run_type="sweep", ledger_bytes=UNDECODABLE_LEDGER
+    )
+    before = load_state(run_dir)
+    # The interactive path's first two side effects, recorded rather than suppressed:
+    # `_make_adapters` (its entry) and `resolve.run_session` (the conversation itself).
+    from bmad_loop import resolve as resolve_mod
+
+    sessions: list = []
+    monkeypatch.setattr(
+        cli, "_make_adapters", lambda *a, **k: sessions.append("adapters") or {"dev": object()}
+    )
+    monkeypatch.setattr(resolve_mod, "build_context", lambda *a, **k: (None, [], []))
+    monkeypatch.setattr(
+        resolve_mod, "run_session", lambda *a, **k: sessions.append("session") or False
+    )
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--resume"]
+    if not interactive:
+        argv.append("--no-interactive")
+    rc = cli.main(argv)
+
+    assert rc == cli.ExitCode.FAILURE
+    err = capsys.readouterr().err
+    _assert_ledger_refusal(err, project)
+    assert "invalid start byte" in err
+    assert sessions == []  # no interactive conversation thrown away
+    assert rearms == []  # and the escalation not spent
+    _assert_escalation_intact(run_dir, before)
+
+
+def test_resolve_story_run_ignores_undecodable_ledger(project, monkeypatch, capsys):
+    # Scope is the same on this call site as on `resume`'s: sweeps only. A story run
+    # over the same corrupt ledger is safe to decline since DW-231: the engine routes
+    # its own `read_for_write` sites, so the decline no longer hands it to a crash.
+    _run_dir, rearms = _resolve_gate_run(
+        project, monkeypatch, run_type="story", ledger_bytes=UNDECODABLE_LEDGER
+    )
+    argv = ["resolve", "--project", str(project.project), "r1", "--no-interactive", "--resume"]
+    assert cli.main(argv) == 0
+    assert rearms == ["s1"]
+    assert "`bmad-loop sweep`" not in capsys.readouterr().err
+
+
+def test_resolve_sweep_run_proceeds_on_a_readable_ledger(project, monkeypatch, capsys):
+    # The happy path, and the row that keeps the gate from becoming a blanket refusal
+    # for escalated sweeps: a ledger that decodes is not the fault it screens for.
+    _run_dir, rearms = _resolve_gate_run(
+        project, monkeypatch, run_type="sweep", ledger_bytes=READABLE_LEDGER
+    )
+    argv = ["resolve", "--project", str(project.project), "r1", "--no-interactive", "--resume"]
+    assert cli.main(argv) == 0
+    assert rearms == ["s1"]
+    assert "`bmad-loop sweep`" not in capsys.readouterr().err
+
+
+def test_resolve_live_refusal_wins_over_the_ledger_gate(project, monkeypatch, capsys):
+    # The gate sits at the END of resolve's pre-side-effect block: the refusals above
+    # it answer "this gesture does not apply to this run at all", and repairing the
+    # ledger would not make re-driving a live engine safe.
+    # Ablation: probe before the live refusal and discard its result; the read
+    # recorder still fails even though stderr retains the live-engine message.
+    run_dir, rearms = _resolve_gate_run(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        ledger_bytes=UNDECODABLE_LEDGER,
+        liveness="alive",
+    )
+    from bmad_loop import deferredwork
+    from bmad_loop.journal import load_state
+
+    ledger_reads = []
+    read_for_write = deferredwork.read_for_write
+
+    def record_read(path):
+        ledger_reads.append(path)
+        return read_for_write(path)
+
+    monkeypatch.setattr(deferredwork, "read_for_write", record_read)
+
+    before = load_state(run_dir)
+    assert cli.main(["resolve", "--project", str(project.project), "r1"]) == 1
+    err = capsys.readouterr().err
+    assert "is still live — stop it first" in err
+    assert "`bmad-loop sweep`" not in err
+    assert ledger_reads == []  # even a discarded probe violates live-engine precedence
+    assert rearms == []
+    _assert_escalation_intact(run_dir, before)
+
+
+def test_resolve_ledger_gate_declines_when_it_cannot_answer(project, monkeypatch, capsys):
+    # No _bmad/bmm/config.yaml: the probe's own `load_paths` raises, so it declines and
+    # hands control on — `cmd_resolve` degrades to re-arming against the recorded root
+    # (its own documented behavior) instead of being answered for with a ledger message
+    # naming a ledger the probe never located.
+    _run_dir, rearms = _resolve_gate_run(
+        project,
+        monkeypatch,
+        run_type="sweep",
+        ledger_bytes=UNDECODABLE_LEDGER,
+        config=False,
+    )
+    argv = ["resolve", "--project", str(project.project), "r1", "--no-interactive", "--resume"]
+    assert cli.main(argv) == 0
+    assert rearms == ["s1"]
+    err = capsys.readouterr().err
+    assert "cannot read the project config to confirm the code root" in err
+    assert "`bmad-loop sweep`" not in err
+
+
+def test_resolve_sweep_os_refused_ledger_is_refused_with_the_storage_repair(
+    project, monkeypatch, capsys
+):
+    """The DW-234 row at the `resolve` call site, replacing
+    `test_resolve_sweep_os_refused_ledger_propagates`: the same `OSError` arm
+    answers here, so an OS-refused ledger names its repair instead of reaching
+    `main`'s tail, and nothing is re-armed on the way out — the escalation stays
+    resolvable. Ablation: delete the arm and `error: [Errno 13]` returns with no
+    `bmad-loop sweep` route."""
+    from bmad_loop import deferredwork
+    from bmad_loop.journal import load_state
+
+    run_dir, rearms = _resolve_gate_run(
+        project, monkeypatch, run_type="sweep", ledger_bytes=READABLE_LEDGER
+    )
+    before = load_state(run_dir)
+
+    def _refused(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(deferredwork, "read_for_write", _refused)
+    assert cli.main(["resolve", "--project", str(project.project), "r1"]) == cli.ExitCode.FAILURE
+    err = capsys.readouterr().err
+    _assert_ledger_refusal(err, project)
+    assert "PermissionError: [Errno 13]" in err
+    assert "permissions or storage" in err
+    assert "error: [Errno 13]" not in err
+    assert rearms == []
+    _assert_escalation_intact(run_dir, before)
+
+
 def test_resume_unknown_warns_but_proceeds(project, monkeypatch, capsys):
     # resume must remain the unknown-recovery path: it warns, then rewrites
     # engine.pid via runs.write_pid — blocking here would make a squatted pid
@@ -8044,7 +8855,8 @@ def test_validate_warns_on_unknown_closes_deferred_in_sprint_mode(project, capsy
     assert findings[0]["detail"] == {"source": "spec spec-1-1-a.md", "unknown_ids": ["DW-99"]}
 
 
-def test_validate_fails_when_the_ledger_itself_is_unreadable(project, capsys, monkeypatch):
+@pytest.mark.parametrize("fault", ["read_text", "metadata-3.14", "metadata-3.13"])
+def test_validate_fails_when_the_ledger_itself_is_unreadable(project, capsys, monkeypatch, fault):
     """The ledger read shared a `try` with the manifest read, and that arm returns
     silently — correctly for the manifest, which `queue.stories-manifest` already
     reports, but nothing else in `validate` reads the ledger. So an unreadable one
@@ -8057,13 +8869,22 @@ def test_validate_fails_when_the_ledger_itself_is_unreadable(project, capsys, mo
     narrowed by asking whether the project gates anything, because the file that
     would answer is the unreadable one. `Engine._refuse_gated_story` pauses on the
     same fault, and the two surfaces have to give the same verdict about the same
-    file."""
+    file.
+
+    Three faults, one arm. `read_text` is the read refused; the two `metadata`
+    rows refuse the PRESENCE PROBE (DW-267). `metadata-3.14` pins `Path.is_file`
+    False for the ledger AND refuses `stat` — the Python 3.14 shape, where
+    `is_file()` suppresses every OS error and answers False, so the old
+    `read_text(...) if ledger.is_file() else ""` read the refusal as an empty
+    ledger and `validate` reported a clean deferred check. `metadata-3.13` refuses
+    `stat` alone. Ablation: restore `if ledger.is_file() else ""` and the
+    `metadata-3.14` row reds with zero `deferred.ledger-unreadable` findings."""
     install_bmad_config(project)
     _write_policy(project.project)
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     write_ledger(project, {"DW-1": "open"}, commit=False)
     write_spec(spec_path(project, "1-1-a"), "ready-for-dev", "abc123", closes_deferred=["DW-1"])
-    fault_read_text(monkeypatch, project.deferred_work)
+    _fault_ledger(monkeypatch, project.deferred_work, fault)
     args = argparse.Namespace(project=str(project.project), spec=None, json=True)
 
     cli.cmd_validate(args)
@@ -8078,6 +8899,44 @@ def test_validate_fails_when_the_ledger_itself_is_unreadable(project, capsys, mo
     # refusal had run and found nothing
     assert "gate:" in findings[0]["message"] and "hard gates" in findings[0]["message"]
     # and the declaration checks it could not run stay quiet rather than guessing
+    assert not [f for f in doc["findings"] if f["check"] == "deferred.closes-unknown"]
+    assert not [f for f in doc["findings"] if f["check"].startswith("deferred.hard-gate")]
+
+
+@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
+def test_validate_fails_when_the_ledger_path_cannot_be_encoded(project, capsys, monkeypatch, fault):
+    """The `ValueError` class of `_validate_deferred_ledger`'s `except`, driven on its
+    own. `Path.stat` raises a plain `ValueError` for an embedded NUL in the
+    configured `deferred_work` path and a `UnicodeEncodeError` (a `ValueError`
+    subclass) for a lone surrogate — neither an `OSError`, and both a path
+    `is_file()` had answered False for. Before DW-267 that False read as an empty
+    ledger and `validate` reported a clean deferred check; after it the probe raised
+    past a tuple spelled `(OSError, UnicodeDecodeError)` and `validate` CRASHED
+    (#794 review). An observation arm attributes a non-encodable path as a fault,
+    never as absence, so the verdict is the same `deferred.ledger-unreadable`
+    problem a refused `stat` earns, naming the fault, and `Engine._refuse_gated_story`
+    pauses on the same fault — the two surfaces keep agreeing about the same file.
+    Injected through `fault_metadata_probe(..., "stat", error=)` from
+    `NUL_PATH_RESOLVE_FAULTS` so both classes are driven on every platform.
+    Ablation: narrow the tuple back to `(OSError, UnicodeDecodeError)` and both rows
+    red with the injected fault escaping `cmd_validate`; the `PermissionError` rows
+    above stay green."""
+    install_bmad_config(project)
+    _write_policy(project.project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    write_spec(spec_path(project, "1-1-a"), "ready-for-dev", "abc123", closes_deferred=["DW-1"])
+    fault_metadata_probe(monkeypatch, project.deferred_work, "stat", error=fault)
+    args = argparse.Namespace(project=str(project.project), spec=None, json=True)
+
+    cli.cmd_validate(args)
+
+    doc = json.loads(capsys.readouterr().out)
+    findings = [f for f in doc["findings"] if f["check"] == "deferred.ledger-unreadable"]
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "problem"
+    assert findings[0]["detail"] == {"ledger": str(project.deferred_work), "error": str(fault)}
+    assert "gate:" in findings[0]["message"] and "hard gates" in findings[0]["message"]
     assert not [f for f in doc["findings"] if f["check"] == "deferred.closes-unknown"]
     assert not [f for f in doc["findings"] if f["check"].startswith("deferred.hard-gate")]
 
@@ -9607,6 +10466,35 @@ def test_dry_run_stories_unresolvable_absolute_folder_refused(project, monkeypat
     assert "linear schedule" not in cap.out  # no preview of a folder we cannot place
 
 
+def test_dry_run_stories_surrogate_refusal_is_safe_on_strict_ascii_stderr(project, monkeypatch):
+    install_bmad_config(project)
+    _write_policy(project.project)
+    abs_folder = str(project.project / "caf\xe9-\ud800")
+    fault = UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogates not allowed")
+    refuse_to_resolve(monkeypatch, Path(abs_folder), error=fault)
+    monkeypatch.setattr(cli, "_warn_preflight_would_abort", lambda *_args, **_kwargs: None)
+    stderr_bytes = io.BytesIO()
+    stderr = io.TextIOWrapper(stderr_bytes, encoding="ascii", errors="strict")
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    rc = cli.main(
+        [
+            "run",
+            "--project",
+            str(project.project),
+            "--spec",
+            abs_folder,
+            "--dry-run",
+        ]
+    )
+
+    stderr.flush()
+    message = stderr_bytes.getvalue().decode("ascii")
+    assert rc == 1
+    assert "stories mode: cannot canonicalize the spec folder" in message
+    assert "caf\\xe9-\\ud800" in message
+
+
 # --------------- `bmad-loop mux`: backend listing + persisted choice (issue #87) ----
 
 
@@ -10903,6 +11791,133 @@ def test_reverify_walks_every_command_when_they_all_pass(tmp_path, capsys):
 
     assert sentinel.is_file()
     assert "verify commands passed" in capsys.readouterr().out
+
+
+def test_confirm_drops_a_record_path_replaced_by_a_directory(project, capsys, monkeypatch):
+    """DW-237 at `_land_confirmation`, which reached `commit_paths` with three
+    operands and no publishable-target guard on any of them.
+
+    `commit_paths` forces every operand LITERAL, so `git add -- .bmad-loop/operator`
+    on a DIRECTORY at the record's name stages its descendants RECURSIVELY — an
+    unrelated tree published under a `chore(operator):` message. The drop is PER
+    OPERAND, like `decisions.apply_pre_answer`'s GATE TWO and like the `board_ignored`
+    drop beside it: the spec and the board still commit, and the confirmation still
+    exits 0, because the on-disk state is the value and git history is best effort.
+
+    Ablation: delete `_land_confirmation`'s per-operand guard loop and this reds —
+    `swept-in.txt` lands in `git ls-files` (or, where `git add` refuses the set,
+    the spec and board commit vanishes with it)."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    sp = _park_story(project)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park")
+    head = git(project.project, "rev-parse", "HEAD")
+    record = operatoractions.record_path(project.project, "1-1-a")
+    real_drop = operatoractions.drop
+
+    def drop_then_replace(*a, **kw):
+        # The drop unlinks the record; a directory arriving at its name afterwards is
+        # the window this guard closes. Staged through the seam because the drop is
+        # what creates the absence the #356 contract otherwise keeps as a deletion.
+        result = real_drop(*a, **kw)
+        record.mkdir(parents=True, exist_ok=True)
+        (record / "swept-in.txt").write_text("an unrelated tree\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(cli.operatoractions, "drop", drop_then_replace)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+
+    out = capsys.readouterr()
+    assert "target-not-a-file" in out.err and "✓ 1-1-a confirmed" in out.out
+    # the surviving operands still moved into history together...
+    assert git(project.project, "rev-parse", "HEAD") != head
+    changed = git(project.project, "show", "--name-only", "--format=", "HEAD").splitlines()
+    assert sp.relative_to(project.project).as_posix() in changed
+    # ...and not one descendant of the directory rode in with them
+    assert "swept-in.txt" not in git(project.project, "ls-files")
+    assert not any(name.endswith("swept-in.txt") for name in changed)
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    # the dropped operand is dropped WHOLE: the record's own deletion does not ride
+    # this commit either, which is the honest cost of refusing its path — the
+    # `chore(operator):` commit is not the place to guess what belongs at a name a
+    # directory is sitting on, and HEAD still carries the record for the operator to
+    # reconcile by hand.
+    assert ".bmad-loop/operator/1-1-a.json" not in changed
+    assert git(project.project, "ls-files", "--", ".bmad-loop/operator/1-1-a.json").strip()
+
+
+@pytest.mark.parametrize("refused", ["record", "all"])
+def test_confirm_drops_operands_it_cannot_resolve(project, capsys, monkeypatch, refused):
+    """The OTHER cause `_land_confirmation`'s per-operand guard can return, and the
+    arm that grades `_publication_refusal`'s `except (OSError, RuntimeError,
+    ValueError)` fold on its `OSError` class:
+    `Path.resolve` fails before the family leg is ever asked, so without the fold a
+    bare `OSError` escapes into a publish that is best effort by construction.
+
+    The `all` row is the empty-survivors arm, and it is graded on the CALL rather
+    than on HEAD: `commit_paths` happens to no-op on an empty operand list, so a HEAD
+    assertion alone would pass whether or not the branch exists. What the branch
+    buys is that git is not entered at all — no `commit_paths`, and therefore none of
+    the `status`/`add` machinery inside it — rather than an empty list being handed
+    over and the function left to decide what that means. The confirmation still
+    exits 0 either way, because the spec's flip and the board's advance are already
+    on disk and git history is best effort here exactly as it is in `decisions`.
+
+    The refusal is installed through the `drop` seam for the reason its sibling row
+    above states: the operands are read and written by the statements ahead of the
+    guard, and only the window between the drop and the commit is this guard's.
+
+    Ablation: delete `_publication_refusal`'s `except (OSError, RuntimeError,
+    ValueError)` and both rows red with the stubbed `OSError` escaping `cli.main`. Delete the
+    `if survivors:` test and the `all` row reds on its `commit_paths` call count."""
+    from bmad_loop import operatoractions, sprintstatus
+
+    install_bmad_config(project)
+    sp = _park_story(project)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park")
+    head = git(project.project, "rev-parse", "HEAD")
+    record = operatoractions.record_path(project.project, "1-1-a")
+    targets = [record] if refused == "record" else [sp, project.sprint_status, record]
+    real_drop = operatoractions.drop
+
+    def drop_then_refuse(*a, **kw):
+        result = real_drop(*a, **kw)
+        refuse_to_resolve(monkeypatch, *targets)
+        return result
+
+    monkeypatch.setattr(cli.operatoractions, "drop", drop_then_refuse)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+    published: list[list] = []
+    real_commit = cli.verify.commit_paths
+
+    def spy_commit(repo, message, paths):
+        published.append(list(paths))
+        return real_commit(repo, message, paths)
+
+    monkeypatch.setattr(cli.verify, "commit_paths", spy_commit)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+
+    out = capsys.readouterr()
+    assert out.err.count("target-unreadable") == len(targets)
+    assert UNRESOLVABLE in out.err  # the fault text rides the warning
+    assert "✓ 1-1-a confirmed" in out.out
+    # the on-disk confirmation happened either way — git history is what varies
+    assert sprintstatus.story_status(project.sprint_status, "1-1-a") == "done"
+    assert operatoractions.load(project.project) == {}
+    if refused == "all":
+        assert published == []  # git was never entered, not entered with nothing
+        assert git(project.project, "rev-parse", "HEAD") == head
+    else:
+        assert [len(paths) for paths in published] == [2]  # spec + board, not the record
+        changed = git(project.project, "show", "--name-only", "--format=", "HEAD").splitlines()
+        assert sp.relative_to(project.project).as_posix() in changed
+        assert ".bmad-loop/operator/1-1-a.json" not in changed  # the dropped operand
 
 
 def test_confirm_survives_a_non_git_project(project, capsys, monkeypatch):
@@ -13041,9 +14056,9 @@ def test_sweep_archive_rejects_bad_before_date(project, capsys):
 
 def test_sweep_archive_rejects_bad_before_date_without_a_ledger(project, capsys):
     """The same malformed `--before` is refused whether or not the project has
-    a ledger. `archive_closed` validates dates ahead of its own `is_file`
-    short-circuit for that reason; a missing-ledger early return in the CLI
-    graded the invocation by optional project data instead (#711 review)."""
+    a ledger. `archive_closed` validates dates ahead of its own presence guard
+    for that reason; a missing-ledger early return in the CLI graded the
+    invocation by optional project data instead (#711 review)."""
     install_bmad_config(project)  # no ledger written
     rc = cli.main(["sweep", "--archive", "--before", "bad-date", "--project", str(project.project)])
     assert rc == 1
@@ -13186,6 +14201,38 @@ def test_sweep_archive_missing_ledger_named(project, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "no deferred-work ledger at" in out
+    assert "no closed entries" not in out
+
+
+@pytest.mark.parametrize("fault", ["metadata-3.14", "metadata-3.13"])
+def test_sweep_archive_post_report_refuses_a_ledger_whose_metadata_probe_is_refused(
+    project, capsys, monkeypatch, fault
+):
+    """DW-265. The post-report presence probe ran OUTSIDE the archive `try`, as
+    `is_file()`. It is reachable only in the window after `archive_closed`'s own
+    guard answered — which is why the primitive is stubbed to `[]` here: the real
+    one raises on the refused ledger first and never reaches the post-report —
+    but in that window Python 3.14's `is_file()` suppressed the refusal and
+    printed "no deferred-work ledger" AFTER a successful archive, and 3.11–3.13's
+    raised a `PermissionError` traceback out of the CLI. The probe is `stat` +
+    `S_ISREG` inside the same `try` now, so both shapes reach the existing
+    `cannot archive` FAILURE arm. Ablation: restore `if not ledger.is_file():`
+    outside the `try` and the `metadata-3.14` row reds exiting 0 with "no
+    deferred-work ledger"; the `metadata-3.13` row reds raising `PermissionError`."""
+    from bmad_loop import deferredwork
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "done 2026-06-01"}, commit=False)
+    monkeypatch.setattr(deferredwork, "archive_closed", lambda *a, **k: [])
+    _fault_ledger(monkeypatch, project.deferred_work, fault)
+
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+
+    assert rc == 1
+    out, err = capsys.readouterr()
+    assert "cannot archive the deferred-work ledger" in err
+    assert "Permission denied" in err
+    assert "no deferred-work ledger" not in out
     assert "no closed entries" not in out
 
 
@@ -13990,3 +15037,42 @@ def test_cleanup_says_nothing_about_a_registry_with_no_remainder(project, capsys
 
     assert cli.main(["cleanup", "--project", str(project.project)]) == 0
     assert "not migrated" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("read_target", ["ledger", "archive"])
+@pytest.mark.parametrize("operation", ["stat", "read_text"])
+def test_sweep_archive_routes_a_locked_ledger_os_read_fault(
+    project, monkeypatch, capsys, operation, read_target
+):
+    """DW-279: the archive's read fault stays a CLI failure without publishing.
+
+    Refuse the main ledger or an existing archive sibling under the main lock.
+    Removing the selected OS wrap loses the attributed read-refusal wording;
+    removing LedgerReadFault from _sweep_archive's catch loses its archive error.
+    """
+    from conftest import fault_locked_ledger_read
+
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "done 2026-06-01"}, commit=False)
+    ledger = project.deferred_work
+    archive = ledger.parent / "deferred-work-archive.md"
+    archive_before = b"# Archived deferred work\n\nExisting entry\n"
+    if read_target == "archive":
+        archive.write_bytes(archive_before)
+    target = ledger if read_target == "ledger" else archive
+    before = ledger.read_bytes()
+    fault_locked_ledger_read(monkeypatch, target, operation, lock_target=ledger)
+
+    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
+
+    assert rc == 1
+    out, err = capsys.readouterr()
+    assert "cannot archive the deferred-work ledger" in err
+    assert f"{target} could not be read (PermissionError:" in err
+    assert "Permission denied" in err
+    assert not out
+    assert ledger.read_bytes() == before
+    if read_target == "archive":
+        assert archive.read_bytes() == archive_before
+    else:
+        assert not archive.exists()

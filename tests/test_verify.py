@@ -1,4 +1,5 @@
 import dataclasses
+import errno
 import hashlib
 import inspect
 import io
@@ -6,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -13,13 +15,16 @@ from conftest import (
     _FAIL,
     _OK,
     MISSING_TOOL_CMD,
+    NUL_PATH_RESOLVE_FAULTS,
     OMIT,
     PROJECT_MARKER_CMD,
     REPO_ROOT_MARKER_CMD,
     UNRESOLVABLE,
     _Omit,
+    fault_metadata_probe,
     fault_read_text,
     git,
+    ignore_before_commit,
     make_git_noisy,
     nested_repo_root_paths,
     plant_root_markers,
@@ -2816,6 +2821,12 @@ def test_verify_commands_undecodable_failure_stays_fixable_retry(tmp_path):
 def make_bundle_task(paths, dw_ids=("DW-1", "DW-2")):
     task = StoryTask(story_key="dw-test-bundle", epic=0, dw_ids=list(dw_ids))
     task.baseline_commit = verify.rev_parse_head(paths.project)
+    # the attempt-start snapshot `SweepEngine._artifact_baseline` stamps beside
+    # the baseline, so the receipt (DW-273) can tell this attempt's residue from
+    # what was already there — `None` where the dir cannot be listed at all
+    task.baseline_artifacts = verify.artifact_dir_snapshot(
+        paths.repo_root, paths.implementation_artifacts
+    )
     return task
 
 
@@ -2871,6 +2882,478 @@ def test_verify_dev_bundle_absent_dw_ids_passes(project, claim):
     out = verify.verify_dev_bundle(task, project, rj)
     assert out.ok
     assert task.spec_file == str(sp)
+
+
+# ------------------------------------------- the bundle's artifact-only receipt (DW-273)
+
+
+def ignore_artifacts_before_baseline(paths) -> None:
+    """Gitignore the whole `_bmad-output/` tree and COMMIT the rule, so the baseline
+    a task cut afterwards already carries it and everything later written under
+    `implementation_artifacts` is ignored — invisible to the ordinary
+    proof-of-work probe (tracked + untracked-not-ignored) and visible only to a
+    `--ignored` listing. This is the production shape DW-236 hit: a project that
+    keeps its BMAD output out of git."""
+    ignore_before_commit(paths, "_bmad-output/")
+    git(paths.project, "add", "-A")
+    git(paths.project, "commit", "-q", "-m", "ignore bmad output")
+
+
+def artifact_only_bundle(paths, *, status: str = "in-review"):
+    """The accepted-receipt tree: `_bmad-output/` ignored before the baseline, and
+    the attempt's ENTIRE residue the bundle spec under `implementation_artifacts`.
+    Returns `(task, spec_path)`; the ordinary probe finds nothing here."""
+    ignore_artifacts_before_baseline(paths)
+    task = make_bundle_task(paths)
+    sp = paths.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, status, task.baseline_commit)
+    return task, sp
+
+
+def test_verify_dev_bundle_accepts_an_asserted_artifact_only_receipt(project):
+    """DW-273. A bundle whose only permitted deliverable lives under a gitignored
+    `implementation_artifacts` (a spec-only erratum) can never satisfy the ordinary
+    proof-of-work probe. With the strict `artifact_only: True` assertion in the
+    result, the bundle gate consults a directory-scoped `git status --ignored`
+    listing instead and accepts a positive one, carrying the count out.
+
+    Ablation, MEASURED: drop the `artifact_only_dir=` argument from
+    `verify_dev_bundle`'s call into `_verify_shared_gates` and this fails on
+    `assert out.ok` — the retry reason is the verbatim
+    `no changes in worktree since baseline commit`."""
+    task, sp = artifact_only_bundle(project)
+    # a second ignored file, so the count is pinned to FILES: dropping
+    # `--untracked-files=all` collapses the listing to one directory record
+    (project.implementation_artifacts / "erratum-note.md").write_text("note\n", encoding="utf-8")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert out.ok
+    assert out.artifact_only_accepted is True
+    assert out.artifact_only_residue == 2
+    assert task.spec_file == str(sp)
+
+
+def test_verify_dev_bundle_refuses_ignored_residue_that_predates_the_attempt(project):
+    """The ownership half of the receipt. Everything under the artifacts dir was
+    already there — with the same fingerprint — when the attempt's snapshot was
+    taken, so an asserted bundle that wrote nothing is refused with the verbatim
+    prefix and a cause naming the listing's size and that none of it is this
+    attempt's; nothing is accepted, no count is carried.
+
+    Ablation, MEASURED: make `_artifact_dir_owned_entries` return every listed
+    entry (drop the baseline comparison) and this passes the gate with
+    `artifact_only_residue == 2`."""
+    task, sp = artifact_only_bundle(project)
+    (project.implementation_artifacts / "erratum-note.md").write_text("note\n", encoding="utf-8")
+    # re-snapshot AFTER the residue: the attempt "starts" now and writes nothing
+    task.baseline_artifacts = verify.artifact_dir_snapshot(
+        project.repo_root, project.implementation_artifacts
+    )
+    assert task.baseline_artifacts is not None and len(task.baseline_artifacts) == 2
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "artifact-only receipt refused" in out.reason
+    assert "lists 2 ignored entries, none created or changed by this attempt" in out.reason
+    assert out.artifact_only_accepted is False
+    assert out.artifact_only_residue is None
+
+
+def test_verify_dev_bundle_credits_a_pre_existing_entry_the_attempt_changed(project):
+    """ "Created OR changed": an entry that was in the snapshot but now carries a
+    different fingerprint — rewritten with more bytes, so size differs whatever
+    the filesystem's mtime granularity — is this attempt's, and is the ONLY one
+    counted beside an untouched sibling.
+
+    Ablation: compare presence alone (`rel not in baseline`) and this refuses."""
+    task, sp = artifact_only_bundle(project)
+    sibling = project.implementation_artifacts / "erratum-note.md"
+    sibling.write_text("note\n", encoding="utf-8")
+    task.baseline_artifacts = verify.artifact_dir_snapshot(
+        project.repo_root, project.implementation_artifacts
+    )
+    # the attempt: append to the spec, leave the sibling alone
+    sp.write_text(sp.read_text(encoding="utf-8") + "\n## Erratum\n\nfixed\n", encoding="utf-8")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert out.ok
+    assert out.artifact_only_accepted is True
+    assert out.artifact_only_residue == 1
+
+
+def test_verify_dev_bundle_without_a_snapshot_refuses_the_receipt(project):
+    """No attempt-start snapshot on the task — a pre-upgrade run, a story task
+    handed to the bundle verifier, or a capture that degraded — is uncertainty,
+    and uncertainty keeps the gate strict: refused with a cause naming the missing
+    snapshot (not "outside the tree": the dir IS listable, and the cause says so
+    by not claiming otherwise).
+
+    Ablation: treat a `None` snapshot as `{}` and this accepts with a count of 1."""
+    task, sp = artifact_only_bundle(project)
+    task.baseline_artifacts = None
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "no attempt-start snapshot" in out.reason
+    assert "outside the code tree" not in out.reason
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_unmeasurable_snapshot_entry_is_never_credited(project):
+    """An entry the snapshot lists as `None` — present at attempt start but
+    `lstat` refused it — is not credited even though it measures now: a
+    fingerprint that could not be taken proves no change. The sibling the attempt
+    genuinely created still counts, alone.
+
+    Ablation: treat a `None` baseline fingerprint as "absent" and the count
+    reads 2."""
+    task, sp = artifact_only_bundle(project)
+    task.baseline_artifacts = verify.artifact_dir_snapshot(
+        project.repo_root, project.implementation_artifacts
+    )
+    assert task.baseline_artifacts is not None
+    [spec_rel] = list(task.baseline_artifacts)
+    task.baseline_artifacts[spec_rel] = None
+    (project.implementation_artifacts / "erratum-note.md").write_text("note\n", encoding="utf-8")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert out.ok
+    assert out.artifact_only_accepted is True
+    assert out.artifact_only_residue == 1
+
+
+def test_artifact_dir_snapshot_keys_are_paths_git_would_otherwise_quote(project):
+    """The listing is read as `-z` bytes and `os.fsdecode`d, so a non-ASCII
+    artifact name is a key the receipt can `lstat` — under `core.quotePath`'s
+    default the ordinary porcelain would have C-quoted it (`"\\303\\251..."`), a
+    record no fingerprint can be taken of. Pins the decode by the fingerprint:
+    the snapshot carries the file's real size.
+
+    Ablation: read `--porcelain` text lines instead of `-z` bytes and the key
+    is the quoted spelling, whose `lstat` fails and whose fingerprint is `None`."""
+    ignore_artifacts_before_baseline(project)
+    named = project.implementation_artifacts / "r\u00e9sum\u00e9-erratum.md"
+    named.parent.mkdir(parents=True, exist_ok=True)
+    named.write_bytes(b"12345")
+
+    snapshot = verify.artifact_dir_snapshot(project.repo_root, project.implementation_artifacts)
+
+    assert snapshot is not None
+    rel = named.relative_to(project.repo_root).as_posix()
+    assert list(snapshot) == [rel]
+    assert snapshot[rel] is not None and snapshot[rel][1] == 5
+
+
+def test_verify_dev_bundle_unasserted_artifact_only_tree_is_refused(project):
+    """The same tree WITHOUT the assertion keeps the ordinary refusal, reason
+    verbatim — the receipt is never consulted on the session's behalf.
+
+    Ablation: make the receipt unconditional (pass `artifact_only_dir` regardless
+    of `rj`) and this passes the gate."""
+    task, sp = artifact_only_bundle(project)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp)}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason == "no changes in worktree since baseline commit"
+    assert out.artifact_only_accepted is False
+    assert out.artifact_only_residue is None
+
+
+@pytest.mark.parametrize("loose", ["true", 1, "yes"], ids=["str-true", "int-1", "str-yes"])
+def test_verify_dev_bundle_loose_truthy_artifact_only_is_no_assertion(project, loose):
+    """The selector is `is True` — a truthy string or int never asserts, the same
+    strictness `park_asserted` holds.
+
+    Ablation: change the selector to `bool(rj.get("artifact_only"))` and every
+    parameter passes the gate."""
+    task, sp = artifact_only_bundle(project)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": loose}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_story_ignores_an_artifact_only_assertion(project):
+    """The receipt fires on the bundle path ONLY. A sprint story result carrying
+    `artifact_only: True` over an artifact-only tree still owes the ordinary diff
+    and no receipt field is set.
+
+    Ablation: pass `artifact_only_dir=paths.implementation_artifacts` from
+    `verify_dev` and this passes the gate."""
+    ignore_artifacts_before_baseline(project)
+    write_sprint(project, {"1-1-a": "review"})
+    task = make_task(project)
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {**dev_result(sp), "artifact_only": True}
+
+    out = verify.verify_dev(task, project, rj)
+
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+    assert out.artifact_only_accepted is False
+    assert out.artifact_only_residue is None
+
+
+def test_verify_dev_stories_ignores_an_artifact_only_assertion(project):
+    """Stories-mode twin of the sprint row above: `verify_dev_stories` never
+    passes `artifact_only_dir`, so the assertion changes nothing."""
+    ignore_artifacts_before_baseline(project)
+    spec_folder = project.planning_artifacts / "epic-a"
+    task = StoryTask(story_key="1", epic=0)
+    task.baseline_commit = verify.rev_parse_head(project.project)
+    d = spec_folder / "stories"
+    d.mkdir(parents=True, exist_ok=True)
+    sp = d / "1-user-auth.md"
+    write_spec(sp, "done", task.baseline_commit)
+    # artifact-only residue the bundle receipt WOULD have counted
+    (project.implementation_artifacts / "spec-1.md").write_text("erratum\n", encoding="utf-8")
+    rj = {**dev_result(sp), "artifact_only": True}
+
+    out = verify.verify_dev_stories(
+        task, project, rj, spec_folder=spec_folder, review_enabled=False
+    )
+
+    assert not out.ok
+    assert out.reason == "no changes in worktree since baseline commit"
+    assert out.artifact_only_accepted is False
+    assert out.artifact_only_residue is None
+
+
+def test_verify_dev_bundle_real_change_passes_the_ordinary_arm_without_a_receipt(project):
+    """An asserted bundle that ALSO changed a tracked file passes through the
+    ordinary probe; the receipt is consulted only after a positive "nothing
+    changed", so nothing is accepted on its account and no count is carried."""
+    task, sp = artifact_only_bundle(project)
+    (project.project / "src.txt").write_text("real work\n", encoding="utf-8")
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert out.ok
+    assert out.artifact_only_accepted is False
+    assert out.artifact_only_residue is None
+
+
+def test_verify_dev_bundle_empty_artifacts_listing_refuses_the_receipt(project):
+    """An asserted bundle whose artifacts dir holds NO ignored or untracked entry
+    — the spec is a tracked file outside it and the attempt only flipped its
+    status, which the probe already excludes — is refused with the verbatim
+    prefix and the receipt's cause.
+
+    Ablation: make the receipt accept on `entries is not None` and this passes."""
+    sp = project.project / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-progress", "placeholder")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track the bundle spec outside the artifacts dir")
+    task = make_bundle_task(project)
+    write_spec(sp, "in-review", task.baseline_commit)
+    assert not any(project.implementation_artifacts.iterdir())
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "artifact-only receipt refused" in out.reason
+    assert "lists no ignored entries" in out.reason
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_tracked_spec_status_flip_under_a_not_ignored_dir_is_refused(project):
+    """The `bmad-loop init` default layout: `_bmad-output/` is NOT gitignored. An
+    asserted bundle whose only residue is its own TRACKED spec's status flip (a
+    ` M` record the ordinary probe already excludes) must not be accepted on that
+    record — only `!!` entries count.
+
+    Ablation: keep every porcelain record in `_artifact_dir_entries` and this
+    passes the gate with a count of one."""
+    sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-progress", "placeholder")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track the bundle spec under the artifacts dir")
+    task = make_bundle_task(project)
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "lists no ignored entries" in out.reason
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_untracked_spec_under_a_not_ignored_dir_is_refused(project):
+    """Same default layout, the other excluded record: the bundle spec newly
+    written (`??`) under a not-ignored `implementation_artifacts` is what the
+    ordinary probe excludes as the spec path, and it is no receipt either."""
+    task = make_bundle_task(project)
+    sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "lists no ignored entries" in out.reason
+    assert out.artifact_only_accepted is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="`*` is not a legal filename on Windows")
+def test_verify_dev_bundle_glob_magic_artifacts_dir_is_listed_literally(project):
+    """An ignored artifacts dir whose name carries pathspec magic (`impl*`) is
+    listed as ITSELF — pins `_literal_specs`. Measured: git literal-prefix-matches
+    a `[1]` or `?` name either way, so a bracket or question mark cannot separate
+    the two spellings; a `*` can, because as a glob it sweeps a SIBLING ignored
+    dir (`impl-sibling/`) into the listing and the count reads 2 for a dir
+    holding one file.
+
+    Ablation, MEASURED: hand `rel.as_posix()` to git bare instead of through
+    `_literal_specs` and this fails on the count (2, not 1)."""
+    magic = project.output_folder / "impl*"
+    magic.mkdir(parents=True)
+    sibling = project.output_folder / "impl-sibling"
+    sibling.mkdir()
+    paths = dataclasses.replace(project, implementation_artifacts=magic)
+    ignore_artifacts_before_baseline(paths)
+    (sibling / "unrelated.md").write_text("not this bundle's\n", encoding="utf-8")
+    task = make_bundle_task(paths)
+    sp = magic / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, paths, rj)
+
+    assert out.ok
+    assert out.artifact_only_accepted is True
+    assert out.artifact_only_residue == 1
+
+
+def test_verify_dev_bundle_artifacts_dir_at_the_repo_root_refuses_without_git(project, monkeypatch):
+    """An `implementation_artifacts` that IS `repo_root` would make the receipt's
+    pathspec `.`, listing every ignored file in the tree (`.venv`, caches) and
+    accepting the receipt trivially. Refused before any `status --ignored` is
+    spawned, with the same cause as the outside-the-tree shape."""
+    at_root = dataclasses.replace(project, implementation_artifacts=project.project)
+    task = make_bundle_task(at_root)
+    sp = project.project / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    real = verify._run_git
+    receipt_calls: list[list[str]] = []
+
+    def spy(cmd, repo, **kw):
+        if "status" in cmd and "--ignored" in cmd:
+            receipt_calls.append(cmd)
+        return real(cmd, repo, **kw)
+
+    monkeypatch.setattr(verify, "_run_git", spy)
+    out = verify.verify_dev_bundle(task, at_root, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "outside the code tree" in out.reason
+    assert receipt_calls == []
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_artifacts_dir_outside_the_tree_refuses_without_git(
+    project, tmp_path, monkeypatch
+):
+    """An `implementation_artifacts` configured OUTSIDE `repo_root` cannot be listed
+    by git in the code tree, so the receipt is refused before any `status --ignored`
+    is spawned — fail closed, no git call for the receipt."""
+    outside = tmp_path / "outside-artifacts"
+    outside.mkdir()
+    external = dataclasses.replace(project, implementation_artifacts=outside)
+    task = make_bundle_task(external)
+    sp = outside / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-review", task.baseline_commit)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    real = verify._run_git
+    receipt_calls: list[list[str]] = []
+
+    def spy(cmd, repo, **kw):
+        if "status" in cmd and "--ignored" in cmd:
+            receipt_calls.append(cmd)
+        return real(cmd, repo, **kw)
+
+    monkeypatch.setattr(verify, "_run_git", spy)
+    out = verify.verify_dev_bundle(task, external, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "artifact-only receipt refused" in out.reason
+    assert "outside the code tree" in out.reason
+    assert receipt_calls == []
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_git_refusing_the_listing_refuses_the_receipt(project, monkeypatch):
+    """rc 128 on the receipt's `status --ignored` is a REFUSAL, not an answer: the
+    receipt fails closed onto the ordinary retry with the cause named."""
+    task, sp = artifact_only_bundle(project)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    real = verify._run_git
+
+    def refuse_listing(cmd, repo, **kw):
+        proc = real(cmd, repo, **kw)
+        if "status" in cmd and "--ignored" in cmd:
+            proc.returncode = 128
+            proc.stderr = "fatal: simulated refusal\n"
+        return proc
+
+    monkeypatch.setattr(verify, "_run_git", refuse_listing)
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert out.reason.startswith("no changes in worktree since baseline commit (")
+    assert "artifact-only receipt refused" in out.reason
+    assert "git refused to list it" in out.reason
+    assert out.artifact_only_accepted is False
+
+
+def test_verify_dev_bundle_git_fault_on_the_listing_escalates(project, monkeypatch):
+    """A `GitError` from the receipt's listing is an environment fault and takes
+    the same `except GitError` the ordinary probe's does: escalate, never retry."""
+    task, sp = artifact_only_bundle(project)
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    real = verify._run_git
+
+    def hang_listing(cmd, repo, **kw):
+        if "status" in cmd and "--ignored" in cmd:
+            raise verify.GitTimeoutError(f"git status timed out after 1s in {repo}")
+        return real(cmd, repo, **kw)
+
+    monkeypatch.setattr(verify, "_run_git", hang_listing)
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL"
+    assert "git status timed out" in out.reason
 
 
 def test_verify_dev_bundle_ancestor_baseline_passes(project):
@@ -3857,15 +4340,37 @@ def test_verify_review_gates_read_artifacts_from_the_project_root(project, tmp_p
     assert ("in-progress" if mode == "review" else "DW-1") in refused.reason
 
 
-def test_verify_review_bundle_ledger_oserror_degrades_to_retry(project, monkeypatch):
+@pytest.mark.parametrize("fault", ["read_text", "metadata-3.14", "metadata-3.13"])
+def test_verify_review_bundle_ledger_oserror_degrades_to_retry(project, monkeypatch, fault):
     """The ledger read is the same TOCTOU class as the spec read beside it — the
-    orchestrator's own `mark_done` rewrites it between the dev and review gates."""
+    orchestrator's own `mark_done` rewrites it between the dev and review gates.
+
+    Three faults, one arm. `read_text` is the read refused; the two `metadata`
+    rows refuse the PRESENCE PROBE (DW-267). `metadata-3.14` pins `Path.is_file`
+    False for the ledger AND refuses `stat` — the Python 3.14 shape, where
+    `is_file()` suppresses every OS error and answers False, so the old
+    `read_text(...) if ledger.is_file() else ""` read the refusal as an empty
+    ledger and the verify retried with the misleading "entries not marked done"
+    verdict, fixable. `metadata-3.13` refuses `stat` alone. Ablation: restore
+    `if ledger.is_file() else ""` and the `metadata-3.14` row reds with "DW-1"
+    in the reason and `fixable=True`."""
     task = make_bundle_task(project)
     sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
     write_spec(sp, "done", task.baseline_commit)
     task.spec_file = str(sp)
     bundle_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
-    fault_read_text(monkeypatch, project.deferred_work)  # spec reads fine
+    ledger = project.deferred_work
+    if fault == "read_text":
+        fault_read_text(monkeypatch, ledger)  # spec reads fine
+    else:
+        if fault == "metadata-3.14":
+            real = Path.is_file
+            monkeypatch.setattr(
+                Path,
+                "is_file",
+                lambda self, *a, **kw: False if self == ledger else real(self, *a, **kw),
+            )
+        fault_metadata_probe(monkeypatch, ledger, "stat")
 
     out = verify.verify_review_bundle(task, project, Policy())
     assert not out.ok and out.retryable and not out.fixable
@@ -3893,6 +4398,39 @@ def test_verify_review_bundle_ledger_undecodable_degrades_to_retry(project):
     assert not out.ok and out.retryable and not out.fixable
     assert "deferred-work ledger unreadable" in out.reason
     assert "UnicodeDecodeError" in out.reason
+    assert "DW-1" not in out.reason  # not the "entries not marked done" verdict
+
+
+@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
+def test_verify_review_bundle_non_encodable_ledger_path_degrades_to_retry(
+    project, monkeypatch, fault
+):
+    """The `ValueError` class of this arm's `except`, driven at the PROBE rather
+    than the read. `Path.stat` raises a plain `ValueError` for an embedded NUL in
+    the configured `deferred_work` path and a `UnicodeEncodeError` (a `ValueError`
+    subclass) for a lone surrogate — neither an `OSError`, and both a path
+    `is_file()` had answered False for. Before DW-267 that False read as an empty
+    ledger and the verify retried, fixable, naming every id; after it the probe
+    raised past a tuple spelled `(OSError, UnicodeDecodeError)` and the verify
+    ABORTED (#794 review). An observation arm attributes a non-encodable path as a
+    fault, never as absence, so the outcome is the SAME shape as the two rows
+    above — retryable, not fixable, naming the fault's class. Injected through
+    `fault_metadata_probe(..., "stat", error=)` from `NUL_PATH_RESOLVE_FAULTS` so
+    both classes are driven on every platform.
+    Ablation: narrow the tuple back to `(OSError, UnicodeDecodeError)` and both
+    rows red with the injected fault escaping `verify_review_bundle`; the
+    `UnicodeDecodeError` row above stays green."""
+    task = make_bundle_task(project)
+    sp = project.implementation_artifacts / "spec-dw-test-bundle.md"
+    write_spec(sp, "done", task.baseline_commit)
+    task.spec_file = str(sp)
+    bundle_ledger(project, {"DW-1": "done 2026-06-11", "DW-2": "done 2026-06-11"})
+    fault_metadata_probe(monkeypatch, project.deferred_work, "stat", error=fault)
+
+    out = verify.verify_review_bundle(task, project, Policy())
+    assert not out.ok and out.retryable and not out.fixable
+    assert "deferred-work ledger unreadable" in out.reason
+    assert type(fault).__name__ in out.reason and str(fault) in out.reason
     assert "DW-1" not in out.reason  # not the "entries not marked done" verdict
 
 
@@ -5459,6 +5997,37 @@ def test_path_clean_ignores_stderr_chatter_on_success(project):
     assert not verify.path_clean(repo, "src.txt")  # ...and a genuine change still shows
 
 
+def test_verify_dev_bundle_empty_artifacts_listing_refuses_the_receipt_under_host_noise(project):
+    """`_artifact_dir_entries` inherits `path_clean`'s hazard: `status --porcelain`
+    exits 0 while warning on stderr, so read against a merged stream an EMPTY
+    artifacts dir would list one phantom record and the receipt would be accepted
+    over nothing. Only stdout counts.
+
+    Two guards stand between the chatter and the receipt — the stdout-alone read
+    and the `!! ` record filter — and either alone keeps this row green, so the
+    row pins the PAIR: it holds as long as at least one survives. Ablation,
+    MEASURED: build the entries from `(proc.stdout + proc.stderr)` AND keep every
+    non-blank line, and this fails with the receipt accepted over an empty dir;
+    the merged stream with the filter kept still passes, which is why the filter
+    is not a license to drop the stdout-alone read (the filter is about which
+    RECORDS count, not about which STREAM carries them)."""
+    make_git_noisy(project.project)
+    sp = project.project / "spec-dw-test-bundle.md"
+    write_spec(sp, "in-progress", "placeholder")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track the bundle spec outside the artifacts dir")
+    task = make_bundle_task(project)
+    write_spec(sp, "in-review", task.baseline_commit)
+    assert not any(project.implementation_artifacts.iterdir())
+    rj = {"workflow": "auto-dev", "spec_file": str(sp), "artifact_only": True}
+
+    out = verify.verify_dev_bundle(task, project, rj)
+
+    assert not out.ok and out.retryable
+    assert "lists no ignored entries" in out.reason
+    assert out.artifact_only_accepted is False
+
+
 # ------------------------------------------ probes that return git's text (#442)
 #
 # The rest of the family #441 documented and did not widen to. A real git config
@@ -5785,6 +6354,359 @@ def test_finalize_commit_only_uncommitted_bookkeeping(project):
     assert log.splitlines() == ["story: via bmad-loop"]
 
 
+def test_finalize_commit_validates_once_after_add_and_never_restages(project):
+    baseline = verify.rev_parse_head(project.project)
+    path = project.project / "src.txt"
+    path.write_text("accepted bytes\n")
+    rel = path.relative_to(project.repo_root).as_posix()
+    accepted_oid = verify.git_normalized_blob_oid(project.repo_root, rel, path)
+    calls = []
+
+    def validate_staged():
+        calls.append(verify.staged_blob_oid(project.repo_root, rel))
+        path.write_text("post-staging writer\n")
+
+    sha = verify.finalize_commit(
+        project.project,
+        baseline,
+        "story: via bmad-loop",
+        staged_validator=validate_staged,
+    )
+
+    assert sha is not None
+    assert calls == [accepted_oid]
+    assert git(project.project, "show", "HEAD:src.txt") == "accepted bytes"
+    assert path.read_text() == "post-staging writer\n"
+
+
+def test_finalize_commit_staged_rejection_precedes_commit_and_preserves_head(project):
+    baseline = verify.rev_parse_head(project.project)
+    path = project.project / "src.txt"
+    path.write_text("skill commit bytes\n")
+    git(project.project, "add", "--", "src.txt")
+    git(project.project, "commit", "-q", "-m", "skill: implementation")
+    original_head = verify.rev_parse_head(project.project)
+    path.write_text("rejected bytes\n")
+    marker = project.project / "commit-hook-ran"
+    hook = project.project / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nprintf ran > commit-hook-ran\n")
+    hook.chmod(0o755)
+
+    def reject_staged():
+        raise RuntimeError("staged deliverable drift")
+
+    with pytest.raises(RuntimeError, match="staged deliverable drift"):
+        verify.finalize_commit(
+            project.project,
+            baseline,
+            "story: via bmad-loop",
+            staged_validator=reject_staged,
+        )
+
+    assert not marker.exists()
+    assert verify.rev_parse_head(project.project) == original_head
+
+
+def test_finalize_commit_restores_original_chain_when_hook_mutates_validated_index(project):
+    baseline = verify.rev_parse_head(project.project)
+    path = project.project / "src.txt"
+    path.write_text("skill commit bytes\n")
+    git(project.project, "add", "--", "src.txt")
+    git(project.project, "commit", "-q", "-m", "skill: implementation")
+    original_head = verify.rev_parse_head(project.project)
+    assert original_head != baseline
+    path.write_text("accepted bytes\n")
+    rel = path.relative_to(project.repo_root).as_posix()
+    accepted_oid = verify.git_normalized_blob_oid(project.repo_root, rel, path)
+    hook = project.project / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nprintf 'hook mutation\\n' > src.txt\ngit add -- src.txt\n")
+    hook.chmod(0o755)
+
+    def validate_commit(revision, staged_snapshot):
+        if verify.revision_blob_oids(project.repo_root, revision, (rel,)) != staged_snapshot:
+            raise RuntimeError("committed deliverable drift")
+
+    with pytest.raises(RuntimeError, match="committed deliverable drift"):
+        verify.finalize_commit(
+            project.project,
+            baseline,
+            "story: via bmad-loop",
+            staged_validator=lambda: {rel: accepted_oid},
+            committed_validator=validate_commit,
+        )
+
+    assert verify.rev_parse_head(project.project) == original_head
+    assert git(project.project, "show", "HEAD:src.txt") == "skill commit bytes"
+
+
+def test_finalize_commit_restores_original_chain_when_head_probe_fails(project, monkeypatch):
+    """The squash is not accepted until its HEAD identity is known; a failed
+    post-commit probe restores the skill chain and clean index without discarding
+    the accepted working-tree bytes staged by the one allowed add pass.
+
+    Ablation: move the post-commit ``rev_parse_head`` above the recovery ``try``;
+    the injected fault leaves the squash at HEAD and the accepted bytes staged.
+    """
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    path = repo / "src.txt"
+    path.write_text("skill commit bytes\n")
+    git(repo, "add", "--", "src.txt")
+    git(repo, "commit", "-q", "-m", "skill: implementation")
+    original_head = verify.rev_parse_head(repo)
+    path.write_text("accepted bytes\n")
+    marker = repo / "commit-hook-ran"
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nprintf ran > commit-hook-ran\n")
+    hook.chmod(0o755)
+
+    real_rev_parse_head = verify.rev_parse_head
+    rev_parse_calls = 0
+
+    def fail_second_head_probe(probe_repo):
+        nonlocal rev_parse_calls
+        rev_parse_calls += 1
+        if rev_parse_calls == 2:
+            raise RuntimeError("HEAD identity probe failed")
+        return real_rev_parse_head(probe_repo)
+
+    real_git = verify._git
+    git_calls = []
+
+    def spy_git(git_repo, *args):
+        git_calls.append(args)
+        return real_git(git_repo, *args)
+
+    monkeypatch.setattr(verify, "rev_parse_head", fail_second_head_probe)
+    monkeypatch.setattr(verify, "_git", spy_git)
+
+    with pytest.raises(RuntimeError, match="HEAD identity probe failed"):
+        verify.finalize_commit(repo, baseline, "story: via bmad-loop")
+
+    assert rev_parse_calls == 2
+    assert verify.rev_parse_head(repo) == original_head
+    assert git(repo, "diff", "--cached", "--quiet") == ""
+    assert git(repo, "show", "HEAD:src.txt") == "skill commit bytes"
+    assert path.read_text() == "accepted bytes\n"
+    assert marker.read_text() == "ran"
+    assert [args for args in git_calls if args[:1] == ("add",)] == [("add", "-A")]
+
+
+@pytest.mark.parametrize("raised_restore_fault", [False, True], ids=["nonzero", "raised"])
+def test_finalize_commit_reports_head_probe_and_restore_failures(
+    project, monkeypatch, raised_restore_fault
+):
+    repo = project.project
+    baseline = verify.rev_parse_head(repo)
+    (repo / "src.txt").write_text("skill commit bytes\n")
+    git(repo, "add", "--", "src.txt")
+    git(repo, "commit", "-q", "-m", "skill: implementation")
+    (repo / "src.txt").write_text("accepted bytes\n")
+
+    real_rev_parse_head = verify.rev_parse_head
+    rev_parse_calls = 0
+
+    def fail_second_head_probe(probe_repo):
+        nonlocal rev_parse_calls
+        rev_parse_calls += 1
+        if rev_parse_calls == 2:
+            raise RuntimeError("HEAD identity probe failed")
+        return real_rev_parse_head(probe_repo)
+
+    real_git = verify._git
+
+    def refuse_mixed_restore(git_repo, *args):
+        if args[:2] == ("reset", "--mixed"):
+            if raised_restore_fault:
+                raise verify.GitTimeoutError("restore timed out")
+            return 1, "restore refused"
+        return real_git(git_repo, *args)
+
+    monkeypatch.setattr(verify, "rev_parse_head", fail_second_head_probe)
+    monkeypatch.setattr(verify, "_git", refuse_mixed_restore)
+
+    with pytest.raises(
+        verify.GitError,
+        match=(
+            r"post-commit finalization failed \(RuntimeError: HEAD identity probe failed\); "
+            r"additionally failed to restore HEAD"
+        ),
+    ) as caught:
+        verify.finalize_commit(repo, baseline, "story: via bmad-loop")
+
+    expected_restore_diagnostic = "restore timed out" if raised_restore_fault else "restore refused"
+    assert expected_restore_diagnostic in str(caught.value)
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert str(caught.value.__cause__) == "HEAD identity probe failed"
+
+
+def test_finalize_commit_no_op_arm_validates_baseline_and_restores_chain_on_index_reset(project):
+    """The no-op arm sits INSIDE the validated window: "nothing staged" is read
+    off the index after the staged validator returned, so an index reset to
+    baseline in between (a concurrent writer) reads as a clean no-op while the
+    snapshot says a pending-tracked deliverable was staged. Before the fix
+    (#795 review) that returned `None` with HEAD soft-reset to baseline — the
+    accepted skill chain orphaned and the caller free to record baseline as the
+    commit. Now the committed-tree validator runs against baseline itself,
+    refuses, and the original chain AND index are restored; the deliverable is
+    still on disk, untracked, for the replay's `add -A`.
+
+    Ablation: drop the validator call from the no-op arm and this reds on
+    `pytest.raises` — `finalize_commit` returns None with HEAD at baseline."""
+    baseline = verify.rev_parse_head(project.project)
+    src = project.project / "src.txt"
+    src.write_text("skill commit bytes\n")
+    git(project.project, "add", "--", "src.txt")
+    git(project.project, "commit", "-q", "-m", "skill: implementation")
+    original_head = verify.rev_parse_head(project.project)
+    deliverable = project.project / "report.bin"
+    deliverable.write_bytes(b"pending-tracked deliverable")
+    rel = deliverable.relative_to(project.repo_root).as_posix()
+    accepted_oid = verify.git_normalized_blob_oid(project.repo_root, rel, deliverable)
+    validated = []
+
+    def snapshot_then_concurrent_reset():
+        snapshot = verify.staged_blob_oids(project.repo_root, (rel,))
+        git(project.project, "read-tree", baseline)  # the concurrent writer
+        return snapshot
+
+    def validate_commit(revision, staged_snapshot):
+        validated.append(revision)
+        if verify.revision_blob_oids(project.repo_root, revision, (rel,)) != staged_snapshot:
+            raise RuntimeError("committed deliverable drift")
+
+    with pytest.raises(RuntimeError, match="committed deliverable drift"):
+        verify.finalize_commit(
+            project.project,
+            baseline,
+            "story: via bmad-loop",
+            staged_validator=snapshot_then_concurrent_reset,
+            committed_validator=validate_commit,
+        )
+
+    assert validated == [baseline]  # validated against the tree "nothing" would leave
+    assert verify.rev_parse_head(project.project) == original_head
+    assert git(project.project, "show", "HEAD:src.txt") == "skill commit bytes"
+    assert deliverable.read_bytes() == b"pending-tracked deliverable"
+    assert (
+        verify.staged_blob_oids(project.repo_root, (rel,)) == {}
+    )  # index restored: untracked again
+    assert accepted_oid not in git(project.project, "ls-files", "-s")
+
+
+def test_finalize_commit_no_op_arm_returns_none_when_the_snapshot_is_already_in_baseline(project):
+    """The honest no-op: the deliverable's accepted bytes are in baseline already
+    and nothing else changed, so the validator agrees with baseline and the
+    pre-existing `None` contract stands — HEAD at baseline, no commit."""
+    deliverable = project.project / "report.bin"
+    deliverable.write_bytes(b"already landed")
+    git(project.project, "add", "--", "report.bin")
+    git(project.project, "commit", "-q", "-m", "baseline carries the deliverable")
+    baseline = verify.rev_parse_head(project.project)
+    rel = deliverable.relative_to(project.repo_root).as_posix()
+    validated = []
+
+    def validate_commit(revision, staged_snapshot):
+        validated.append(revision)
+        if verify.revision_blob_oids(project.repo_root, revision, (rel,)) != staged_snapshot:
+            raise RuntimeError("committed deliverable drift")
+
+    sha = verify.finalize_commit(
+        project.project,
+        baseline,
+        "story: via bmad-loop",
+        staged_validator=lambda: verify.staged_blob_oids(project.repo_root, (rel,)),
+        committed_validator=validate_commit,
+    )
+
+    assert sha is None
+    assert validated == [baseline]
+    assert verify.rev_parse_head(project.project) == baseline
+
+
+def test_staged_blob_oid_requires_an_exact_literal_stage_zero_blob(project):
+    literal = project.project / "artifact[1].txt"
+    neighbour = project.project / "artifact1.txt"
+    literal.write_text("literal\n")
+    neighbour.write_text("neighbour\n")
+    git(project.project, "add", "-A")
+    rel = literal.relative_to(project.repo_root).as_posix()
+
+    assert verify.staged_blob_oid(project.repo_root, rel) == verify.git_normalized_blob_oid(
+        project.repo_root, rel, literal
+    )
+    git(project.project, "reset", "-q", "HEAD", "--", rel)
+    with pytest.raises(verify.GitError, match="no exact unambiguous entry"):
+        verify.staged_blob_oid(project.repo_root, rel)
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        b"",
+        b"malformed\tartifact.txt\0",
+        b"100644 0000000000000000000000000000000000000000 0\tother.txt\0",
+        (
+            b"100644 0000000000000000000000000000000000000000 1\tartifact.txt\0"
+            b"100644 0000000000000000000000000000000000000000 2\tartifact.txt\0"
+        ),
+    ],
+    ids=["missing", "malformed", "wrong-path", "unmerged"],
+)
+def test_staged_blob_oid_fails_closed_on_inexact_index_evidence(project, monkeypatch, records):
+    def index_evidence(*_args, **_kwargs):
+        return subprocess.CompletedProcess([], 0, stdout=records, stderr=b"")
+
+    monkeypatch.setattr(verify, "git_bytes", index_evidence)
+
+    with pytest.raises(verify.GitError) as raised:
+        verify.staged_blob_oid(project.repo_root, "artifact.txt")
+
+    assert "0000000000000000000000000000000000000000" not in str(raised.value)
+
+
+def test_staged_blob_oid_refuses_gitlinks_without_exposing_the_oid(project, monkeypatch):
+    oid = b"0000000000000000000000000000000000000000"
+
+    def gitlink_index(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            [], 0, stdout=b"160000 " + oid + b" 0\tartifact.txt\0", stderr=b""
+        )
+
+    monkeypatch.setattr(verify, "git_bytes", gitlink_index)
+
+    with pytest.raises(verify.GitError, match="not a regular") as raised:
+        verify.staged_blob_oid(project.repo_root, "artifact.txt")
+
+    assert oid.decode() not in str(raised.value)
+
+
+def test_staged_blob_oid_fails_closed_when_git_refuses_the_probe(project, monkeypatch):
+    secret = b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    monkeypatch.setattr(
+        verify,
+        "git_bytes",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 1, stdout=b"", stderr=secret),
+    )
+
+    with pytest.raises(verify.GitError, match="blob probe failed") as raised:
+        verify.staged_blob_oid(project.repo_root, "artifact.txt")
+
+    assert secret.decode() not in str(raised.value)
+
+
+def test_staged_blob_oid_does_not_turn_executable_mode_into_content_policy(project):
+    path = project.project / "src.txt"
+    path.write_text("accepted bytes\n")
+    rel = path.relative_to(project.repo_root).as_posix()
+    git(project.project, "add", "--", rel)
+    accepted = verify.staged_blob_oid(project.repo_root, rel)
+
+    git(project.project, "update-index", "--chmod=+x", "--", rel)
+
+    assert verify.staged_blob_oid(project.repo_root, rel) == accepted
+
+
 def test_finalize_commit_rerun_is_content_idempotent(project):
     """The #115 resume re-drive may run finalize_commit on a post-squash tree
     (the first finalize completed just before a host death). The re-run must
@@ -5926,30 +6848,67 @@ def test_unpublishable_target_refuses_an_absent_ledger(project):
 
 
 def test_unpublishable_target_refuses_an_undecodable_ledger_with_the_fault(project):
-    """`target-unreadable`, carrying the decode fault as the second element. The
+    """`target-undecodable`, carrying the decode fault as the second element. The
     ledger's own read contract (DW-146) raises `LedgerReadError` for bytes nobody
     can decode, and that is what this arm folds into a refusal.
 
-    Ablation: drop `deferredwork.LedgerReadError` from the `except` tuple and the
-    call raises instead of answering, reddening the assertion below."""
+    Ablation: drop the `deferredwork.LedgerReadError` arm and the call raises
+    instead of answering, reddening the assertion below."""
     write_ledger(project, {"DW-1": "open"})
     project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
 
     cause, error = verify.unpublishable_target(project.deferred_work, "ledger")
 
-    assert cause == "target-unreadable"
+    assert cause == "target-undecodable"
     assert "not valid UTF-8" in error
+
+
+@pytest.mark.parametrize(
+    "fault,cause,fragment",
+    [
+        ("undecodable", "target-undecodable", "not valid UTF-8"),
+        ("stat-refused", "target-unreadable", "Permission denied"),
+    ],
+)
+def test_unpublishable_target_splits_the_durable_decode_fault_from_the_transient_os_fault(
+    project, monkeypatch, fault, cause, fragment
+):
+    """The DW-237 split, graded on the guard itself: the ledger
+    leg's two faults are two CAUSES, not one. Invalid UTF-8 is a DURABLE content
+    shape — a replay re-reads the same bytes and refuses them identically — and
+    returns `target-undecodable`; a `stat` the OS REFUSED is a TRANSIENT host answer
+    the next pass may not see, and returns `target-unreadable`. The split is drawn
+    here rather than at a call site because `Engine._carry_harvested_deferrals`, the
+    one publisher with a durable commit latch, refuses the first and retries the
+    second — and before the split both arrived as `target-unreadable`, so the
+    undecodable ledger fell through to git, which accepts any bytes, and reached HEAD.
+
+    Ablation: collapse the two `except` arms back into
+    `except (deferredwork.LedgerReadError, OSError)` returning `target-unreadable`
+    and the undecodable row reds on its cause."""
+    write_ledger(project, {"DW-1": "open"})
+    if fault == "undecodable":
+        project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
+    else:
+        fault_metadata_probe(monkeypatch, project.deferred_work, "stat")
+
+    got_cause, error = verify.unpublishable_target(project.deferred_work, "ledger")
+
+    assert got_cause == cause
+    assert fragment in error
 
 
 def test_unpublishable_target_folds_a_ledger_oserror_into_the_refusal(project, monkeypatch):
     """The arm that has to be said out loud: `read_for_write`'s contract lets
     `OSError` PROPAGATE, and here it deliberately does not. Both callers are
     best-effort bookkeeping whose degrade discipline exists so a publication fault
-    never aborts the work that wrote the file, so an unreadable target joins the
-    undecodable cause rather than escaping into a caller with no handler for it.
+    never aborts the work that wrote the file, so an unreadable target is refused
+    `target-unreadable` rather than escaping into a caller with no handler for it —
+    its OWN cause, kept apart from the decode fault's `target-undecodable` since the
+    DW-237 resolution.
 
-    Ablation: drop `OSError` from the `except` tuple and this reds with the
-    `PermissionError` escaping instead of the tuple coming back."""
+    Ablation: drop the `OSError` arm and this reds with the `PermissionError`
+    escaping instead of the tuple coming back."""
     write_ledger(project, {"DW-1": "open"})
     fault_read_text(monkeypatch, project.deferred_work)
 
@@ -5959,18 +6918,172 @@ def test_unpublishable_target_folds_a_ledger_oserror_into_the_refusal(project, m
     assert "Permission denied" in error
 
 
-def test_unpublishable_target_refuses_an_absent_store(project):
-    """The store family, whose whole probe is existence.
+def test_unpublishable_target_refuses_a_ledger_replaced_by_a_directory(project):
+    """DW-238: ONE on-disk shape, ONE cause, across both families. A directory
+    standing at the ledger's own name is present and the wrong TYPE — exactly what
+    the store arm has reported `target-not-a-file` since DW-211/228 — but the
+    ledger arm collapsed the reader's `None` into `target-absent` and named an
+    operator repair (restore the file) that does not fit a directory sitting right
+    there.
 
-    Ablation: return `None` unconditionally from the store arm and this reds."""
+    The reader answers `None` for this non-regular path, as it also does for
+    absence. A refused metadata probe instead raises out of `read_for_write`
+    and folds to `target-unreadable`.
+
+    Ablation: restore the ledger arm's single `return ("target-absent", None)` and
+    this reds with the directory reported as an absence."""
+    write_ledger(project, {"DW-1": "open"})
+    ledger = project.deferred_work
+    ledger.unlink()
+    ledger.mkdir()
+    (ledger / "swept-in.txt").write_text("a descendant `git add` would stage\n")
+
+    assert verify.unpublishable_target(ledger, "ledger") == ("target-not-a-file", None)
+
+
+@pytest.mark.parametrize("failure", [PermissionError, FileNotFoundError, NotADirectoryError])
+def test_unpublishable_target_classifies_second_ledger_probe_independently(
+    project, monkeypatch, failure
+):
+    """A successful first stat cannot guarantee the second probe is readable.
+
+    Simulate 3.14's suppressing exists() independently of the host runtime.
+    Ablation: restore the exists() discriminator; the refusal case reports absence.
+    """
+    ledger = project.deferred_work
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.mkdir()
+    real_stat = Path.stat
+    real_exists = Path.exists
+    calls = 0
+    fault = failure("metadata changed between probes")
+
+    def changing_stat(self, *args, **kwargs):
+        nonlocal calls
+        if self == ledger:
+            calls += 1
+            if calls > 1:
+                raise fault
+        return real_stat(self, *args, **kwargs)
+
+    def suppressing_exists(self, *args, **kwargs):
+        if self == ledger:
+            try:
+                self.stat()
+            except OSError:
+                return False
+            return True
+        return real_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", changing_stat)
+    monkeypatch.setattr(Path, "exists", suppressing_exists)
+    expected = (
+        ("target-unreadable", str(fault)) if failure is PermissionError else ("target-absent", None)
+    )
+    assert verify.unpublishable_target(ledger, "ledger") == expected
+    assert calls == 2
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX FIFOs")
+def test_unpublishable_target_refuses_a_ledger_replaced_by_a_fifo(project, monkeypatch):
+    """The second of the three shapes DW-238's token actually covers (directory,
+    FIFO, socket), and the one that is not merely a variation: a FIFO is what makes
+    `S_ISREG` load-bearing rather than decorative in the reader below this guard —
+    `read_text` on it would BLOCK forever rather than raise, wedging the publisher.
+    It is present and the wrong type, so it reports the wrong-type cause.
+
+    Ablation: restore the ledger arm's single `return ("target-absent", None)` and
+    this reds with the FIFO reported as an absence."""
+    write_ledger(project, {"DW-1": "open"})
+    ledger = project.deferred_work
+    ledger.unlink()
+    os.mkfifo(ledger)
+
+    real_read = Path.read_text
+
+    def refuse_fifo_read(self, *args, **kwargs):
+        if self == ledger:
+            pytest.fail("publisher attempted to read a FIFO")
+        return real_read(self, *args, **kwargs)
+
+    # Make a missing regular-file guard fail immediately instead of hanging.
+    monkeypatch.setattr(Path, "read_text", refuse_fifo_read)
+    assert verify.unpublishable_target(ledger, "ledger") == ("target-not-a-file", None)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_unpublishable_target_refuses_a_ledger_symlink_loop_as_unreadable(project):
+    """The shape where the two families deliberately DISAGREE, graded so the
+    disagreement is a recorded fact rather than an accident. ELOOP used to be
+    absence for the ledger (errno 40 is in `pathlib`'s ignored tuple, so
+    `is_file()` answered False), and DW-221 made it a refusal — so this arm reports
+    `target-unreadable`, naming the errno, where it once said `target-absent`.
+
+    The identical link at the STORE's name still publishes, through the store
+    leg's `S_ISLNK` arm (the old `is_symlink()` disjunct, since DW-257 answered
+    from one `lstat`) that exists to preserve the 3.13+ loop's link entry — see
+    `test_unpublishable_target_publishes_a_store_symlink_loop`. That is not an
+    oversight DW-238 left behind: DW-238 unified the present-but-wrong-TYPE
+    shapes, and this one is not one of them.
+
+    Ablation: restore `if not path.is_file(): return None` in
+    `deferredwork.read_for_write` and this reds with `target-absent` — the guard
+    reports a path that is right there as gone."""
+    write_ledger(project, {"DW-1": "open"})
+    ledger = project.deferred_work
+    ledger.unlink()
+    other = project.project / "ledger-loop"
+    ledger.symlink_to(other)
+    other.symlink_to(ledger)
+
+    cause, error = verify.unpublishable_target(ledger, "ledger")
+
+    assert cause == "target-unreadable"
+    assert "Too many levels of symbolic links" in error
+
+
+def test_unpublishable_target_folds_a_refused_ledger_metadata_probe(project, monkeypatch):
+    """The arm DW-221 newly routes here. Before it, a ledger whose metadata probe
+    the OS refused answered `None` on Python 3.14 and was refused `target-absent` —
+    a present file reported as gone. `read_for_write` raises `OSError` on every
+    interpreter now, and this guard folds it into `target-unreadable` with the
+    errno text, the same way it already folds a decode fault.
+
+    Ablation: drop `OSError` from the `except` tuple and the `PermissionError`
+    escapes this best-effort guard instead of the tuple coming back."""
+    write_ledger(project, {"DW-1": "open"})
+    fault_metadata_probe(monkeypatch, project.deferred_work, "stat")
+
+    cause, error = verify.unpublishable_target(project.deferred_work, "ledger")
+
+    assert cause == "target-unreadable"
+    assert "Permission denied" in error
+
+
+@pytest.mark.parametrize("shape", ["enoent", "enotdir-parent"])
+def test_unpublishable_target_refuses_an_absent_store(project, shape):
+    """The store family's absence arm: `lstat` raised `FileNotFoundError`, or
+    `NotADirectoryError` for a regular file standing where `.bmad-loop/` should
+    be — the two errno shapes the leg absorbs as absence (DW-257), through the
+    same `deferredwork.probe_absence` the reader asks (DW-268; the winerror and
+    NUL shapes it also absorbs are
+    `test_unpublishable_target_absorbs_pathlibs_ignored_store_probe_faults`).
+
+    Ablation: return `None` unconditionally from the store arm and both rows red;
+    drop `NotADirectoryError` from `probe_absence` and `enotdir-parent` reds
+    with `target-unreadable`."""
     store = project.project / ".bmad-loop" / "decisions.json"
-    store.parent.mkdir(parents=True, exist_ok=True)
+    if shape == "enoent":
+        store.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        store.parent.write_text("a regular file where a directory is expected\n")
 
     assert verify.unpublishable_target(store, "store") == ("target-absent", None)
 
 
 def test_unpublishable_target_publishes_a_present_store_that_is_not_decodable(project):
-    """EXISTENCE ONLY for the store, and that boundary is exactly why the family is
+    """NO CONTENT POLICY for the store — DW-211/228 tightened the store leg to a
+    TYPE test, not a bytes test — and that boundary is exactly why the family is
     DECLARED by the caller rather than derived from the path: the store's writer
     emits valid UTF-8 JSON, so bytes that will not decode represent a replacement
     after that write, and publication deliberately preserves the existing
@@ -5983,6 +7096,386 @@ def test_unpublishable_target_publishes_a_present_store_that_is_not_decodable(pr
     store.write_bytes(b'{"DW-1": "\xff"}')  # present, and not UTF-8
 
     assert verify.unpublishable_target(store, "store") is None
+
+
+def test_unpublishable_target_refuses_a_store_replaced_by_a_directory(project):
+    """DW-211/228: a DIRECTORY at the store's own name is present, so the old
+    existence-only probe published it — and `commit_paths` hands the literal
+    pathspec to `git add`, which stages a directory's descendants RECURSIVELY. The
+    wrong TYPE is neither absent nor unreadable, so it gets its own token and names
+    its own operator repair.
+
+    Ablation: widen the store leg's publish test from `S_ISREG or S_ISLNK` to
+    "anything `lstat` reports", or drop the `target-not-a-file` arm entirely, and
+    this reds — the directory publishes, or is misreported as an absence."""
+    store = project.project / ".bmad-loop" / "decisions.json"
+    store.mkdir(parents=True)
+    (store / "swept-in.txt").write_text("a descendant `git add` would stage\n")
+
+    assert verify.unpublishable_target(store, "store") == ("target-not-a-file", None)
+
+
+def test_unpublishable_target_refuses_a_store_symlinked_to_a_directory(project):
+    """The same refusal reached the other way — and the row that pins WHICH path the
+    type test is taken on. Callers hand this guard the RESOLVED target (DW-188), and
+    a link to a directory resolves to that directory: `lstat` reports a directory,
+    neither `S_ISREG` nor `S_ISLNK`, so it lands on `target-not-a-file`. `git add`
+    on the operand would otherwise stage that directory's descendants exactly as a
+    directory in place of the store does.
+
+    The second half is the property that keeps the tightening from over-refusing:
+    a store symlinked to a regular file publishes whether the guard sees the link
+    (the `S_ISLNK` arm) or its resolved target (the `S_ISREG` arm).
+
+    Ablation: widen the publish test to "anything `lstat` reports" and the
+    resolved directory publishes again; drop the `S_ISLNK` arm and the
+    link-to-a-regular-file half still passes on its resolved read while the
+    unresolved read and the 3.13+ loop row red — the two arms answer different
+    questions."""
+    root = project.project / ".bmad-loop"
+    root.mkdir(parents=True, exist_ok=True)
+    elsewhere = root / "operator-chosen-dir"
+    elsewhere.mkdir()
+    (elsewhere / "swept-in.txt").write_text("a descendant `git add` would stage\n")
+    store = root / "decisions.json"
+    try:
+        store.symlink_to(elsewhere)
+    except OSError as exc:  # pragma: no cover - win32 without developer mode
+        pytest.skip(f"symlinks unavailable on this host: {exc}")
+    # premise: the lexical path really is a link, and the RESOLVE is what the
+    # publishers hand over — it lands on the directory itself
+    assert store.is_symlink()
+    resolved = store.resolve()
+    assert resolved == elsewhere.resolve() and resolved.is_dir()
+
+    assert verify.unpublishable_target(resolved, "store") == ("target-not-a-file", None)
+
+    # ...while a link to a REGULAR file publishes, seen either way
+    regular = root / "operator-chosen-file.json"
+    regular.write_text("{}", encoding="utf-8")
+    store.unlink()
+    store.symlink_to(regular)
+    assert verify.unpublishable_target(store, "store") is None  # the `S_ISLNK` arm
+    assert verify.unpublishable_target(store.resolve(), "store") is None  # `S_ISREG`
+
+
+def test_unpublishable_target_publishes_a_store_symlink_loop(project):
+    """The one entry the old `is_symlink()` disjunct bought, kept by DW-257's
+    `S_ISLNK` arm: on Python 3.13+ a symlink LOOP at the store's name resolves to
+    the link ITSELF, and `lstat` — declining to follow the last component —
+    reports a link where `stat` would raise `ELOOP`. The store leg publishes it,
+    where its own ledger leg (`test_unpublishable_target_refuses_a_ledger_symlink_loop_as_unreadable`)
+    refuses the same shape `target-unreadable`; the families deliberately still
+    disagree here, and this row is what makes that a recorded fact.
+
+    Python 3.11–3.12 raise out of `resolve()` itself, which each caller handles
+    before this guard runs — so the row hands the guard the UNRESOLVED link, the
+    shape 3.13+'s resolve hands over, and asks nothing of `resolve()`.
+
+    Ablation: drop the `S_ISLNK` arm (publish on `S_ISREG` alone) and this reds
+    with `target-not-a-file`; probe with `stat()` instead of `lstat()` and it
+    reds with `target-unreadable` naming ELOOP."""
+    root = project.project / ".bmad-loop"
+    root.mkdir(parents=True, exist_ok=True)
+    store = root / "decisions.json"
+    other = root / "store-loop"
+    try:
+        store.symlink_to(other)
+        other.symlink_to(store)
+    except OSError as exc:  # pragma: no cover - win32 without developer mode
+        pytest.skip(f"symlinks unavailable on this host: {exc}")
+
+    assert verify.unpublishable_target(store, "store") is None
+
+
+@pytest.mark.parametrize("kind", ["file", "dir"])
+def test_unpublishable_target_folds_a_store_metadata_fault_into_the_refusal(
+    project, monkeypatch, kind
+):
+    """DW-227: the store probe can FAIL rather than answer. On Python 3.11–3.13
+    the `Path.exists()`/`is_file()`/`is_symlink()` probes this leg used until
+    DW-257 absorbed only the `ENOENT`/`ENOTDIR`/`ELOOP` class of errnos and RAISED
+    the rest, so an `EACCES` arriving after a successful write escaped this
+    best-effort guard — aborting `bmad-loop decisions`' walk or undercounting a
+    TUI answer. The fault is INJECTED on `lstat`, the one probe the leg takes now,
+    which reports the refusal on every interpreter rather than only where the old
+    probes raised it on their own.
+
+    ONE probe, so `kind` does not grade separate entry paths into the guard the
+    way the pre-DW-257 per-probe rows did; it pins that the fold is taken BEFORE
+    the type test, so a present regular file and a present directory fold the same
+    way when neither can be examined.
+
+    Ablation: delete the store leg's `except OSError` and both rows red with the
+    `PermissionError` escaping instead of the tuple coming back."""
+    store = project.project / ".bmad-loop" / "decisions.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "file":
+        store.write_text("{}", encoding="utf-8")
+    else:
+        store.mkdir()
+    fault_metadata_probe(monkeypatch, store, "lstat")
+
+    cause, error = verify.unpublishable_target(store, "store")
+
+    assert cause == "target-unreadable"
+    assert "Permission denied" in error
+
+
+def test_unpublishable_target_folds_a_refused_store_metadata_probe_on_every_interpreter(
+    project, monkeypatch
+):
+    """DW-257. The store leg asked `is_file() or is_symlink()`, then `exists()`,
+    and Python 3.14 suppresses every OS error inside all three, so a refused
+    store degraded to `target-absent` there — a present file reported as gone,
+    where this guard's own ledger leg says `target-unreadable` for the same
+    refusal (DW-221). The leg answers from one `lstat()` now, which reports the
+    refusal on every interpreter, and DW-227's fold catches it everywhere.
+
+    The 3.14 CONTRACT is simulated rather than the 3.14 interpreter: the three
+    convenience probes are pinned to answer False for the store — what 3.14 does
+    with a refusal — while `lstat` carries it. That is what makes the ablation
+    real on the 3.13 dev interpreter and not merely on one CI leg.
+
+    Ablation: restore the old `if target.is_file() or target.is_symlink(): return
+    None` / `if target.exists(): return ("target-not-a-file", None)` shape and
+    this reds with `target-absent`."""
+    store = project.project / ".bmad-loop" / "decisions.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text("{}", encoding="utf-8")
+    for probe in ("is_file", "is_symlink", "exists"):
+        real = getattr(Path, probe)
+        monkeypatch.setattr(
+            Path,
+            probe,
+            lambda self, *a, _real=real, **kw: False if self == store else _real(self, *a, **kw),
+        )
+    fault_metadata_probe(monkeypatch, store, "lstat")
+
+    cause, error = verify.unpublishable_target(store, "store")
+
+    assert cause == "target-unreadable"
+    assert error is not None and "Permission denied" in error
+
+
+ABSORBED_PROBE_FAULTS = ["winerror-21", "winerror-123", "winerror-1921", "nul-path"]
+"""The four probe-fault shapes `deferredwork.probe_absence` absorbs beyond
+`ENOENT`/`ENOTDIR` (DW-256/DW-268) — pathlib's `_IGNORED_WINERRORS` and the
+`ValueError` a non-encodable path raises; the twin of the table in
+`tests/test_deferredwork.py`."""
+
+
+def _absorb_probe_fault(monkeypatch, target: Path, shape: str, probe: str) -> Path:
+    """Install shape `shape` at `target`'s `probe` and return the path to hand the
+    guard. Winerrors are simulated the `tests/test_install.py` way — an
+    `OSError(errno.EIO)` with `.winerror` set, for this path only, on every
+    platform; `nul-path` swaps the target for a sibling with a REAL embedded NUL,
+    which the probe refuses with `ValueError` everywhere, so nothing is patched."""
+    if shape == "nul-path":
+        return Path(str(target.parent) + "/bad\0" + target.name)
+    fault = OSError(errno.EIO, "metadata refused", str(target))
+    fault.winerror = int(shape.removeprefix("winerror-"))
+    real = getattr(Path, probe)
+
+    def faulting(self, *a, **kw):
+        if self == target:
+            raise fault
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, probe, faulting)
+    return target
+
+
+@pytest.mark.parametrize("shape", ABSORBED_PROBE_FAULTS)
+def test_unpublishable_target_absorbs_pathlibs_ignored_store_probe_faults(
+    project, monkeypatch, shape
+):
+    """DW-268 at the store leg. DW-257's one `lstat()` kept only
+    `FileNotFoundError`/`NotADirectoryError` as absence, but the
+    `is_file()`/`is_symlink()`/`exists()` probes it replaced had also absorbed
+    pathlib's `_IGNORED_WINERRORS` (21/123/1921) and the `ValueError` a
+    non-encodable path raises — so a store on a disconnected mapped drive folded
+    to `target-unreadable` where the old probes said absent, and a NUL in the
+    store path ESCAPED as a `ValueError` past every caller's `except OSError`.
+    The leg asks `deferredwork.probe_absence` now, the same classification the
+    ledger's reader makes, so all four shapes are `target-absent`; `EACCES` is
+    still `target-unreadable`
+    (`test_unpublishable_target_folds_a_refused_store_metadata_probe_on_every_interpreter`).
+
+    Ablation: restore `except (FileNotFoundError, NotADirectoryError)` (with the
+    `except OSError` fold below it) at the store leg and the winerror rows red
+    with `target-unreadable`, the `nul-path` row with `ValueError` escaping."""
+    store = project.project / ".bmad-loop" / "decisions.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text("{}", encoding="utf-8")
+    target = _absorb_probe_fault(monkeypatch, store, shape, "lstat")
+
+    assert verify.unpublishable_target(target, "store") == ("target-absent", None)
+
+
+@pytest.mark.parametrize("shape", ABSORBED_PROBE_FAULTS)
+def test_unpublishable_target_absorbs_pathlibs_ignored_ledger_probe_faults(
+    project, monkeypatch, shape
+):
+    """DW-256/DW-268 at the ledger leg. The reader answers `None` for these four
+    shapes now (`test_read_for_write_absorbs_pathlibs_ignored_probe_faults`), and
+    the leg's `stat()` re-probe — which discriminates `target-absent` from
+    `target-not-a-file` — asks the SAME `probe_absence`, so the answer is
+    `target-absent`, inherited, and never an escaping `ValueError`: the enclosing
+    `except OSError` would not catch one, and this is a best-effort publisher.
+
+    Ablation: restore `except (FileNotFoundError, NotADirectoryError)` at the
+    re-probe alone and the winerror rows red with `target-unreadable` (the
+    re-raised `OSError` lands in the fold), the `nul-path` row with `ValueError`
+    escaping; restore it at `read_for_write` instead and every row reds the
+    same way one step earlier."""
+    write_ledger(project, {"DW-1": "open"})
+    target = _absorb_probe_fault(monkeypatch, project.deferred_work, shape, "stat")
+
+    assert verify.unpublishable_target(target, "ledger") == ("target-absent", None)
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_commit_paths_omits_a_candidate_whose_presence_probe_faults(project, monkeypatch, staged):
+    """DW-227 at the other probe site: `commit_paths`' own presence check can raise,
+    and that fault takes the SAME per-candidate uncertainty path a failed `resolve()`
+    takes — omit this candidate, commit the healthy sibling, never escape as a bare
+    `OSError` into a publisher with no handler for it.
+
+    ONE probe, where this was parametrized over `exists`/`is_symlink` until DW-239:
+    both suppress every OS error on Python 3.14, so the fault this row grades could
+    not arrive there at all and the candidate was silently ruled MISSING. `lstat`
+    suppresses nothing on any interpreter, so the row now grades the same handler on
+    every version of the matrix rather than only the older half.
+
+    Ablation: remove the `try/except OSError` around the presence probe and this
+    reds with the `PermissionError` escaping before the healthy sibling commits."""
+    repo = project.project.resolve()
+    faulted = repo / "src.txt"
+    faulted.write_text("operator edit\n")
+    if staged:
+        git(repo, "add", "--", "src.txt")
+        staged_blob = git(repo, "show", ":src.txt")
+    healthy = repo / "healthy.txt"
+    healthy.write_text("commit me\n")
+    fault_metadata_probe(monkeypatch, faulted, "lstat")
+
+    sha = verify.commit_paths(repo, "chore: healthy only", [faulted, healthy])
+
+    assert sha is not None
+    assert git(repo, "show", "--format=", "--name-only", sha).splitlines() == ["healthy.txt"]
+    status = git(repo, "status", "--porcelain")
+    assert "src.txt" in status  # the faulted path stayed uncommitted
+    assert "healthy.txt" not in status
+    if staged:
+        assert git(repo, "show", ":src.txt") == staged_blob
+
+
+def test_commit_paths_raises_when_the_only_candidates_presence_probe_faults(project, monkeypatch):
+    """The no-survivor half of the same contract: a sole faulted candidate is a typed
+    exact-write failure, not a successful no-op — the harvested-deferral carry clears
+    its durable commit-pending latch on a clean return, so `None` here would suppress
+    the retry forever. The `OSError` rides as `__cause__`, and no `git add` runs.
+
+    On `lstat` for the reason its sibling row above states (DW-239).
+
+    Ablation: record no fault for a faulted presence probe (leave the uncertainty
+    slot untouched) and this returns `None` instead of raising."""
+    repo = project.project.resolve()
+    faulted = repo / "src.txt"
+    faulted.write_text("uncommitted exact write\n")
+    fault_metadata_probe(monkeypatch, faulted, "lstat")
+    git_calls: list[tuple[str, ...]] = []
+    real_git = verify._git
+
+    def spy_git(r, *args):
+        git_calls.append(args)
+        return real_git(r, *args)
+
+    monkeypatch.setattr(verify, "_git", spy_git)
+
+    with pytest.raises(verify.GitError, match="no exact commit operand remains") as caught:
+        verify.commit_paths(repo, "chore: exact", [faulted])
+
+    assert isinstance(caught.value.__cause__, PermissionError)
+    assert not any(args[:1] == ("add",) for args in git_calls)
+    assert faulted.read_text() == "uncommitted exact write\n"
+
+
+def test_commit_paths_treats_a_symlink_to_nothing_as_present(project):
+    """Half of what the `lstat` probe must PRESERVE (DW-239): a directory entry that
+    is a symlink to nothing is still PRESENT — never offered to `ls-files` as a
+    possible deletion, and staged as the link entry it is. `exists() or is_symlink()`
+    answered True for it on the SECOND disjunct alone, and `lstat` answers the same
+    way because it does not follow the last component.
+
+    The entry has to be a symlink LOOP rather than a plainly dangling link, and that
+    is not a contrivance — it is the only shape that reaches the probe as a link at
+    all. `commit_paths` resolves every operand first, and non-strict `Path.resolve`
+    collapses a dangling link to the plain non-existent path it points at (which then
+    correctly reads MISSING, identically under either probe); a LOOP is the fixed
+    point that survives the resolve as itself, which is exactly the case
+    `verify.unpublishable_target`'s RESOLVED-argument paragraph says the store
+    leg's `S_ISLNK` arm (once an `is_symlink()` disjunct) is there to buy. Gated
+    on 3.13 for the same reason its
+    sibling row above is: older `Path.resolve` raises on the loop instead.
+
+    Ablation: swap the probe for a bare `candidate.exists()` and this reds — the link
+    is ruled missing, `ls-files` reports it untracked, the operand is dropped, and
+    `commit_paths` returns `None` with the link uncommitted."""
+    if sys.version_info < (3, 13):
+        pytest.skip("Path.resolve raises on a symlink loop before 3.13")
+    repo = project.project.resolve()
+    loop = repo / "loop.txt"
+    try:
+        loop.symlink_to("loop.txt")
+    except OSError as exc:  # pragma: no cover - win32 without developer mode
+        pytest.skip(f"symlinks unavailable on this host: {exc}")
+    assert loop.resolve() == loop  # premise: the resolve keeps it a link
+    raw_calls: list[tuple[str, ...]] = []
+    real_git_raw = verify._git_raw
+
+    with pytest.MonkeyPatch.context() as mp:
+
+        def spy_raw(r, *args):
+            raw_calls.append(args)
+            return real_git_raw(r, *args)
+
+        mp.setattr(verify, "_git_raw", spy_raw)
+        sha = verify.commit_paths(repo, "chore: link", [loop])
+
+    assert sha is not None
+    assert git(repo, "show", "--format=", "--name-only", sha).splitlines() == ["loop.txt"]
+    # PRESENT, so the deletion probe was never asked about it
+    assert not any(args[:1] == ("ls-files",) for args in raw_calls)
+    # ...and it rode in as a link, not as a deletion
+    assert git(repo, "show", "--format=", "--name-status", sha).split()[0] == "A"
+    assert git(repo, "show", f"{sha}:loop.txt") == "loop.txt"
+    assert verify.worktree_clean(repo)
+
+
+def test_commit_paths_still_stages_an_absent_but_tracked_operands_deletion(project):
+    """The other half of the preserved semantics: `ENOENT` out of `lstat` is the same
+    MISSING the old pair answered False for, so a tracked-but-removed operand still
+    takes the missing-but-tracked arm and its DELETION rides the commit. That is the
+    contract `cli.confirm` depends on for the park record it unlinks (#356).
+
+    Ablation: fold `FileNotFoundError` into the uncertainty `except OSError` and this
+    reds — the operand is omitted, nothing survives, and a `GitError` replaces the
+    deletion commit."""
+    repo = project.project.resolve()
+    doomed = repo / "doomed.txt"
+    doomed.write_text("tracked\n")
+    git(repo, "add", "--", "doomed.txt")
+    git(repo, "commit", "-q", "-m", "track it")
+    doomed.unlink()
+
+    sha = verify.commit_paths(repo, "chore: delete", [doomed])
+
+    assert sha is not None
+    assert git(repo, "show", "--format=", "--name-only", sha).splitlines() == ["doomed.txt"]
+    assert git(repo, "show", "--format=", "--name-status", sha).split()[0] == "D"
+    assert verify.worktree_clean(repo)
 
 
 def test_unpublishable_target_reads_a_present_empty_ledger_as_publishable(project):
@@ -5998,22 +7491,23 @@ def test_unpublishable_target_reads_a_present_empty_ledger_as_publishable(projec
 
 
 def test_a_dangling_link_resolves_to_an_absence_before_the_probes_run(project):
-    """The probes are taken on the RESOLVED argument, and that is what decides what
-    the `is_symlink()` disjunct actually buys — not the spelling. A DANGLING link
-    does not survive the resolve as a link: non-strict `Path.resolve` collapses it
-    to the plain non-existent path it points at, so both probes answer False and
-    the store is refused `target-absent`. That is the right answer for it —
+    """The probe is taken on the RESOLVED argument, and that is what decides what
+    the store leg's `S_ISLNK` arm (the old `is_symlink()` disjunct, DW-257)
+    actually buys — not the spelling. A DANGLING link does not survive the
+    resolve as a link: non-strict `Path.resolve` collapses it to the plain
+    non-existent path it points at, so `lstat` raises `ENOENT` and the store is
+    refused `target-absent`. That is the right answer for it —
     `atomic_write_text_confined` REFUSES to write through a link at the store's
     own name, so a dangling one holds no write of ours to publish — but it is the
     opposite of what "keeps a dangling link publishable" would mean.
 
-    On Python 3.13+ the disjunct keeps a symlink LOOP publishable: it resolves to
-    the link ITSELF (`exists()` False, `is_symlink()` True). Python 3.11-3.12
+    On Python 3.13+ the arm keeps a symlink LOOP publishable: it resolves to the
+    link ITSELF, which `lstat` reports as a link (`S_ISLNK`). Python 3.11-3.12
     raise during resolve, which each caller handles on its own.
 
-    Ablation: on Python 3.13+, drop `or target.is_symlink()` and the loop case
-    starts refusing too. Reverse the arm to `if target.exists():` and the dangling
-    case stops being refused on every version."""
+    Ablation: on Python 3.13+, drop the `S_ISLNK` arm and the loop case starts
+    refusing too. Publish on anything `lstat` reports and the dangling case is
+    still refused (ENOENT), but the directory rows above stop being."""
     store = project.project / ".bmad-loop" / "decisions.json"
     store.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -6552,6 +8046,1436 @@ def test_verify_dev_stories_roots_its_exclude_on_the_code_tree(project, tmp_path
     # genuinely different directories. Should the fixture ever collapse them, the
     # recorded-root assertion stops separating the two spellings and this reddens.
     assert paths.project != paths.repo_root
+
+
+# ------------------------------------------------ accepted exact-path publication
+
+
+def _bound_publish_inputs(project):
+    repo = project.project
+    path = repo / "src.txt"
+    baseline = path.read_text(encoding="utf-8")
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    return repo, path, baseline, accepted
+
+
+def test_commit_path_bound_publishes_only_accepted_path_and_preserves_real_index(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    unrelated = repo / "operator.txt"
+    unrelated.write_text("staged operator work\n", encoding="utf-8")
+    git(repo, "add", "--", unrelated.name)
+
+    sha = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert sha == verify.rev_parse_head(repo)
+    assert git(repo, "show", "--format=", "--name-only", sha) == "src.txt"
+    assert git(repo, "show", f"{sha}:src.txt") == accepted.rstrip("\n")
+    assert git(repo, "diff", "--cached", "--name-only") == unrelated.name
+
+
+@pytest.mark.parametrize("index_flag", ["--assume-unchanged", "--skip-worktree"])
+def test_commit_path_bound_does_not_accept_a_false_clean_index_flag(project, index_flag):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    # Apply the hiding bit after the working-tree edit: both flags can suppress
+    # porcelain even though HEAD still contains the legacy baseline.
+    git(repo, "update-index", index_flag, "--", path.name)
+    assert verify.path_clean(repo, path.name)
+
+    sha = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert sha is not None
+    assert git(repo, "show", f"{sha}:src.txt") == accepted.rstrip("\n")
+
+
+def test_commit_path_bound_refuses_current_tree_outside_the_bound_baseline(project):
+    repo, path, _baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    wrong_baseline = "different claimed baseline\n"
+
+    with pytest.raises(verify.GitError, match="committed publication target holds rival"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=wrong_baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.read_text(encoding="utf-8") == accepted
+
+
+def test_commit_path_bound_rejects_hook_mutation_before_authoritative_publication(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nprintf 'hook bytes\\n' > src.txt\ngit add -- src.txt\n")
+    hook.chmod(0o755)
+
+    with pytest.raises(verify.GitError, match="accepted ledger"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.read_text(encoding="utf-8") == accepted
+
+
+def test_commit_path_bound_rejects_hook_added_paths_before_authoritative_publication(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\nprintf 'extra hook path\\n' > hook-extra.txt\ngit add -- hook-extra.txt\n"
+    )
+    hook.chmod(0o755)
+
+    with pytest.raises(verify.GitError, match="outside its declared scope"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert not (repo / "hook-extra.txt").exists()
+
+
+def test_bound_candidate_refuses_a_merge_commit_even_with_an_exact_path_delta(project):
+    repo = project.project
+    path = repo / "src.txt"
+    rel = path.name
+    baseline = path.read_text(encoding="utf-8")
+    original_branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    git(repo, "checkout", "-q", "-b", "bound-side")
+    accepted = "accepted merge candidate\n"
+    path.write_text(accepted, encoding="utf-8")
+    git(repo, "add", "--", rel)
+    git(repo, "commit", "-q", "-m", "side ledger change")
+    git(repo, "checkout", "-q", original_branch)
+    git(repo, "merge", "-q", "--no-ff", "bound-side", "-m", "merge ledger candidate")
+    candidate = verify.rev_parse_head(repo)
+    first_parent = git(repo, "rev-parse", "HEAD^1")
+    accepted_oid = verify.git_normalized_blob_oid_for_bytes(repo, rel, accepted.encode())
+    baseline_oid = verify.git_normalized_blob_oid_for_bytes(repo, rel, baseline.encode())
+
+    with pytest.raises(verify.GitError, match="exactly one parent"):
+        verify._validate_bound_candidate(
+            repo,
+            candidate,
+            first_parent,
+            rel,
+            accepted_oid,
+            baseline_oid,
+        )
+
+
+def test_commit_path_bound_refuses_a_tracked_target_index_deletion(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    git(repo, "rm", "--cached", "--", path.name)
+
+    with pytest.raises(verify.GitError, match="foreign content"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert git(repo, "ls-files", "--", path.name) == ""
+
+
+def test_commit_path_bound_refuses_a_committed_deletion_of_the_tracked_baseline(project):
+    """The committed twin of the staged deletion above: a rival commits the
+    ledger's removal while the working tree still holds the accepted rewrite.
+    Building the candidate on that commit would re-add the ledger over the
+    rival's decision. Ablation: drop `_preflight_bound_absence` and this
+    publishes a child of the deleting commit that carries the ledger again."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    baseline_commit = verify.rev_parse_head(repo)
+    git(repo, "rm", "--cached", "-q", "--", path.name)
+    git(repo, "commit", "-q", "-m", "rival: drop the ledger")
+    deleting_head = verify.rev_parse_head(repo)
+
+    with pytest.raises(verify.GitError, match="deleted after the accepted baseline"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+            baseline_commit=baseline_commit,
+        )
+
+    assert verify.rev_parse_head(repo) == deleting_head
+    assert git(repo, "ls-files", "--", path.name) == ""
+    assert path.read_text(encoding="utf-8") == accepted
+
+
+def test_commit_path_bound_refuses_an_absent_target_without_baseline_authority(project):
+    repo = project.project
+    path = repo / "new-ledger.md"
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    original_head = verify.rev_parse_head(repo)
+
+    with pytest.raises(verify.GitError, match="absence has no baseline authority"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text="legacy\n",
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert git(repo, "ls-files", "--", path.name) == ""
+
+
+def test_commit_path_bound_publishes_a_target_proven_untracked_at_the_baseline(project):
+    repo = project.project
+    path = repo / "new-ledger.md"
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    baseline_commit = verify.rev_parse_head(repo)
+
+    sha = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text="legacy\n",
+        baseline_commit=baseline_commit,
+    )
+
+    assert sha == verify.rev_parse_head(repo)
+    assert git(repo, "show", "--format=", "--name-only", sha) == path.name
+    assert git(repo, "show", f"{sha}:{path.name}") == accepted.rstrip("\n")
+
+
+def test_commit_path_bound_refuses_replay_over_a_committed_deletion_of_its_own_publication(
+    project,
+):
+    """The originally-untracked arm of the deletion refusal: the transition
+    published the ledger, a rival then committed its removal, and a COMMITTING
+    replay arrives with the accepted text still live. The baseline commit
+    proves nothing here (it never tracked the ledger), so the accepted
+    transition beneath the absent HEAD is what refuses. Ablation: drop the
+    ancestry probe in `_preflight_bound_absence` and the replay publishes a
+    second child that re-adds the ledger over the deletion."""
+    repo = project.project
+    path = repo / "new-ledger.md"
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    baseline_commit = verify.rev_parse_head(repo)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text="legacy\n",
+        baseline_commit=baseline_commit,
+    )
+    assert published == verify.rev_parse_head(repo)
+    git(repo, "rm", "--cached", "-q", "--", path.name)
+    git(repo, "commit", "-q", "-m", "rival: drop the published ledger")
+    deleting_head = verify.rev_parse_head(repo)
+    assert path.read_text(encoding="utf-8") == accepted
+
+    with pytest.raises(verify.GitError, match="deleted after its accepted publication"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text="legacy\n",
+            baseline_commit=baseline_commit,
+        )
+
+    assert verify.rev_parse_head(repo) == deleting_head
+    assert git(repo, "ls-files", "--", path.name) == ""
+
+
+def test_commit_path_bound_terminal_ref_cas_preserves_concurrent_head(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    real_run_git = verify._run_git
+    concurrent_head = []
+
+    def advance_before_cas(cmd, git_repo, **kwargs):
+        if kwargs.get("prepared_update") is not None and not concurrent_head:
+            rival = repo / "concurrent.txt"
+            rival.write_text("keep concurrent commit\n", encoding="utf-8")
+            git(repo, "add", "--", rival.name)
+            git(repo, "commit", "-q", "-m", "concurrent commit")
+            concurrent_head.append(verify.rev_parse_head(repo))
+        return real_run_git(cmd, git_repo, **kwargs)
+
+    monkeypatch.setattr(verify, "_run_git", advance_before_cas)
+
+    with pytest.raises(verify.GitError, match="prepared ref transaction failed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == concurrent_head[0]
+    assert (repo / "concurrent.txt").read_text(encoding="utf-8") == "keep concurrent commit\n"
+
+
+def test_commit_path_bound_replays_accepted_ancestor_beneath_unrelated_descendant(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+    descendant = repo / "descendant.txt"
+    descendant.write_text("keep descendant\n", encoding="utf-8")
+    git(repo, "add", "--", descendant.name)
+    git(repo, "commit", "-q", "-m", "unrelated descendant")
+    descendant_head = verify.rev_parse_head(repo)
+
+    replayed = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert replayed == published
+    assert verify.rev_parse_head(repo) == descendant_head
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+
+
+def test_commit_path_bound_skips_newer_invalid_same_ledger_descendant(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+    extra = repo / "descendant-extra.txt"
+    extra.write_text("wider descendant\n", encoding="utf-8")
+    git(repo, "update-index", "--chmod=+x", "--", path.name)
+    git(repo, "add", "--", extra.name)
+    git(repo, "commit", "-q", "-m", "multi-path same-ledger descendant")
+    descendant_head = verify.rev_parse_head(repo)
+    assert set(git(repo, "show", "--format=", "--name-only", "HEAD").splitlines()) == {
+        path.name,
+        extra.name,
+    }
+
+    replayed = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert replayed == published
+    assert verify.rev_parse_head(repo) == descendant_head
+    assert git(repo, "show", "HEAD:src.txt") == accepted.rstrip("\n")
+
+
+def test_commit_path_bound_propagates_probe_failure_on_a_newer_candidate(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+    git(repo, "update-index", "--chmod=+x", "--", path.name)
+    git(repo, "commit", "-q", "-m", "newer ledger mode transition")
+    descendant_head = verify.rev_parse_head(repo)
+
+    def unavailable_scope(*_args, **_kwargs):
+        raise verify.GitError("candidate scope unavailable")
+
+    monkeypatch.setattr(verify, "_bound_changed_paths", unavailable_scope)
+
+    with pytest.raises(verify.GitError, match="candidate scope unavailable"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == descendant_head
+
+
+def test_commit_path_bound_keeps_published_commit_when_index_sync_faults(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    real_git = verify._git
+    faulted = []
+
+    def fail_target_sync(git_repo, *args, **kwargs):
+        if args[:1] == ("reset",) and not faulted:
+            faulted.append(True)
+            return 1, "injected sync fault"
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", fail_target_sync)
+    with pytest.raises(verify.GitError, match="index synchronization"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    published = verify.rev_parse_head(repo)
+    assert published != original_head
+    monkeypatch.setattr(verify, "_git", real_git)
+    assert (
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+        == published
+    )
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+
+
+def test_commit_path_bound_refuses_foreign_target_index_change_before_sync(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    shadow = repo / "foreign-index.txt"
+    shadow.write_text("foreign staged ledger\n", encoding="utf-8")
+    foreign_oid = git(repo, "hash-object", "-w", "--", str(shadow))
+    shadow.unlink()
+    real_run_git = verify._run_git
+    published = []
+
+    def change_index_after_cas(cmd, git_repo, **kwargs):
+        result = real_run_git(cmd, git_repo, **kwargs)
+        update = kwargs.get("prepared_update")
+        if update is not None and not published:
+            published.append(update.new_oid)
+            git(repo, "update-index", "--cacheinfo", "100644", foreign_oid, path.name)
+        return result
+
+    monkeypatch.setattr(verify, "_run_git", change_index_after_cas)
+
+    with pytest.raises(verify.GitError, match="real index target changed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == published[0]
+    assert verify.staged_blob_oid(repo, path.name) == foreign_oid
+
+
+def test_commit_path_bound_rejects_lossy_filter_live_text_drift(project, monkeypatch):
+    repo = project.project
+    attributes = repo / ".gitattributes"
+    attributes.write_text("src.txt filter=collapse\n", encoding="utf-8")
+    git(repo, "config", "filter.collapse.clean", "sed s/rival/accepted/")
+    git(repo, "add", ".gitattributes")
+    git(repo, "commit", "-q", "-m", "configure lossy filter")
+    repo, path, baseline, _accepted = _bound_publish_inputs(project)
+    accepted = "accepted\n"
+    path.write_text(accepted, encoding="utf-8")
+    original_head = verify.rev_parse_head(repo)
+    real_git = verify._git
+
+    def rival_after_staging(git_repo, *args, **kwargs):
+        if args[:1] == ("commit",) and git_repo != repo:
+            path.write_text("rival\n", encoding="utf-8")
+        return real_git(git_repo, *args, **kwargs)
+
+    assert verify.git_normalized_blob_oid_for_bytes(
+        repo, "src.txt", accepted.encode()
+    ) == verify.git_normalized_blob_oid_for_bytes(repo, "src.txt", b"rival\n")
+    monkeypatch.setattr(verify, "_git", rival_after_staging)
+
+    with pytest.raises(verify.GitError, match="target changed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.read_text(encoding="utf-8") == "rival\n"
+
+
+def test_commit_path_bound_rejects_post_staging_symlink_substitution(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    replacement = repo / "replacement.txt"
+    replacement.write_text(accepted, encoding="utf-8")
+    real_git = verify._git
+
+    def substitute_after_staging(git_repo, *args, **kwargs):
+        if args[:1] == ("commit",) and git_repo != repo:
+            path.unlink()
+            path.symlink_to(replacement.name)
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", substitute_after_staging)
+    with pytest.raises(verify.GitError, match="target changed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.is_symlink()
+
+
+def test_commit_path_bound_publishes_the_live_bytes_under_any_line_ending(project):
+    # `atomic_write_text` renders the accepted rewrite with the host's line
+    # ending, so on Windows the live ledger is CRLF while the accepted text is
+    # LF. Under `core.autocrlf=false` a candidate built from the text's own
+    # encoding commits LF over a CRLF checkout and DONE is earned beside a
+    # dirty ledger; the candidate must carry the bytes actually validated.
+    repo = project.project
+    path = repo / "src.txt"
+    baseline = path.read_text(encoding="utf-8")
+    accepted = "accepted migration ledger\n"
+    live = b"accepted migration ledger\r\n"
+    path.write_bytes(live)
+    git(repo, "config", "core.autocrlf", "false")
+
+    sha = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert sha == verify.rev_parse_head(repo)
+    assert verify.git_bytes(repo, "show", f"{sha}:src.txt").stdout == live
+    assert git(repo, "status", "--porcelain", "--", "src.txt") == ""
+    assert path.read_bytes() == live
+
+
+def test_commit_path_bound_publishes_over_a_crlf_committed_baseline(project):
+    """A tracked legacy ledger Git preserves with CRLF bytes (`core.autocrlf=false`,
+    the shape every Windows-written ledger takes) reads back as LF text, so
+    hashing that text's own encoding names a blob HEAD never held. Ablation:
+    derive `baseline_oid` from `baseline_text.encode()` and the unchanged
+    committed baseline refuses as rival content, leaving the migration in
+    COMMITTING for good."""
+    repo = project.project
+    path = repo / "src.txt"
+    git(repo, "config", "core.autocrlf", "false")
+    committed = b"legacy ledger\r\nsecond line\r\n"
+    path.write_bytes(committed)
+    git(repo, "add", "--", path.name)
+    git(repo, "commit", "-q", "-m", "crlf legacy ledger")
+    baseline_commit = verify.rev_parse_head(repo)
+    baseline = path.read_text(encoding="utf-8")
+    assert baseline == "legacy ledger\nsecond line\n"
+    accepted = "accepted migration ledger\n"
+    live = accepted.replace("\n", "\r\n").encode("utf-8")
+    path.write_bytes(live)
+
+    sha = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+        baseline_commit=baseline_commit,
+    )
+
+    assert sha == verify.rev_parse_head(repo)
+    assert git(repo, "rev-parse", f"{sha}^") == baseline_commit
+    assert verify.git_bytes(repo, "show", f"{sha}:src.txt").stdout == live
+    assert git(repo, "status", "--porcelain", "--", "src.txt") == ""
+
+
+def test_commit_path_bound_refuses_a_baseline_text_outside_its_commit(project):
+    """The committed blob lends the baseline its identity only while the text
+    still decodes to it: a baseline record that describes some other content
+    than the commit it claims to have been read beside is refused, not given
+    that commit's blob as its name. Ablation: drop the decoded comparison in
+    `_bound_baseline_blob` and this publishes on the committed blob's word."""
+    repo, path, _baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+
+    with pytest.raises(verify.GitError, match="does not match the committed baseline"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text="different claimed baseline\n",
+            baseline_commit=original_head,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.read_text(encoding="utf-8") == accepted
+
+
+def test_commit_path_bound_refuses_the_same_text_under_other_line_endings(project, monkeypatch):
+    # A rival rendering of the accepted text — CRLF where the observation read
+    # LF — decodes identically under the universal-newline reading, so only a
+    # raw-byte comparison tells the live file from the candidate's bytes.
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    rival = accepted.replace("\n", "\r\n").encode("utf-8")
+    real_git = verify._git
+
+    def rerender_after_staging(git_repo, *args, **kwargs):
+        if args[:1] == ("commit",) and git_repo != repo:
+            path.write_bytes(rival)
+        return real_git(git_repo, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "_git", rerender_after_staging)
+    with pytest.raises(verify.GitError, match="target changed during validation"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.read_bytes() == rival
+
+
+def test_commit_path_bound_refuses_an_in_place_rewrite_inside_the_final_validation(
+    project, monkeypatch
+):
+    # The rival lands on the SAME inode between the final pre-publication read
+    # and its trailing stat: the bytes read are still the accepted ones and the
+    # device/inode pair is unchanged, so only the size/mtime/ctime bracket can
+    # refuse it before the transaction commits over rival live content.
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+    rival = b"rival bytes written in place over the same inode\n"
+    armed = False
+    real_validate = verify._validate_bound_candidate
+    real_read_bytes = Path.read_bytes
+
+    def arm_after_candidate_validation(*args, **kwargs):
+        nonlocal armed
+        real_validate(*args, **kwargs)
+        armed = True
+
+    def rewrite_in_place_after_reading(self):
+        nonlocal armed
+        data = real_read_bytes(self)
+        if armed and self == path:
+            armed = False
+            with open(path, "r+b") as handle:
+                handle.write(rival)
+                handle.truncate()
+        return data
+
+    monkeypatch.setattr(verify, "_validate_bound_candidate", arm_after_candidate_validation)
+    monkeypatch.setattr(Path, "read_bytes", rewrite_in_place_after_reading)
+    with pytest.raises(verify.GitError, match="target changed during validation"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.read_bytes() == rival
+
+
+def test_commit_path_bound_refuses_detached_head_before_candidate_hooks(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    marker = repo / "bound-hook-ran"
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\nprintf ran > '{marker}'\n")
+    hook.chmod(0o755)
+    git(repo, "checkout", "-q", "--detach")
+
+    with pytest.raises(verify.GitError, match="attached direct branch"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original
+    assert not marker.exists()
+
+
+def test_commit_path_bound_refuses_same_oid_checkout_switch_before_hooks(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    marker = repo / "bound-hook-ran"
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\nprintf ran > '{marker}'\n")
+    hook.chmod(0o755)
+    real_identity = verify._bound_checkout_identity
+    captures = []
+
+    def switch_on_revalidation(git_repo):
+        if captures:
+            git(repo, "branch", "same-object-rival", original)
+            git(repo, "symbolic-ref", "HEAD", "refs/heads/same-object-rival")
+        captures.append(True)
+        return real_identity(git_repo)
+
+    monkeypatch.setattr(verify, "_bound_checkout_identity", switch_on_revalidation)
+
+    with pytest.raises(verify.GitError, match="checkout changed before.*hooks"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original
+    assert not marker.exists()
+
+
+def test_commit_path_bound_publishes_terminal_branch_through_symbolic_chain(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    terminal = git(repo, "symbolic-ref", "HEAD")
+    alias = "refs/heads/publication-alias"
+    git(repo, "symbolic-ref", alias, terminal)
+    git(repo, "symbolic-ref", "HEAD", alias)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert git(repo, "symbolic-ref", "--no-recurse", "HEAD") == alias
+    assert git(repo, "symbolic-ref", "--no-recurse", alias) == terminal
+    assert git(repo, "rev-parse", terminal) == published
+
+
+def test_commit_path_bound_lock_held_direct_ref_proof_is_load_bearing(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    real_probe = verify._bound_direct_ref_probe
+    probes = []
+
+    def fail_publication_probe(git_repo, ref, *, timeout_s=None):
+        probes.append(ref)
+        if len(probes) == 3:
+            raise verify.GitError("exact-path publication branch changed ref kind")
+        return real_probe(git_repo, ref, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "_bound_direct_ref_probe", fail_publication_probe)
+
+    with pytest.raises(verify.GitError, match="changed ref kind"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def test_commit_path_bound_refuses_terminal_ref_converted_to_same_oid_symref_before_prepare(
+    project, monkeypatch
+):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    terminal = git(repo, "symbolic-ref", "HEAD")
+    referent = "refs/heads/publication-referent"
+    git(repo, "branch", referent.removeprefix("refs/heads/"), original)
+    real_probe = verify._bound_direct_ref_probe
+    probes = []
+
+    def convert_terminal_inside_prepared_window(git_repo, ref, *, timeout_s=None):
+        probes.append(ref)
+        if len(probes) == 3:
+            terminal_path = repo / ".git" / terminal
+            terminal_path.write_text(f"ref: {referent}\n", encoding="ascii")
+        return real_probe(git_repo, ref, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "_bound_direct_ref_probe", convert_terminal_inside_prepared_window)
+
+    with pytest.raises(verify.GitError, match="changed ref kind"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert git(repo, "symbolic-ref", "--no-recurse", terminal) == referent
+    assert git(repo, "rev-parse", terminal) == original
+    assert git(repo, "rev-parse", referent) == original
+
+
+def test_commit_path_bound_does_not_publish_new_head_selected_while_prepared(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    captured_branch = git(repo, "symbolic-ref", "HEAD")
+    rival_branch = "refs/heads/same-object-rival"
+    git(repo, "branch", rival_branch.removeprefix("refs/heads/"), original)
+    real_probe = verify._bound_direct_ref_probe
+    probes = []
+
+    def switch_head_inside_prepared_window(git_repo, ref, *, timeout_s=None):
+        probes.append(ref)
+        if len(probes) == 3:
+            (repo / ".git" / "HEAD").write_text(f"ref: {rival_branch}\n", encoding="ascii")
+        return real_probe(git_repo, ref, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "_bound_direct_ref_probe", switch_head_inside_prepared_window)
+
+    with pytest.raises(verify.GitError, match="checkout changed during.*reconciliation"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert git(repo, "rev-parse", rival_branch) == original
+    assert git(repo, "rev-parse", captured_branch) != original
+    assert verify.rev_parse_head(repo) == original
+
+
+def test_commit_path_bound_repairs_index_after_detach_during_prepared(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    captured_branch = git(repo, "symbolic-ref", "HEAD")
+    original_index = verify._bound_index_entry(repo, path.name)
+    real_probe = verify._bound_direct_ref_probe
+    probes = []
+
+    def detach_head_inside_prepared_window(git_repo, ref, *, timeout_s=None):
+        probes.append(ref)
+        if len(probes) == 3:
+            (repo / ".git" / "HEAD").write_text(f"{original}\n", encoding="ascii")
+        return real_probe(git_repo, ref, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "_bound_direct_ref_probe", detach_head_inside_prepared_window)
+
+    with pytest.raises(verify.GitError, match="checkout changed during.*reconciliation"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert git(repo, "rev-parse", captured_branch) != original
+    assert verify.rev_parse_head(repo) == original
+    assert verify._bound_index_entry(repo, path.name) == original_index
+
+
+def test_prepared_ref_transaction_redacts_protocol_authority(project):
+    repo = project.project
+    oid = verify.rev_parse_head(repo)
+    secret_ref = "refs/heads/secret ref"
+    update = verify._PreparedRefUpdate(secret_ref, oid, oid, lambda _remaining: None)
+
+    with pytest.raises(verify.GitError) as raised:
+        verify._run_git(
+            ["git", "-C", str(repo), "update-ref", "--stdin"],
+            repo,
+            prepared_update=update,
+        )
+
+    evidence = str(raised.value)
+    assert secret_ref not in evidence
+    assert oid not in evidence
+
+
+def test_prepared_ref_transaction_start_failure_changes_no_ref(project):
+    repo = project.project
+    oid = verify.rev_parse_head(repo)
+    ref = git(repo, "symbolic-ref", "HEAD")
+    update = verify._PreparedRefUpdate(ref, oid, oid, lambda _remaining: None)
+
+    with pytest.raises(verify.GitError, match="prepared ref transaction failed"):
+        verify._run_git(
+            ["git", "-C", str(repo), "update-ref", "--stdin", "--invalid-option"],
+            repo,
+            prepared_update=update,
+        )
+
+    assert verify.rev_parse_head(repo) == oid
+
+
+def test_prepared_ref_transaction_spawn_failure_is_typed_and_chained(project, monkeypatch):
+    repo = project.project
+    oid = verify.rev_parse_head(repo)
+    ref = git(repo, "symbolic-ref", "HEAD")
+    cause = OSError(errno.EMFILE, "injected descriptor exhaustion")
+
+    def fail_spawn(*_args, **_kwargs):
+        raise cause
+
+    monkeypatch.setattr(verify.subprocess, "Popen", fail_spawn)
+    update = verify._PreparedRefUpdate(ref, oid, oid, lambda _remaining: None)
+    with pytest.raises(verify.GitSpawnError) as raised:
+        verify._run_git(
+            ["git", "-C", str(repo), "update-ref", "--stdin"],
+            repo,
+            prepared_update=update,
+        )
+
+    assert raised.value.__cause__ is cause
+
+
+def test_prepared_ref_transaction_propagates_non_git_validation_fault(project):
+    repo = project.project
+    oid = verify.rev_parse_head(repo)
+    ref = git(repo, "symbolic-ref", "HEAD")
+    fault = RuntimeError("non-git validation fault")
+
+    def fail_validation(_remaining):
+        raise fault
+
+    update = verify._PreparedRefUpdate(ref, oid, oid, fail_validation)
+    with pytest.raises(RuntimeError) as raised:
+        verify._run_git(
+            ["git", "-C", str(repo), "update-ref", "--stdin"],
+            repo,
+            prepared_update=update,
+        )
+
+    assert raised.value is fault
+    assert verify.rev_parse_head(repo) == oid
+
+
+def test_prepared_ref_transaction_abort_failure_changes_no_ref(project, monkeypatch):
+    repo = project.project
+    oid = verify.rev_parse_head(repo)
+    ref = git(repo, "symbolic-ref", "HEAD")
+    real_popen = subprocess.Popen
+    children = []
+
+    def record_child(*args, **kwargs):
+        child = real_popen(*args, **kwargs)
+        children.append(child)
+        return child
+
+    def broken_write(_line):
+        raise OSError("injected command stream fault")
+
+    def break_abort(_remaining):
+        # Break the command stream WITHOUT closing it: closing the pipe hands
+        # git EOF, and git aborts and exits on its own — if it does so before
+        # the except arm polls it, there is no live transaction left to abort
+        # and the injected fault is what propagates (seen on a loaded CI leg).
+        # Overriding the wrapper's write keeps git waiting in `prepare` so the
+        # abort is attempted and fails, deterministically.
+        children[0].stdin.write = broken_write
+        raise verify.GitError("injected prepared validation fault")
+
+    monkeypatch.setattr(verify.subprocess, "Popen", record_child)
+    update = verify._PreparedRefUpdate(ref, oid, oid, break_abort)
+    with pytest.raises(verify.GitError, match="transaction abort failed"):
+        verify._run_git(
+            ["git", "-C", str(repo), "update-ref", "--stdin"],
+            repo,
+            prepared_update=update,
+        )
+
+    assert verify.rev_parse_head(repo) == oid
+
+
+def test_commit_path_bound_recovers_lost_commit_acknowledgement(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    real_run_git = verify._run_git
+    faulted = []
+
+    def lose_ack_after_commit(cmd, git_repo, **kwargs):
+        result = real_run_git(cmd, git_repo, **kwargs)
+        if kwargs.get("prepared_update") is not None and not faulted:
+            faulted.append(True)
+            raise verify._GitCommitIndeterminate("injected acknowledgement loss")
+        return result
+
+    monkeypatch.setattr(verify, "_run_git", lose_ack_after_commit)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert faulted == [True]
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+
+
+def test_commit_path_bound_retries_after_lost_ack_with_unchanged_ref(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    real_run_git = verify._run_git
+
+    def lose_ack_without_commit(cmd, git_repo, **kwargs):
+        if kwargs.get("prepared_update") is not None:
+            raise verify._GitCommitIndeterminate("injected acknowledgement loss")
+        return real_run_git(cmd, git_repo, **kwargs)
+
+    monkeypatch.setattr(verify, "_run_git", lose_ack_without_commit)
+    with pytest.raises(verify.GitError, match="lost before ref movement"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+    assert verify.rev_parse_head(repo) == original
+
+    monkeypatch.setattr(verify, "_run_git", real_run_git)
+    assert verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    ) == verify.rev_parse_head(repo)
+
+
+def test_commit_path_bound_refuses_committed_rival_before_candidate_hooks(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    path.write_text("committed rival ledger\n", encoding="utf-8")
+    git(repo, "add", "--", path.name)
+    git(repo, "commit", "-q", "-m", "rival ledger")
+    rival_head = verify.rev_parse_head(repo)
+    path.write_text(accepted, encoding="utf-8")
+    marker = repo / "bound-hook-ran"
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\nprintf ran > '{marker}'\n")
+    hook.chmod(0o755)
+
+    with pytest.raises(verify.GitError, match="committed publication target holds rival"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == rival_head
+    assert not marker.exists()
+
+
+def test_commit_path_bound_repairs_index_to_moved_checkout_then_refuses(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    unrelated = repo / "operator.txt"
+    unrelated.write_text("staged operator work\n", encoding="utf-8")
+    git(repo, "add", "--", unrelated.name)
+    real_git = verify._git
+    moved = []
+
+    def move_head_during_first_reset(git_repo, *args, **kwargs):
+        result = real_git(git_repo, *args, **kwargs)
+        if args[:1] == ("reset",) and not moved:
+            git(repo, "branch", "index-race", original)
+            git(repo, "symbolic-ref", "HEAD", "refs/heads/index-race")
+            moved.append(True)
+        return result
+
+    monkeypatch.setattr(verify, "_git", move_head_during_first_reset)
+    with pytest.raises(verify.GitError, match="checkout changed during.*reconciliation"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert moved == [True]
+    assert verify.rev_parse_head(repo) == original
+    assert verify.staged_blob_oid(repo, path.name) == git(repo, "rev-parse", f"{original}:src.txt")
+    assert git(repo, "diff", "--cached", "--name-only") == unrelated.name
+
+
+def test_commit_path_bound_refuses_staged_mode_only_target_change(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    git(repo, "update-index", "--chmod=+x", "--", path.name)
+
+    with pytest.raises(verify.GitError, match="real index holds foreign content"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original
+    assert git(repo, "ls-files", "-s", "--", path.name).startswith("100755 ")
+
+
+def test_commit_path_bound_preserves_tracked_executable_target_mode(project):
+    repo = project.project
+    path = repo / "src.txt"
+    git(repo, "update-index", "--chmod=+x", "--", path.name)
+    git(repo, "commit", "-q", "-m", "track executable ledger")
+    baseline = path.read_text(encoding="utf-8")
+    accepted = "accepted executable migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "ls-tree", published, "--", path.name).startswith("100755 blob ")
+    assert git(repo, "ls-files", "-s", "--", path.name).startswith("100755 ")
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+
+
+def test_commit_path_bound_rejects_hook_mode_mutation(project):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    original = verify.rev_parse_head(repo)
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\ngit update-index --chmod=+x -- src.txt\n")
+    hook.chmod(0o755)
+
+    with pytest.raises(verify.GitError, match="changed the publication target mode"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == original
+
+
+def test_commit_path_bound_refuses_committed_symlink_parent_before_candidate_write(project):
+    repo = project.project
+    parent = repo / "ledger-parent"
+    outside = repo / "outside-target"
+    outside.mkdir()
+    parent.symlink_to(outside.name)
+    git(repo, "add", "--", parent.name)
+    git(repo, "commit", "-q", "-m", "track ledger parent symlink")
+    parent.unlink()
+    parent.mkdir()
+    path = parent / "ledger.md"
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+
+    with pytest.raises(verify.GitError, match="non-directory committed parent"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text="legacy migration ledger\n",
+            baseline_commit=verify.rev_parse_head(repo),
+        )
+
+    assert not (outside / "ledger.md").exists()
+
+
+def test_prepared_ref_timeout_before_commit_is_not_indeterminate(project):
+    repo = project.project
+    oid = verify.rev_parse_head(repo)
+    ref = git(repo, "symbolic-ref", "HEAD")
+
+    def expire_deadline(_remaining):
+        time.sleep(0.02)
+
+    update = verify._PreparedRefUpdate(ref, oid, oid, expire_deadline)
+    with pytest.raises(verify.GitError) as raised:
+        verify._run_git(
+            ["git", "-C", str(repo), "update-ref", "--stdin"],
+            repo,
+            timeout_s=0.01,
+            prepared_update=update,
+        )
+
+    assert not isinstance(raised.value, verify._GitCommitIndeterminate)
+    assert verify.rev_parse_head(repo) == oid
+
+
+def _bound_transaction_only(monkeypatch, timeout_s: float) -> list[str]:
+    """Bound only the prepared `update-ref --stdin` transaction to `timeout_s`.
+
+    Shrinking `_git_timeout_s` instead would put the same bound on every other
+    git child `commit_path_bound` spawns (`worktree add`, the candidate commit,
+    the index reconciliation), and a loaded runner — Windows CI in particular —
+    turned that into `git worktree timed out after 1s` before the transaction
+    under test ever started. Returns the log of how each bounded transaction
+    ended: `"ok"`, or the name of the `GitError` it raised."""
+    real_run_git = verify._run_git
+    outcomes: list[str] = []
+
+    def bounded(cmd, git_repo, **kwargs):
+        if kwargs.get("prepared_update") is None:
+            return real_run_git(cmd, git_repo, **kwargs)
+        try:
+            result = real_run_git(cmd, git_repo, timeout_s=timeout_s, **kwargs)
+        except verify.GitError as exc:
+            outcomes.append(type(exc).__name__)
+            raise
+        outcomes.append("ok")
+        return result
+
+    monkeypatch.setattr(verify, "_run_git", bounded)
+    return outcomes
+
+
+def test_commit_path_bound_recovers_post_commit_timeout(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    hook = repo / ".git" / "hooks" / "reference-transaction"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = committed ] && grep -q ' refs/heads/'; then\n"
+        "  sleep 4\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    outcomes = _bound_transaction_only(monkeypatch, 2)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    # premise: the acknowledgement really was lost, and recovery observed the
+    # moved ref rather than retrying the transaction
+    assert outcomes == ["_GitCommitIndeterminate"]
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+
+
+def test_commit_path_bound_hands_the_prepared_probe_its_fractional_remaining(project, monkeypatch):
+    """The lock-held probe gets what is LEFT of the transaction's budget, as a
+    float. A `prepared` hook that sleeps makes that remainder non-integral, so an
+    `int(...)` anywhere between the deadline and the probe's `timeout_s` shows up
+    as a whole number here — the shape that once truncated a sub-second remainder
+    to `0` and timed the probe out on the spot. Observed at the probe rather than
+    provoked with a one-second budget: the provoked form raced the runner's load
+    (the probe, commit and exit all had to fit in what the sleep left of 1s) and
+    reddened on healthy trees."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    hook = repo / ".git" / "hooks" / "reference-transaction"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = prepared ] && grep -q ' refs/heads/'; then\n"
+        "  sleep 0.2\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    budget = 5
+    _bound_transaction_only(monkeypatch, budget)
+    real_probe = verify._bound_direct_ref_probe
+    handed = []
+
+    def record_prepared_probe(git_repo, ref, *, timeout_s=None):
+        if timeout_s is not None:  # only the lock-held call carries a remainder
+            handed.append(timeout_s)
+        return real_probe(git_repo, ref, timeout_s=timeout_s)
+
+    monkeypatch.setattr(verify, "_bound_direct_ref_probe", record_prepared_probe)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    [remaining] = handed
+    assert isinstance(remaining, float)
+    assert 0 < remaining < budget - 0.2  # the sleep came off the budget...
+    assert remaining != int(remaining)  # ...and nothing rounded what was left
+
+
+def test_commit_path_bound_recovers_real_git_commit_ack_loss(project):
+    if sys.platform == "win32":
+        pytest.skip("POSIX signal injection")
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    hook = repo / ".git" / "hooks" / "reference-transaction"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = committed ] && grep -q ' refs/heads/'; then\n"
+        '  kill -KILL "$PPID"\n'
+        "fi\n"
+    )
+    hook.chmod(0o755)
+
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+    )
+
+    assert published == verify.rev_parse_head(repo)
+    assert git(repo, "show", f"{published}:src.txt") == accepted.rstrip("\n")
+
+
+def test_commit_path_bound_refuses_rival_after_lost_commit_acknowledgement(project, monkeypatch):
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    real_run_git = verify._run_git
+    rival_head = []
+
+    def replace_transaction_with_rival(cmd, git_repo, **kwargs):
+        if kwargs.get("prepared_update") is not None and not rival_head:
+            rival = repo / "rival.txt"
+            rival.write_text("rival branch commit\n", encoding="utf-8")
+            git(repo, "add", "--", rival.name)
+            git(repo, "commit", "-q", "-m", "rival branch commit")
+            rival_head.append(verify.rev_parse_head(repo))
+            raise verify._GitCommitIndeterminate("injected acknowledgement loss")
+        return real_run_git(cmd, git_repo, **kwargs)
+
+    monkeypatch.setattr(verify, "_run_git", replace_transaction_with_rival)
+    with pytest.raises(verify.GitError, match="captured branch changed"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+        )
+
+    assert verify.rev_parse_head(repo) == rival_head[0]
+
+
+def test_bound_index_reconciliation_is_bounded_and_repairs_latest_observation(project, monkeypatch):
+    repo = project.project
+    path = repo / "src.txt"
+    rel = path.name
+    commits = []
+    for number in range(4):
+        path.write_text(f"moving target {number}\n", encoding="utf-8")
+        git(repo, "add", "--", rel)
+        git(repo, "commit", "-q", "-m", f"moving target {number}")
+        commits.append(verify.rev_parse_head(repo))
+    unrelated = repo / "operator.txt"
+    unrelated.write_text("staged operator work\n", encoding="utf-8")
+    git(repo, "add", "--", unrelated.name)
+    observed_index = verify._bound_index_entry(repo, rel)
+    branch = git(repo, "symbolic-ref", "HEAD")
+    observations = [verify._BoundCheckoutIdentity(branch, branch, commit) for commit in commits]
+
+    def keep_moving(_repo, *, require_branch=True):
+        assert require_branch is False
+        return observations.pop(0)
+
+    monkeypatch.setattr(verify, "_bound_checkout_identity", keep_moving)
+    expected = verify._BoundCheckoutIdentity(branch, branch, commits[0])
+    with pytest.raises(verify.GitError, match="checkout did not stabilize"):
+        verify._synchronize_bound_index(repo, expected, rel, observed_index)
+
+    assert observations == []
+    assert verify._bound_index_entry(repo, rel) == verify._bound_tree_entry(repo, commits[-1], rel)
+    assert git(repo, "diff", "--cached", "--name-only") == unrelated.name
+
+
+def test_bound_index_reconciliation_can_align_a_moved_symlink_entry(project, monkeypatch):
+    repo = project.project
+    path = repo / "src.txt"
+    rel = path.name
+    original = verify.rev_parse_head(repo)
+    original_index = verify._bound_index_entry(repo, rel)
+    target = repo / "symlink-target.txt"
+    target.write_text("target\n", encoding="utf-8")
+    path.unlink()
+    path.symlink_to(target.name)
+    git(repo, "add", "--", rel)
+    git(repo, "commit", "-q", "-m", "move target to symlink")
+    symlink_commit = verify.rev_parse_head(repo)
+    git(repo, "reset", "--hard", original)
+    branch = git(repo, "symbolic-ref", "HEAD")
+    moved = verify._BoundCheckoutIdentity(branch, branch, symlink_commit)
+    observations = [moved, moved]
+
+    def observe_moved(_repo, *, require_branch=True):
+        assert require_branch is False
+        return observations.pop(0)
+
+    monkeypatch.setattr(verify, "_bound_checkout_identity", observe_moved)
+    expected = verify._BoundCheckoutIdentity(branch, branch, original)
+    with pytest.raises(verify.GitError, match="checkout changed during.*reconciliation"):
+        verify._synchronize_bound_index(repo, expected, rel, original_index)
+
+    entry = verify._bound_index_entry(repo, rel)
+    assert entry is not None and entry.mode == "120000"
+    assert entry == verify._bound_tree_entry(repo, symlink_commit, rel)
 
 
 def test_stories_relpaths_follows_the_root_it_is_given(project, tmp_path):
@@ -7398,6 +10322,21 @@ def test_spec_within_roots_refuses_uncertain_trusted_root(
     assert verify.spec_within_roots(reported, project) is False
 
 
+@pytest.mark.parametrize("resolve_fault", NUL_PATH_RESOLVE_FAULTS)
+@pytest.mark.parametrize(
+    "refused_operand",
+    ["reported", "project", "output_folder", "implementation_artifacts", "planning_artifacts"],
+)
+def test_spec_within_roots_refuses_value_error_family_from_every_operand(
+    project, tmp_path, monkeypatch, resolve_fault, refused_operand
+):
+    reported = tmp_path / "outside" / "spec.md"
+    refused = reported if refused_operand == "reported" else getattr(project, refused_operand)
+    refuse_to_resolve(monkeypatch, refused, error=resolve_fault)
+
+    assert verify.spec_within_roots(reported, project) is False
+
+
 def test_commits_above_empty_at_baseline(project):
     """HEAD sitting at baseline has no attempt commits to preserve."""
     repo = project.project
@@ -8231,3 +11170,121 @@ def test_verify_dev_roots_its_exclude_on_the_code_tree(project, tmp_path, monkey
     # genuinely different directories. Should the fixture ever collapse them, the
     # recorded-root assertion stops separating the two spellings and this reddens.
     assert paths.project != paths.repo_root
+
+
+def test_unfolded_changes_reads_a_squashed_unit_against_the_targets_tree(project):
+    """The reading a consumed squash integration stands on (#796 review): every
+    change the unit made over its baseline — an add, a rewrite, a delete, a
+    mode flip and a rename's two sides — is folded into the target's tree
+    blob for blob after a squash over an unmoved target, whose commit is never
+    the unit's descendant; a target that drifted on any of them names exactly
+    those paths. The target that moved before the squash is the next row's.
+
+    Ablation: compare object ids alone and the mode-flip row reads folded;
+    skip the deleted arm and a resurrected path reads folded."""
+    repo = project.repo_root
+    (repo / "kept.txt").write_text("kept\n")
+    (repo / "gone.txt").write_text("gone\n")
+    (repo / "moved.txt").write_text("moved\n")
+    (repo / "flip.sh").write_text("#!/bin/sh\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "baseline")
+    baseline = git(repo, "rev-parse", "HEAD")
+    target = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    git(repo, "checkout", "-q", "-b", "unit")
+    (repo / "kept.txt").write_text("rewritten\n")
+    (repo / "added.txt").write_text("added\n")
+    (repo / "gone.txt").unlink()
+    (repo / "moved.txt").rename(repo / "renamed.txt")
+    git(repo, "add", "-A")
+    git(repo, "update-index", "--chmod=+x", "flip.sh")
+    git(repo, "commit", "-q", "-m", "unit")
+    source = git(repo, "rev-parse", "HEAD")
+    # `-f`: the index seals the chmod, the checkout never did (a filemode=false
+    # host never would), and the mode-only dirt would otherwise refuse the switch.
+    git(repo, "checkout", "-q", "-f", target)
+    git(repo, "merge", "-q", "--squash", "unit")
+    git(repo, "commit", "-q", "-m", "squash")
+    squashed = git(repo, "rev-parse", "HEAD")
+
+    assert not verify.is_ancestor(repo, source, squashed)
+    assert verify.unfolded_changes(repo, baseline, source, squashed) == ()
+    assert verify.unfolded_changes(repo, baseline, source, baseline) == (
+        "added.txt",
+        "flip.sh",
+        "gone.txt",
+        "kept.txt",
+        "moved.txt",
+        "renamed.txt",
+    )
+
+    (repo / "gone.txt").write_text("resurrected\n")
+    git(repo, "add", "-A")
+    git(repo, "update-index", "--chmod=-x", "flip.sh")
+    git(repo, "commit", "-q", "-m", "drift")
+    drifted = git(repo, "rev-parse", "HEAD")
+    assert verify.unfolded_changes(repo, baseline, source, drifted) == ("flip.sh", "gone.txt")
+    with pytest.raises(verify.IntegrationEvidenceError, match="change set"):
+        verify.unfolded_changes(repo, baseline, "0" * 40, drifted)
+
+
+def test_unfolded_changes_reads_a_squash_the_target_had_moved_under_three_way(project):
+    """A squash over a target that had itself edited a file the unit also
+    edited, on other lines, seals the three-way result: a blob holding both
+    sides' edits, never the unit's own (Codex, #796 review). Blob equality
+    read every such file as unfolded, and the consumed-source resume paused a
+    landed, validated integration for ever. The reading is now git's own
+    three-way merge of the unit's change over its baseline into the held
+    blob: clean and byte-identical to what is held means folded, on a file
+    with and without a final newline alike. Read as unfolded: a held blob the
+    target rewrote on the unit's own lines (the replay would conflict), a
+    binary the target rewrote (git three-way merges no binary, so a divergent
+    one is a later change of the target's), and an added file the target
+    edited afterwards (add/add over an empty base).
+
+    Ablation: read `row[2] != new_oid` as unfolded without the three-way
+    probe and the landed row names `shared.txt` and `tail.txt`; skip the
+    binary guard and `blob.bin` raises out of `merge-file` instead of
+    reading unfolded."""
+    repo = project.repo_root
+    (repo / "shared.txt").write_text("a\nb\nc\nd\ne\nf\ng\nh\n")
+    (repo / "tail.txt").write_text("one\ntwo\nthree")
+    (repo / "blob.bin").write_bytes(b"\x00base\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "baseline")
+    baseline = git(repo, "rev-parse", "HEAD")
+    target = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    git(repo, "checkout", "-q", "-b", "unit")
+    (repo / "shared.txt").write_text("a\nb\nc\nd\ne\nf\ng\nH\n")
+    (repo / "tail.txt").write_text("one\ntwo\nTHREE")
+    (repo / "blob.bin").write_bytes(b"\x00unit\n")
+    (repo / "added.txt").write_text("added\nby the unit\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "unit")
+    source = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-q", target)
+    # the target moves on the same files, on lines the unit left alone
+    (repo / "shared.txt").write_text("A\nb\nc\nd\ne\nf\ng\nh\n")
+    (repo / "tail.txt").write_text("ONE\ntwo\nthree")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "target moved")
+    git(repo, "merge", "-q", "--squash", "unit")
+    git(repo, "commit", "-q", "-m", "squash")
+    squashed = git(repo, "rev-parse", "HEAD")
+
+    assert (repo / "shared.txt").read_text() == "A\nb\nc\nd\ne\nf\ng\nH\n"
+    assert (repo / "tail.txt").read_text() == "ONE\ntwo\nTHREE"
+    assert not verify.is_ancestor(repo, source, squashed)
+    assert verify.unfolded_changes(repo, baseline, source, squashed) == ()
+
+    (repo / "shared.txt").write_text("A\nb\nc\nd\ne\nf\ng\nX\n")
+    (repo / "blob.bin").write_bytes(b"\x00rewritten\n")
+    (repo / "added.txt").write_text("added\nby the unit\nand grown by the target\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "drift")
+    drifted = git(repo, "rev-parse", "HEAD")
+    assert verify.unfolded_changes(repo, baseline, source, drifted) == (
+        "added.txt",
+        "blob.bin",
+        "shared.txt",
+    )

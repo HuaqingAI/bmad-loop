@@ -16,6 +16,9 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    BMAD_CONFIG_REL,
+    READABLE_LEDGER,
+    UNDECODABLE_LEDGER,
     assert_run_state_lock_held,
     git,
     install_bmad_config,
@@ -164,6 +167,13 @@ def make_run(
 
 def notifications(app: BmadLoopApp) -> list[str]:
     return [n.message for n in app._notifications]
+
+
+def notifications_with_severity(app: BmadLoopApp) -> list[tuple[str, str]]:
+    """`notifications()` discards severity, so a refusal that softened from `error`
+    to an information toast still matches on text alone. Rows that are ABOUT a
+    refusal read this instead."""
+    return [(n.message, n.severity) for n in app._notifications]
 
 
 async def until(pilot, condition, timeout: float = 10.0) -> None:
@@ -4310,6 +4320,394 @@ async def test_tui_rearm_refuses_a_control_alias_run_before_mutating(project, mo
         assert rearms == []
 
 
+@pytest.mark.parametrize("fault", ["decode", "os"])
+async def test_resume_confirm_refuses_unreadable_sweep_ledger(project, monkeypatch, fault):
+    """DW-270: plain resume displays the real probe's refusal on the dashboard.
+
+    Ablation: remove the ledger refusal block from `_do_resume`; both rows fail
+    because the detached-launch recorder fills.
+    Ablation: remove `markup=False` from the refusal toast; its rendered text
+    loses the literal `[red]` path component.
+    """
+    install_bmad_config(project)
+    config = project.project / BMAD_CONFIG_REL
+    config.write_text(
+        config.read_text().replace("implementation-artifacts'", "implementation-artifacts/[red]'"),
+        encoding="utf-8",
+    )
+    ledger = project.implementation_artifacts / "[red]" / "deferred-work.md"
+    ledger.parent.mkdir()
+    ledger.write_bytes(UNDECODABLE_LEDGER if fault == "decode" else READABLE_LEDGER)
+    read_refused = True
+    if fault == "os":
+        read_text = Path.read_text
+
+        def refused_read(path, *args, **kwargs):
+            if path == ledger and read_refused:
+                raise PermissionError(13, "Permission denied", str(path))
+            return read_text(path, *args, **kwargs)
+
+        # Refuse only this sandbox file's text read, through the real reader and
+        # probe. chmod is not reliable under root or on Windows.
+        monkeypatch.setattr(Path, "read_text", refused_read)
+
+    resumes = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid) or "@1")
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    run_dir = _escalated_sweep_run(project.project)
+    original_state = (run_dir / "state.json").read_bytes()
+    refusal = runs_mod.unreadable_sweep_ledger(project.project, run_dir)
+    assert refusal is not None
+    app = BmadLoopApp(project.project)
+    async with app.run_test(notifications=True) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
+        await pilot.press("e")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await pilot.pause()
+        assert resumes == []
+        assert (run_dir / "state.json").read_bytes() == original_state
+        assert (refusal, "error") in notifications_with_severity(app)
+        assert str(app.screen.query_one("Toast", Static).render()) == refusal
+        assert str(ledger) in refusal
+        assert "bmad-loop sweep" in refusal
+        assert "stays resumable" in refusal
+        if fault == "os":
+            assert "permissions or storage" in refusal
+
+        # Repair and retry in this same dashboard, retaining the paused run.
+        read_refused = False
+        ledger.write_bytes(READABLE_LEDGER)
+        await pilot.press("e")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: resumes == [run_dir.name])
+        await pilot.pause()
+        assert resumes == [run_dir.name]
+
+
+@pytest.mark.parametrize("case", ["readable", "story", "absent", "config", "state"])
+async def test_resume_confirm_ledger_probe_preserves_handoff(project, monkeypatch, case):
+    """The real probe permits readable sweeps and declines outside its scope.
+
+    Unavailable state is introduced AFTER opening the modal so the confirmation
+    reaches the probe; action_resume_run owns the earlier state-read refusal.
+    """
+    if case != "config":
+        install_bmad_config(project)
+    if case != "absent":
+        project.deferred_work.write_bytes(
+            READABLE_LEDGER if case == "readable" else UNDECODABLE_LEDGER
+        )
+    resumes = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid) or "@1")
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    run_dir = make_run(
+        project.project,
+        "20260611-100000-aaaa",
+        run_type="story" if case == "story" else "sweep",
+        paused_stage="DEV_VERIFY",
+        paused_reason="verify failed",
+    )
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
+        await pilot.press("e")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        if case == "state":
+            (run_dir / "state.json").unlink()
+        await pilot.click(await ready(pilot, "#ok"))
+        await until(pilot, lambda: resumes == [run_dir.name])
+        await pilot.pause()
+        assert any(f"resume of {run_dir.name} launched" in m for m in notifications(app))
+
+
+@pytest.mark.parametrize("guard", ["mux", "alive", "unknown"])
+async def test_resume_confirm_guards_precede_ledger_probe(project, monkeypatch, guard):
+    """Earlier guards win even if the sweep ledger is unreadable.
+
+    Ablation: move the ledger block above the mux/liveness guards in `_do_resume`;
+    the probe recorder fills instead of the existing guard owning the refusal.
+    """
+    install_bmad_config(project)
+    project.deferred_work.write_bytes(UNDECODABLE_LEDGER)
+    probes = []
+    resumes = []
+    probe = runs_mod.unreadable_sweep_ledger
+
+    def record_probe(root, run_dir):
+        probes.append(run_dir)
+        return probe(root, run_dir)
+
+    monkeypatch.setattr(runs_mod, "unreadable_sweep_ledger", record_probe)
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid) or "@1")
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    run_dir = _escalated_sweep_run(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id == run_dir.name)
+        await pilot.press("e")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmResumeModal))
+        # Change the guard at confirmation time to exercise `_do_resume` itself.
+        if guard == "mux":
+            monkeypatch.setattr(launch, "mux_available", lambda: False)
+            message, severity = "multiplexer backend unavailable", "error"
+        else:
+            monkeypatch.setattr(data, "liveness", lambda run_dir: guard)
+            if guard == "unknown":
+                (run_dir / "engine.pid").write_text("4242 123.0", encoding="utf-8")
+            message, severity = "may still be live", "warning"
+        await pilot.click(await ready(pilot, "#ok"))
+        await pilot.pause()
+        assert probes == []
+        assert resumes == []
+        assert any(message in m and s == severity for m, s in notifications_with_severity(app))
+
+
+def _escalated_sweep_run(root: Path, run_id: str = "20260611-100000-aaaa") -> Path:
+    """A SWEEP run paused at a CRITICAL escalation — the only run shape
+    `runs.unreadable_sweep_ledger` is scoped to, and the shape `_do_rearm`'s ledger
+    probe is graded on. Sweeps really do park at `PAUSE_ESCALATION` (an escalated
+    bundle resolves like a story escalation), so this is a reachable state, not a
+    fixture-only one."""
+    from bmad_loop.model import PAUSE_ESCALATION
+
+    return make_run(
+        root,
+        run_id,
+        run_type="sweep",
+        tasks={"s1": StoryTask(story_key="s1", epic=1, phase=Phase.ESCALATED)},
+        paused_stage=PAUSE_ESCALATION,
+        paused_reason="CRITICAL escalation",
+        paused_story_key="s1",
+    )
+
+
+async def test_tui_rearm_refuses_a_sweep_run_whose_ledger_does_not_decode(project, monkeypatch):
+    """DW-230: the readable-ledger refusal `cli.cmd_resume`/`cli.cmd_resolve` make,
+    made HERE too.
+
+    This gesture re-arms and then hands off to `launch.resume_detached`, so without
+    the probe the detached child refuses for the same reason — but only after
+    `rearm_escalation` has spent the escalation, and into a pane nobody opens. The
+    toast is the point: on screen, with the escalation still armed.
+
+    Ablation: delete the `runs.unreadable_sweep_ledger` block from `_do_rearm` and the
+    re-arm recorder fills instead of returning the ledger refusal. The persisted
+    phase assertion complements that recorder; the stub itself does not mutate state."""
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    install_bmad_config(project)
+    project.implementation_artifacts.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(UNDECODABLE_LEDGER)  # conftest's, so the CLI rows share it
+
+    rearms: list = []
+    resumes: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda rd, sk, **kw: rearms.append((rd, sk)) or _rearm_outcome(sk),
+    )
+    run_dir = _escalated_sweep_run(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app._do_rearm("20260611-100000-aaaa", run_dir, "s1")
+        await pilot.pause()
+        assert rearms == []  # the escalation is not spent
+        assert resumes == []  # and no detached child to bounce off the CLI gate
+        assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
+        # Severity, not just text: a refusal softened to an information toast reads
+        # as advice beside a gesture that appeared to work, and matching on wording
+        # alone would not notice.
+        toast, severity = next(
+            (m, s) for m, s in notifications_with_severity(app) if "bmad-loop sweep" in m
+        )
+        assert severity == "error"
+        assert str(project.deferred_work) in toast
+        assert "stays resumable" in toast
+
+
+async def test_tui_rearm_proceeds_on_a_readable_ledger(project, monkeypatch):
+    """The probe's happy path at this call site: a ledger that decodes is not the
+    fault it screens for, so the gesture re-arms and resumes exactly as before.
+
+    Without this row the refusal row above passes just as well against a `_do_rearm`
+    that refused EVERY escalated sweep. Ablation: make the probe return a refusal
+    unconditionally and this reddens on both recorders."""
+    from bmad_loop import runs
+
+    install_bmad_config(project)
+    project.implementation_artifacts.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(READABLE_LEDGER)
+
+    rearms: list = []
+    resumes: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda rd, sk, **_k: rearms.append(sk) or _rearm_outcome(sk),
+    )
+    run_dir = _escalated_sweep_run(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app._do_rearm("20260611-100000-aaaa", run_dir, "s1")
+        # `_do_rearm` is synchronous, so its recorders fill before the message pump has
+        # delivered a single toast — pump first, or `notifications(app)` reads empty and
+        # every "no such toast" assertion below passes for the wrong reason.
+        await pilot.pause()
+        await until(pilot, lambda: rearms == ["s1"] and resumes == ["20260611-100000-aaaa"])
+        assert any("re-armed s1" in m for m in notifications(app))  # toasts ARE captured
+        assert not any("bmad-loop sweep" in m for m in notifications(app))
+
+
+async def test_tui_rearm_ledger_gate_declines_when_it_cannot_answer(project, monkeypatch):
+    """The probe cannot locate a ledger without the BMAD config, so it declines and
+    the gesture proceeds — the fault's own owner answers for it (here `_do_rearm`'s
+    existing "cannot read the project config" warning, which re-arms against the
+    root the run recorded). A gate that answered for it would report a ledger it
+    never managed to find."""
+    from bmad_loop import runs
+
+    # The corrupt ledger IS on disk; what is missing is _bmad/bmm/config.yaml, so
+    # `bmadconfig.load_paths` raises inside the probe before it can resolve a path.
+    project.implementation_artifacts.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(UNDECODABLE_LEDGER)
+
+    rearms: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: None)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda rd, sk, **_k: rearms.append(sk) or _rearm_outcome(sk),
+    )
+    run_dir = _escalated_sweep_run(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app._do_rearm("20260611-100000-aaaa", run_dir, "s1")
+        await pilot.pause()  # deliver the toasts the synchronous call queued
+        await until(pilot, lambda: rearms == ["s1"])
+        assert any("cannot read the project config" in m for m in notifications(app))
+        assert not any("bmad-loop sweep" in m for m in notifications(app))
+
+
+async def test_tui_rearm_live_refusal_wins_over_the_ledger_gate(project, monkeypatch):
+    """The probe sits AFTER the alias/liveness gates, and that ordering is load-bearing
+    rather than incidental: a provably-live engine is the stronger fact (re-driving one
+    corrupts the run itself, while an unreadable ledger only costs an arm), and
+    repairing the ledger would not make THIS re-arm safe. Mirrors
+    `test_resolve_live_refusal_wins_over_the_ledger_gate` on the CLI side.
+
+    Without this row, hoisting the probe above `_resolve_blocked_by_liveness` keeps the
+    whole suite green. Ablation: move the probe block above that gate and this reddens
+    on the ledger toast it must not produce. An early probe whose result is discarded
+    instead fails the read recorder while preserving the live-engine toast."""
+    from bmad_loop import deferredwork, runs
+    from bmad_loop.journal import load_state
+
+    install_bmad_config(project)
+    project.implementation_artifacts.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_bytes(UNDECODABLE_LEDGER)
+
+    ledger_reads = []
+    read_for_write = deferredwork.read_for_write
+
+    def record_read(path):
+        ledger_reads.append(path)
+        return read_for_write(path)
+
+    monkeypatch.setattr(deferredwork, "read_for_write", record_read)
+
+    rearms: list = []
+    resumes: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "alive")
+    monkeypatch.setattr(runs, "rearm_escalation", lambda rd, sk, **kw: rearms.append((rd, sk)))
+    run_dir = _escalated_sweep_run(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app._do_rearm("20260611-100000-aaaa", run_dir, "s1")
+        await pilot.pause()
+        assert any("may still be live" in m for m in notifications(app))
+        assert not any("bmad-loop sweep" in m for m in notifications(app))
+        assert ledger_reads == []  # includes probes whose refusal was discarded
+        assert rearms == []
+        assert resumes == []
+        assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
+async def test_tui_rearm_refuses_an_os_refused_ledger_read_with_the_probe_route(
+    project, monkeypatch
+):
+    """The DW-234 row on the TUI surface. `runs.unreadable_sweep_ledger` now refuses an
+    OS-refused read itself, with the permissions-or-storage repair and the
+    `bmad-loop sweep` route, so `_do_rearm`'s stopgap `except OSError` (which toasted
+    the bare fault "rather than waiting for DW-234") is gone: the probe's refusal
+    reaches the error toast through the same `refusal is not None` arm the decode
+    refusal takes, and nothing is re-armed or launched.
+
+    Ablation: delete the probe's `except OSError` arm and the row fails on the
+    PermissionError escaping `_do_rearm` — there is no local catch left to absorb it,
+    which is the point: one arm, in the shared helper, for all three entry points."""
+    from bmad_loop import deferredwork, runs
+    from bmad_loop.journal import load_state
+
+    install_bmad_config(project)
+    project.implementation_artifacts.mkdir(parents=True, exist_ok=True)
+    # DECODABLE bytes on disk: the refused read is the only fault in play. Monkeypatched
+    # rather than chmod'd — a mode bit does not hold as root and does not exist on
+    # Windows, so the row would silently stop testing anything.
+    project.deferred_work.write_bytes(READABLE_LEDGER)
+
+    def _refused(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    rearms: list = []
+    resumes: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(runs, "rearm_escalation", lambda rd, sk, **kw: rearms.append((rd, sk)))
+    monkeypatch.setattr(deferredwork, "read_for_write", _refused)
+    run_dir = _escalated_sweep_run(project.project)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app._do_rearm("20260611-100000-aaaa", run_dir, "s1")  # must not raise
+        await pilot.pause()
+        toast, severity = next(
+            (m, s) for m, s in notifications_with_severity(app) if "Errno 13" in m
+        )
+        assert severity == "error"
+        # The probe's own refusal, route included — not a locally-worded toast.
+        assert str(project.deferred_work) in toast
+        assert "permissions or storage" in toast
+        assert "bmad-loop sweep" in toast
+        assert "stays resumable" in toast
+        assert rearms == []
+        assert resumes == []
+        assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
 async def test_story_checkpoint_continue_resumes(project, monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
@@ -6353,14 +6751,34 @@ _GATE_REASON = (
         # sweep's ledger-migration gate (sweep.py): the task IS registered, it just
         # has no spec_file — the other arm of _paused_spec's (None, "") return
         ("sweep-migrate", {"sweep-migrate": StoryTask(story_key="sweep-migrate", epic=0)}),
+        # DW-243: a sweep bundle re-armed after a dev escalation KEEPS its spec_file,
+        # and its intent-regeneration refusal pauses at the story gate. The gate is
+        # about the ledger, never the spec, so the reason (with its repair steer)
+        # must show — not the spec viewer's "Approve & resume". Ablation: drop the
+        # story-gate shortcut before `_paused_spec` in `_review_gate`
+        # and this case attempts the forbidden spec read.
+        ("dw-fix", {"dw-fix": "with-spec-file"}),
     ],
-    ids=["task-unregistered", "task-without-spec-file"],
+    ids=["task-unregistered", "task-without-spec-file", "task-with-spec-file"],
 )
 async def test_story_gate_pause_shows_reason_and_resumes(project, monkeypatch, story_key, tasks):
+    spec_reads: list[bool] = []
+
+    def unused_spec_read(*args):
+        spec_reads.append(True)
+        return None, "", True
+
+    monkeypatch.setattr(BmadLoopApp, "_paused_spec", unused_spec_read)
     calls: list[str] = []
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    if tasks.get("dw-fix") == "with-spec-file":
+        spec = project.implementation_artifacts / "spec-dw-fix.md"
+        spec.write_text("# spec-dw-fix\n", encoding="utf-8")
+        tasks = {
+            "dw-fix": StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"], spec_file=str(spec))
+        }
     make_run(
         project.project,
         "20260611-100000-aaaa",
@@ -6372,6 +6790,7 @@ async def test_story_gate_pause_shows_reason_and_resumes(project, monkeypatch, s
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, PauseReasonModal)  # routed away from the spec viewer
+        assert spec_reads == [], "a story-gate reason viewer must not read the unused spec"
         await ready(pilot, "#reason Static")
         body = render(app.screen.query_one("#reason Static", Static).content)
         assert "gated by unlanded deferred work" in body
@@ -7308,6 +7727,11 @@ async def test_decision_modal_toasts_a_ledger_that_took_no_decision_line(
     [
         ("target-absent", None),
         ("target-unreadable", "cannot open /tmp/[/]/[red]/decisions.json"),
+        ("target-not-a-file", None),  # DW-211/228: present, wrong type, no fault text
+        (
+            "target-undecodable",
+            "deferred-work.md is not valid UTF-8",
+        ),  # DW-237: ledger decode fault
     ],
 )
 async def test_decision_modal_toast_carries_both_a_non_write_and_a_refusal(
@@ -7384,6 +7808,11 @@ async def test_decision_modal_toast_carries_both_a_non_write_and_a_refusal(
     [
         ("target-absent", None),
         ("target-unreadable", "cannot open /tmp/[/]/[red]/decisions.json"),
+        ("target-not-a-file", None),  # DW-211/228: present, wrong type, no fault text
+        (
+            "target-undecodable",
+            "deferred-work.md is not valid UTF-8",
+        ),  # DW-237: ledger decode fault
     ],
 )
 async def test_decision_modal_toasts_an_answer_it_could_not_publish(
@@ -7450,6 +7879,85 @@ async def test_decision_modal_toasts_an_answer_it_could_not_publish(
         assert {n.severity for n in toasts} == {"warning"}
         assert all(f"deferred-work.md ({detail})" in n.message for n in toasts)
         # The line DID land, so the answer is answered: the refusal changes neither
+        # the count nor the walk, and it is not the non-write toast.
+        await until(pilot, lambda: any("recorded 2 decision(s)" in m for m in notifications(app)))
+        assert not any("no decision line was written" in m for m in notifications(app))
+        assert not any("failed to record" in m for m in notifications(app))
+        assert app.is_running
+
+
+async def test_decision_modal_toasts_an_answer_git_could_not_commit(project, monkeypatch):
+    """DW-226 on this surface — the mirror of the refusal row beside it, for the
+    OTHER unpublished lane. `verify.commit_paths` raises `GitError` (a gitignored
+    operand, a parent in no repository, git absent), which used to be swallowed
+    silently, so an answer written to disk and missing from git history reached
+    neither the CLI nor this dashboard.
+
+    What it must NOT change is the count: the ledger line landed, so the answer is
+    answered and `recorded 2 decision(s)` still fires. The walk advances the same
+    way, and nothing reads as an `error` — a failed publish is a degrade, not a
+    fault of the recording.
+
+    Ablation: drop `_record_decision`'s `if note is not None:` arm and this reds on
+    the toast while `recorded 2 decision(s)` still passes; hand the failure to the
+    `recorded` boolean instead and it reds on the count; restore
+    `except verify.GitError: pass` in `apply_pre_answer` and it reds on both toasts.
+    """
+    # Ablation: remove markup=False from this toast arm; the bracketed git error
+    # then raises MarkupError in the real notification renderer — git's own stderr
+    # is where the brackets come from, so this is the arm that needs it most.
+    from bmad_loop import verify
+
+    install_bmad_config(project)
+    project.deferred_work.write_text(
+        "# Deferred Work\n\n"
+        "### DW-1: first thing\n\norigin: t\nlocation: a.py:1\nreason: t.\nstatus: open\n\n"
+        "### DW-2: second thing\n\norigin: t\nlocation: b.py:1\nreason: t.\nstatus: open\n",
+        encoding="utf-8",
+    )
+    _write_two_triage_decisions(make_run(project.project, "20260101-000000-aaaa", run_type="sweep"))
+    # Multi-line, as git's stderr is: `publish_note` renders on ONE line, so the
+    # collapse is part of what this row grades.
+    error = "git add failed:\n  The following paths are ignored by [red]one[/red] of your .gitignore files"
+
+    def boom(*_a, **_k):
+        raise verify.GitError(error)
+
+    monkeypatch.setattr(verify, "commit_paths", boom)
+    collapsed = " ".join(error.split())
+
+    app = BmadLoopApp(project.project)
+    async with app.run_test(notifications=True) as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("d")
+        await until(pilot, lambda: isinstance(app.screen, DecisionModal))
+        await pilot.click(await ready(pilot, "#opt-1"))
+        await until(
+            pilot,
+            lambda: any("DW-1: not committed to git" in m for m in notifications(app)),
+        )
+        await until(
+            pilot,
+            lambda: isinstance(app.screen, DecisionModal) and app.screen._decision.id == "DW-2",
+        )
+        await pilot.click(await ready(pilot, "#opt-1"))
+        # DW-2's toast, not merely the dashboard: see the sibling row above for
+        # the `dismiss`/`call_next` window the Windows runners hit.
+        await until(
+            pilot,
+            lambda: any("DW-2: not committed to git" in m for m in notifications(app)),
+        )
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+
+        toasts = [n for n in app._notifications if "not committed to git" in n.message]
+        assert len(toasts) == 2
+        assert {n.severity for n in toasts} == {"warning"}
+        assert all(
+            f"deferred-work.md (commit-unavailable: {collapsed})" in n.message for n in toasts
+        )
+        assert all(f"decisions.json (commit-unavailable: {collapsed})" in n.message for n in toasts)
+        assert not any("\n" in n.message for n in toasts)  # one line at this surface
+        # The line DID land, so the answer is answered: the failure changes neither
         # the count nor the walk, and it is not the non-write toast.
         await until(pilot, lambda: any("recorded 2 decision(s)" in m for m in notifications(app)))
         assert not any("no decision line was written" in m for m in notifications(app))

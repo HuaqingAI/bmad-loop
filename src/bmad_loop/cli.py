@@ -12,6 +12,7 @@ import sys
 import time
 from enum import IntEnum
 from pathlib import Path
+from stat import S_ISREG
 from typing import TYPE_CHECKING, Any
 
 from . import (
@@ -69,7 +70,7 @@ from .documents import (
     status_document,
     validate_document,
 )
-from .engine import Engine
+from .engine import Engine, _publication_refusal
 from .escalation import display_pause_reason
 from .journal import Journal, load_state, save_state, state_lock
 from .model import RunState
@@ -1600,9 +1601,23 @@ def _validate_deferred_ledger(
     # routed through `read_for_observation`: `validate` writes nothing, but it has
     # to REPORT the fault as a graded problem rather than degrade quietly to an
     # empty ledger — see the reasoning below. Same classification, richer response.
+    # The presence probe is `stat` + `S_ISREG` INSIDE the `try` (DW-267): the
+    # `is_file()` it replaced suppresses every OS error on Python 3.14 and answers
+    # False, so a refused ledger read as an empty one and `validate` reported a
+    # clean deferred check with the finding below unreachable. Only absence
+    # (`ENOENT`/`ENOTDIR`, a present non-regular file) is the empty text; a
+    # refused probe takes the same arm a refused `read_text` does. `ValueError`,
+    # not `UnicodeDecodeError` (its subclass): `Path.stat` raises a plain
+    # `ValueError` for an embedded NUL in the configured path and a
+    # `UnicodeEncodeError` for a lone surrogate, neither an `OSError`, which
+    # `is_file()` had answered False for — an observation arm attributes those
+    # as a fault, never as absence, so they are the same graded problem.
     try:
-        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
-    except (OSError, UnicodeDecodeError) as e:
+        try:
+            text = ledger.read_text(encoding="utf-8") if S_ISREG(ledger.stat().st_mode) else ""
+        except (FileNotFoundError, NotADirectoryError):
+            text = ""
+    except (OSError, ValueError) as e:
         # Split from the manifest read in the checks below, which is silent for a
         # good reason that does not apply here: nothing else in `validate` reads
         # the ledger, so returning quietly reported success for preflights that
@@ -2514,32 +2529,44 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
     ledger = paths.deferred_work
     # Call the primitive BEFORE reporting a missing ledger, and report the
     # missing ledger from its empty result. `archive_closed` validates `before`
-    # ahead of its own `is_file` short-circuit precisely so a malformed date
-    # fails the same way whether or not a ledger exists; short-circuiting here
-    # first put that back, and `--before not-a-date` then exited 0 on a project
-    # that happens to have no ledger today and 1 on one that does — the same
+    # ahead of its own presence guard precisely so a malformed date fails the
+    # same way whether or not a ledger exists; short-circuiting here first put
+    # that back, and `--before not-a-date` then exited 0 on a project that
+    # happens to have no ledger today and 1 on one that does — the same
     # invocation graded by optional project data rather than by its own shape
     # (#711 review). The call is safe on a missing file: it short-circuits to
     # an empty list without writing.
+    #
+    # The post-report presence probe sits INSIDE the same `try`, as `stat` +
+    # `S_ISREG` (DW-265). It is reachable only in the window after
+    # `archive_closed`'s own guard answered without raising, but a probe that
+    # raised a traceback out of the CLI (Python 3.13, where `is_file()` raises
+    # EACCES) or reported "no deferred-work ledger" after a successful archive
+    # (3.14, where `is_file()` suppresses every OS error and answers False) is
+    # still wrong; a refused probe now reaches the FAILURE arm below, whose
+    # message already says the ledger could not be read.
     try:
         archived = deferredwork.archive_closed(
             ledger,
             before=args.before,
             dry_run=args.dry_run,
         )
+        try:
+            present = S_ISREG(ledger.stat().st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            present = False
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return ExitCode.FAILURE
-    except (OSError, runs.StateRootError) as exc:
+    except (OSError, deferredwork.LedgerReadFault, runs.StateRootError) as exc:
         # `archive_closed` serializes on the ledger's sidecar lock (#286/#469).
-        # THREE ways this arm is reached, not two: the acquisition raises
-        # `OSError` (a rival holder outlasting the blocking retry, or an
-        # unwritable locks dir); deriving the sidecar's path raises
+        # Acquisition raises `OSError` (a rival holder outlasting the blocking
+        # retry, or an unwritable locks dir); deriving the sidecar's path raises
         # `runs.StateRootError` — NOT an OSError — when the environment names no
-        # usable state root; and the archive's own I/O raises `OSError` too, for
-        # the ledger read and for either atomic write. Naming the lock is what
-        # makes the message actionable — a bare `error: [Errno 11] ...` from a
-        # command with no other lock in sight reads as a bug in the archive — but
+        # usable state root; pre-lock probes and atomic writes raise `OSError`,
+        # while the authoritative read wraps OS faults as `LedgerReadFault`
+        # (DW-279). Naming the lock makes the message actionable — a bare
+        # `error: [Errno 11] ...` from a command with no other lock in sight reads as a bug in the archive — but
         # the message must not ASSERT contention, or a full disk sends the
         # operator hunting a rival process that was never there. So it names both
         # possibilities and lets the carried cause decide between them. Existing
@@ -2551,7 +2578,7 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
             file=sys.stderr,
         )
         return ExitCode.FAILURE
-    if not ledger.is_file():
+    if not present:
         print(f"no deferred-work ledger at {ledger}")
         return ExitCode.OK
     archive_path = ledger.parent / deferredwork.ARCHIVE_REL
@@ -2592,7 +2619,22 @@ def _sweep_dry_run(
     # about whether or not there is anything to sweep.
     _warn_preflight_would_abort(paths, pol)
     ledger = paths.deferred_work
-    if not ledger.is_file():
+    # OBSERVATION arm of the ledger-read contract (DW-146): this listing writes
+    # nothing, but it is an OPERATOR SURFACE, so degrading to an empty document
+    # would report "0 open" for a ledger nobody could read — a fabricated listing
+    # is worse than no listing. Say which file and which fault, and fail.
+    # Absence is taken from the reader's own `("", None)` answer rather than an
+    # `is_file()` pre-gate (DW-265): that gate suppressed every OS error on
+    # Python 3.14 and answered False, printing "no deferred-work ledger" for a
+    # refused one (and raised a traceback out of the CLI on 3.11–3.13), so the
+    # DW-254 attributed fault below was shadowed before the reader was asked. A
+    # 0-byte ledger answers the same empty text and is reported as absent too —
+    # deliberate, it holds nothing to list.
+    text, fault = deferredwork.read_for_observation(ledger)
+    if fault is not None:
+        print(f"error: {ledger} cannot be read ({fault})", file=sys.stderr)
+        return ExitCode.FAILURE
+    if not text:
         if only_ids is not None:
             try:
                 select_entries((), only_ids=only_ids, validate_only=True)
@@ -2601,14 +2643,6 @@ def _sweep_dry_run(
                 return ExitCode.FAILURE
         print(f"no deferred-work ledger at {ledger}")
         return 0
-    # OBSERVATION arm of the ledger-read contract (DW-146): this listing writes
-    # nothing, but it is an OPERATOR SURFACE, so degrading to an empty document
-    # would report "0 open" for a ledger nobody could read — a fabricated listing
-    # is worse than no listing. Say which file and which fault, and fail.
-    text, fault = deferredwork.read_for_observation(ledger)
-    if fault is not None:
-        print(f"error: {ledger} cannot be read ({fault})", file=sys.stderr)
-        return ExitCode.FAILURE
     entries = deferredwork.parse_ledger(text)
     open_entries = [e for e in entries if e.open]
     legacy = deferredwork.parse_legacy(text)
@@ -3111,6 +3145,22 @@ def cmd_resume(args: argparse.Namespace) -> int:
             "resuming could double-drive this run",
             file=sys.stderr,
         )
+    # DW-204: sweep runs only, for a ledger that cannot currently be read — bytes
+    # that do not decode, or (since DW-234) a read the OS refused; each names its
+    # own repair (see the helper). Gated HERE and not in `_resume_paused_run`, for
+    # the same reason the liveness block above is:
+    # that helper is also resolve's re-arm path, which has already run its
+    # interactive session and re-armed the escalation by the time it is reached, so
+    # a refusal there would be a refusal after the side effects. Deliberately AFTER
+    # the 'unknown' warning, so the recovery warning still prints; the live-engine
+    # refusal above still wins outright and never probes the ledger.
+    #
+    # The probe lives in `runs` because two more entry points take it at their own
+    # entries for that same reason (DW-229/DW-230): `cmd_resolve` below, and the
+    # TUI's `_do_rearm`. One implementation, so the three cannot drift.
+    if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
+        print(refusal, file=sys.stderr)
+        return ExitCode.FAILURE
     return _resume_paused_run(project, run_dir)
 
 
@@ -3200,7 +3250,7 @@ def _resolve_restore_patch(
     # answer here could pass containment on the wrong directory.
     try:
         patch = verify.resolve_restore_path(raw, project).resolve()
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         return None, (
             f"cannot canonicalize the restore patch path {raw!r}: {e} — whether it "
             "lies inside or outside the project tree cannot be determined, so the "
@@ -3343,6 +3393,19 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if story_key is None or task is None or task.phase != Phase.ESCALATED:
         print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
         return 1
+
+    # DW-204/DW-229: the same probe `cmd_resume` takes, taken here at resolve's own
+    # entry. `_resume_paused_run` cannot carry this gate for resolve — by the time
+    # this flow reaches it the interactive session has run and `runs.rearm_escalation`
+    # has spent the escalation, so a refusal there is a refusal after the side
+    # effects. LAST in this gate block, not first: the refusals above answer "this
+    # gesture does not apply to this run at all" (alias, not paused at an escalation,
+    # live engine, no escalated story) and must not be displaced by a ledger-repair
+    # steer that would not help. Mirrors `cmd_resume`, where the live-engine refusal
+    # also wins outright and the ledger gate follows it.
+    if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
+        print(refusal, file=sys.stderr)
+        return ExitCode.FAILURE
 
     pol = policy_mod.load(_policy_path(project))
 
@@ -3998,14 +4061,53 @@ def _land_confirmation(
         board_ignored = verify.path_ignored(paths.repo_root, paths.sprint_status)
     except verify.GitError:
         board_ignored = False  # uncertainty keeps the board in: the older behavior
-    try:
-        verify.commit_paths(
-            paths.repo_root,
-            f"chore(operator): confirm {story.story_key}",
-            [spec, record] if board_ignored else [spec, paths.sprint_status, record],
+    # THE PUBLISHABLE-TARGET GUARD (DW-237), per operand and before any git runs.
+    # `commit_paths` forces every operand LITERAL, so an operand replaced by a
+    # DIRECTORY is handed to `git add` as a pathspec and staged RECURSIVELY —
+    # an unrelated tree published under this `chore(operator):` message.
+    # Family `"store"` at all three: the family names the validation POLICY, not
+    # the file's role, and a spec, a board and a park record all want exactly
+    # "a regular file is there" and nothing about their bytes.
+    # PER OPERAND, like `decisions.apply_pre_answer`'s GATE TWO: a dropped one must
+    # not sink its siblings, which is the whole point of the `board_ignored` drop
+    # this joins.
+    operands: list[Path] = [spec, record] if board_ignored else [spec, paths.sprint_status, record]
+    survivors: list[Path] = []
+    for path in operands:
+        # The SAME resolve-then-guard the four carries take, imported rather than
+        # re-spelled: one rule, one place it can drift from. Its resolve fold matters
+        # here too — an operand `confirm` cannot even NAME must not be handed to git.
+        refusal = _publication_refusal(path, "store")
+        if refusal is None or refusal[0] == "target-absent":
+            # An ABSENT operand STAYS (#356): `record` was unlinked by the drop a few
+            # lines above, and its DELETION is exactly what must ride this commit —
+            # `commit_paths` keeps a missing-but-TRACKED path for that reason and
+            # drops one git has never seen. Only a present-but-wrong-TYPE or
+            # unreadable operand is a hazard to git, and only those are dropped.
+            survivors.append(path)
+            continue
+        cause, error = refusal
+        # ONE collapsed line per dropped operand: git's own text is multi-line
+        # where this prints on one, and the operator needs the full path (not the
+        # basename a journal row carries) to find what is sitting there.
+        detail = "" if error is None else f": {' '.join(error.split())}"
+        print(
+            f"warning: {path} was left out of the {story.story_key} confirm commit "
+            f"({cause}){detail} — the confirm's on-disk change landed before the path "
+            f"took this shape; inspect it and commit it by hand once the path is repaired.",
+            file=sys.stderr,
         )
-    except verify.GitError:
-        pass  # files are written; git history is best effort (as `decisions`)
+    if survivors:
+        # An empty list spawns no git at all, rather than handing `commit_paths`
+        # nothing and letting it decide what that means.
+        try:
+            verify.commit_paths(
+                paths.repo_root,
+                f"chore(operator): confirm {story.story_key}",
+                survivors,
+            )
+        except verify.GitError:
+            pass  # files are written; git history is best effort (as `decisions`)
     print(f"✓ {story.story_key} confirmed — spec and board are done")
     return 0
 
@@ -4113,7 +4215,8 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             # codec error escaped untyped. Retyping it to a plain `Exception` is what
             # dropped it out of this handler; naming it puts it back, so the
             # attribution this arm exists for is not lost to the contract that made
-            # the fault attributable.
+            # the fault attributable. Its `LedgerReadFault` subclass also covers
+            # OS metadata/text-read failures since DW-279.
             print(f"error: could not record {decision.id}: {e}", file=sys.stderr)
             return 1
         if option.effect == "close":
@@ -4127,25 +4230,43 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             # This later probe is only diagnostic: paths predates the prompt and
             # may differ from the writer's reloaded config. A probe fault must not
             # turn a completed non-write into a failed walk.
+            #
+            # The probe is the observation reader, not `is_file()` inside a
+            # `try/except OSError` (DW-282): `is_file()` answers False for a
+            # refused ledger on Python 3.14 — it suppresses every OS error there —
+            # so the fault never reached the `except` and a ledger sitting in
+            # place, unreadable, was reported as GONE, the sentence that says every
+            # `decision:` line already written went with it. The reader never
+            # raises: absence is its own `(None, None)` answer, and a refused ledger
+            # is an attributed fault on every interpreter, which keeps the
+            # "ledger state unavailable" wording.
+            #
+            # `observe_ledger`, not `read_for_observation`: this sentence says
+            # whether the FILE is there, and the text-only reader folds a present
+            # 0-byte ledger into the same `""` as a missing one, so testing the
+            # text reported a ledger that exists and holds no entry as GONE — the
+            # sentence that tells the operator every `decision:` line already
+            # written went with it (PR #794 review). `None` is absence; `""` is a
+            # present, empty ledger, which the recorder reached and found no entry
+            # in, the same news as any other missing entry.
             outcome = "no decision line was written"
-            try:
-                why = (
-                    "the ledger file is gone"
-                    if not paths.deferred_work.is_file()
-                    else "the ledger holds no entry for this id"
-                )
-            except OSError:
+            text, fault = deferredwork.observe_ledger(paths.deferred_work)
+            if fault is not None:
                 outcome += "; ledger state unavailable"
+            elif text is None:
+                outcome += ": the ledger file is gone"
             else:
-                outcome += f": {why}"
+                outcome += ": the ledger holds no entry for this id"
             if option.effect != "close":
                 outcome += "; your answer was saved to the pre-answer store"
-        # A written operand that could not be published (DW-209/213). Separate from
-        # the non-write above and reportable on TOP of a successful record: the
-        # operand list is already gated on what the call wrote, so a refusal means
-        # an answer that really landed on disk is missing from git history. It is
-        # not an error — the exit code, the walk and the outcome wording above are
-        # all unchanged by it.
+        # A written operand that could not be published, in either of its two
+        # lanes: REFUSED before any git ran (DW-209/213), or FAILED once git ran
+        # and answered `GitError` (DW-225/226 — an operand in no repository, a
+        # gitignored path). Separate from the non-write above and reportable on TOP
+        # of a successful record: the operand list is already gated on what the
+        # call wrote, so either lane means an answer that really landed on disk is
+        # missing from git history. Neither is an error — the exit code, the walk
+        # and the outcome wording above are all unchanged by both.
         note = result.publish_note()
         if note is not None:
             outcome += f"; {note}"

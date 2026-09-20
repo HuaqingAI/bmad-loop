@@ -22,13 +22,14 @@ from __future__ import annotations
 
 import copy
 import json
+import secrets
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, NoReturn
+from typing import TYPE_CHECKING, Any, Callable, NoReturn
 
-from . import gates, verify
+from . import artifact_publication, gates, verify
 from .install import (
     _REVIEW_LAYER_SKILLS,
     BASE_SKILLS,
@@ -567,28 +568,30 @@ def worktree_seed_undelivered(
     try:
         worktree = worktree.resolve()
         repo_root = repo_root.resolve()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         # Observation only: root uncertainty cannot prove delivery, but it must
         # not turn an informational journal probe into a run-wide failure.
         rels = [str(rel) for rel in seed_files]
         for pattern in seed_globs:
             try:
                 matches = sorted(unresolved_repo_root.glob(pattern))
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, ValueError):
                 continue
             rels.extend(match.relative_to(unresolved_repo_root).as_posix() for match in matches)
         return list(dict.fromkeys(rels))
     rels = [str(rel) for rel in seed_files]
     for pattern in seed_globs:
-        rels.extend(
-            match.relative_to(repo_root).as_posix() for match in sorted(repo_root.glob(pattern))
-        )
+        try:
+            matches = sorted(repo_root.glob(pattern))
+        except (OSError, RuntimeError, ValueError):
+            continue
+        rels.extend(match.relative_to(repo_root).as_posix() for match in matches)
     hook_configs = {Path(rel) for rel in config_paths}
 
     def contained(path: Path, root: Path) -> bool:
         try:
             return path.resolve().is_relative_to(root)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
 
     def delivered(src: Path, dst: Path) -> bool:
@@ -682,7 +685,7 @@ def module_skills_seed_undelivered(
         skills_root = resources.files("bmad_loop.data").joinpath("skills")
     try:
         worktree = worktree.resolve()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         # This is a journal-only observation. Root uncertainty means every
         # bundled skill the wheel actually carries is coarsely undelivered.
         return [
@@ -695,7 +698,7 @@ def module_skills_seed_undelivered(
     def contained(target: Path) -> bool:
         try:
             return target.resolve().is_relative_to(worktree)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             return False
 
     def delivered(src: Traversable, dst: Path) -> bool:
@@ -817,7 +820,7 @@ def provision_worktree(
     try:
         worktree = worktree.resolve()
         repo_root = repo_root.resolve()
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         raise verify.GitError(
             "cannot resolve worktree provisioning roots safely "
             f"(worktree={unresolved_worktree}, repo_root={unresolved_repo_root}): {e}"
@@ -857,7 +860,7 @@ def provision_worktree(
         try:
             src = (repo_root / rel).resolve()
             dst = raw.resolve()
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             continue
         if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
             continue
@@ -925,13 +928,17 @@ def provision_worktree(
     # copy-when-absent semantics. rel is taken from the unresolved match so the
     # worktree path mirrors the repo layout; resolve only guards containment.
     for pattern in seed_globs:
-        for match in sorted(repo_root.glob(pattern)):
+        try:
+            matches = sorted(repo_root.glob(pattern))
+        except (OSError, RuntimeError, ValueError):
+            continue
+        for match in matches:
             rel = match.relative_to(repo_root)
             raw = worktree / rel
             try:
                 src = match.resolve()
                 dst = raw.resolve()
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, ValueError):
                 continue
             if not src.is_relative_to(repo_root) or not dst.is_relative_to(worktree):
                 continue
@@ -1017,7 +1024,7 @@ def provision_worktree(
             dst = tree_dir / skill
             try:
                 src = (repo_root / tree / skill).resolve()
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, ValueError):
                 continue
             if not src.is_relative_to(repo_root) or not _is_dir(src):
                 continue
@@ -1063,7 +1070,7 @@ def provision_worktree(
                     break
                 cursor = cursor.parent
             config_path = raw_config_path.resolve()
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             continue
         if refused or config_path != raw_config_path or not config_path.is_relative_to(worktree):
             continue
@@ -1324,6 +1331,9 @@ class WorktreeFlow:
         self._pause = escalation_pause
         self._workspace_get = workspace_get
         self._workspace_set = workspace_set
+        verify.reconcile_integration_state_roots(
+            run_dir, (task.integration_attempt for task in state.tasks.values())
+        )
 
     @property
     def isolated(self) -> bool:
@@ -1913,6 +1923,12 @@ class WorktreeFlow:
             "worktree-opened", story_key=task.story_key, branch=unit.branch, path=str(unit.path)
         )
         task.branch = unit.branch
+        if task.dw_ids:
+            try:
+                artifact_publication.capture(task, self.paths)
+            except (artifact_publication.PublicationError, OSError, ValueError) as exc:
+                self._save()
+                self._pause(f"artifact baseline capture failed: {exc}", task.story_key, cause=exc)
         # A worktree checks out tracked files only, but the bmad-loop-* skill
         # trees + signal-hook config are typically gitignored, so they are absent
         # from the fresh checkout. Re-lay them into the worktree so the bundled
@@ -2309,6 +2325,398 @@ class WorktreeFlow:
                 rels.append(rel)
         return tuple(rels)
 
+    def _validated_integration_attempt(self, task: StoryTask) -> dict[str, Any] | None:
+        raw = task.integration_attempt
+        if raw is None:
+            return None
+        required = (
+            "version",
+            "target_ref",
+            "strategy",
+            "source_revision",
+            "operation_identity",
+            "pre_target_revision",
+            "snapshots",
+            "submodules",
+            "phase",
+            "cleanup_plan",
+        )
+        if not isinstance(raw, dict) or any(key not in raw for key in required):
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        if raw["version"] != 3 or any(
+            not isinstance(raw.get(key), str) or not raw.get(key)
+            for key in required
+            if key not in {"version", "snapshots", "submodules", "cleanup_plan"}
+        ):
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        if raw["strategy"] not in {"merge", "squash", "ff"}:
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        target_ref = raw["target_ref"]
+        if (
+            not target_ref.startswith("refs/heads/")
+            or ".." in target_ref
+            or "\\" in target_ref
+            or any(ord(char) < 32 or ord(char) == 127 for char in target_ref)
+        ):
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        operation = raw["operation_identity"]
+        revisions = (raw["source_revision"], raw["pre_target_revision"])
+        if (
+            len(operation) != 32
+            or any(char not in "0123456789abcdef" for char in operation)
+            or any(
+                len(value) not in (40, 64) or any(char not in "0123456789abcdef" for char in value)
+                for value in revisions
+            )
+        ):
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        old = raw.get("old_revision")
+        new = raw.get("new_revision")
+        if (old is None) != (new is None) or any(
+            value is not None and (not isinstance(value, str) or not value) for value in (old, new)
+        ):
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        if any(
+            value is not None
+            and (
+                len(value) not in (40, 64) or any(char not in "0123456789abcdef" for char in value)
+            )
+            for value in (old, new)
+        ):
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        outcome = raw.get("outcome")
+        if outcome is not None and outcome != "refused-restored":
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        phase = raw.get("phase")
+        cleanup_plan = raw.get("cleanup_plan")
+        if phase not in {"armed", "cleanup-pending", "cleanup-applied", "integrated"}:
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        if cleanup_plan is not None:
+            if (
+                not isinstance(cleanup_plan, dict)
+                or set(cleanup_plan) != {"cleaned", "tolerated", "untracked"}
+                or any(
+                    not isinstance(cleanup_plan.get(key), list)
+                    or any(not isinstance(path, str) for path in cleanup_plan[key])
+                    for key in ("cleaned", "tolerated", "untracked")
+                )
+            ):
+                raise verify.IntegrationEvidenceError(
+                    "persisted target integration receipt is missing or malformed"
+                )
+            for key in ("cleaned", "tolerated", "untracked"):
+                verify.preflight_integration_paths(cleanup_plan[key])
+        if phase == "armed" and cleanup_plan is not None:
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        if phase != "armed" and cleanup_plan is None:
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        # `index_flags`, `ignored`: optional — a receipt armed before either
+        # was recorded reads without that reading
+        allowed = set(required) | {
+            "old_revision",
+            "new_revision",
+            "outcome",
+            "index_flags",
+            "ignored",
+        }
+        if set(raw) - allowed or (outcome is not None and old is None):
+            raise verify.IntegrationEvidenceError(
+                "persisted target integration receipt is missing or malformed"
+            )
+        if "index_flags" in raw:
+            verify.validate_index_flags_evidence(raw["index_flags"])
+        if "ignored" in raw:
+            verify.validate_ignored_entries_evidence(raw["ignored"])
+        verify.validate_integration_state_schema(
+            self.run_dir,
+            raw["snapshots"],
+            raw["submodules"],
+            operation,
+            payload_max_bytes=self.policy.limits.artifact_payload_max_mb * 1_048_576,
+        )
+        return raw
+
+    def _arm_integration_attempt(
+        self,
+        task: StoryTask,
+        *,
+        target_ref: str,
+        strategy: str,
+        source: str,
+        snapshot_paths: Collection[str],
+    ) -> dict[str, Any]:
+        previous = task.integration_attempt
+        verify.require_ref_reflog(self.paths.repo_root, target_ref)
+        operation_identity = secrets.token_hex(16)
+        pre_target_revision = verify.ref_revision(self.paths.repo_root, target_ref)
+        snapshots, submodules = verify.capture_integration_state(
+            self.paths.repo_root,
+            self.run_dir,
+            operation_identity,
+            snapshot_paths,
+            payload_max_bytes=self.policy.limits.artifact_payload_max_mb * 1_048_576,
+        )
+        # The flag words of the index OUTSIDE the snapshot set — a hook's
+        # `update-index --assume-unchanged` on a clean tracked file there is
+        # invisible to every other reading (#796 review); captured after the
+        # snapshots, inside the same ref-revision bracket
+        # and the whole tree's ignored entries — a hook's gitignored write
+        # beside an incoming path in a directory the target already held
+        # populated is listed by no other reading (#796 review)
+        try:
+            index_flags = verify.capture_index_flags(
+                self.paths.repo_root, exclude=[str(entry["path"]) for entry in snapshots]
+            )
+            ignored = verify.capture_ignored_entries(
+                self.paths.repo_root, self.run_dir, operation_identity
+            )
+        except BaseException:
+            verify.discard_integration_state(
+                self.run_dir, {"operation_identity": operation_identity}
+            )
+            raise
+        if verify.ref_revision(self.paths.repo_root, target_ref) != pre_target_revision:
+            verify.discard_integration_state(
+                self.run_dir, {"operation_identity": operation_identity}
+            )
+            raise verify.IntegrationEvidenceError(
+                "target changed during integration snapshot capture"
+            )
+        attempt = {
+            "version": 3,
+            "target_ref": target_ref,
+            "strategy": strategy,
+            "source_revision": source,
+            "operation_identity": operation_identity,
+            "pre_target_revision": pre_target_revision,
+            "snapshots": snapshots,
+            "submodules": submodules,
+            "index_flags": index_flags,
+            "ignored": ignored,
+            "phase": "armed",
+            "cleanup_plan": None,
+        }
+        task.integration_attempt = attempt
+        try:
+            self._save()
+        except BaseException:
+            task.integration_attempt = previous
+            verify.discard_integration_state(
+                self.run_dir, {"operation_identity": operation_identity}
+            )
+            raise
+        verify.discard_integration_state(self.run_dir, previous)
+        return attempt
+
+    def _refuse_refused_residue(self, attempt: dict[str, Any], *, revision: str) -> None:
+        """Refuse a re-arm while the refused attempt's named residue stands.
+
+        The refusal restored the receipt's own paths and left a hook's write
+        outside them in place, named; `integration_restoration_complete` reads
+        only the former, so a resume after the hook was disabled — but before
+        the output it left was cleared — re-armed over the write and the retry
+        recorded ``unit-merged`` with it still there (#796 review). The refused
+        receipt's readings are taken again (`verify.refused_integration_residue`)
+        and keep their authority until nothing is named.
+        """
+        residue = verify.refused_integration_residue(
+            self.paths.repo_root, self.run_dir, attempt, revision=revision
+        )
+        if residue:
+            raise verify.IntegrationEvidenceError(
+                "the refused integration's residue is still in the target — the paths "
+                "its pause named as left in place, or work of yours since (the run "
+                "cannot tell them apart); clear it, or commit or stash what is yours, "
+                "then resume: " + ", ".join(residue)
+            )
+
+    def _integration_artifact_paths(self, task: StoryTask) -> tuple[str, ...]:
+        """The accepted artifact paths on the target, for the receipt's snapshot and
+        its restore. Raises rather than degrading: an ignored deliverable's
+        destination is never in the merge's own delta, so this entry is the only
+        thing that lets a target hook's write to it be seen and restored. A
+        resolver refusal (the target's artifact dir swapped for a symlink after
+        acceptance, or replayed authority the path validator rejects) therefore
+        has to pause BEFORE the receipt is armed and anything on the target moves
+        — `merge_local` resolves once, ahead of the snapshot, and threads the
+        result to the restore — never snapshot short and let the later
+        `validate_integrated` refusal claim an exact restore over it (#796 review)."""
+        if not task.dw_ids:
+            return ()
+        return artifact_publication.integrated_artifact_repo_paths(task, self.paths)
+
+    def _retire_unmoved_integration_attempt(self, task: StoryTask) -> None:
+        """Restore receipt cleanup, then retire a proven no-ref typed refusal."""
+        if not task.dw_ids or task.integration_attempt is None:
+            return
+        try:
+            attempt = self._validated_integration_attempt(task)
+            assert attempt is not None
+            update = verify.integration_ref_update(
+                self.paths.repo_root,
+                str(attempt["target_ref"]),
+                str(attempt["operation_identity"]),
+            )
+            pre = str(attempt["pre_target_revision"])
+            if (
+                update is not None
+                or verify.ref_revision(self.paths.repo_root, str(attempt["target_ref"])) != pre
+            ):
+                raise verify.IntegrationEvidenceError(
+                    "typed Git refusal did not prove the target ref remained unchanged"
+                )
+            verify.restore_integration_nonref_state(
+                self.paths.repo_root,
+                str(attempt["target_ref"]),
+                revision=pre,
+                run_dir=self.run_dir,
+                snapshots=attempt["snapshots"],
+                submodules=attempt["submodules"],
+                operation_identity=str(attempt["operation_identity"]),
+            )
+        except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
+            # Preserve the caller's typed merge-failure classification and remedy;
+            # this companion record explains why receipt authority was retained.
+            self.journal.append(
+                "artifact-publication-refused",
+                story_key=task.story_key,
+                error=f"typed Git refusal target restoration failed: {exc}",
+            )
+            self._save()
+            return
+        retired = task.integration_attempt
+        task.integration_attempt = None
+        self._save()
+        verify.discard_integration_state(self.run_dir, retired)
+
+    def _pause_integration_evidence(
+        self, task: StoryTask, exc: BaseException, *, prefix: str
+    ) -> NoReturn:
+        self.journal.append(
+            "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+        )
+        self._save()
+        self._pause(
+            f"{prefix}: {exc}; source retained at {task.worktree_path}",
+            task.story_key,
+            cause=exc,
+        )
+
+    def _refuse_integrated_artifacts(
+        self,
+        task: StoryTask,
+        attempt: dict[str, str],
+        update: verify.IntegrationRefUpdate | None,
+        exc: BaseException,
+        *,
+        artifact_paths: tuple[str, ...],
+    ) -> NoReturn:
+        try:
+            if update is not None:
+                if update.old_revision != attempt["pre_target_revision"]:
+                    raise verify.IntegrationRestoreError(
+                        "integration ref epoch differs from the snapshotted target; "
+                        "no non-ref restoration was attempted"
+                    )
+                verify.restore_integration_ref(
+                    self.paths.repo_root,
+                    attempt["target_ref"],
+                    old_revision=update.old_revision,
+                    new_revision=update.new_revision,
+                    extra_paths=artifact_paths,
+                    run_dir=self.run_dir,
+                    snapshots=attempt["snapshots"],
+                    submodules=attempt["submodules"],
+                    operation_identity=attempt["operation_identity"],
+                )
+            else:
+                pre = attempt["pre_target_revision"]
+                if verify.ref_revision(self.paths.repo_root, attempt["target_ref"]) != pre:
+                    raise verify.IntegrationRestoreError(
+                        "target changed without readable integration ownership evidence; "
+                        "no restoration was attempted"
+                    )
+                verify.restore_integration_nonref_state(
+                    self.paths.repo_root,
+                    attempt["target_ref"],
+                    revision=pre,
+                    run_dir=self.run_dir,
+                    snapshots=attempt["snapshots"],
+                    submodules=attempt["submodules"],
+                    operation_identity=attempt["operation_identity"],
+                )
+                if not verify.integration_restoration_complete(
+                    self.paths.repo_root,
+                    attempt["target_ref"],
+                    old_revision=pre,
+                    new_revision=pre,
+                    extra_paths=artifact_paths,
+                    run_dir=self.run_dir,
+                    snapshots=attempt["snapshots"],
+                    submodules=attempt["submodules"],
+                    operation_identity=attempt["operation_identity"],
+                ):
+                    raise verify.IntegrationRestoreError(
+                        "target non-ref state changed without a ref update; no restoration "
+                        "authority was inferred"
+                    )
+        except (verify.GitError, OSError, RuntimeError, ValueError) as restore_exc:
+            self.journal.append(
+                "artifact-publication-refused",
+                story_key=task.story_key,
+                error=f"{exc}; target restoration failed: {restore_exc}",
+            )
+            self._save()
+            self._pause(
+                "artifact target integration validation failed and the target could not "
+                f"be restored safely: {restore_exc}; source retained at {task.worktree_path}",
+                task.story_key,
+                cause=restore_exc,
+            )
+        if update is None:
+            # No ref update to own (an artifact-only bundle's squash stages
+            # nothing; a fast-forward of a source the target already holds):
+            # the transition is pre -> pre, and the receipt says so. An outcome
+            # without its revisions is the one shape `_validated_integration_attempt`
+            # refuses, and it used to be written here — every resume then read
+            # "receipt is missing or malformed" with no re-arm (#796 review).
+            attempt["old_revision"] = attempt["pre_target_revision"]
+            attempt["new_revision"] = attempt["pre_target_revision"]
+        attempt["outcome"] = "refused-restored"
+        task.integration_attempt = attempt
+        self.journal.append(
+            "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+        )
+        self._save()
+        self._pause(
+            "artifact target integration validation failed and the exact pre-attempt "
+            f"target was restored: {exc}; source retained at {task.worktree_path}",
+            task.story_key,
+            cause=exc,
+        )
+
     def merge_local(
         self,
         task: StoryTask,
@@ -2316,16 +2724,49 @@ class WorktreeFlow:
         *,
         replay: bool = False,
         replay_strategy: str | None = None,
+        first_integration: bool = False,
     ) -> None:
         """Merge a DONE unit's branch into the target branch from the main repo."""
-        if not replay:
+        if first_integration:
+            self._emit("pre_integrate", task)
+        if task.dw_ids:
+            self.prepare_publication(task, unit.workspace.paths)
+        receipt_required = False
+        if task.dw_ids:
+            try:
+                receipt_required = artifact_publication.requires_target_integration_receipt(task)
+            except artifact_publication.PublicationError as exc:
+                self._pause_integration_evidence(
+                    task, exc, prefix="target integration evidence is unsafe"
+                )
+        if not replay or first_integration:
             self._emit("pre_merge", task)
         scm = self.policy.scm
         merge_strategy = scm.merge_strategy if replay_strategy is None else replay_strategy
         repo = self.paths.repo_root
         target = self.state.target_branch
+        if task.dw_ids and not target:
+            # Compatibility for persisted runs created before target_branch was
+            # stamped into state: integration historically used the branch checked
+            # out in the main repository.  Resolve and persist that same target
+            # before constructing receipt authority.
+            target = verify.current_branch(repo)
+            if target == "HEAD":
+                self._pause_integration_evidence(
+                    task,
+                    verify.IntegrationEvidenceError(
+                        "target branch is unavailable for integration receipt"
+                    ),
+                    prefix="target integration evidence is unsafe",
+                )
+            self.state.target_branch = target
+            self._save()
         source = task.commit_sha or verify.rev_parse_head(unit.path)
-        merge_ref = unit.branch
+        # The completed task's recorded commit is the only source revision this
+        # run accepted.  A pre_merge plugin (or another process) may advance the
+        # unit branch after final verification, so never let the movable branch
+        # name choose bytes for either the collision probe or the merge itself.
+        merge_ref = source
         if replay:
             current_source = verify.rev_parse_head(unit.path)
             if current_source != source:
@@ -2337,10 +2778,8 @@ class WorktreeFlow:
                 )
                 self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
                 return
-            # Pin both the collision allowlist and the merge operand to the
-            # write-ahead SHA. The branch can move after the check; replay must
-            # integrate only the commit the completed session actually proved.
-            merge_ref = source
+            # ``merge_ref`` stays pinned to the write-ahead SHA even after this
+            # diagnostic check; the branch can move again before Git runs.
         # A per_worktree Unity Editor can leak asset writes into the *main*
         # checkout (see the unity plugin's worktree setup), dirtying the target with the very
         # files this branch already committed. Reconcile that first: clean only
@@ -2352,7 +2791,96 @@ class WorktreeFlow:
         # post-merge carry stages the board and the ledger BY PATHSPEC, so any dirt on
         # them — staged or not, whoever wrote it — would ride the run's own bookkeeping
         # commit. Inert-under-merge and safe-to-proceed are not the same predicate.
+        target_ref = f"refs/heads/{target}" if receipt_required else ""
+        landed = False
+        update: verify.IntegrationRefUpdate | None = None
+        attempt: dict[str, Any] | None = None
+        if receipt_required and task.integration_attempt is not None:
+            try:
+                attempt = self._validated_integration_attempt(task)
+                assert attempt is not None
+                if (
+                    attempt["target_ref"] != target_ref
+                    or attempt["strategy"] != merge_strategy
+                    or attempt["source_revision"] != source
+                ):
+                    raise verify.IntegrationEvidenceError(
+                        "persisted target integration receipt does not match the replay"
+                    )
+                update = verify.integration_ref_update(
+                    repo, target_ref, attempt["operation_identity"]
+                )
+                if update is None and attempt["phase"] in {
+                    "cleanup-pending",
+                    "cleanup-applied",
+                }:
+                    pre = str(attempt["pre_target_revision"])
+                    if verify.ref_revision(repo, target_ref) != pre:
+                        raise verify.IntegrationEvidenceError(
+                            "cleanup-phase receipt no longer owns the target epoch"
+                        )
+                    if not verify.integration_cleanup_state_recoverable(
+                        repo,
+                        self.run_dir,
+                        attempt["snapshots"],
+                        cleaned=attempt["cleanup_plan"]["cleaned"],
+                        untracked=attempt["cleanup_plan"]["untracked"],
+                        revision=pre,
+                        operation_identity=str(attempt["operation_identity"]),
+                    ):
+                        raise verify.IntegrationEvidenceError(
+                            "receipt-owned collision changed outside the cleanup transaction"
+                        )
+                    verify.restore_integration_nonref_state(
+                        repo,
+                        target_ref,
+                        revision=pre,
+                        run_dir=self.run_dir,
+                        snapshots=attempt["snapshots"],
+                        submodules=attempt["submodules"],
+                        operation_identity=str(attempt["operation_identity"]),
+                        include_paths=attempt["cleanup_plan"]["cleaned"],
+                    )
+                    retired = task.integration_attempt
+                    task.integration_attempt = None
+                    self._save()
+                    verify.discard_integration_state(self.run_dir, retired)
+                    attempt = None
+                if update is not None:
+                    assert attempt is not None
+                    if update.old_revision != attempt["pre_target_revision"]:
+                        raise verify.IntegrationEvidenceError(
+                            "integration ref epoch differs from the snapshotted target"
+                        )
+                    persisted_old = attempt.get("old_revision")
+                    persisted_new = attempt.get("new_revision")
+                    if persisted_old is not None and (
+                        persisted_old != update.old_revision or persisted_new != update.new_revision
+                    ):
+                        raise verify.IntegrationEvidenceError(
+                            "persisted target transition disagrees with reflog evidence"
+                        )
+                    if persisted_old is None:
+                        attempt["old_revision"] = update.old_revision
+                        attempt["new_revision"] = update.new_revision
+                        attempt["phase"] = "integrated"
+                        task.integration_attempt = attempt
+                        self._save()
+                    landed = verify.ref_revision(repo, target_ref) == update.new_revision
+            except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
+                self._pause_integration_evidence(
+                    task, exc, prefix="target integration evidence is unsafe"
+                )
         tolerated: list[str] = []
+        planned_target_revision = (
+            verify.ref_revision(repo, target_ref)
+            if attempt is not None and attempt.get("outcome") == "refused-restored"
+            else (
+                str(attempt["pre_target_revision"])
+                if attempt is not None
+                else verify.ref_revision(repo, target_ref) if receipt_required else target
+            )
+        )
 
         def note_tolerated(paths: list[str]) -> None:
             """Journal the guard's decision AND keep the paths for the arms below.
@@ -2376,13 +2904,27 @@ class WorktreeFlow:
             )
 
         try:
-            cleaned = verify.clean_incoming_collisions(
-                repo,
-                target,
-                merge_ref,
-                protected=self._carried_artifact_rels(repo),
-                on_tolerated=note_tolerated,
-            )
+            if landed:
+                collision_plan = verify.IncomingCollisionPlan((), (), ())
+                cleaned_without_receipt: list[str] | None = []
+            elif receipt_required:
+                collision_plan = verify.plan_incoming_collisions(
+                    repo,
+                    planned_target_revision,
+                    merge_ref,
+                    protected=self._carried_artifact_rels(repo),
+                    on_tolerated=note_tolerated,
+                )
+                cleaned_without_receipt = None
+            else:
+                cleaned_without_receipt = verify.clean_incoming_collisions(
+                    repo,
+                    target,
+                    merge_ref,
+                    protected=self._carried_artifact_rels(repo),
+                    on_tolerated=note_tolerated,
+                )
+                collision_plan = verify.IncomingCollisionPlan((), (), ())
         except (verify.GitError, OSError, RuntimeError) as e:
             # OSError/RuntimeError join GitError because clean_incoming_collisions
             # mutates the checkout directly (resolve/unlink/iterdir/rmdir) — non-spawn
@@ -2414,6 +2956,301 @@ class WorktreeFlow:
                 )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return
+        prospective_paths: tuple[str, ...] = ()
+        artifact_paths: tuple[str, ...] = ()
+        if receipt_required:
+            try:
+                prospective_paths = verify.preflight_integration_paths(
+                    verify.branch_incoming_paths(repo, planned_target_revision, merge_ref)
+                )
+            except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
+                self._pause_integration_evidence(
+                    task, exc, prefix="target integration path preflight failed"
+                )
+            # Resolved once, here, and threaded to the restore: a refusal pauses
+            # before the receipt is armed and before cleanup or git touch the
+            # target (see `_integration_artifact_paths`).
+            try:
+                artifact_paths = self._integration_artifact_paths(task)
+            except (
+                artifact_publication.PublicationError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as exc:
+                self._pause_integration_evidence(
+                    task, exc, prefix="target integration evidence is unsafe"
+                )
+        snapshot_paths = tuple(
+            dict.fromkeys(
+                [
+                    *prospective_paths,
+                    *collision_plan.cleaned,
+                    *collision_plan.tolerated,
+                    *artifact_paths,
+                ]
+            )
+        )
+        if receipt_required:
+            try:
+                attempt = self._validated_integration_attempt(task)
+                if attempt is not None:
+                    if (
+                        attempt["target_ref"] != target_ref
+                        or attempt["strategy"] != merge_strategy
+                        or attempt["source_revision"] != source
+                    ):
+                        raise verify.IntegrationEvidenceError(
+                            "persisted target integration receipt does not match the replay"
+                        )
+                    update = verify.integration_ref_update(
+                        repo, target_ref, attempt["operation_identity"]
+                    )
+                    current = verify.ref_revision(repo, target_ref)
+                    if update is not None:
+                        if update.old_revision != attempt["pre_target_revision"]:
+                            raise verify.IntegrationEvidenceError(
+                                "integration ref epoch differs from the snapshotted target"
+                            )
+                        persisted_old = attempt.get("old_revision")
+                        persisted_new = attempt.get("new_revision")
+                        if persisted_old is not None and (
+                            persisted_old != update.old_revision
+                            or persisted_new != update.new_revision
+                        ):
+                            raise verify.IntegrationEvidenceError(
+                                "persisted target transition disagrees with reflog evidence"
+                            )
+                        if persisted_old is None:
+                            attempt["old_revision"] = update.old_revision
+                            attempt["new_revision"] = update.new_revision
+                            attempt["phase"] = "integrated"
+                            task.integration_attempt = attempt
+                            self._save()
+                        if current == update.new_revision:
+                            landed = True
+                        elif current == update.old_revision:
+                            restored = verify.integration_restoration_complete(
+                                repo,
+                                target_ref,
+                                old_revision=update.old_revision,
+                                new_revision=update.new_revision,
+                                extra_paths=artifact_paths,
+                                run_dir=self.run_dir,
+                                snapshots=attempt["snapshots"],
+                                submodules=attempt["submodules"],
+                                operation_identity=attempt["operation_identity"],
+                            )
+                            if restored:
+                                # Complete for the receipt's own paths; what
+                                # the refusal named and left in place is
+                                # outside them, and re-arming over it made
+                                # it the retry's baseline (#796 review).
+                                self._refuse_refused_residue(attempt, revision=current)
+                                attempt = self._arm_integration_attempt(
+                                    task,
+                                    target_ref=target_ref,
+                                    strategy=merge_strategy,
+                                    source=source,
+                                    snapshot_paths=snapshot_paths,
+                                )
+                                update = None
+                            else:
+                                raise verify.IntegrationEvidenceError(
+                                    "restored target receipt state is incomplete"
+                                )
+                        elif attempt.get("outcome") == "refused-restored":
+                            # The durable outcome is written only after guarded
+                            # restoration succeeded. A later target commit is an
+                            # operator/concurrent advance, not the refused result;
+                            # preserve it and make it the next attempt's baseline
+                            # — the refused residue, still outside every set the
+                            # commit could have taken up, is not (#796 review).
+                            self._refuse_refused_residue(attempt, revision=current)
+                            attempt = self._arm_integration_attempt(
+                                task,
+                                target_ref=target_ref,
+                                strategy=merge_strategy,
+                                source=source,
+                                snapshot_paths=snapshot_paths,
+                            )
+                            update = None
+                        else:
+                            raise verify.IntegrationEvidenceError(
+                                "target no longer matches the receipt-owned integration result"
+                            )
+                    elif current != attempt["pre_target_revision"]:
+                        raise verify.IntegrationEvidenceError(
+                            "target changed without the receipt-owned ref-update evidence"
+                        )
+                    else:
+                        existing_snapshot_paths = [
+                            str(entry["path"])
+                            for entry in attempt["snapshots"]
+                            if isinstance(entry, dict) and "path" in entry
+                        ]
+                        covered_cleanup = set(collision_plan.cleaned) & set(existing_snapshot_paths)
+                        if covered_cleanup and not verify.integration_nonref_state_unchanged(
+                            repo,
+                            self.run_dir,
+                            attempt["snapshots"],
+                            attempt["submodules"],
+                            exclude_paths=set(existing_snapshot_paths) - covered_cleanup,
+                            operation_identity=attempt["operation_identity"],
+                        ):
+                            raise verify.IntegrationEvidenceError(
+                                "receipt-owned collision state changed before cleanup"
+                            )
+                        missing_coverage = set(snapshot_paths) - set(existing_snapshot_paths)
+                        if missing_coverage:
+                            if not verify.integration_nonref_state_unchanged(
+                                repo,
+                                self.run_dir,
+                                attempt["snapshots"],
+                                attempt["submodules"],
+                                operation_identity=attempt["operation_identity"],
+                            ):
+                                raise verify.IntegrationEvidenceError(
+                                    "persisted target receipt changed before cleanup coverage "
+                                    "could be extended"
+                                )
+                            attempt = self._arm_integration_attempt(
+                                task,
+                                target_ref=target_ref,
+                                strategy=merge_strategy,
+                                source=source,
+                                snapshot_paths=tuple(
+                                    dict.fromkeys([*existing_snapshot_paths, *snapshot_paths])
+                                ),
+                            )
+                else:
+                    attempt = self._arm_integration_attempt(
+                        task,
+                        target_ref=target_ref,
+                        strategy=merge_strategy,
+                        source=source,
+                        snapshot_paths=snapshot_paths,
+                    )
+                if attempt["pre_target_revision"] != planned_target_revision:
+                    raise verify.IntegrationEvidenceError(
+                        "target changed while collision planning was being captured; "
+                        "integration was not attempted"
+                    )
+            except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
+                self._pause_integration_evidence(
+                    task, exc, prefix="target integration evidence is unsafe"
+                )
+        if receipt_required and not landed:
+            assert attempt is not None
+            plan_payload = {
+                "cleaned": list(collision_plan.cleaned),
+                "tolerated": list(collision_plan.tolerated),
+                "untracked": list(collision_plan.untracked),
+            }
+            try:
+                if attempt["phase"] != "armed":
+                    raise verify.IntegrationEvidenceError(
+                        "target cleanup receipt phase is not re-armable"
+                    )
+                if not verify.integration_nonref_state_unchanged(
+                    repo,
+                    self.run_dir,
+                    attempt["snapshots"],
+                    attempt["submodules"],
+                    operation_identity=attempt["operation_identity"],
+                ):
+                    raise verify.IntegrationEvidenceError(
+                        "target changed after collision planning and before cleanup"
+                    )
+                attempt["cleanup_plan"] = plan_payload
+                attempt["phase"] = "cleanup-pending"
+                task.integration_attempt = attempt
+                self._save()
+            except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
+                self._pause_integration_evidence(
+                    task, exc, prefix="target collision cleanup could not be armed"
+                )
+        # What the cleanup has TOUCHED, for the restore in the except arm: the
+        # paths it finished plus the one in flight when it failed. Never the
+        # whole plan — a path still ahead may hold fresh operator state by then,
+        # and the snapshot would flatten it (#796 review). The identity error's
+        # own `cleaned` is this inventory minus the in-flight path, which that
+        # error proved untouched. Bound before the `try` so a probe fault ahead
+        # of the cleanup restores nothing rather than naming an unbound list.
+        progress: list[str] = []
+        try:
+            if receipt_required and not landed:
+                assert attempt is not None
+                if not verify.integration_nonref_state_unchanged(
+                    repo,
+                    self.run_dir,
+                    attempt["snapshots"],
+                    attempt["submodules"],
+                    operation_identity=attempt["operation_identity"],
+                ):
+                    self._pause_integration_evidence(
+                        task,
+                        verify.IntegrationEvidenceError(
+                            "target collision identity changed immediately before cleanup"
+                        ),
+                        prefix="target collision cleanup evidence is unsafe",
+                    )
+
+            def cleanup_identity_unchanged(path: str) -> bool:
+                if attempt is None:
+                    return True
+                return verify.integration_nonref_state_unchanged(
+                    repo,
+                    self.run_dir,
+                    attempt["snapshots"],
+                    attempt["submodules"],
+                    exclude_paths={
+                        str(entry["path"])
+                        for entry in attempt["snapshots"]
+                        if str(entry["path"]) != path
+                    },
+                    operation_identity=attempt["operation_identity"],
+                )
+
+            cleaned = (
+                verify.apply_incoming_collision_plan(
+                    repo,
+                    collision_plan,
+                    before_mutate=cleanup_identity_unchanged,
+                    progress=progress,
+                )
+                if cleaned_without_receipt is None
+                else cleaned_without_receipt
+            )
+        except (verify.GitError, OSError, RuntimeError) as e:
+            if receipt_required and attempt is not None:
+                try:
+                    verify.restore_integration_nonref_state(
+                        repo,
+                        target_ref,
+                        revision=str(attempt["pre_target_revision"]),
+                        run_dir=self.run_dir,
+                        snapshots=attempt["snapshots"],
+                        submodules=attempt["submodules"],
+                        operation_identity=str(attempt["operation_identity"]),
+                        include_paths=(
+                            e.cleaned
+                            if isinstance(e, verify.IntegrationCleanupChangedError)
+                            else tuple(progress)
+                        ),
+                    )
+                except (verify.GitError, OSError, RuntimeError, ValueError) as restore_exc:
+                    e = verify.IntegrationRestoreError(
+                        f"{e}; partial collision cleanup restoration failed: {restore_exc}"
+                    )
+            self._pause_integration_evidence(
+                task, e, prefix="target collision cleanup failed after receipt capture"
+            )
+        if receipt_required and not landed:
+            assert attempt is not None
+            attempt["phase"] = "cleanup-applied"
+            task.integration_attempt = attempt
+            self._save()
         if cleaned:
             self.journal.append(
                 "merge-target-cleaned",
@@ -2421,11 +3258,23 @@ class WorktreeFlow:
                 branch=unit.branch,
                 paths=cleaned,
             )
-        if not replay:
-            # The task is already terminal and durable here. Record integration
-            # intent immediately before git so a host loss after merge success but
-            # before `unit-merged` can safely re-run the merge instead of losing a
-            # gitignored ledger when the stale worktree is reclaimed.
+        if receipt_required and not landed:
+            assert attempt is not None
+            # state.json is the durable authority; this record is a diagnostic
+            # mirror only and may be the torn final journal line after a crash.
+            self.journal.append(
+                "unit-merge-started",
+                story_key=task.story_key,
+                branch=unit.branch,
+                target=target,
+                strategy=merge_strategy,
+                source=source,
+                operation_id=attempt["operation_identity"],
+                pre_target_revision=attempt["pre_target_revision"],
+            )
+        elif not receipt_required and (not replay or first_integration):
+            # Released ordinary-story behavior: journal intent and replay the
+            # exact strategy idempotently without target-reflog dependency.
             self.journal.append(
                 "unit-merge-started",
                 story_key=task.story_key,
@@ -2434,14 +3283,48 @@ class WorktreeFlow:
                 strategy=merge_strategy,
                 source=source,
             )
+        if receipt_required and not landed:
+            assert attempt is not None
+            try:
+                if verify.ref_revision(repo, target_ref) != attempt["pre_target_revision"]:
+                    raise verify.IntegrationEvidenceError(
+                        "target changed after integration snapshot capture"
+                    )
+                if not verify.integration_nonref_state_unchanged(
+                    repo,
+                    self.run_dir,
+                    attempt["snapshots"],
+                    attempt["submodules"],
+                    exclude_paths=collision_plan.cleaned,
+                    operation_identity=attempt["operation_identity"],
+                ):
+                    raise verify.IntegrationEvidenceError(
+                        "target non-ref state changed after integration snapshot capture"
+                    )
+            except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
+                self._pause_integration_evidence(
+                    task, exc, prefix="target integration evidence is unsafe"
+                )
+        # The tree the squash leg staged before its own commit sealed it; the
+        # receipt block below proves the sealed commit against it. None on the
+        # other legs and on a replay that found the result already landed.
+        squash_staged_tree: str | None = None
         try:
-            verify.merge_branch(
-                repo,
-                merge_ref,
-                strategy=merge_strategy,
-                message=self.merge_message(task),
-                allow_empty_squash=replay,
-            )
+            if not landed:
+                squash_staged_tree = verify.merge_branch(
+                    repo,
+                    merge_ref,
+                    strategy=merge_strategy,
+                    message=self.merge_message(task),
+                    allow_empty_squash=(
+                        replay or (bool(task.dw_ids) and source == task.baseline_commit)
+                    ),
+                    reflog_action=(
+                        f"bmad-loop-integrate:{attempt['operation_identity']}"
+                        if attempt is not None
+                        else None
+                    ),
+                )
         except verify.MergePreflightError as e:
             # Subclass arm, so it must precede the GitError one below. git declined
             # before the merge began: nothing was merged and the target checkout is
@@ -2471,6 +3354,7 @@ class WorktreeFlow:
                     tolerated=tolerated,
                     error=str(e),
                 )
+            self._retire_unmoved_integration_attempt(task)
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
         except verify.MergeHalfAppliedError as e:
@@ -2543,6 +3427,7 @@ class WorktreeFlow:
                 f"required clean/smudge filter that cannot run is the measured cause — "
                 f"and `bmad-loop resume {self.state.run_id}`. {e}"
             )
+            self._retire_unmoved_integration_attempt(task)
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
         except verify.MergeResidueUnreadError as e:
@@ -2617,6 +3502,7 @@ class WorktreeFlow:
                     f"names both failures. Then `bmad-loop resume {self.state.run_id}`. "
                     f"{e}"
                 )
+            self._retire_unmoved_integration_attempt(task)
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
         except verify.MergeConflictError as e:
@@ -2629,6 +3515,7 @@ class WorktreeFlow:
                 f"(content conflict against the target): resolve it by hand, then "
                 f"`bmad-loop resume {self.state.run_id}`. {e}"
             )
+            self._retire_unmoved_integration_attempt(task)
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
         except verify.GitError as e:
@@ -2650,15 +3537,415 @@ class WorktreeFlow:
             )
             self.keep_branch_and_escalate(task, unit, reason)  # always raises RunPaused
             return  # defensive: never fall through to the success teardown below
-        self.journal.append(
-            "unit-merged",
-            story_key=task.story_key,
-            branch=unit.branch,
-            target=self.state.target_branch,
-            strategy=merge_strategy,
-            source=source,
-        )
+        if receipt_required:
+            assert attempt is not None
+            try:
+                if update is None:
+                    update = verify.integration_ref_update(
+                        repo, target_ref, attempt["operation_identity"]
+                    )
+                if update is None:
+                    current = verify.ref_revision(repo, target_ref)
+                    if current != attempt["pre_target_revision"]:
+                        raise verify.IntegrationEvidenceError(
+                            "integration changed the target without readable ref-update evidence"
+                        )
+                    expected_revision = current
+                else:
+                    if update.old_revision != attempt["pre_target_revision"]:
+                        raise verify.IntegrationEvidenceError(
+                            "integration ref epoch differs from the snapshotted target"
+                        )
+                    attempt["old_revision"] = update.old_revision
+                    attempt["new_revision"] = update.new_revision
+                    attempt["phase"] = "integrated"
+                    task.integration_attempt = attempt
+                    self._save()
+                    current = verify.ref_revision(repo, target_ref)
+                    if current != update.new_revision:
+                        raise verify.IntegrationEvidenceError(
+                            "target moved after the receipt-owned integration"
+                        )
+                    expected_revision = update.new_revision
+                artifact_publication.validate_integrated(task, self.paths, expected_revision)
+                # Three readings, one per place a TARGET hook can put its output.
+                # Outside the incoming set the snapshot is the authority (below);
+                # on it the integrated commit is — the merge changed those paths
+                # by design — so the post-hook index and checkout must hold each
+                # one as that commit has it; and the squash leg's commit, which
+                # re-reads the index after `pre-commit`, must have sealed the tree
+                # git resolved, since a rewrite landed THERE matches index and
+                # checkout alike (#796 review). Path-only evidence throughout.
+                if squash_staged_tree is not None:
+                    if verify.revision_tree_oid(repo, expected_revision) != squash_staged_tree:
+                        raise verify.IntegrationEvidenceError(
+                            "target commit hook changed the squash result after the merge "
+                            "resolved it"
+                        )
+                # The submodule reading goes first: a populated checkout git
+                # left behind when the commit deleted its gitlink is git's, not
+                # a hook's, and only that reading can say so to the probe.
+                retained_checkouts = verify.validate_integrated_submodule_state(
+                    repo,
+                    attempt["submodules"],
+                    prospective_paths=prospective_paths,
+                    revision=expected_revision,
+                )
+                drifted = verify.integrated_paths_drift(
+                    repo,
+                    expected_revision,
+                    prospective_paths,
+                    retained_checkouts=retained_checkouts,
+                )
+                if drifted:
+                    raise verify.IntegrationEvidenceError(
+                        "target hook changed incoming paths after integration: "
+                        + ", ".join(sorted(drifted))
+                    )
+                # The diff readings compare blobs; an index flag a hook set on an
+                # incoming path (`update-index --assume-unchanged`, which hides
+                # later edits from git) changes none, so the post-hook flag word
+                # of every incoming entry is read against what a fresh entry may
+                # carry or what the receipt captured — and an entry git trusts
+                # unread under an accepted word is read from disk against the
+                # integrated commit, the diff reading above having trusted the
+                # bit (#796 review).
+                flagged = verify.integrated_index_flags_drift(
+                    repo,
+                    self.run_dir,
+                    attempt["snapshots"],
+                    prospective_paths,
+                    revision=expected_revision,
+                    operation_identity=attempt["operation_identity"],
+                )
+                if flagged:
+                    raise verify.IntegrationEvidenceError(
+                        "target hook changed index flags on incoming paths after "
+                        "integration: " + ", ".join(flagged)
+                    )
+                if not verify.integration_nonref_state_unchanged(
+                    repo,
+                    self.run_dir,
+                    attempt["snapshots"],
+                    attempt["submodules"],
+                    exclude_paths=prospective_paths,
+                    operation_identity=attempt["operation_identity"],
+                ):
+                    raise verify.IntegrationEvidenceError(
+                        "target hook changed receipt-owned index, worktree, ignored, "
+                        "or submodule state"
+                    )
+                # The fourth place: a clean tracked file outside every set
+                # above has no baseline in the receipt, so the whole-tree
+                # reading closes it — after the hooks the target may hold
+                # exactly the strays the guard tolerated before the merge,
+                # plus an ignored file that was already there and that an
+                # incoming `.gitignore` change uncovered (the receipt's
+                # ignored listing holds it at its identity), and nothing
+                # else (#796 review). The plan is read from the receipt,
+                # not the local variable: a replay that finds the ref
+                # already moved plans no collisions of its own.
+                cleanup_plan = attempt.get("cleanup_plan") or {}
+                strays = verify.integrated_stray_paths(
+                    repo,
+                    tolerated=cleanup_plan.get("tolerated", ()),
+                    incoming=prospective_paths,
+                    retained_checkouts=retained_checkouts,
+                    run_dir=self.run_dir,
+                    ignored=attempt.get("ignored"),
+                )
+                if strays:
+                    raise verify.IntegrationEvidenceError(
+                        "target hook changed paths outside the incoming set after "
+                        "integration (staged changes restored; unstaged and untracked "
+                        "entries left in place): " + ", ".join(strays)
+                    )
+                # What status cannot list: an index flag word a hook flipped on
+                # a clean tracked file outside the incoming set, proved unchanged
+                # by the receipt's digest and named from its map — and the file
+                # behind an entry the index already trusted unread (assume-
+                # unchanged, skip-worktree), which a hook can overwrite with no
+                # word, blob, or status reading moving, named from the receipt's
+                # `lstat` identity of it (#796 review). After the stray reading,
+                # which owns an entry added or removed. Left in place by the
+                # restore, like unstaged dirt, and named.
+                if attempt.get("index_flags") is not None:
+                    flipped = verify.integrated_index_flags_outside_drift(
+                        repo,
+                        attempt["index_flags"],
+                        exclude=[str(entry["path"]) for entry in attempt["snapshots"]],
+                    )
+                    if flipped:
+                        raise verify.IntegrationEvidenceError(
+                            "target hook changed index flags, or files the index trusts "
+                            "unread, outside the incoming set after integration (left in "
+                            "place): " + ", ".join(flipped)
+                        )
+                # And the one place none of those list: a directory the commit
+                # created where the receipt proved nothing was — or proved a
+                # file, a symlink, or an unpopulated gitlink — walked on disk
+                # — a hook's gitignored write or nested `.git` there is
+                # attempt-era with everything else in it (#796 review).
+                residue = verify.integrated_introduced_directories_drift(
+                    repo,
+                    expected_revision,
+                    self.run_dir,
+                    attempt["snapshots"],
+                    submodules=attempt["submodules"],
+                    operation_identity=attempt["operation_identity"],
+                )
+                if residue:
+                    raise verify.IntegrationEvidenceError(
+                        "target hook wrote into a directory the integration created: "
+                        + ", ".join(residue)
+                    )
+                # And wherever else: an ignored entry the receipt's whole-tree
+                # listing did not record, recorded under another identity, or
+                # recorded and now gone — a hook's write beside an incoming
+                # path in a directory the target already held populated, over
+                # an ignored file that was already there, or its deletion of
+                # one, which no reading above lists — and a nested `.git`
+                # anywhere, which git lists in no reading at all, a checkout
+                # the submodule reading accepted at a gitlink the commit
+                # introduced excepted, and a write inside a nested repository
+                # git tracks nothing under (the tolerated `vendor` among
+                # them), which git never descends into; the incoming set is
+                # the commit's own, an ignored entry git clobbered on its way
+                # in included, and the leftover of a deleted gitlink is the
+                # captured checkout's reading's below (#796 review). Left as
+                # found by the restore, like unstaged dirt, and named.
+                if attempt.get("ignored") is not None:
+                    added = verify.integrated_ignored_additions(
+                        repo,
+                        self.run_dir,
+                        attempt["ignored"],
+                        tolerated=cleanup_plan.get("tolerated", ()),
+                        incoming=prospective_paths,
+                        introduced_checkouts=verify.integrated_introduced_gitlinks(
+                            repo,
+                            self.run_dir,
+                            attempt["submodules"],
+                            revision=expected_revision,
+                        ),
+                        retained_checkouts=retained_checkouts,
+                    )
+                    if added:
+                        raise verify.IntegrationEvidenceError(
+                            "target hook wrote, changed or removed ignored entries after "
+                            "integration (left as found): " + ", ".join(added)
+                        )
+                # And inside a captured submodule checkout, which that listing
+                # never descends into and whose own reading takes `status`
+                # without `--ignored`: against the listing the receipt sealed
+                # beside its HEAD (#796 review). Left as found the same way.
+                added = verify.integrated_submodule_ignored_additions(
+                    repo,
+                    self.run_dir,
+                    attempt["submodules"],
+                    revision=expected_revision,
+                )
+                if added:
+                    raise verify.IntegrationEvidenceError(
+                        "target hook wrote, changed or removed ignored entries in a captured "
+                        "submodule checkout after integration (left as found): " + ", ".join(added)
+                    )
+                if verify.ref_revision(repo, target_ref) != expected_revision:
+                    raise verify.IntegrationEvidenceError(
+                        "target moved during artifact integration validation"
+                    )
+            except artifact_publication.PublicationError as exc:
+                self._refuse_integrated_artifacts(
+                    task, attempt, update, exc, artifact_paths=artifact_paths
+                )
+            except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
+                self._refuse_integrated_artifacts(
+                    task, attempt, update, exc, artifact_paths=artifact_paths
+                )
+            self.journal.append(
+                "unit-merged",
+                story_key=task.story_key,
+                branch=unit.branch,
+                target=self.state.target_branch,
+                strategy=merge_strategy,
+                source=source,
+                operation_id=attempt["operation_identity"],
+            )
+            # The validated completion record is durable before rollback authority is
+            # retired. A crash between these writes replays from unit-merged and may
+            # safely clear the leftover receipt without touching Git.
+            completed_attempt = task.integration_attempt
+            task.integration_attempt = None
+            self._save()
+            verify.discard_integration_state(self.run_dir, completed_attempt)
+        else:
+            self.journal.append(
+                "unit-merged",
+                story_key=task.story_key,
+                branch=unit.branch,
+                target=self.state.target_branch,
+                strategy=merge_strategy,
+                source=source,
+            )
         self._emit("post_merge", task)
+        self.finish_publication(task, unit)
+
+    def prepare_publication(self, task: StoryTask, source: ProjectPaths) -> None:
+        """Persist accepted bytes before merge can consume the unit."""
+        try:
+            limits = self.policy.limits
+            artifact_publication.prepare(
+                task,
+                self.paths,
+                source,
+                file_max_bytes=limits.artifact_file_max_mb * 1_048_576,
+                payload_max_bytes=limits.artifact_payload_max_mb * 1_048_576,
+            )
+            self._save()
+        except artifact_publication.PublicationSizeError as exc:
+            self.journal.append(
+                "artifact-publication-refused",
+                story_key=task.story_key,
+                error=str(exc),
+                publication_cause=exc.cause,
+                measured_bytes=exc.measured_bytes,
+                limit_bytes=exc.limit_bytes,
+                measurement_is_lower_bound=exc.measurement_is_lower_bound,
+            )
+            self._save()
+            self._pause(
+                f"artifact publication preparation failed: {exc}", task.story_key, cause=exc
+            )
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            self._save()
+            self._pause(
+                f"artifact publication preparation failed: {exc}", task.story_key, cause=exc
+            )
+
+    def bind_publication(
+        self, task: StoryTask, source: ProjectPaths, acceptance_identity: str
+    ) -> None:
+        """Persist final-verification source authority for one accepted result.
+
+        Arm and save the append-only session identity before reading source
+        bytes. If the process dies during the read, replay sees the same identity
+        with no digest map and refuses rather than blessing whatever bytes are
+        present after restart.
+        """
+        if task.artifact_acceptance_identity == acceptance_identity:
+            if task.artifact_source_digests is None or task.artifact_tracked_source_oids is None:
+                exc = artifact_publication.PublicationError(
+                    "accepted artifact source binding is unavailable for replay"
+                )
+                self.journal.append(
+                    "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+                )
+                self._save()
+                self._pause(
+                    f"artifact publication binding failed: {exc}",
+                    task.story_key,
+                    cause=exc,
+                )
+            return
+        try:
+            artifact_publication.arm_binding(task, acceptance_identity)
+            self._save()
+            limits = self.policy.limits
+            artifact_publication.bind_armed(
+                task,
+                source,
+                file_max_bytes=limits.artifact_file_max_mb * 1_048_576,
+                payload_max_bytes=limits.artifact_payload_max_mb * 1_048_576,
+            )
+            self._save()
+        except artifact_publication.PublicationSizeError as exc:
+            self.journal.append(
+                "artifact-publication-refused",
+                story_key=task.story_key,
+                error=str(exc),
+                publication_cause=exc.cause,
+                measured_bytes=exc.measured_bytes,
+                limit_bytes=exc.limit_bytes,
+                measurement_is_lower_bound=exc.measurement_is_lower_bound,
+            )
+            self._save()
+            self._pause(f"artifact publication binding failed: {exc}", task.story_key, cause=exc)
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            self._save()
+            self._pause(f"artifact publication binding failed: {exc}", task.story_key, cause=exc)
+
+    def validate_staged_publication(self, task: StoryTask, source: ProjectPaths) -> dict[str, str]:
+        """Validate final staged Git deliverables or retain the unit mount."""
+        try:
+            return artifact_publication.validate_staged(task, source)
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            self._save()
+            self._pause(
+                f"artifact publication staging failed: {exc}",
+                task.story_key,
+                cause=exc,
+            )
+
+    def validate_committed_publication(
+        self,
+        task: StoryTask,
+        source: ProjectPaths,
+        revision: str,
+        staged_snapshot: object,
+    ) -> None:
+        """Validate the committed tree or roll back while retaining the mount."""
+        try:
+            if not isinstance(staged_snapshot, dict) or not all(
+                isinstance(rel, str) and isinstance(identity, str)
+                for rel, identity in staged_snapshot.items()
+            ):
+                raise artifact_publication.PublicationError(
+                    "validated staged artifact snapshot is missing or malformed"
+                )
+            artifact_publication.validate_committed(task, source, revision, staged_snapshot)
+        except (artifact_publication.PublicationError, verify.GitError, OSError, ValueError) as exc:
+            self.journal.append(
+                "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+            )
+            self._save()
+            self._pause(
+                f"artifact publication commit validation failed: {exc}",
+                task.story_key,
+                cause=exc,
+            )
+
+    def finish_publication(self, task: StoryTask, unit: UnitWorkspace | None) -> None:
+        """Publish and latch before successful teardown, including merge replay."""
+        if task.dw_ids:
+            try:
+                artifact_publication.publish(task, self.paths)
+                self._save()
+            except (
+                artifact_publication.PublicationError,
+                verify.GitError,
+                OSError,
+                ValueError,
+            ) as exc:
+                self.journal.append(
+                    "artifact-publication-refused", story_key=task.story_key, error=str(exc)
+                )
+                self._save()
+                self._pause(
+                    f"artifact publication failed: {exc}; source retained at {task.worktree_path}",
+                    task.story_key,
+                    cause=exc,
+                )
+        if unit is None:
+            return  # journal-proven merge can publish from durable bytes alone
+        scm = self.policy.scm
         close_unit_workspace(
             unit,
             success=True,
@@ -2711,18 +3998,24 @@ class WorktreeFlow:
     def gc_run_worktrees(self) -> None:
         """Reclaim this run's worktree scaffolding once it finishes cleanly.
 
-        DONE units drop their worktree at merge time; this is a safety net for a
-        worktree leaked by a crash between merge and teardown, plus it prunes
-        stale git admin entries and removes the now-empty run worktree dir.
+        DONE and AWAITING_OPERATOR units drop their worktree at merge time; this
+        is a safety net for a worktree leaked by a crash between merge and
+        teardown, plus it prunes stale git admin entries and removes the now-empty
+        run worktree dir.
         Worktrees deliberately kept for inspection (a kept-failed/escalated unit)
         are left in place and journaled so the operator can find them."""
         if not self.isolated:
             return
         repo = self.paths.repo_root
         for task in self.state.tasks.values():
-            if task.phase == Phase.DONE and task.worktree_path:
+            if task.phase in (Phase.DONE, Phase.AWAITING_OPERATOR) and task.worktree_path:
                 wt = Path(task.worktree_path)
                 if wt.is_dir():
+                    if task.dw_ids and not task.artifact_publication_complete:
+                        self._pause(
+                            f"artifact publication incomplete; source retained at {task.worktree_path}",
+                            task.story_key,
+                        )
                     discard_worktree(repo, task.worktree_path, task.branch, run_dir=self.run_dir)
             elif task.terminal and task.worktree_path and Path(task.worktree_path).is_dir():
                 # kept on purpose (keep_failed): leave it, but surface where.

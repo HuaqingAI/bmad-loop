@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from bmad_loop import cli, documents, envvars, platform_util, runs
+from bmad_loop import cli, documents, envvars, platform_util, runs, win32_at
 from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.bmadconfig import ProjectPaths, load_paths
 from bmad_loop.checks import ValidationReport
@@ -595,6 +595,48 @@ def remove_tree(path: Path) -> None:
     shutil.rmtree(path)
 
 
+_REAL_OS_REPLACE = os.replace
+_REAL_WIN32_REPLACE_AT = win32_at.replace_at
+
+
+def real_publish_rename(src, dst, *, src_dir_fd=None, dst_dir_fd=None) -> None:
+    """The rename a :func:`patch_publish_rename` interceptor falls through to.
+
+    ``os.replace``'s shape, routed to the syscall the arm actually publishes with:
+    a path-based rename is ``os.replace``, a dir_fd-relative one is ``os.replace``
+    on POSIX and ``win32_at.replace_at`` on Windows (where ``os.replace`` refuses
+    ``dir_fd`` outright). Bound to the ORIGINALS at import, so calling it from
+    inside the interceptor never re-enters the patch."""
+    if src_dir_fd is None and dst_dir_fd is None:
+        _REAL_OS_REPLACE(src, dst)
+    elif platform_util.DIR_FD_ANCHORED_WRITES:
+        _REAL_OS_REPLACE(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+    else:
+        _REAL_WIN32_REPLACE_AT(src_dir_fd, src, dst_dir_fd, dst)
+
+
+def patch_publish_rename(monkeypatch: pytest.MonkeyPatch, fn) -> None:
+    """Route every rename a writer publishes with through ``fn``, on either arm.
+
+    ``fn(src, dst, *, src_dir_fd=None, dst_dir_fd=None)`` — ``os.replace``'s shape,
+    because on POSIX that IS the floor every publish reaches: the path-based
+    ``atomic_replace`` and the confined writer's anchored arm (a bare
+    dir_fd-relative ``os.replace``, #593) alike, so one patch covers both the
+    row's ablation and a reversion to the hand-rolled ``tmp + atomic_replace``.
+    Windows' anchored arm renames through ``win32_at.replace_at`` (handle-relative
+    ``NtSetInformationFile``; ``os.replace`` is never called), so a test patching
+    only ``os.replace`` fires on nothing there and passes having faulted nobody.
+    That name is patched too, with the argument order adapted, on the arm where
+    it is live. ``fn`` falls through with :func:`real_publish_rename`."""
+    monkeypatch.setattr(os, "replace", fn)
+    if win32_at.AVAILABLE:
+
+        def _at(src_dir_fd: int, src: str, dst_dir_fd: int, dst: str) -> None:
+            fn(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        monkeypatch.setattr(win32_at, "replace_at", _at)
+
+
 NOISY_GIT_KEY = "core.fsyncMethod"
 NOISY_GIT_VALUE = "bmad-loop-not-a-method"
 
@@ -1082,6 +1124,28 @@ def seed_outer_decoy_ledger(paths: ProjectPaths) -> tuple[Path, bytes]:
 
 UNRESOLVABLE = "stubbed: the provider is registered but not serving"
 
+# The two `ValueError`-family faults `Path.resolve()` raises on CPython 3.11-3.14 POSIX
+# (DW-275), spelled once for the three publisher rows that drive them through
+# `refuse_to_resolve(..., error=)`: an embedded NUL in the path raises `ValueError`
+# with CPython's own `lstat: embedded null character in path` wording (3.12+; 3.11
+# says `embedded null byte`), and a lone surrogate OUTSIDE the `surrogateescape`
+# range (`\ud800`; a `\udcff` round-trips through `os.fsencode` and does not raise)
+# raises `UnicodeEncodeError`, a `ValueError` subclass, which `refuse_to_resolve`
+# reconstructs faithfully from its five args. INJECTED rather than driven with a
+# real path because `ntpath.realpath` tolerates a NUL, so a real NUL path is not a
+# cross-platform driver at the publisher. `Path.stat()` bottoms out in the same
+# `os.stat` and raises the same two, so the observation-arm rows that grade the
+# `stat` + `S_ISREG` presence probe (DW-266/267) drive them through
+# `fault_metadata_probe(..., "stat", error=)`; a real lone surrogate is not a
+# cross-platform driver there either (the Windows W-API accepts it).
+NUL_PATH_RESOLVE_FAULTS = [
+    pytest.param(ValueError("lstat: embedded null character in path"), id="nul"),
+    pytest.param(
+        UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogates not allowed"),
+        id="lone-surrogate",
+    ),
+]
+
 
 def refuse_to_resolve(monkeypatch, *targets: Path, error: Exception | None = None) -> None:
     """Make ``Path.resolve()`` fail for exactly ``targets``.
@@ -1295,6 +1359,109 @@ def fault_read_text(monkeypatch, target: Path) -> None:
         return real(self, *a, **kw)
 
     monkeypatch.setattr(Path, "read_text", fake)
+
+
+def fault_locked_ledger_read(
+    monkeypatch, target: Path, operation: str, *, lock_target: Path | None = None
+) -> bytes:
+    """Refuse only the authoritative read inside the real ledger lock (DW-279).
+
+    Earlier probes remain healthy. Each wrap is independently ablatable by
+    selecting the stat or read_text rows. Return the target bytes that must survive.
+    `lock_target` permits an archive sibling read under the main ledger lock.
+    """
+    from bmad_loop import deferredwork
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists():
+        target.write_text("# Deferred Work\n", encoding="utf-8")
+    before = target.read_bytes()
+    lock_target = target if lock_target is None else lock_target
+    real_lock = deferredwork.ledger_lock
+    real_read = getattr(Path, operation)
+
+    def refuse(path, *args, **kwargs):
+        if path == target:
+            raise PermissionError(13, "Permission denied", str(target))
+        return real_read(path, *args, **kwargs)
+
+    @contextlib.contextmanager
+    def locked(path):
+        with real_lock(path):
+            with monkeypatch.context() as patch:
+                if path == lock_target:
+                    patch.setattr(Path, operation, refuse)
+                yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", locked)
+    return before
+
+
+def fault_metadata_probe(
+    monkeypatch, target: Path, probe: str, *, error: Exception | None = None
+) -> None:
+    """Make exactly ``target``'s ``probe`` metadata call raise PermissionError; every
+    other path still answers normally, and so does every other probe on ``target`` —
+    with the ``stat`` family the documented exception, see its own paragraph below.
+
+    ``error`` supplies a DIFFERENT fault instead, on the same terms as
+    ``refuse_to_resolve(..., error=)``: RE-CONSTRUCTED from its class and args on
+    every matching probe rather than re-raised as one object, so a consumer probing
+    the target twice does not see the first raise's frames on the second. Its use
+    is the ``ValueError`` family ``Path.stat`` raises for a path the OS cannot
+    encode (:data:`NUL_PATH_RESOLVE_FAULTS`), which no ``PermissionError`` row can
+    reach and no ``except OSError`` catches.
+
+    ``probe`` is one of ``exists`` / ``is_file`` / ``is_symlink`` / ``stat`` /
+    ``lstat`` — one probe at a time, which does NOT make one guard-per-probe
+    ablatable: a caller may well take several inside a single ``try``, where one
+    ``except`` covers the lot. What it buys is coverage of each ENTRY PATH into
+    that one guard — each probe is reached only after the ones before it answered
+    a particular way, so a row per probe proves every reachable arm is inside the
+    guard rather than only the first.
+
+    Selective monkeypatching rather than chmod, and here that is not merely the
+    ``fault_read_text`` convention: chmod is a no-op for root, carries no read bit
+    on Windows, and since Python 3.14 ``Path.is_file()`` suppresses OS errors
+    internally, so a permission bit cannot raise out of that probe on Python 3.14.
+
+    The point of the fault is that on Python 3.11–3.13 these calls do NOT swallow
+    everything: they absorb only ``pathlib``'s ignored errnos
+    (``ENOENT``/``ENOTDIR``/``EBADF``/``ELOOP``) and raise the rest, so ``EACCES``
+    is a real answer a caller must handle.
+    Python 3.14 suppresses all OS errors in them, so this helper INJECTS on every
+    version the fault only the older ones raise on their own — which is the point:
+    the handler under grade must exist for the versions that can reach it.
+
+    ``stat`` and ``lstat`` are the exception to that whole paragraph, and ``stat``
+    is why DW-221 moved the repair/write ledger reader onto it: neither suppresses
+    ANYTHING on any interpreter — CPython's pathlib docs name ``stat`` as the probe
+    that reports the error rather than answering False, which is exactly what
+    ``is_file()`` stopped doing in 3.14 when its body became ``os.path.isfile``, and
+    ``lstat`` is the same call declining to follow the last component. So a fault
+    injected on either is not a simulation of an older runtime the way the other
+    three are; it is the fault a real EACCES parent directory produces on 3.11
+    through 3.14 alike. DW-239 moved ``verify.commit_paths``' presence probe onto
+    ``lstat`` for exactly that reason, which is what makes that probe ablatable
+    here at all — on ``exists``/``is_symlink`` a 3.14 run could not reach the
+    handler under grade.
+
+    On Python 3.11–3.13, ``exists()``, ``is_file()`` and ``is_dir()`` call
+    ``self.stat()``, so this injection can affect sibling probes too. Their
+    default Python 3.14 implementations instead delegate to ``os.path`` and
+    bypass a ``Path.stat`` monkeypatch. A test simulating 3.14 suppression on an
+    older interpreter must also pin ``Path.is_file`` to return ``False``; see
+    ``test_read_for_write_propagates_a_refused_metadata_probe``."""
+    real = getattr(Path, probe)
+
+    def fake(self, *a, **kw):
+        if self == target:
+            if error is None:
+                raise PermissionError(13, "Permission denied")
+            raise type(error)(*error.args)  # fresh per raise — see the docstring
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, probe, fake)
 
 
 def write_sprint(paths: ProjectPaths, statuses: dict[str, str]) -> None:
@@ -1710,6 +1877,15 @@ def crash_at_merge_back(engine, *, after: str = "merge") -> None:
 # ----------------------------------------------------------- sweep helpers
 
 
+# The two ledger byte strings the DW-204/DW-229/DW-230 readable-ledger rows screen on,
+# shared by test_cli and test_tui_app so the CLI and TUI surfaces are provably graded on
+# the SAME bytes: 0xff is not a legal UTF-8 start byte in any position (the decode fault
+# the refusal itself reports), and the readable counterpart must actually decode, since
+# an ABSENT ledger takes a different arm of the probe and cannot stand in for it.
+UNDECODABLE_LEDGER = b"### DW-1: broken\n\xff\xfe not utf-8\n"
+READABLE_LEDGER = b"### DW-1: fine\nstatus: open\n"
+
+
 def write_ledger(paths: ProjectPaths, statuses: dict[str, str], commit: bool = True) -> None:
     """Write a DW-format deferred-work ledger; statuses maps id -> status
     value. Committed by default — sweeps start from a clean tree."""
@@ -1929,6 +2105,7 @@ def escalated_run(
     worktree_path: str = "",
     with_session: bool = False,
     git_project: bool = False,
+    run_type: str = "story",
 ) -> EscalatedRun:
     """A saved RunState paused at a CRITICAL escalation, with one ESCALATED task —
     the shared shape behind test_runs / test_resolve / test_cli, whose three local
@@ -1938,7 +2115,10 @@ def escalated_run(
     fixture-specific assertion is weakened by the dedup.
 
     ``with_session`` appends the completed review SessionRecord the resolve-context
-    builder reads. ``git_project`` makes ``state.project`` a REAL repo (spec files
+    builder reads. ``run_type`` defaults to the story pipeline; ``"sweep"`` builds the
+    escalated SWEEP run that `runs.unreadable_sweep_ledger` is scoped to (an escalated
+    sweep is a real state — the ledger gate at resolve's entry is graded on it).
+    ``git_project`` makes ``state.project`` a REAL repo (spec files
     already written are committed, run state is gitignored) so `rearm_escalation`'s
     baseline snapshot refresh actually runs and `baseline_commit` defaults to HEAD.
     That refresh reads `state.code_root`, not `state.project`; the two name the same
@@ -1982,6 +2162,7 @@ def escalated_run(
         run_id=run_id,
         project=str(project),
         started_at=started_at,
+        run_type=run_type,
         paused_reason=paused_reason,
         paused_stage=PAUSE_ESCALATION,
         paused_story_key=story_key,
