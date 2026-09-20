@@ -480,6 +480,13 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Bound the GitHub release body `scripts/release.py publish` sends at GitHub's
+  125,000-character limit, cutting at an entry boundary and linking the full
+  `CHANGELOG.md` section. An oversize section was rejected with HTTP 422 only after
+  `gh release create` had pushed the tag, stranding a tag with no release that the
+  next publish then treated as already published. `prepare` warns when a section
+  will be truncated.
+
 - Bind legacy migration dispatch and publication to the ledger bytes actually accepted
   (DW-311, DW-316). Retire stale recovery authority when the ledger changes before
   the true post-hook adapter-launch boundary, then publish a validated one-path,

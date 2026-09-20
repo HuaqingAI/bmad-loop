@@ -141,6 +141,40 @@ def has_curated_section(text: str, version: str) -> bool:
     return bool(body)
 
 
+# GitHub rejects a release whose body exceeds this many characters with
+# `HTTP 422: body is too long (maximum is 125000 characters)`. `gh release create`
+# creates the tag before the API rejects the body, so an unbounded section leaves a
+# tag with no release behind — and a re-run then sees the tag and refuses to publish.
+GITHUB_NOTES_LIMIT = 125_000
+
+
+def bound_release_notes(notes: str, version: str, url: str, limit: int = GITHUB_NOTES_LIMIT) -> str:
+    """Return ``notes`` if they fit GitHub's release-body limit, else a prefix that
+    does, cut at an entry boundary and closed with a pointer at the full section.
+
+    The CHANGELOG stays the record; the release body is a view of it. Truncating
+    the view is preferable to curating the record down to the limit."""
+    if len(notes) <= limit:
+        return notes
+    footer = (
+        "\n\n---\n\n_Release notes truncated at GitHub's "
+        f"{limit:,}-character limit. The full section is in "
+        f"[CHANGELOG.md]({url}/blob/v{version}/CHANGELOG.md)._"
+    )
+    budget = limit - len(footer)
+    # Cut where the next entry begins so no entry is sliced mid-sentence; fall back
+    # to a hard cut only when the very first entry alone overflows the budget.
+    cut = notes.rfind("\n- ", 0, budget)
+    head = notes[:cut] if cut > 0 else notes[:budget]
+    head = head.rstrip()
+    # A `### Type` heading left with no entries under it points at nothing — drop it.
+    lines = head.splitlines()
+    while lines and lines[-1].startswith("#"):
+        lines.pop()
+    head = "\n".join(lines).rstrip()
+    return head + footer
+
+
 # The shape a promoted heading must take: `## [X.Y.Z] — YYYY-MM-DD`. `section_re`
 # accepts any suffix after `]`, so nothing else notices a dateless or garbled one.
 # Every release heading in CHANGELOG.md matches this — the sole exception is the
@@ -374,7 +408,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     changelog = CHANGELOG.read_text()
     problems: list[str] = []
     if branch == "main":
-        problems.append("on `main`; run prepare from a release/feature branch")
+        problems.append("on `main`; run prepare from a feature branch")
     if tag_exists(tag):
         problems.append(f"tag {tag} already exists")
     if not version_gt(version, canonical):
@@ -463,6 +497,21 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
     print(f"prepare {tag} on branch '{branch}' (was {canonical}, last tag {last_tag or 'none'})")
     print(f"assets: {reason}")
+    if branch.startswith("release/"):
+        # release.yml publishes on push to `release/*` (maintenance branches), so a PR
+        # branch by that name tags its own pre-merge commit the moment it is pushed.
+        print(
+            f"warning: '{branch}' matches release.yml's `release/*` trigger — pushing it "
+            f"publishes {tag} from this branch immediately, before any PR merges. That is "
+            "the maintenance-branch flow; a PR aimed at `main` belongs on `chore/release-X.Y.Z`"
+        )
+    section_len = len(extract_section(changelog, version) or "")
+    if section_len > GITHUB_NOTES_LIMIT:
+        print(
+            f"warning: the `## [{version}]` section is {section_len:,} chars; GitHub caps release "
+            f"notes at {GITHUB_NOTES_LIMIT:,}, so `publish` will truncate the release body and "
+            "link the full CHANGELOG section"
+        )
 
     if args.dry_run:
         print("\n[dry-run] planned actions:")
@@ -522,6 +571,14 @@ def cmd_publish(args: argparse.Namespace) -> int:
     notes = extract_section(CHANGELOG.read_text(), version)
     if not notes:
         _die(f"no CHANGELOG `## [{version}]` section — cannot publish release notes")
+
+    bounded = bound_release_notes(notes, version, repo_url())
+    if bounded is not notes:
+        print(
+            f"release notes: CHANGELOG section is {len(notes):,} chars, over GitHub's "
+            f"{GITHUB_NOTES_LIMIT:,} limit — publishing a truncated body that links the full section"
+        )
+    notes = bounded
 
     sha = _git_out("rev-parse", "HEAD")
     if args.dry_run:
