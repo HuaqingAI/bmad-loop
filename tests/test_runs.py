@@ -64,6 +64,16 @@ def _dead_pid() -> int:
     proc = subprocess.Popen([sys.executable, "-c", ""])
     proc.wait()
     _DEAD_CHILDREN.append(proc)
+    # `wait()` returns when the process object is signaled; on Windows the pid
+    # can still be enumerated for a moment after that, and a test probing it
+    # right away read the dead engine as running (test_discover_runs_classification,
+    # Windows py3.11). Hand back the pid only once the probe every consumer uses
+    # agrees it is dead — bounded, and loud rather than flaky if it never does.
+    deadline = time.monotonic() + 10.0
+    while platform_util.pid_alive(proc.pid):
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"exited child {proc.pid} still reads alive after 10s")
+        time.sleep(0.01)
     return proc.pid
 
 
