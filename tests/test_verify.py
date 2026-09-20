@@ -8855,8 +8855,17 @@ def test_prepared_ref_transaction_abort_failure_changes_no_ref(project, monkeypa
         children.append(child)
         return child
 
+    def broken_write(_line):
+        raise OSError("injected command stream fault")
+
     def break_abort(_remaining):
-        children[0].stdin.close()
+        # Break the command stream WITHOUT closing it: closing the pipe hands
+        # git EOF, and git aborts and exits on its own — if it does so before
+        # the except arm polls it, there is no live transaction left to abort
+        # and the injected fault is what propagates (seen on a loaded CI leg).
+        # Overriding the wrapper's write keeps git waiting in `prepare` so the
+        # abort is attempted and fails, deterministically.
+        children[0].stdin.write = broken_write
         raise verify.GitError("injected prepared validation fault")
 
     monkeypatch.setattr(verify.subprocess, "Popen", record_child)
