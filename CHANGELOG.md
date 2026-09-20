@@ -589,7 +589,11 @@ breaking changes may land in a minor release.
   probes read clean over an assume-unchanged or skip-worktree entry
   whatever the worktree holds, so a flag an operator set after the host
   died, and any edit under it, read as the planned result and the resume
-  put the captured entry back over them),
+  put the captured entry back over them; every flag-word reading masks to
+  the bits the index file holds — on a `core.fsmonitor` target git's
+  in-process fsmonitor-valid bit read as identity, refusing the rollback
+  that recreated an entry without it and reading every fresh entry as a
+  hook's),
   a populated checkout this repository's, clean (ignored entries included, the
   path having been proved absent), at the gitlink — since an
   incoming `.gitmodules` with `ignore = all` hides a hook's `submodule update

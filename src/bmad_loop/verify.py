@@ -426,6 +426,16 @@ _INDEX_DEBUG_RECORD = re.compile(
     rb"  uid: [0-9]+\tgid: [0-9]+\n"
     rb"  size: [0-9]+\tflags: ([0-9a-fA-F]+)\n"
 )
+# The bits of a `ls-files --debug` flag word the index FILE holds: name length
+# (`0fff`), stage (`3000`), CE_EXTENDED (`4000`), assume-unchanged (CE_VALID,
+# `8000`), intent-to-add (`20000000`) and skip-worktree (`40000000`). Bits
+# 16–28 are git's in-process bookkeeping, printed raw by `show_ce`; on a
+# `core.fsmonitor` target CE_FSMONITOR_VALID (`200000`) reads on every entry
+# the monitor calls unchanged and is gone from an entry `update-index` wrote
+# or the monitor since reported, so a word taken as identity paused every
+# integration on such a target (Codex, #796 review). Every reading masks to
+# what the file holds — the captured word, the fresh words, the digest.
+_INDEX_FILE_FLAG_MASK = 0x6000FFFF
 
 
 def _index_debug_records(debug: bytes) -> list[tuple[bytes, str]]:
@@ -437,7 +447,8 @@ def _index_debug_records(debug: bytes) -> list[tuple[bytes, str]]:
     whole output for ``flags:``, which read a filename holding a newline
     followed by that text as one flag word more than the index has entries
     and paused every integration on this target as malformed (#796 review).
-    The flag word is lowercased.
+    The flag word is lowercased and masked to the bits the index file holds
+    (`_INDEX_FILE_FLAG_MASK`).
     """
     records: list[tuple[bytes, str]] = []
     position = 0
@@ -448,7 +459,8 @@ def _index_debug_records(debug: bytes) -> list[tuple[bytes, str]]:
         match = _INDEX_DEBUG_RECORD.match(debug, nul + 1)
         if match is None:
             raise IntegrationEvidenceError("target index flag evidence is malformed")
-        records.append((debug[position:nul], match.group(1).decode("ascii").lower()))
+        word = int(match.group(1), 16) & _INDEX_FILE_FLAG_MASK
+        records.append((debug[position:nul], f"{word:x}"))
         position = match.end()
     return records
 

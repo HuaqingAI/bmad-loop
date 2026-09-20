@@ -4236,6 +4236,64 @@ def test_index_flag_readings_walk_debug_records_past_a_newline_in_a_path(project
         verify._index_debug_records(b"x\0  ctime: 1:2\n  flags: 0\n")
 
 
+def test_index_flag_readings_mask_the_fsmonitor_valid_bit(project, tmp_path):
+    """On a `core.fsmonitor` target `ls-files --debug` prints CE_FSMONITOR_VALID
+    (`200000`) on every entry the monitor calls unchanged — git's in-process
+    bookkeeping, not index content: `update-index --index-info` recreates an
+    entry without it and the monitor clears it on any report. Read as
+    identity, the word failed the receipt's exact comparison after a rollback
+    recreated the entry, and flagged every fresh entry as a hook's (Codex,
+    #796 review). Every reading now masks to the bits the index file holds.
+
+    Ablation: drop the `_INDEX_FILE_FLAG_MASK` and the reading below is
+    `200000`, the digest moves, and the recreated entry no longer matches."""
+    repo = project.project
+    hook = tmp_path / "fsmonitor.sh"
+    # query-fsmonitor v2: a token line, then NUL-separated changed paths (none)
+    hook.write_text("#!/bin/sh\nprintf 'token:1\\n'\n")
+    hook.chmod(0o755)
+    git(repo, "config", "core.fsmonitor", hook.as_posix())
+    # twice: the first refresh only re-stats the copied sandbox index (git
+    # marks an entry valid on a refresh that found its stat data unchanged)
+    git(repo, "status", "--porcelain")
+    git(repo, "status", "--porcelain")
+    raw = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--debug", "--", "src.txt"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    if "flags: 200000" not in raw:
+        pytest.skip("git did not drive the fsmonitor hook on this host")
+    (repo / "notes.txt").write_text("an operator's\n")
+    git(repo, "add", "--", "notes.txt")
+    git(repo, "commit", "-q", "-m", "notes")
+    git(repo, "update-index", "--assume-unchanged", "--", "notes.txt")
+
+    assert verify._index_state(repo, "src.txt")["entries"][0]["flags"] == "0"
+    assert verify._index_state(repo, "notes.txt")["entries"][0]["flags"] == "8000"
+    words = dict(verify._index_file_flag_words(repo))
+    assert words["src.txt"] == "0"
+    assert words["notes.txt"] == "8000"
+    evidence = verify.capture_index_flags(repo, exclude=["src.txt"])
+    assert evidence["marked"] == {"notes.txt": "8000"}
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    snapshots, _submodules = verify.capture_integration_state(repo, run_dir, "f" * 32, ("src.txt",))
+    # the entry recreated the way a rollback recreates it: no monitor bit
+    verify._restore_receipt_index(repo, snapshots)
+    assert git(repo, "ls-files", "--debug", "--", "src.txt").endswith("flags: 0")
+    assert verify._receipt_snapshots_complete(repo, run_dir, snapshots)
+    assert verify.integration_nonref_state_unchanged(
+        repo, run_dir, snapshots, [], operation_identity="f" * 32
+    )
+    assert verify.integrated_index_flags_outside_drift(repo, evidence, exclude=["src.txt"]) == ()
+    assert verify._index_debug_records(
+        b"x\0  ctime: 1:2\n  mtime: 3:4\n  dev: 5\tino: 6\n  uid: 7\tgid: 8\n"
+        b"  size: 9\tflags: 4020C000\n"
+    ) == [(b"x", "4000c000")]
+
+
 def test_integrated_index_flags_outside_drift_accepts_a_sparse_target(project, tmp_path):
     """On a sparse target every out-of-cone entry carries skip-worktree, git's
     own word: the digest proves them unchanged, the map holds none of them,
