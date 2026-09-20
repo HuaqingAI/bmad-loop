@@ -679,8 +679,11 @@ breaking changes may land in a minor release.
   down, branch gone) the completion stands only on the target as it is
   now — the unit's commit in its history, or, since a squash seals a
   commit of its own and never that one, every change the unit made over
-  its baseline folded into the target's tree blob for blob (mode and
-  object id per added or rewritten path, each deleted path absent) — and
+  its baseline folded into the target's tree (mode and object id per added
+  or rewritten path, or — where the target had moved the same file before
+  the squash resolved it, so the sealed blob holds both sides' edits — the
+  three-way merge of the unit's change over its baseline that stages
+  nothing over the held blob; each deleted path absent) — and
   every accepted artifact blob in its tree and index — or pauses naming
   the reason (the released legacy payload integrates without a receipt
   and keeps its bare row).

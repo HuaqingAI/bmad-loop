@@ -1883,8 +1883,11 @@ class Engine:
         the unit's integration — ``task.commit_sha`` in its history, or, since
         a squash seals a commit of its own and never that one (#796 review),
         every change the unit made over ``task.baseline_commit`` folded into
-        its tree blob for blob — and `validate_integrated` accepts its tree
-        and the index at that head. Neither reading branches on the strategy:
+        its tree — blob for blob, or, where the target had moved the same
+        file before the squash resolved it, as the three-way merge of the
+        unit's change that stages nothing over what is held (#796 review) —
+        and `validate_integrated` accepts its tree and the index at that
+        head. Neither reading branches on the strategy:
         both are the target as it is now. Anything else pauses the run naming
         the reason — there is no source left to replay and no receipt left to
         restore.

@@ -3688,19 +3688,86 @@ def revision_tree_oid(repo: Path, revision: str) -> str:
     return tree
 
 
+_FILE_BLOB_MODES = frozenset({b"100644", b"100755"})
+
+
+def _blob_bytes(repo: Path, oid: str) -> bytes:
+    """One blob byte-exactly, for a reading that already knows its object id."""
+    proc = git_bytes(repo, "cat-file", "blob", oid)
+    if proc.returncode != 0:
+        raise IntegrationEvidenceError(f"blob {oid[:12]} could not be read in {repo}")
+    return proc.stdout
+
+
+def _blob_is_binary(data: bytes) -> bool:
+    """Git's own heuristic (``buffer_is_binary``): a NUL in the first 8000 bytes."""
+    return b"\0" in data[:8000]
+
+
+def _three_way_folds(repo: Path, base: str | None, held: str, incoming: str) -> bool:
+    """Whether blob ``held`` already holds ``incoming``'s change over ``base``:
+    the three-way merge of ``incoming`` into ``held`` over ``base`` is clean
+    and yields ``held`` byte for byte, so replaying the change would stage
+    nothing.
+
+    ``git merge-file``, the same xdiff three-way a ``merge --squash`` resolved
+    the file with; ``base`` is ``None`` for a path the change added. A binary
+    blob on any side is never folded this way — git merges no binary content,
+    so a divergent binary is the target's own later change — and is read as
+    unfolded before the probe rather than as a probe fault. Conflicts read
+    as unfolded; a probe that could not run raises.
+    """
+    held_bytes = _blob_bytes(repo, held)
+    base_bytes = b"" if base is None else _blob_bytes(repo, base)
+    incoming_bytes = _blob_bytes(repo, incoming)
+    if any(_blob_is_binary(data) for data in (held_bytes, base_bytes, incoming_bytes)):
+        return False
+    with tempfile.TemporaryDirectory() as tmp:
+        shadow = Path(tmp)
+        (shadow / "held").write_bytes(held_bytes)
+        (shadow / "base").write_bytes(base_bytes)
+        (shadow / "incoming").write_bytes(incoming_bytes)
+        proc = git_bytes(
+            repo,
+            "merge-file",
+            "-p",
+            "--",
+            str(shadow / "held"),
+            str(shadow / "base"),
+            str(shadow / "incoming"),
+        )
+    if proc.returncode == 0:
+        return proc.stdout == held_bytes
+    # the exit status is the conflict count, truncated to 127; a fault is negative
+    if 0 < proc.returncode < 128:
+        return False
+    raise IntegrationEvidenceError(
+        f"the three-way reading of blob {held[:12]} against {incoming[:12]} could not be "
+        f"taken in {repo}"
+    )
+
+
 def unfolded_changes(repo: Path, baseline: str, source: str, revision: str) -> tuple[str, ...]:
-    """Paths ``baseline..source`` changed that ``revision``'s tree does not hold as
-    ``source`` has them.
+    """Paths ``baseline..source`` changed that ``revision``'s tree does not hold
+    folded.
 
     The reading a consumed integration stands on when ancestry cannot answer:
     a squash seals a commit of its own, so the unit's commit is never in the
     target's history, but every change it made over its baseline is in the
-    target's tree — each added or modified path held with ``source``'s mode
-    and object id, each deleted path absent (#796 review). One whole-tree
+    target's tree — each added or modified path held with ``source``'s mode,
+    and with ``source``'s object id or, where the target had itself moved
+    the file before the squash resolved it, with the blob a three-way merge
+    of the unit's change over the baseline into the held one leaves as it is
+    (the squash result holds both sides' edits, so blob equality alone read
+    every such file as unfolded and paused a landed, validated integration
+    for ever — #796 review); each deleted path absent. One whole-tree
     ``diff-tree`` between the unit's own commits and one whole-tree inventory
-    of ``revision``, the shape that keeps a wide change set off argv; renames
-    read as their two sides so a moved path's source is checked absent. Empty
-    when the tree folds the whole change set; an unreadable probe raises.
+    of ``revision``, the shape that keeps a wide change set off argv, and one
+    per-file three-way probe only where the object ids differ; renames read
+    as their two sides so a moved path's source is checked absent. A symlink
+    or gitlink folds only at ``source``'s exact object id: git three-way
+    merges neither. Empty when the tree folds the whole change set; an
+    unreadable probe raises.
     """
     proc = git_bytes(repo, "diff-tree", "-r", "-z", "--no-renames", baseline, source)
     if proc.returncode != 0:
@@ -3713,7 +3780,7 @@ def unfolded_changes(repo: Path, baseline: str, source: str, revision: str) -> t
     # ``:<old mode> <new mode> <old oid> <new oid> <status>`` then the path, NUL-separated.
     for metadata, raw_path in zip(fields[0::2], fields[1::2], strict=False):
         try:
-            _old_mode, new_mode, _old_oid, new_oid, status = metadata.lstrip(b":").split(b" ", 4)
+            old_mode, new_mode, old_oid, new_oid, status = metadata.lstrip(b":").split(b" ", 4)
         except ValueError as exc:
             raise IntegrationEvidenceError("the unit's change set is malformed") from exc
         path = os.fsdecode(raw_path)
@@ -3722,7 +3789,19 @@ def unfolded_changes(repo: Path, baseline: str, source: str, revision: str) -> t
             if row is not None:
                 unfolded.append(path)
             continue
-        if row is None or row[0] != new_mode or row[2] != os.fsdecode(new_oid):
+        incoming = os.fsdecode(new_oid)
+        if row is None or row[0] != new_mode:
+            unfolded.append(path)
+            continue
+        if row[2] == incoming:
+            continue
+        if new_mode not in _FILE_BLOB_MODES:
+            unfolded.append(path)
+            continue
+        # the unit's own base for the file: absent (an add, or a path that was
+        # something other than a file) reads as empty
+        base = os.fsdecode(old_oid) if old_mode in _FILE_BLOB_MODES else None
+        if not _three_way_folds(repo, base, row[2], incoming):
             unfolded.append(path)
     return tuple(sorted(unfolded))
 

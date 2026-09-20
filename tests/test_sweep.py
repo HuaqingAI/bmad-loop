@@ -30662,7 +30662,9 @@ def test_a_consumed_sources_recorded_completion_stands_on_the_target_alone(
     now stands on the target as it is now — the unit's commit in the target's
     history, or, since a squash seals no such commit (Codex, #796 review),
     every change the unit made over its baseline folded into the target's
-    tree blob for blob — and every accepted artifact blob in its tree and
+    tree (blob for blob, or as a three-way result the target had moved
+    under; `test_unfolded_changes_reads_a_squash_the_target_had_moved_under_three_way`
+    grades that reading) — and every accepted artifact blob in its tree and
     index — and the carry proceeds (`holds`); a target that does not hold it
     pauses the run naming the reason, the source consumed
     (`artifact-rewritten`: another writer changed the accepted artifact after

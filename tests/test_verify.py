@@ -9745,8 +9745,9 @@ def test_unfolded_changes_reads_a_squashed_unit_against_the_targets_tree(project
     """The reading a consumed squash integration stands on (#796 review): every
     change the unit made over its baseline — an add, a rewrite, a delete, a
     mode flip and a rename's two sides — is folded into the target's tree
-    blob for blob after a squash, whose commit is never the unit's descendant;
-    a target that drifted on any of them names exactly those paths.
+    blob for blob after a squash over an unmoved target, whose commit is never
+    the unit's descendant; a target that drifted on any of them names exactly
+    those paths. The target that moved before the squash is the next row's.
 
     Ablation: compare object ids alone and the mode-flip row reads folded;
     skip the deleted arm and a resurrected path reads folded."""
@@ -9794,3 +9795,65 @@ def test_unfolded_changes_reads_a_squashed_unit_against_the_targets_tree(project
     assert verify.unfolded_changes(repo, baseline, source, drifted) == ("flip.sh", "gone.txt")
     with pytest.raises(verify.IntegrationEvidenceError, match="change set"):
         verify.unfolded_changes(repo, baseline, "0" * 40, drifted)
+
+
+def test_unfolded_changes_reads_a_squash_the_target_had_moved_under_three_way(project):
+    """A squash over a target that had itself edited a file the unit also
+    edited, on other lines, seals the three-way result: a blob holding both
+    sides' edits, never the unit's own (Codex, #796 review). Blob equality
+    read every such file as unfolded, and the consumed-source resume paused a
+    landed, validated integration for ever. The reading is now git's own
+    three-way merge of the unit's change over its baseline into the held
+    blob: clean and byte-identical to what is held means folded, on a file
+    with and without a final newline alike. Read as unfolded: a held blob the
+    target rewrote on the unit's own lines (the replay would conflict), a
+    binary the target rewrote (git three-way merges no binary, so a divergent
+    one is a later change of the target's), and an added file the target
+    edited afterwards (add/add over an empty base).
+
+    Ablation: read `row[2] != new_oid` as unfolded without the three-way
+    probe and the landed row names `shared.txt` and `tail.txt`; skip the
+    binary guard and `blob.bin` raises out of `merge-file` instead of
+    reading unfolded."""
+    repo = project.repo_root
+    (repo / "shared.txt").write_text("a\nb\nc\nd\ne\nf\ng\nh\n")
+    (repo / "tail.txt").write_text("one\ntwo\nthree")
+    (repo / "blob.bin").write_bytes(b"\x00base\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "baseline")
+    baseline = git(repo, "rev-parse", "HEAD")
+    target = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    git(repo, "checkout", "-q", "-b", "unit")
+    (repo / "shared.txt").write_text("a\nb\nc\nd\ne\nf\ng\nH\n")
+    (repo / "tail.txt").write_text("one\ntwo\nTHREE")
+    (repo / "blob.bin").write_bytes(b"\x00unit\n")
+    (repo / "added.txt").write_text("added\nby the unit\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "unit")
+    source = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-q", target)
+    # the target moves on the same files, on lines the unit left alone
+    (repo / "shared.txt").write_text("A\nb\nc\nd\ne\nf\ng\nh\n")
+    (repo / "tail.txt").write_text("ONE\ntwo\nthree")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "target moved")
+    git(repo, "merge", "-q", "--squash", "unit")
+    git(repo, "commit", "-q", "-m", "squash")
+    squashed = git(repo, "rev-parse", "HEAD")
+
+    assert (repo / "shared.txt").read_text() == "A\nb\nc\nd\ne\nf\ng\nH\n"
+    assert (repo / "tail.txt").read_text() == "ONE\ntwo\nTHREE"
+    assert not verify.is_ancestor(repo, source, squashed)
+    assert verify.unfolded_changes(repo, baseline, source, squashed) == ()
+
+    (repo / "shared.txt").write_text("A\nb\nc\nd\ne\nf\ng\nX\n")
+    (repo / "blob.bin").write_bytes(b"\x00rewritten\n")
+    (repo / "added.txt").write_text("added\nby the unit\nand grown by the target\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "drift")
+    drifted = git(repo, "rev-parse", "HEAD")
+    assert verify.unfolded_changes(repo, baseline, source, drifted) == (
+        "added.txt",
+        "blob.bin",
+        "shared.txt",
+    )
