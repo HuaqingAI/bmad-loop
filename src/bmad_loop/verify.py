@@ -3537,7 +3537,14 @@ def integration_cleanup_state_recoverable(
     """Prove each cleanup operand is either pre-clean or the planned result.
 
     Anything else may be fresh operator state and must never be overwritten by a
-    crash replay merely because a ``cleanup-pending`` receipt exists.
+    crash replay merely because a ``cleanup-pending`` receipt exists. The
+    planned result of a tracked operand is its worktree at the index — the
+    cleanup is ``checkout -- path``, which never writes the index entry — so
+    the index it carries is the captured one, flag word included; the content
+    probes alone cannot say so, since ``diff`` trusts an assume-unchanged or
+    skip-worktree entry and reads clean over whatever the worktree holds, and
+    a flag an operator set after the host died is exactly what the restore
+    would flatten (#796 review).
     """
     validated, _submodules = validate_integration_state_schema(
         run_dir, snapshots, [], operation_identity
@@ -3560,6 +3567,8 @@ def integration_cleanup_state_recoverable(
             ):
                 return False
             continue
+        if _index_state(repo, rel) != _validated_index_state(entry["index"]):
+            return False
         worktree = git_bytes(repo, "diff", "--quiet", revision, "--", rel)
         index = git_bytes(repo, "diff", "--cached", "--quiet", revision, "--", rel)
         if worktree.returncode != 0 or index.returncode != 0:

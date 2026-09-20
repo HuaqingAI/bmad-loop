@@ -583,7 +583,13 @@ breaking changes may land in a minor release.
   preserved — every modern integration into a target holding one paused,
   even of a bundle that never touched the submodule — a hook's flip of the
   captured word is drift, and the restore puts the word back where
-  `git restore` cleared it),
+  `git restore` cleared it; a crash replay of a `cleanup-pending` receipt
+  takes a cleaned tracked collision for the planned result only with the
+  captured index entry still there, flag word included — the two content
+  probes read clean over an assume-unchanged or skip-worktree entry
+  whatever the worktree holds, so a flag an operator set after the host
+  died, and any edit under it, read as the planned result and the resume
+  put the captured entry back over them),
   a populated checkout this repository's, clean (ignored entries included, the
   path having been proved absent), at the gitlink — since an
   incoming `.gitmodules` with `ignore = all` hides a hook's `submodule update

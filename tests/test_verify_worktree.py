@@ -856,6 +856,61 @@ def test_collision_cleanup_rechecks_identity_at_each_mutation(project):
     assert collision.read_bytes() == b"new operator bytes"
 
 
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_cleanup_replay_refuses_a_flag_an_operator_set_after_the_cleanup(project, tmp_path, flag):
+    """The crash-replay arm restores a `cleanup-pending` receipt's collisions
+    only when each operand is pre-clean or the planned result, so fresh
+    operator state is never flattened. For a tracked operand the planned
+    result was read by two content probes against the target revision —
+    and `git diff` trusts an assume-unchanged or skip-worktree entry, reading
+    clean over whatever the worktree holds. So an operator who set either
+    flag on the cleaned path after the host died, an edit under it or not,
+    read as the planned result, and the resume put the captured index entry
+    back over the flag (Codex, #796 review). The cleanup is `checkout --
+    path`, which never writes the index entry, so the planned result carries
+    the captured index verbatim, flag word included — and the probe now asks
+    for it.
+
+    Ablation: drop the `_index_state` comparison and both rows read
+    recoverable — with the edited worktree too, which is the blindness."""
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    _branch_with(repo, tmp_path, modifies={"src.txt": "branch\n"})
+    (repo / "src.txt").write_text("editor edited\n")  # tracked-modified collision
+    pre = verify.rev_parse_head(repo)
+    plan = verify.plan_incoming_collisions(repo, "main", "feat")
+    assert plan.cleaned == ("src.txt",) and plan.untracked == ()
+    snapshots, _submodules = verify.capture_integration_state(repo, run_dir, "c" * 32, plan.cleaned)
+
+    def recoverable():
+        return verify.integration_cleanup_state_recoverable(
+            repo,
+            run_dir,
+            snapshots,
+            cleaned=plan.cleaned,
+            untracked=plan.untracked,
+            revision=pre,
+            operation_identity="c" * 32,
+        )
+
+    assert recoverable()  # pre-clean
+    verify.apply_incoming_collision_plan(repo, plan)
+    assert (repo / "src.txt").read_text() == "original\n"
+    assert recoverable()  # the planned result
+
+    git(repo, "update-index", flag, "--", "src.txt")
+    assert not recoverable()
+    (repo / "src.txt").write_text("operator's edit under the flag\n")
+    assert verify.git_bytes(repo, "diff", "--quiet", pre, "--", "src.txt").returncode == 0
+    assert not recoverable()
+
+    git(repo, "update-index", f"--no-{flag.removeprefix('--')}", "--", "src.txt")
+    assert not recoverable()  # the edit alone is fresh operator state too
+    (repo / "src.txt").write_text("original\n")
+    assert recoverable()
+
+
 @pytest.mark.parametrize(
     "path",
     [
