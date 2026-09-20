@@ -10054,6 +10054,43 @@ def _preflight_bound_tree_blob(
         raise GitError("committed publication target holds rival content")
 
 
+def _bound_baseline_blob(
+    repo: Path, baseline_commit: str | None, rel: str, baseline_text: str
+) -> str | None:
+    """The baseline's committed blob id, or `None` when no commit tracks it.
+
+    `baseline_text` is a universal-newline reading of the ledger beside
+    `baseline_commit`, so re-encoding it names the LF blob and never the CRLF
+    one Git preserves under `core.autocrlf=false` or a `-text` attribute — the
+    shape every Windows-written ledger takes, since `atomic_write_text` renders
+    CRLF there. Hashing that re-encoding misread an unchanged committed
+    baseline as rival content and left the migration in COMMITTING for good.
+    The committed blob is the authority instead, held to the text under the
+    same reading (`deferredwork.read_for_write`) so a baseline record that no
+    longer describes its commit refuses rather than lending that commit's blob
+    its name.
+    """
+    if baseline_commit is None:
+        return None
+    entry = _bound_tree_entry(repo, baseline_commit, rel)
+    if entry is None:
+        return None
+    if entry.kind != "blob" or entry.mode not in {"100644", "100755"}:
+        raise GitError("accepted baseline is not a regular file at its commit")
+    proc = git_bytes(repo, "cat-file", "blob", entry.oid)
+    if proc.returncode != 0:
+        raise GitError(f"accepted baseline blob could not be read in {repo}")
+    try:
+        committed = io.IncrementalNewlineDecoder(None, translate=True).decode(
+            proc.stdout.decode("utf-8"), final=True
+        )
+    except UnicodeDecodeError as exc:
+        raise GitError("accepted baseline blob is not valid UTF-8") from exc
+    if committed != baseline_text:
+        raise GitError("accepted baseline does not match the committed baseline")
+    return entry.oid
+
+
 def _preflight_bound_absence(
     repo: Path,
     head: str,
@@ -10338,11 +10375,14 @@ def commit_path_bound(
     real-index reconciliation is replayable housekeeping: no later fault rolls the
     truthful commit back.
 
-    `baseline_commit` is the HEAD beside which `baseline_text` was read. It is
-    consulted only when the captured HEAD does not carry the target at all: a
-    target that commit tracked has since been deleted by a rival commit, and the
-    publication refuses rather than re-adding it. Without it an absent target
-    has no authority and is refused the same way.
+    `baseline_commit` is the HEAD beside which `baseline_text` was read. The
+    blob that commit holds at the target is the baseline's identity — the text
+    is a universal-newline reading, so its own encoding cannot name a CRLF blob
+    Git preserved — and a text that no longer decodes to that blob is refused.
+    The commit is also what tells an absent captured target apart: one it
+    tracked has since been deleted by a rival commit, and the publication
+    refuses rather than re-adding it. Without it an absent target has no
+    authority and is refused the same way.
     """
     try:
         rc, top, _detail = _git_out(repo, "rev-parse", "--show-toplevel")
@@ -10359,10 +10399,16 @@ def commit_path_bound(
     lexical = live_path if live_path is not None else path
     observed = _bound_live_ledger_identity(lexical, target, accepted_text)
     accepted_bytes = observed.data
-    baseline_bytes = baseline_text.encode("utf-8")
+    # The baseline's identity is the blob its commit holds; only a baseline no
+    # commit tracks is named by its own text, and that name is then consulted
+    # solely as an index allowance beneath an absent committed target.
+    baseline_oid = _bound_baseline_blob(repo_root, baseline_commit, rel, baseline_text)
     try:
         accepted_oid = git_normalized_blob_oid_for_bytes(repo_root, rel, accepted_bytes)
-        baseline_oid = git_normalized_blob_oid_for_bytes(repo_root, rel, baseline_bytes)
+        if baseline_oid is None:
+            baseline_oid = git_normalized_blob_oid_for_bytes(
+                repo_root, rel, baseline_text.encode("utf-8")
+            )
     except GitError as exc:
         raise GitError("publication target content could not be normalized by Git") from exc
     captured = _bound_checkout_identity(repo_root)

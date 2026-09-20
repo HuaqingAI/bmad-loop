@@ -485,7 +485,12 @@ breaking changes may land in a minor release.
   and a CRLF checkout is not left dirty beside an LF commit; every later validation
   re-reads those bytes and holds the target's size, mtime and ctime with its inode, so a
   rewrite in place — rival bytes, or the same text under other line endings — is refused
-  before the transaction commits rather than noticed after it.
+  before the transaction commits rather than noticed after it. The baseline's identity
+  is the blob its commit holds, bound to the baseline text under the ledger readers'
+  universal-newline decoding, rather than the LF blob re-encoding that text names: a
+  tracked legacy ledger Git preserves with CRLF bytes (`core.autocrlf=false`, the
+  shape every Windows-written ledger takes) was refused as rival content and left the
+  migration in COMMITTING for good.
 
 - Refuse no-descriptor attempt-owned spec restoration before staging or lifecycle
   normalization, preserving the existing target bytes for manual recovery (DW-310).

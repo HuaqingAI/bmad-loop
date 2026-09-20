@@ -8599,6 +8599,65 @@ def test_commit_path_bound_publishes_the_live_bytes_under_any_line_ending(projec
     assert path.read_bytes() == live
 
 
+def test_commit_path_bound_publishes_over_a_crlf_committed_baseline(project):
+    """A tracked legacy ledger Git preserves with CRLF bytes (`core.autocrlf=false`,
+    the shape every Windows-written ledger takes) reads back as LF text, so
+    hashing that text's own encoding names a blob HEAD never held. Ablation:
+    derive `baseline_oid` from `baseline_text.encode()` and the unchanged
+    committed baseline refuses as rival content, leaving the migration in
+    COMMITTING for good."""
+    repo = project.project
+    path = repo / "src.txt"
+    git(repo, "config", "core.autocrlf", "false")
+    committed = b"legacy ledger\r\nsecond line\r\n"
+    path.write_bytes(committed)
+    git(repo, "add", "--", path.name)
+    git(repo, "commit", "-q", "-m", "crlf legacy ledger")
+    baseline_commit = verify.rev_parse_head(repo)
+    baseline = path.read_text(encoding="utf-8")
+    assert baseline == "legacy ledger\nsecond line\n"
+    accepted = "accepted migration ledger\n"
+    live = accepted.replace("\n", "\r\n").encode("utf-8")
+    path.write_bytes(live)
+
+    sha = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text=baseline,
+        baseline_commit=baseline_commit,
+    )
+
+    assert sha == verify.rev_parse_head(repo)
+    assert git(repo, "rev-parse", f"{sha}^") == baseline_commit
+    assert verify.git_bytes(repo, "show", f"{sha}:src.txt").stdout == live
+    assert git(repo, "status", "--porcelain", "--", "src.txt") == ""
+
+
+def test_commit_path_bound_refuses_a_baseline_text_outside_its_commit(project):
+    """The committed blob lends the baseline its identity only while the text
+    still decodes to it: a baseline record that describes some other content
+    than the commit it claims to have been read beside is refused, not given
+    that commit's blob as its name. Ablation: drop the decoded comparison in
+    `_bound_baseline_blob` and this publishes on the committed blob's word."""
+    repo, path, _baseline, accepted = _bound_publish_inputs(project)
+    original_head = verify.rev_parse_head(repo)
+
+    with pytest.raises(verify.GitError, match="does not match the committed baseline"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text="different claimed baseline\n",
+            baseline_commit=original_head,
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert path.read_text(encoding="utf-8") == accepted
+
+
 def test_commit_path_bound_refuses_the_same_text_under_other_line_endings(project, monkeypatch):
     # A rival rendering of the accepted text — CRLF where the observation read
     # LF — decodes identically under the universal-newline reading, so only a
