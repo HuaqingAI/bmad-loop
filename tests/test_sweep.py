@@ -32006,6 +32006,47 @@ def test_migration_rival_during_bound_publication_replays_commit_only(project, m
     assert project.deferred_work.read_text(encoding="utf-8") == accepted
 
 
+def test_migration_post_commit_hook_rewrite_of_live_ledger_never_earns_done(project):
+    """A `post-commit` hook runs after the commit exists and cannot change it, so
+    a hook that rewrites the AUTHORITATIVE ledger by absolute path lands bytes
+    Git never validated. The bound publisher re-reads the live text against the
+    accepted rewrite before the prepared transaction (and again after), so the
+    hook's rewrite refuses publication outright; the resume then names the live
+    divergence instead of stamping DONE over it. Ablation: route the migration
+    commit through `verify.commit_paths` (the pre-bound shape) and the first run
+    reaches DONE with the hook bytes live."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    accepted = migrated_ledger()
+    engine, first_adapter = make_sweep(project, [migrate_effect(project, accepted, mapping)])
+    original_head = verify.rev_parse_head(project.project)
+    ledger = project.deferred_work
+    hook = project.project / ".git" / "hooks" / "post-commit"
+    hook.write_text(
+        f"#!/bin/sh\nprintf '\\n<!-- post-commit hook -->\\n' >> '{ledger.as_posix()}'\n"
+    )
+    hook.chmod(0o755)
+    first = engine.run()
+
+    assert first.crashed and len(first_adapter.sessions) == 1
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.COMMITTING
+    assert verify.rev_parse_head(project.project) == original_head
+    live = ledger.read_text(encoding="utf-8")
+    assert live != accepted and "post-commit hook" in live
+    assert len(_records(engine, "sweep-ledger-commit-unavailable")) == 1
+
+    hook.unlink()
+    resumed, resumed_adapter = resume_sweep(project, engine, [])
+    second = resumed.run()
+
+    assert second.paused and not second.crashed and resumed_adapter.sessions == []
+    assert resumed.state.tasks["sweep-migrate"].phase == Phase.ESCALATED
+    assert verify.rev_parse_head(project.project) == original_head
+    assert ledger.read_text(encoding="utf-8") == live
+    invalid = _records(resumed, "sweep-migration-recovery-invalid")
+    assert [row["detail"] for row in invalid] == ["live ledger differs from accepted rewrite"]
+
+
 def test_migration_prepared_publication_fault_is_sanitized_and_replayable(project, monkeypatch):
     write_legacy_ledger(project, LEGACY_LEDGER)
     mapping = _valid_migration_mapping()
