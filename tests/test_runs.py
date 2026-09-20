@@ -48,11 +48,22 @@ def _make_state_run(project, run_id, **state_kwargs):
     return run_dir
 
 
+# Every `_dead_pid()` child, kept for the interpreter's lifetime: Windows recycles a
+# pid the moment the last handle to the exited process closes, and `Popen` holds
+# that handle only as long as the object lives. Dropping it let another xdist
+# worker's child take the "dead" pid and `psutil.pid_exists` call the engine alive
+# (test_prunable_sessions_claims_an_untagged_session_on_a_run_id_collision, Windows
+# py3.14). A held handle pins the pid to the exited process, which psutil reports as
+# not running. On POSIX the reaped child is gone either way; the list is harmless.
+_DEAD_CHILDREN: list[subprocess.Popen[bytes]] = []
+
+
 def _dead_pid() -> int:
     # A process that exits immediately, cross-platform (POSIX `true` isn't on
     # Windows). The interpreter is always present and on every host.
     proc = subprocess.Popen([sys.executable, "-c", ""])
     proc.wait()
+    _DEAD_CHILDREN.append(proc)
     return proc.pid
 
 
