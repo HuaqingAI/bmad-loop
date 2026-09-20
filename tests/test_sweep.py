@@ -27404,6 +27404,101 @@ def test_target_hook_changing_a_path_outside_the_incoming_set_is_refused(
     assert durable.commit_sha not in (None, durable.baseline_commit)
 
 
+@pytest.mark.parametrize("advance", ["restored-epoch", "operator-commit-since"])
+@pytest.mark.parametrize("shape", ["untracked", "ignored", "flag"])
+def test_a_resume_over_the_refused_hook_residue_is_refused_until_it_is_cleared(
+    project, shape, advance
+):
+    """The refusal above restores the receipt's own paths and leaves the
+    hook's write outside them in place, named for the operator. A resume
+    after the hook was disabled — but before its output was cleared — read
+    the restore complete (it is, for the receipt's paths) and RE-ARMED over
+    the target as it stood: the untracked write became a tolerated stray,
+    the ignored one an entry of the new listing, the flipped word a marked
+    entry — and the retry recorded `unit-merged` with the refused output
+    still there (Codex, #796 review). The refused receipt's readings are now
+    taken again before either re-arm — at the restored epoch, and after a
+    commit the operator made since, which the resume otherwise takes as the
+    next baseline — and hold their authority until nothing is named. Cleared,
+    the same resume lands.
+
+    Ablation: drop the `_refuse_refused_residue` call from either re-arm
+    branch and that leg's second run reds on `summary.paused`."""
+    effect, _expected = _ignored_publication_bundle(project)
+    (project.project / "notes.txt").write_text("clean before the merge\n")
+    (project.project / ".gitignore").write_text(
+        (project.project / ".gitignore").read_text() + "*.tmp\n"
+    )
+    git(project.project, "add", "--", "notes.txt", ".gitignore")
+    git(project.project, "commit", "-q", "-m", "notes.txt is clean; tmp is ignored")
+    residue = {"untracked": "hook.log", "ignored": "hook.tmp", "flag": "notes.txt"}[shape]
+    mutation = {
+        "untracked": "printf 'target hook mutation' > hook.log",
+        "ignored": "printf 'target hook mutation' > hook.tmp",
+        "flag": "git update-index --assume-unchanged -- notes.txt",
+    }[shape]
+    hook = project.project / ".git" / "hooks" / "pre-merge-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        f"  {mutation}\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt.get("outcome") == "refused-restored"
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert refusal["error"].endswith(f"left in place): {residue}")
+    hook.unlink()
+    if advance == "operator-commit-since":
+        (project.project / "theirs.txt").write_text("the operator's own commit\n")
+        git(project.project, "add", "--", "theirs.txt")
+        git(project.project, "commit", "-q", "-m", "an operator advance since the refusal")
+    target_head = verify.rev_parse_head(project.repo_root)
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert "unit-merged" not in journal_kinds(resumed)
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    [_first, second] = _records(resumed, "artifact-publication-refused")
+    assert second["error"].endswith(f"then resume: {residue}")
+    assert "refused integration's residue is still in the target" in second["error"]
+    assert "target hook mutation" not in second["error"]  # path-only evidence
+    again = load_state(resumed.run_dir).tasks["dw-fix"]
+    assert again.integration_attempt == durable.integration_attempt  # authority kept
+    assert Path(again.worktree_path).is_dir()
+
+    if shape == "flag":
+        git(project.project, "update-index", "--no-assume-unchanged", "--", "notes.txt")
+    else:
+        (project.project / residue).unlink()
+    cleared, adapter = resume_sweep(project, resumed, [])
+    summary = cleared.run()
+
+    assert not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert "unit-merged" in journal_kinds(cleared)
+    final = cleared.state.tasks["dw-fix"]
+    assert final.artifact_publication_complete
+    assert not Path(final.worktree_path).exists()
+    assert (project.project / "notes.txt").read_text() == "clean before the merge\n"
+    assert not (project.project / residue).exists() or shape == "flag"
+    assert git(project.project, "ls-files", "-v", "--", "notes.txt") == "H notes.txt"
+
+
 @pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
 def test_bundle_replacing_a_tracked_file_with_a_directory_integrates(project, strategy):
     """A unit that turns a tracked file into a directory (`a` deleted, `a/b`

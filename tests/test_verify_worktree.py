@@ -4143,6 +4143,44 @@ def test_integrated_index_flags_outside_drift_names_a_hook_s_flip(project, tmp_p
     )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Win32 forbids newlines in filenames")
+def test_index_flag_readings_walk_debug_records_past_a_newline_in_a_path(project, tmp_path):
+    """`ls-files --debug -z` NUL-terminates the path alone and follows it with
+    five newline-terminated lines, the last `  size: N\tflags: X`; the next
+    path begins right after. A whole-output `flags:` scan therefore read a
+    tracked path holding a newline followed by that text as one flag word
+    more than the index has entries, and every integration on the target
+    paused with malformed index evidence (Codex, #796 review). The readings
+    now walk records, and cross-check each debug path against the staged
+    reading's.
+
+    Ablation: restore the `re.findall` over the whole output and every
+    assertion below raises `malformed`."""
+    repo = project.project
+    odd = "b\n  flags: dead\nc.txt"
+    (repo / odd).write_text("a path, not a flag\n")
+    git(repo, "add", "--", odd)
+    git(repo, "commit", "-q", "-m", "a newline path")
+    git(repo, "update-index", "--assume-unchanged", "--", odd)
+
+    words = dict(verify._index_file_flag_words(repo))
+    assert words[odd] == "8000"
+    assert words["src.txt"] == "0"
+    evidence = verify.capture_index_flags(repo, exclude=["src.txt"])
+    assert evidence["marked"] == {odd: "8000"}
+    assert verify._index_state(repo, odd)["entries"][0]["flags"] == "8000"
+    assert verify._index_state(repo, "src.txt")["entries"][0]["flags"] == "0"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    snapshots, _submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ("src.txt",))
+    assert verify.integrated_index_flags_outside_drift(repo, evidence, exclude=["src.txt"]) == ()
+    assert verify.integration_nonref_state_unchanged(
+        repo, run_dir, snapshots, [], operation_identity="e" * 32
+    )
+    with pytest.raises(verify.IntegrationEvidenceError, match="malformed"):
+        verify._index_debug_records(b"x\0  ctime: 1:2\n  flags: 0\n")
+
+
 def test_integrated_index_flags_outside_drift_accepts_a_sparse_target(project, tmp_path):
     """On a sparse target every out-of-cone entry carries skip-worktree, git's
     own word: the digest proves them unchanged, the map holds none of them,

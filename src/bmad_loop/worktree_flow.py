@@ -2530,6 +2530,28 @@ class WorktreeFlow:
         verify.discard_integration_state(self.run_dir, previous)
         return attempt
 
+    def _refuse_refused_residue(self, attempt: dict[str, Any], *, revision: str) -> None:
+        """Refuse a re-arm while the refused attempt's named residue stands.
+
+        The refusal restored the receipt's own paths and left a hook's write
+        outside them in place, named; `integration_restoration_complete` reads
+        only the former, so a resume after the hook was disabled — but before
+        the output it left was cleared — re-armed over the write and the retry
+        recorded ``unit-merged`` with it still there (#796 review). The refused
+        receipt's readings are taken again (`verify.refused_integration_residue`)
+        and keep their authority until nothing is named.
+        """
+        residue = verify.refused_integration_residue(
+            self.paths.repo_root, self.run_dir, attempt, revision=revision
+        )
+        if residue:
+            raise verify.IntegrationEvidenceError(
+                "the refused integration's residue is still in the target — the paths "
+                "its pause named as left in place, or work of yours since (the run "
+                "cannot tell them apart); clear it, or commit or stash what is yours, "
+                "then resume: " + ", ".join(residue)
+            )
+
     def _integration_artifact_paths(self, task: StoryTask) -> tuple[str, ...]:
         """The accepted artifact paths on the target, for the receipt's snapshot and
         its restore. Raises rather than degrading: an ignored deliverable's
@@ -3020,6 +3042,11 @@ class WorktreeFlow:
                                 operation_identity=attempt["operation_identity"],
                             )
                             if restored:
+                                # Complete for the receipt's own paths; what
+                                # the refusal named and left in place is
+                                # outside them, and re-arming over it made
+                                # it the retry's baseline (#796 review).
+                                self._refuse_refused_residue(attempt, revision=current)
                                 attempt = self._arm_integration_attempt(
                                     task,
                                     target_ref=target_ref,
@@ -3036,7 +3063,10 @@ class WorktreeFlow:
                             # The durable outcome is written only after guarded
                             # restoration succeeded. A later target commit is an
                             # operator/concurrent advance, not the refused result;
-                            # preserve it and make it the next attempt's baseline.
+                            # preserve it and make it the next attempt's baseline
+                            # — the refused residue, still outside every set the
+                            # commit could have taken up, is not (#796 review).
+                            self._refuse_refused_residue(attempt, revision=current)
                             attempt = self._arm_integration_attempt(
                                 task,
                                 target_ref=target_ref,

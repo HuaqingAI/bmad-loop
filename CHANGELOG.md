@@ -531,7 +531,21 @@ breaking changes may land in a minor release.
   paused every receipt-bearing integration before the merge as malformed
   and again at each resume; the restore reverts what
   the hook staged and leaves unstaged, untracked and ignored entries in place, named
-  for the operator; and a directory the unit creates, where the receipt
+  for the operator — and a resume over that residue is refused until it is
+  cleared (a resume after the hook was disabled read the restore complete,
+  which it is for the receipt's own paths, and re-armed over the target as it
+  stood: the untracked write a tolerated stray, the ignored one an entry of
+  the new listing, the flipped word a marked entry, and the retry recorded
+  `unit-merged` with the refused output still there); the refused receipt's
+  readings are taken again before either re-arm, at the restored epoch or
+  after a commit the operator made since, with the receipt's own paths left
+  to the restore's reading, and name what stands — the residue, or work of
+  the operator's since, which they cannot tell apart and say so; and the
+  `ls-files --debug` flag reading walks its records — path to the NUL, then
+  the five fixed lines — instead of scanning the output for `flags:`, which
+  read a tracked path holding a newline followed by that text as one flag
+  word more than the index has entries and paused every integration into
+  that target as malformed; and a directory the unit creates, where the receipt
   proved nothing was — or proved an empty untracked directory, which git
   never tracks and no reading lists — or where the receipt captured a
   tracked file, a symlink, or an unpopulated gitlink the unit replaced — is

@@ -405,13 +405,52 @@ def _index_state(repo: Path, rel: str) -> dict[str, object]:
     debug = git_bytes(repo, "ls-files", "--debug", "-z", "--", validated)
     if debug.returncode != 0:
         raise IntegrationEvidenceError("target index flag evidence is unavailable")
-    flags = re.findall(rb"(?:^|[\t ])flags: ([0-9a-fA-F]+)(?:\n|$)", debug.stdout)
-    if len(flags) != len(entries):
+    records = _index_debug_records(debug.stdout)
+    if len(records) != len(entries) or any(
+        os.fsdecode(raw_path) != validated for raw_path, _word in records
+    ):
         raise IntegrationEvidenceError("target index flag evidence is malformed")
-    for entry, raw_flags in zip(entries, flags, strict=True):
-        entry["flags"] = os.fsdecode(raw_flags).lower()
-    intent = any(int(flag, 16) & 0x20000000 for flag in flags)
+    for entry, (_raw_path, word) in zip(entries, records, strict=True):
+        entry["flags"] = word
+    intent = any(int(word, 16) & 0x20000000 for _raw_path, word in records)
     return {"entries": entries, "intent_to_add": intent}
+
+
+# One `ls-files --debug` record after its path's NUL: the five fixed lines
+# git's `show_ce` prints (`%u` decimals, the flag word `%x`), the next path
+# beginning right after the fifth newline.
+_INDEX_DEBUG_RECORD = re.compile(
+    rb"  ctime: [0-9]+:[0-9]+\n"
+    rb"  mtime: [0-9]+:[0-9]+\n"
+    rb"  dev: [0-9]+\tino: [0-9]+\n"
+    rb"  uid: [0-9]+\tgid: [0-9]+\n"
+    rb"  size: [0-9]+\tflags: ([0-9a-fA-F]+)\n"
+)
+
+
+def _index_debug_records(debug: bytes) -> list[tuple[bytes, str]]:
+    """``(path, flag word)`` per record of a ``ls-files --debug -z`` reading.
+
+    ``-z`` NUL-terminates the path alone; the debug lines that follow it are
+    newline-terminated and fixed in number, so the reading walks records —
+    path to its NUL, then exactly the five lines — rather than scanning the
+    whole output for ``flags:``, which read a filename holding a newline
+    followed by that text as one flag word more than the index has entries
+    and paused every integration on this target as malformed (#796 review).
+    The flag word is lowercased.
+    """
+    records: list[tuple[bytes, str]] = []
+    position = 0
+    while position < len(debug):
+        nul = debug.find(b"\0", position)
+        if nul < 0:
+            raise IntegrationEvidenceError("target index flag evidence is malformed")
+        match = _INDEX_DEBUG_RECORD.match(debug, nul + 1)
+        if match is None:
+            raise IntegrationEvidenceError("target index flag evidence is malformed")
+        records.append((debug[position:nul], match.group(1).decode("ascii").lower()))
+        position = match.end()
+    return records
 
 
 def _validated_index_state(value: object) -> dict[str, object]:
@@ -2678,20 +2717,23 @@ def _index_file_flag_words(repo: Path) -> list[tuple[str, str]]:
     debug = git_bytes(repo, "ls-files", "--debug", "-z")
     if staged.returncode != 0 or debug.returncode != 0:
         raise IntegrationEvidenceError("target index flag evidence is unavailable")
-    flags = re.findall(rb"(?:^|[\t ])flags: ([0-9a-fA-F]+)(?:\n|$)", debug.stdout)
+    debug_records = _index_debug_records(debug.stdout)
     records = [record for record in staged.stdout.split(b"\0") if record]
-    if len(flags) != len(records):
+    if len(debug_records) != len(records):
         raise IntegrationEvidenceError("target index flag evidence is malformed")
     words: list[tuple[str, str]] = []
-    for record, raw_flags in zip(records, flags, strict=True):
+    for record, (debug_path, word) in zip(records, debug_records, strict=True):
         try:
             metadata, raw_path = record.split(b"\t", 1)
             mode, _oid, stage = metadata.split(b" ", 2)
         except ValueError as exc:
             raise IntegrationEvidenceError("target index flag evidence is malformed") from exc
+        # the two readings are the same index in the same order, or neither is read
+        if raw_path != debug_path:
+            raise IntegrationEvidenceError("target index flag evidence is malformed")
         if stage != b"0" or mode == b"160000":
             continue
-        words.append((os.fsdecode(raw_path), os.fsdecode(raw_flags).lower()))
+        words.append((os.fsdecode(raw_path), word))
     return words
 
 
@@ -3074,7 +3116,7 @@ def validate_index_flags_evidence(value: object) -> dict[str, object]:
 
 
 def integrated_index_flags_outside_drift(
-    repo: Path, evidence: object, *, exclude: Iterable[str]
+    repo: Path, evidence: object, *, exclude: Iterable[str], require_named: bool = True
 ) -> tuple[str, ...]:
     """Paths outside the snapshot set whose index flag word a hook changed.
 
@@ -3085,7 +3127,9 @@ def integrated_index_flags_outside_drift(
     entry a hook added or removed, so what is left to a mismatch is a word
     flip — and a flip no entry can be named for (skip-worktree toggled on a
     sparse target, where both words are fresh) is reported as such rather
-    than passed. Path-only evidence, sorted.
+    than passed, unless ``require_named`` is off: the re-arm reading
+    (`refused_integration_residue`) takes the index as the operator left it
+    and asks only what it can name. Path-only evidence, sorted.
     """
     validated = validate_index_flags_evidence(evidence)
     marked = validated["marked"]
@@ -3098,11 +3142,78 @@ def integrated_index_flags_outside_drift(
     drift = sorted(
         path for path, word in words if word != marked.get(path, word if word in fresh else None)
     )
-    if not drift:
+    if not drift and require_named:
         raise IntegrationEvidenceError(
             "target hook changed index flag words outside the incoming set; no path named"
         )
     return tuple(drift)
+
+
+def refused_integration_residue(
+    repo: Path, run_dir: Path, attempt: dict[str, Any], *, revision: str
+) -> tuple[str, ...]:
+    """What a refused attempt's outside-set readings still name, before a re-arm.
+
+    A refusal over a target hook's write outside the incoming set restores
+    the receipt-owned paths and leaves the write where it is, named for the
+    operator (`integrated_stray_paths`, `integrated_index_flags_outside_drift`,
+    `integrated_ignored_additions`, `integrated_submodule_ignored_additions`).
+    A resume that found the restore complete then re-armed over the target
+    as it stood: the ignored write became the new listing's, the untracked
+    one a tolerated stray, the flipped word a marked entry — and the retry
+    recorded ``unit-merged`` with the refused output still in place (#796
+    review). The same four readings, taken again against the refused
+    receipt's baseline with the receipt's own snapshot set left to the
+    restore's reading: a path they name is that residue, or work of the
+    operator's since — the readings cannot tell the two apart, and say so —
+    and the receipt keeps its authority until it is cleared. Read at
+    ``revision``, the target's current tip: the refused epoch after a
+    complete restore, or a commit the operator made since, whose new
+    entries the flag reading takes as it finds them. Path-only evidence,
+    sorted.
+    """
+    validated_snapshots, _validated_submodules = validate_integration_state_schema(
+        run_dir, attempt["snapshots"], attempt["submodules"], attempt["operation_identity"]
+    )
+    snapshot_paths = [str(entry["path"]) for entry in validated_snapshots]
+    cleanup_plan = attempt.get("cleanup_plan") or {}
+    tolerated = tuple(cleanup_plan.get("tolerated", ()))
+    ignored = attempt.get("ignored")
+    named: set[str] = set(
+        integrated_stray_paths(
+            repo,
+            tolerated=tolerated,
+            incoming=snapshot_paths,
+            run_dir=run_dir,
+            ignored=ignored,
+        )
+    )
+    if attempt.get("index_flags") is not None:
+        named.update(
+            integrated_index_flags_outside_drift(
+                repo, attempt["index_flags"], exclude=snapshot_paths, require_named=False
+            )
+        )
+    if ignored is not None:
+        # the receipt's own paths were rewritten by the restore, which
+        # `_receipt_snapshots_complete` reads by digest, not by identity
+        named.update(
+            integrated_ignored_additions(
+                repo,
+                run_dir,
+                ignored,
+                tolerated=(*tolerated, *snapshot_paths),
+                introduced_checkouts=integrated_introduced_gitlinks(
+                    repo, run_dir, attempt["submodules"], revision=revision
+                ),
+            )
+        )
+    named.update(
+        integrated_submodule_ignored_additions(
+            repo, run_dir, attempt["submodules"], revision=revision
+        )
+    )
+    return tuple(sorted(named))
 
 
 # The run's own records under `.bmad-loop/`: per-run and archived state,
