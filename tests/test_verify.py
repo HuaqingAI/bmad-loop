@@ -8207,6 +8207,74 @@ def test_commit_path_bound_refuses_a_tracked_target_index_deletion(project):
     assert git(repo, "ls-files", "--", path.name) == ""
 
 
+def test_commit_path_bound_refuses_a_committed_deletion_of_the_tracked_baseline(project):
+    """The committed twin of the staged deletion above: a rival commits the
+    ledger's removal while the working tree still holds the accepted rewrite.
+    Building the candidate on that commit would re-add the ledger over the
+    rival's decision. Ablation: drop `_preflight_bound_absence` and this
+    publishes a child of the deleting commit that carries the ledger again."""
+    repo, path, baseline, accepted = _bound_publish_inputs(project)
+    baseline_commit = verify.rev_parse_head(repo)
+    git(repo, "rm", "--cached", "-q", "--", path.name)
+    git(repo, "commit", "-q", "-m", "rival: drop the ledger")
+    deleting_head = verify.rev_parse_head(repo)
+
+    with pytest.raises(verify.GitError, match="deleted after the accepted baseline"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text=baseline,
+            baseline_commit=baseline_commit,
+        )
+
+    assert verify.rev_parse_head(repo) == deleting_head
+    assert git(repo, "ls-files", "--", path.name) == ""
+    assert path.read_text(encoding="utf-8") == accepted
+
+
+def test_commit_path_bound_refuses_an_absent_target_without_baseline_authority(project):
+    repo = project.project
+    path = repo / "new-ledger.md"
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    original_head = verify.rev_parse_head(repo)
+
+    with pytest.raises(verify.GitError, match="absence has no baseline authority"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text="legacy\n",
+        )
+
+    assert verify.rev_parse_head(repo) == original_head
+    assert git(repo, "ls-files", "--", path.name) == ""
+
+
+def test_commit_path_bound_publishes_a_target_proven_untracked_at_the_baseline(project):
+    repo = project.project
+    path = repo / "new-ledger.md"
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    baseline_commit = verify.rev_parse_head(repo)
+
+    sha = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text="legacy\n",
+        baseline_commit=baseline_commit,
+    )
+
+    assert sha == verify.rev_parse_head(repo)
+    assert git(repo, "show", "--format=", "--name-only", sha) == path.name
+    assert git(repo, "show", f"{sha}:{path.name}") == accepted.rstrip("\n")
+
+
 def test_commit_path_bound_terminal_ref_cas_preserves_concurrent_head(project, monkeypatch):
     repo, path, baseline, accepted = _bound_publish_inputs(project)
     real_run_git = verify._run_git
@@ -8956,6 +9024,7 @@ def test_commit_path_bound_refuses_committed_symlink_parent_before_candidate_wri
             path,
             accepted_text=accepted,
             baseline_text="legacy migration ledger\n",
+            baseline_commit=verify.rev_parse_head(repo),
         )
 
     assert not (outside / "ledger.md").exists()

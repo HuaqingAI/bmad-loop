@@ -32006,6 +32006,43 @@ def test_migration_rival_during_bound_publication_replays_commit_only(project, m
     assert project.deferred_work.read_text(encoding="utf-8") == accepted
 
 
+def test_migration_committed_ledger_deletion_during_session_refuses_publication(project):
+    """A rival commits the tracked ledger's removal while the migration session
+    runs (the working tree keeps the accepted rewrite, as `git rm --cached`
+    leaves it). The bound publisher must not build its candidate on that
+    deleting commit and re-add the ledger over the rival's decision — the
+    committed twin of the staged deletion it already refuses. Ablation: drop
+    `verify._preflight_bound_absence` and the first run reaches DONE with a
+    child of the deleting commit that carries the ledger again."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    mapping = _valid_migration_mapping()
+    accepted = migrated_ledger()
+    ledger = project.deferred_work
+    rewrite = migrate_effect(project, accepted, mapping)
+
+    def rewrite_then_rival_deletes(spec):
+        result = rewrite(spec)
+        git(project.project, "rm", "--cached", "-q", "--", str(ledger.relative_to(project.project)))
+        git(project.project, "commit", "-q", "-m", "rival: drop the ledger")
+        return result
+
+    engine, adapter = make_sweep(project, [rewrite_then_rival_deletes])
+    first = engine.run()
+    deleting_head = verify.rev_parse_head(project.project)
+
+    assert first.crashed and len(adapter.sessions) == 1
+    assert engine.state.tasks["sweep-migrate"].phase == Phase.COMMITTING
+    assert (
+        git(project.project, "show", "--format=%s", "-s", deleting_head) == "rival: drop the ledger"
+    )
+    assert git(project.project, "ls-files", "--", str(ledger.relative_to(project.project))) == ""
+    assert ledger.read_text(encoding="utf-8") == accepted
+    failures = _records(engine, "sweep-ledger-commit-unavailable")
+    assert [row["error"] for row in failures] == [
+        "committed publication target was deleted after the accepted baseline"
+    ]
+
+
 def test_migration_post_commit_hook_rewrite_of_live_ledger_never_earns_done(project):
     """A `post-commit` hook runs after the commit exists and cannot change it, so
     a hook that rewrites the AUTHORITATIVE ledger by absolute path lands bytes

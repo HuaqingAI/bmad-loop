@@ -474,7 +474,11 @@ breaking changes may land in a minor release.
   clean-filter-normalized candidate through a prepared expected-old transaction on
   the captured terminal direct branch. Resolve lost commit acknowledgements by
   deterministic replay, and reconcile the target index against bounded stable checkout
-  observations while preserving unrelated stages.
+  observations while preserving unrelated stages. An absent committed target is accepted
+  only when the baseline commit proves the ledger was never tracked: a ledger a rival
+  commit deleted after the baseline was taken refuses publication instead of being
+  silently re-added on top of that commit, the committed twin of the staged deletion
+  the publisher already refuses.
 
 - Refuse no-descriptor attempt-owned spec restoration before staging or lifecycle
   normalization, preserving the existing target bytes for manual recovery (DW-310).

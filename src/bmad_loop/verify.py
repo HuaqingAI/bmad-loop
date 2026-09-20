@@ -10007,6 +10007,23 @@ def _preflight_bound_tree_blob(
         raise GitError("committed publication target holds rival content")
 
 
+def _preflight_bound_absence(repo: Path, baseline_commit: str | None, rel: str) -> None:
+    """Accept an absent committed target only on proof it was never tracked.
+
+    The baseline text was read beside `baseline_commit`. A target that commit
+    carried and the captured HEAD no longer does was deleted by a commit that
+    landed after the baseline was taken, and building the candidate on that
+    commit would silently re-add the ledger over a rival's committed decision —
+    the committed twin of the staged deletion the real-index check below
+    refuses. Absence at the baseline commit is the one durable proof the
+    ledger was originally untracked; no baseline commit is no authority.
+    """
+    if baseline_commit is None:
+        raise GitError("committed publication target absence has no baseline authority")
+    if _bound_tree_entry(repo, baseline_commit, rel) is not None:
+        raise GitError("committed publication target was deleted after the accepted baseline")
+
+
 def _bound_changed_paths(repo: Path, parent: str, revision: str) -> set[str]:
     proc = git_bytes(
         repo,
@@ -10242,6 +10259,7 @@ def commit_path_bound(
     *,
     accepted_text: str,
     baseline_text: str,
+    baseline_commit: str | None = None,
     live_path: Path | None = None,
 ) -> str | None:
     """Publish one accepted ledger transition through a validated candidate.
@@ -10253,6 +10271,12 @@ def commit_path_bound(
     captured terminal direct branch.  Once that transaction commits, target-only
     real-index reconciliation is replayable housekeeping: no later fault rolls the
     truthful commit back.
+
+    `baseline_commit` is the HEAD beside which `baseline_text` was read. It is
+    consulted only when the captured HEAD does not carry the target at all: a
+    target that commit tracked has since been deleted by a rival commit, and the
+    publication refuses rather than re-adding it. Without it an absent target
+    has no authority and is refused the same way.
     """
     try:
         rc, top, _detail = _git_out(repo, "rev-parse", "--show-toplevel")
@@ -10280,6 +10304,8 @@ def commit_path_bound(
     head_entry = _bound_tree_entry(repo_root, captured.oid, rel)
     head_blob = _bound_tree_blob(repo_root, captured.oid, rel)
     _preflight_bound_tree_blob(head_blob, baseline_oid, accepted_oid)
+    if head_entry is None:
+        _preflight_bound_absence(repo_root, baseline_commit, rel)
     accepted = (
         _accepted_bound_transition(repo_root, captured.oid, rel, accepted_oid, baseline_oid)
         if head_blob == accepted_oid

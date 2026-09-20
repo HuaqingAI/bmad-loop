@@ -3366,6 +3366,7 @@ class SweepEngine(Engine):
             family="ledger",
             accepted_text=rewrite,
             accepted_baseline_text=baseline,
+            accepted_baseline_commit=task.baseline_commit,
         )
         if task.migration_ledger_doubt_owned and not self.state.sweep_ledger_in_doubt:
             # A Git-only unavailable outcome arms no ledger doubt. Retire the
@@ -5489,6 +5490,7 @@ class SweepEngine(Engine):
         family: Literal["ledger", "store"],
         accepted_text: str | None = None,
         accepted_baseline_text: str | None = None,
+        accepted_baseline_commit: str | None = None,
     ) -> _LedgerCommitOutcome:
         """Publish the orchestrator bookkeeping FILE a phase just wrote: that one
         file reaches HEAD, and everything else the enclosing repository is
@@ -5815,12 +5817,17 @@ class SweepEngine(Engine):
                     # baseline, and `_finish_migration_commit` already ends the
                     # run on `unavailable` — through this arm's journal row, which
                     # keeps the sanitized diagnosis a bare raise would drop.
+                    # The baseline commit is the HEAD the accepted baseline was
+                    # read beside: it is what lets the publisher tell a ledger
+                    # that was never tracked from one a rival commit deleted
+                    # after the baseline was taken.
                     sha = verify.commit_path_bound(
                         root,
                         message,
                         target,
                         accepted_text=accepted_text,
                         baseline_text=accepted_baseline_text,
+                        baseline_commit=accepted_baseline_commit,
                         live_path=path,
                     )
         except verify.GitError as e:
