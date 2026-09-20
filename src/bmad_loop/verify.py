@@ -3049,10 +3049,11 @@ _LSTAT_IDENTITY = re.compile(r"-?[0-9]+(:-?[0-9]+){5}")
 
 def _lstat_identity(repo: Path, path: str) -> str | None:
     """``lstat`` identity of a tree entry — size, mtime, ctime, inode, device,
-    mode — or ``None`` for one that is gone."""
+    mode — or ``None`` for one that is gone, an ancestor of it that is no
+    longer a directory included."""
     try:
         entry = os.lstat(os.fsencode(repo / path))
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return None
     return ":".join(
         str(value)
@@ -3146,68 +3147,107 @@ def integrated_ignored_additions(
     evidence: object,
     *,
     tolerated: Iterable[str] = (),
+    incoming: Iterable[str] = (),
     introduced_checkouts: Iterable[str] = (),
     retained_checkouts: Iterable[str] = (),
     own_records: bool = True,
+    removals: bool = True,
 ) -> tuple[str, ...]:
-    """Ignored entries after the hooks the receipt did not record, or recorded otherwise.
+    """Ignored entries after the hooks the receipt did not record, recorded
+    otherwise, or recorded and gone.
 
     The listing `capture_ignored_entries` sealed, read back against its
     digest, against the same reading now: an entry it does not hold arrived
-    during the attempt, and one it holds under another identity was written
-    during it — a target hook's write, wherever it stands, an ignored file
-    it overwrote or truncated in place included, and a nested ``.git`` it
-    made, which git lists nowhere (#796 review). A ``tolerated`` stray an
+    during the attempt, one it holds under another identity was written
+    during it, and one it holds that is no longer on disk was removed during
+    it — a target hook's write, wherever it stands, an ignored file it
+    overwrote or truncated in place included, a nested ``.git`` it made,
+    which git lists nowhere, and an ignored file that was already there
+    which it deleted, which ``status`` and ``diff`` are as silent about as
+    they are about its overwrite (#796 review). A ``tolerated`` stray an
     incoming ``.gitignore`` change turned ignored, which the pre-merge guard
-    already read, is left out; so is the ``.git`` of each
-    ``introduced_checkouts`` gitlink path (`integrated_introduced_gitlinks`),
-    a checkout the submodule reading accepted where the receipt recorded
-    none; and so is everything under each ``retained_checkouts`` leftover —
-    a captured checkout git could not remove when the commit deleted its
-    gitlink, which the walk descends into now that git tracks nothing there
-    and which is the captured checkout's own reading's
-    (`integrated_submodule_ignored_additions`), as `integrated_stray_paths`
-    leaves it. A file inside a tolerated nested repository (``vendor/tool.py``
-    under the tolerated ``vendor``) is NOT left out: the tolerance covers the
-    repository's presence, which the guard read, not its contents, which no
-    reading captured — the listing holds each at its identity, so a hook's
-    write over one is named like a write over any ignored file (#796
-    review). Removals are not read: the receipt never held ignored bytes, and
-    an entry the cleanup removed or the commit now tracks leaves the listing
-    by design. The restore leaves what this names in place, like unstaged
-    and untracked dirt. Path-only evidence, sorted. ``own_records`` as
-    `ignored_entries` takes it, and as the listing was sealed: the target's
-    reading leaves the run's own records out; a captured checkout's
-    (`integrated_submodule_ignored_additions`) holds none and reads a
-    ``.bmad-loop/`` there like any ignored path. Ceiling: the identity
-    is ``lstat``'s, so a writer that puts size, times and inode back is not
-    read.
+    already read, is left out; so is every ``incoming`` path — the commit's
+    own, the diff readings' and the absent-path probe's — and, from the
+    removal reading alone, every recorded entry beneath an incoming path —
+    an ignored ``d/x`` where the commit put the file ``d``, which git
+    clobbers without a word, ignored entries being its to overwrite (the
+    reverse, the commit's ``p/y`` where an ignored file ``p`` stood, leaves
+    the commit's directory at ``p``, present, and needs no rule); so is the
+    ``.git`` of each ``introduced_checkouts`` gitlink path
+    (`integrated_introduced_gitlinks`), a checkout the submodule reading
+    accepted where the receipt recorded none; and so is everything under
+    each ``retained_checkouts`` leftover — a captured checkout git could not
+    remove when the commit deleted its gitlink, which the walk descends into
+    now that git tracks nothing there and which is the captured checkout's
+    own reading's (`integrated_submodule_ignored_additions`), as
+    `integrated_stray_paths` leaves it. A file inside a tolerated nested
+    repository (``vendor/tool.py`` under the tolerated ``vendor``) is NOT
+    left out: the tolerance covers the repository's presence, which the
+    guard read, not its contents, which no reading captured — the listing
+    holds each at its identity, so a hook's write over one, or its removal,
+    is named like that of any ignored file (#796 review). A recorded entry
+    that left the ignored listing but still stands on disk is not a removal:
+    an incoming ``.gitignore`` change uncovered it and the stray reading
+    holds it at its recorded identity, or a hook staged it and the stray
+    reading names it. The restore leaves what this names as it found it,
+    like unstaged and untracked dirt: the receipt never held ignored bytes
+    and cannot put a removed entry back. Without ``removals`` the recorded
+    side is not read: the refused receipt's residue reading
+    (`refused_integration_residue`) guards a re-arm over a hook's OUTPUT,
+    and an absence has none to seal — while the operator's one way to clear
+    a named rewrite, whose identity nothing can put back, is to delete the
+    file, and a removal the pause named is theirs to weigh before they
+    resume. Path-only evidence, sorted.
+    ``own_records`` as `ignored_entries` takes it, and as the listing was
+    sealed: the target's reading leaves the run's own records out; a
+    captured checkout's (`integrated_submodule_ignored_additions`) holds
+    none and reads a ``.bmad-loop/`` there like any ignored path. Ceiling:
+    the identity is ``lstat``'s, so a writer that puts size, times and inode
+    back is not read.
     """
     validated = validate_ignored_entries_evidence(evidence)
     recorded = _recorded_ignored_entries(run_dir, validated)
-    excluded = {_portable_integration_path(path) for path in tolerated}
+    incoming_set = {_portable_integration_path(path) for path in incoming}
+    excluded = {_portable_integration_path(path) for path in tolerated} | incoming_set
     excluded.update(f"{_portable_integration_path(path)}/.git" for path in introduced_checkouts)
     prefixes = tuple(
         f"{_portable_integration_path(path)}/" for path in dict.fromkeys(retained_checkouts)
     )
-    return tuple(
-        sorted(
-            path
-            for path, identity in ignored_entries(repo, own_records=own_records).items()
-            # `vendor/`: a tolerated nested repository (`plan_incoming_collisions`,
-            # tolerated as `vendor`) an incoming `.gitignore` change turned ignored
-            if path not in excluded
-            and path.rstrip("/") not in excluded
-            and not any(path.startswith(prefix) for prefix in prefixes)
-            and recorded.get(path) != identity
+
+    def left_out(path: str) -> bool:
+        # `vendor/`: a tolerated nested repository (`plan_incoming_collisions`,
+        # tolerated as `vendor`) an incoming `.gitignore` change turned ignored
+        return (
+            path in excluded
+            or path.rstrip("/") in excluded
+            or any(path.startswith(prefix) for prefix in prefixes)
         )
-    )
+
+    current = ignored_entries(repo, own_records=own_records)
+    named = {
+        path
+        for path, identity in current.items()
+        if not left_out(path) and recorded.get(path) != identity
+    }
+    for path in recorded if removals else ():
+        if path in current or left_out(path):
+            continue
+        # beneath an incoming path: git's own clobber, the file the commit
+        # put at `d` leaving no `d/x`; the commit's directory where an ignored
+        # file stood is present, and needs no rule
+        parts = path.rstrip("/").split("/")
+        if any("/".join(parts[:depth]) in incoming_set for depth in range(1, len(parts))):
+            continue
+        if _lstat_identity(repo, path.rstrip("/")) is None:
+            named.add(path)
+    return tuple(sorted(named))
 
 
 def integrated_submodule_ignored_additions(
-    repo: Path, run_dir: Path, submodules: object, *, revision: str
+    repo: Path, run_dir: Path, submodules: object, *, revision: str, removals: bool = True
 ) -> tuple[str, ...]:
-    """Ignored entries in a captured checkout the receipt did not record, or recorded otherwise.
+    """Ignored entries in a captured checkout the receipt did not record,
+    recorded otherwise, or recorded and gone.
 
     `integrated_ignored_additions` for each populated submodule the receipt
     captured, against the listing `capture_integration_state` sealed beside
@@ -3225,8 +3265,9 @@ def integrated_submodule_ignored_additions(
     leftover's rules read them. The run's records are the target's: a
     ``.bmad-loop/cache/x`` the checkout's own rules ignore is read like any
     other ignored path there, as it was sealed (#796 review). Named under
-    the submodule path, sorted; left in place by the restore, like the
-    tree's own ignored dirt.
+    the submodule path, sorted; left as found by the restore, like the
+    tree's own ignored dirt. ``removals`` as `integrated_ignored_additions`
+    takes it.
     """
     _snapshots, validated = validate_integration_state_schema(run_dir, [], submodules)
     inventory: dict[str, tuple[bytes, bytes, str]] | None = None
@@ -3248,7 +3289,12 @@ def integrated_submodule_ignored_additions(
         named.extend(
             f"{rel}/{path}"
             for path in integrated_ignored_additions(
-                checkout, run_dir, evidence, tolerated=held_below, own_records=False
+                checkout,
+                run_dir,
+                evidence,
+                incoming=held_below,
+                own_records=False,
+                removals=removals,
             )
         )
     return tuple(sorted(named))
@@ -3379,7 +3425,11 @@ def refused_integration_residue(
     receipt's baseline with the receipt's own snapshot set left to the
     restore's reading: a path they name is that residue, or work of the
     operator's since — the readings cannot tell the two apart, and say so —
-    and the receipt keeps its authority until it is cleared. Read at
+    and the receipt keeps its authority until it is cleared. A recorded
+    ignored entry that is gone is not residue: the guard is against a
+    re-arm over a hook's output, an absence seals nothing, deleting a named
+    rewrite is how the operator clears it, and a removal the pause named
+    is theirs to weigh. Read at
     ``revision``, the target's current tip: the refused epoch after a
     complete restore, or a commit the operator made since, whose new
     entries the flag reading takes as it finds them. Path-only evidence,
@@ -3415,15 +3465,17 @@ def refused_integration_residue(
                 repo,
                 run_dir,
                 ignored,
-                tolerated=(*tolerated, *snapshot_paths),
+                tolerated=tolerated,
+                incoming=snapshot_paths,
                 introduced_checkouts=integrated_introduced_gitlinks(
                     repo, run_dir, attempt["submodules"], revision=revision
                 ),
+                removals=False,
             )
         )
     named.update(
         integrated_submodule_ignored_additions(
-            repo, run_dir, attempt["submodules"], revision=revision
+            repo, run_dir, attempt["submodules"], revision=revision, removals=False
         )
     )
     return tuple(sorted(named))

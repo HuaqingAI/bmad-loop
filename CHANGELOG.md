@@ -502,13 +502,17 @@ breaking changes may land in a minor release.
   too — `diff --name-only` had named the destination alone — so a renaming
   bundle is not refused over the entry its merge deletes), and a hook's
   gitignored write anywhere — beside an incoming path in a directory the
-  target already held populated, which no reading listed, or over an
+  target already held populated, which no reading listed, over an
   ignored file that was already there, which leaves the path set unchanged
-  and `status` and `diff` silent — is refused by the receipt's sealed
+  and `status` and `diff` silent, or its deletion of one, which they are as
+  silent about — is refused by the receipt's sealed
   listing of the whole tree's ignored entries, each with its `lstat`
   identity (a sidecar under the operation's capture root; bytes never
-  read, removals not read, a tolerated stray an incoming `.gitignore`
-  change turned ignored left out) and named — a listing that also walks
+  read; a tolerated stray an incoming `.gitignore` change turned ignored
+  left out, and an entry beneath an incoming path git's own write clobbered;
+  the refused receipt's residue reading skips the recorded side, so
+  deleting a named rewrite clears it and a named removal is the operator's
+  to weigh before resuming) and named — a listing that also walks
   the tree for every nested `.git` entry, which git lists in no reading at
   all, so a hook's `git init` beneath a populated tracked directory, or a
   repository it puts in an ignored one, is refused the same way (each

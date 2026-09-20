@@ -27458,7 +27458,9 @@ def test_a_resume_over_the_refused_hook_residue_is_refused_until_it_is_cleared(
     assert durable.integration_attempt is not None
     assert durable.integration_attempt.get("outcome") == "refused-restored"
     [refusal] = _records(engine, "artifact-publication-refused")
-    assert refusal["error"].endswith(f"left in place): {residue}")
+    assert refusal["error"].endswith(
+        f"{'left as found' if shape == 'ignored' else 'left in place'}): {residue}"
+    )
     hook.unlink()
     if advance == "operator-commit-since":
         (project.project / "theirs.txt").write_text("the operator's own commit\n")
@@ -27497,6 +27499,94 @@ def test_a_resume_over_the_refused_hook_residue_is_refused_until_it_is_cleared(
     assert (project.project / "notes.txt").read_text() == "clean before the merge\n"
     assert not (project.project / residue).exists() or shape == "flag"
     assert git(project.project, "ls-files", "-v", "--", "notes.txt") == "H notes.txt"
+
+
+@pytest.mark.parametrize("shape", ["rewritten", "removed"])
+def test_a_resume_over_a_refused_hooks_change_to_a_recorded_ignored_file(project, shape):
+    """The refusal that names a hook's rewrite of an ignored file that was
+    already there, or its removal of one, leaves the target as the hook
+    left it: the receipt never held ignored bytes and cannot put either
+    back. The residue reading (`refused_integration_residue`) then guards
+    the resume against a re-arm over the hook's OUTPUT — and reads the
+    recorded side of the ignored listing not at all: a rewritten file's
+    identity is nothing the operator can restore, so deleting it is how
+    they clear that residue, and a deletion has no output to seal — it was
+    named at the pause, and a resume is the operator's answer to it (a later
+    Codex round, #796 review). `rewritten`: refused, named; a resume with the
+    hook disabled is refused again over the rewrite; deleted, the same
+    resume lands. `removed`: refused, named; a resume with the hook disabled
+    lands, the file still gone.
+
+    Ablation: read removals in the residue reading (`removals=True` there)
+    and the `rewritten` row's cleared resume reds on `summary.paused` — the
+    deletion that cleared it is named forever — and the `removed` row's
+    first resume reds the same way."""
+    effect, _expected = _ignored_publication_bundle(project)
+    (project.project / ".gitignore").write_text(
+        (project.project / ".gitignore").read_text() + "*.tmp\n"
+    )
+    git(project.project, "add", "--", ".gitignore")
+    git(project.project, "commit", "-q", "-m", "tmp is ignored")
+    (project.project / "cache.tmp").write_text("ignored before the receipt\n")
+    target_head = verify.rev_parse_head(project.repo_root)
+    hook = project.project / ".git" / "hooks" / "pre-merge-commit"
+    mutation = {
+        "rewritten": "printf 'target hook mutation' > cache.tmp",
+        "removed": "rm cache.tmp",
+    }[shape]
+    hook.write_text(
+        "#!/bin/sh\n"
+        'if [ "$(git symbolic-ref --short HEAD)" = main ]; then\n'
+        f"  {mutation}\n"
+        "fi\n"
+    )
+    hook.chmod(0o755)
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    assert durable.integration_attempt is not None
+    assert durable.integration_attempt.get("outcome") == "refused-restored"
+    [refusal] = _records(engine, "artifact-publication-refused")
+    assert refusal["error"].endswith(
+        "wrote, changed or removed ignored entries after integration (left as found): cache.tmp"
+    )
+    assert verify.rev_parse_head(project.repo_root) == target_head
+    if shape == "rewritten":
+        assert (project.project / "cache.tmp").read_text() == "target hook mutation"
+    else:
+        assert not (project.project / "cache.tmp").exists()
+    hook.unlink()
+
+    resumed, adapter = resume_sweep(project, engine, [])
+    summary = resumed.run()
+
+    if shape == "rewritten":
+        # the rewrite is residue until the operator clears it — by deleting it
+        assert summary.paused and not summary.crashed
+        assert adapter.sessions == []
+        assert "unit-merged" not in journal_kinds(resumed)
+        [_first, second] = _records(resumed, "artifact-publication-refused")
+        assert second["error"].endswith("then resume: cache.tmp")
+        assert "refused integration's residue is still in the target" in second["error"]
+        (project.project / "cache.tmp").unlink()
+        resumed, adapter = resume_sweep(project, resumed, [])
+        summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert adapter.sessions == []
+    assert "unit-merged" in journal_kinds(resumed)
+    final = resumed.state.tasks["dw-fix"]
+    assert final.artifact_publication_complete
+    assert final.integration_attempt is None
+    assert not (project.project / "cache.tmp").exists()
+    assert git(project.project, "status", "--porcelain", "-uall") == ""
 
 
 @pytest.mark.parametrize("strategy", ["merge", "squash", "ff"])
@@ -27541,7 +27631,7 @@ def test_bundle_replacing_a_tracked_file_with_a_directory_integrates(project, st
     assert durable.artifact_publication_complete
 
 
-@pytest.mark.parametrize("write", ["adds", "rewrites", "truncates"])
+@pytest.mark.parametrize("write", ["adds", "rewrites", "truncates", "removes"])
 @pytest.mark.parametrize(
     ("strategy", "hook_name"),
     [
@@ -27565,16 +27655,22 @@ def test_target_hook_writing_an_ignored_file_beside_an_incoming_path_is_refused(
     `lstat` identity — and after the hooks any ignored entry it did not record,
     or whose identity changed (a hook overwriting or truncating an ignored file
     that was already there: the path set is unchanged and `status` and `diff`
-    never list it — Codex, #796 review), is refused by path — wherever it
-    stands, a populated incoming parent included.
+    never list it — Codex, #796 review), or that it recorded and is gone (a
+    hook deleting an ignored file that was already there, which `status` and
+    `diff` are as silent about, and which the reading never examined while
+    it iterated the current listing alone — a later Codex round, #796
+    review), is refused by path — wherever it stands, a populated incoming
+    parent included.
 
-    The restore reverts the commit and leaves the hook's file in place, named
-    for the operator, like unstaged and untracked dirt: the receipt never read
-    ignored bytes and cannot say whose they are.
+    The restore reverts the commit and leaves the hook's output as it found
+    it — the file written, or the file gone — named for the operator, like
+    unstaged and untracked dirt: the receipt never read ignored bytes and
+    cannot say whose they were, or put a removed one back.
 
     Ablation: return `()` from `integrated_ignored_additions` and every row
     reds on `summary.paused` — the run finished, ids `done`, over the hook's
-    file; compare paths alone and the `rewrites` and `truncates` rows red."""
+    output; compare paths alone and the `rewrites` and `truncates` rows red;
+    iterate the current listing alone and the `removes` rows red."""
     effect, _expected = _ignored_publication_bundle(project)
     (project.project / ".gitignore").write_text(
         (project.project / ".gitignore").read_text() + "*.tmp\n"
@@ -27591,6 +27687,7 @@ def test_target_hook_writing_an_ignored_file_beside_an_incoming_path_is_refused(
         "adds": "printf 'target hook mutation' > dir/cache.tmp",
         "rewrites": "printf 'target hook mutation' > dir/cache.tmp",
         "truncates": ": > dir/cache.tmp",
+        "removes": "rm dir/cache.tmp",
     }[write]
     hook.write_text(
         "#!/bin/sh\n"
@@ -27619,17 +27716,21 @@ def test_target_hook_writing_an_ignored_file_beside_an_incoming_path_is_refused(
     assert "unit-merged" not in journal_kinds(engine)
     assert not durable.artifact_publication_complete
     [refusal] = _records(engine, "artifact-publication-refused")
-    assert "wrote or changed ignored entries after integration (left in place): dir/cache.tmp" in (
-        refusal["error"]
+    assert (
+        "wrote, changed or removed ignored entries after integration (left as found): "
+        "dir/cache.tmp" in refusal["error"]
     )
     assert "target hook mutation" not in refusal["error"]  # path-only evidence
     assert verify.rev_parse_head(project.repo_root) == target_head
     assert not (project.project / "dir" / "added").exists()
     assert (project.project / "dir" / "keep").read_text() == "already here\n"
-    # named, and left in place: the receipt never read ignored bytes
-    assert (project.project / "dir" / "cache.tmp").read_text() == (
-        "" if write == "truncates" else "target hook mutation"
-    )
+    # named, and left as found: the receipt never read ignored bytes
+    if write == "removes":
+        assert not (project.project / "dir" / "cache.tmp").exists()
+    else:
+        assert (project.project / "dir" / "cache.tmp").read_text() == (
+            "" if write == "truncates" else "target hook mutation"
+        )
     assert git(project.project, "status", "--porcelain", "-uall") == ""
     assert durable.integration_attempt is not None
     assert durable.integration_attempt.get("outcome") == "refused-restored"
@@ -29053,7 +29154,7 @@ def test_target_hook_writing_an_ignored_file_into_a_captured_submodule_is_refuse
     assert "unit-merged" not in journal_kinds(engine)
     [refusal] = _records(engine, "artifact-publication-refused")
     assert refusal["error"].endswith(
-        "in a captured submodule checkout after integration (left in place): module/hook.log"
+        "in a captured submodule checkout after integration (left as found): module/hook.log"
     )
 
 
@@ -29204,7 +29305,7 @@ def test_target_hook_writing_into_a_captured_submodules_automator_directory_is_r
     assert "unit-merged" not in journal_kinds(engine)
     [refusal] = _records(engine, "artifact-publication-refused")
     assert refusal["error"].endswith(
-        "in a captured submodule checkout after integration (left in place): "
+        "in a captured submodule checkout after integration (left as found): "
         "module/.bmad-loop/cache/hook.log"
     )
 
@@ -29301,8 +29402,9 @@ def test_target_hook_initialising_a_repository_in_a_populated_directory_is_refus
     assert "unit-merged" not in journal_kinds(engine)
     assert not durable.artifact_publication_complete
     [refusal] = _records(engine, "artifact-publication-refused")
-    assert "wrote or changed ignored entries after integration (left in place): dir/.git" in (
-        refusal["error"]
+    assert (
+        "wrote, changed or removed ignored entries after integration (left as found): dir/.git"
+        in (refusal["error"])
     )
     assert "target hook mutation" not in refusal["error"]  # path-only evidence
     assert verify.rev_parse_head(project.repo_root) == target_head

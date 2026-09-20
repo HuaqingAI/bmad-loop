@@ -4629,11 +4629,14 @@ def test_ignored_entries_receipt_names_an_entry_added_after_the_hooks(project, t
     that was already wholly ignored, anywhere — and, each entry sealed with
     its `lstat` identity, one it did record that a hook then overwrote,
     truncated or touched in place, which leaves the path set unchanged and
-    `status` and `diff` silent (Codex, #796 review). What it does not name:
-    an ignored entry that left the listing (the receipt never held its
-    bytes), an ignored path the commit now tracks, a tolerated stray an
-    incoming `.gitignore` change turned ignored, and the run's own records
-    under the automator directory, this receipt's sidecars among them.
+    `status` and `diff` silent (Codex, #796 review) — and one it did record
+    that is gone from disk, a hook's deletion of an ignored file that was
+    already there, which `status` and `diff` are as silent about (a later
+    Codex round, #796 review; `test_ignored_entries_receipt_names_an_entry_removed_after_the_hooks`
+    reads the shapes). What it does not name: an ignored path the commit now
+    tracks (`incoming`), a tolerated stray an incoming `.gitignore` change
+    turned ignored, and the run's own records under the automator directory,
+    this receipt's sidecars among them.
 
     Ablation: return `()` from `integrated_ignored_additions` and the
     additions assertion reds; compare paths alone and the rewritten,
@@ -4698,11 +4701,21 @@ def test_ignored_entries_receipt_names_an_entry_added_after_the_hooks(project, t
     (repo / ".gitignore").write_text("*.tmp\nbuild/\n.bmad-loop/runs/\n*.log\n")
     git(repo, "add", "-f", "--", "dir/added", "dir/becomes-tracked.tmp", ".gitignore")
     git(repo, "commit", "-q", "-m", "integrated")
-    (repo / "dir" / "stale.tmp").unlink()  # a removal is not read
+    incoming = ("dir/added", "dir/becomes-tracked.tmp")
+    assert (
+        verify.integrated_ignored_additions(
+            repo, run_dir, evidence, tolerated=("stray.log",), incoming=incoming
+        )
+        == ()
+    )
+    assert verify.integrated_ignored_additions(repo, run_dir, evidence, incoming=incoming) == (
+        "stray.log",
+    )
+    # the path the commit now tracks left the listing but stands on disk:
+    # not a removal, whether or not the incoming set names it
     assert (
         verify.integrated_ignored_additions(repo, run_dir, evidence, tolerated=("stray.log",)) == ()
     )
-    assert verify.integrated_ignored_additions(repo, run_dir, evidence) == ("stray.log",)
 
     (repo / "dir" / "cache.tmp").write_text("target hook output\n")
     (repo / "build" / "new.o").write_text("target hook output\n")
@@ -4712,12 +4725,16 @@ def test_ignored_entries_receipt_names_an_entry_added_after_the_hooks(project, t
     os.utime(repo / "dir" / "touched.tmp")
     assert git(repo, "status", "--porcelain", "-uall") == ""
 
+    (repo / "dir" / "stale.tmp").unlink()
+    assert git(repo, "status", "--porcelain", "-uall") == ""
+
     assert verify.integrated_ignored_additions(
-        repo, run_dir, evidence, tolerated=("stray.log",)
+        repo, run_dir, evidence, tolerated=("stray.log",), incoming=incoming
     ) == (
         "build/new.o",
         "dir/cache.tmp",
         "dir/rewritten.tmp",
+        "dir/stale.tmp",
         "dir/touched.tmp",
         "dir/truncated.tmp",
         "elsewhere.tmp",
@@ -4736,6 +4753,164 @@ def test_ignored_entries_receipt_names_an_entry_added_after_the_hooks(project, t
         verify.integrated_ignored_additions(repo, run_dir, odd)
     with pytest.raises(verify.IntegrationEvidenceError, match="malformed"):
         verify.integrated_ignored_additions(repo, run_dir, {"sidecar": "x", "size": 1})
+
+
+def test_ignored_entries_receipt_names_an_entry_removed_after_the_hooks(project, tmp_path):
+    """A target hook deleting an ignored file that was already there when the
+    receipt was armed (`rm .env`, `rm -rf build/`) leaves `status` and `diff`
+    as silent as its overwrite does, and the reading compared only the
+    current listing against the record, so the recorded entry was never
+    examined: the run recorded `unit-merged` and retired the receipt over a
+    deletion of pre-existing target data (Codex, #796 review). The record is
+    now read in both directions, and a recorded entry gone from disk is
+    named — a file, a nested repository's `.git`, an entry inside a
+    tolerated nested repository, whose tolerance covers its presence and
+    not its contents. What git's own write explains is not named: a
+    recorded entry at an incoming path (the commit tracks it now) or beneath
+    one (an ignored `d/x` where the commit put the file `d`) — git clobbers
+    each without a word; an ignored file `p` where the commit put `p/y` is
+    clobbered too, but the commit's directory stands there, present, and
+    needs no rule. Nor is a recorded entry that left the ignored listing but
+    still stands: uncovered by an incoming `.gitignore` change, it is the
+    stray reading's, at its recorded identity. Nor an entry under a retained
+    leftover, the captured checkout's reading's.
+
+    Ablation: skip the recorded-side pass and every removal goes unnamed
+    (`removed` reds); drop the beneath-incoming exclusion and
+    `under-file/x.tmp` is named as a removal; catch only `FileNotFoundError`
+    in `_lstat_identity` and the same entry raises `NotADirectoryError`;
+    drop the on-disk probe and `uncovered.tmp` and `becomes-dir.tmp` are
+    named; ignore `removals` and the residue-shaped reading names every
+    removal beside the addition."""
+    repo = project.project
+    run_dir = repo / ".bmad-loop" / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    (repo / ".gitignore").write_text("*.tmp\nbuild/\n.bmad-loop/runs/\nuncovered.tmp\n")
+    (repo / "dir").mkdir()
+    (repo / "dir" / "keep").write_text("already here\n")
+    (repo / "dir" / "removed.tmp").write_text("ignored before\n")
+    (repo / "dir" / "kept.tmp").write_text("ignored before\n")
+    (repo / "build").mkdir()
+    (repo / "build" / "old.o").write_text("ignored before\n")
+    (repo / "under-file").mkdir()
+    (repo / "under-file" / "keep").write_text("the commit replaces this directory with a file\n")
+    (repo / "under-file" / "x.tmp").write_text("git clobbers this for the file under-file\n")
+    (repo / "becomes-dir.tmp").write_text("git clobbers this for becomes-dir.tmp/y\n")
+    (repo / "at-incoming.tmp").write_text("the commit tracks this path\n")
+    (repo / "uncovered.tmp").write_text("the incoming .gitignore uncovers this\n")
+    git(repo, "add", "--", ".gitignore", "dir/keep", "under-file/keep")
+    git(repo, "commit", "-q", "-m", "populated dir; ignored entries")
+    nested = repo / "build" / "nested"
+    nested.mkdir()
+    git(nested, "init", "-q")
+    (nested / "tool.py").write_text("inside a nested repository git tracks nothing under\n")
+    (repo / "vendor").mkdir()
+    git(repo / "vendor", "init", "-q")
+    (repo / "vendor" / "tool.py").write_text("inside the tolerated nested repository\n")
+    incoming = (
+        "under-file",
+        "under-file/keep",
+        "becomes-dir.tmp/y",
+        "at-incoming.tmp",
+        ".gitignore",
+    )
+    # the receipt records `becomes-dir.tmp/y` absent by topology, its parent
+    # an ignored file; measured: `merge` clobbers that file and `under-file/x.tmp`
+    # alike, `status` silent about both
+    verify.capture_integration_state(repo, run_dir, "e" * 32, incoming)
+
+    evidence = verify.capture_ignored_entries(repo, run_dir, "e" * 32)
+
+    recorded = (run_dir / str(evidence["sidecar"])).read_bytes().split(b"\0")[::2]
+    assert set(recorded) >= {
+        b"at-incoming.tmp",
+        b"becomes-dir.tmp",
+        b"build/nested/",
+        b"build/nested/.git",
+        b"build/nested/tool.py",
+        b"build/old.o",
+        b"dir/kept.tmp",
+        b"dir/removed.tmp",
+        b"under-file/x.tmp",
+        b"uncovered.tmp",
+        b"vendor/.git",
+        b"vendor/tool.py",
+    }
+    assert (
+        verify.integrated_ignored_additions(
+            repo, run_dir, evidence, tolerated=("vendor",), incoming=incoming
+        )
+        == ()
+    )
+
+    # the integrated shape: git overwrote the ignored entries the commit's
+    # paths stood on or under, and tracks one; its `.gitignore` uncovers one
+    git(repo, "rm", "-q", "-r", "--cached", "--", "under-file")
+    shutil.rmtree(repo / "under-file")
+    (repo / "under-file").write_text("the commit's file\n")
+    (repo / "becomes-dir.tmp").unlink()
+    (repo / "becomes-dir.tmp").mkdir()
+    (repo / "becomes-dir.tmp" / "y").write_text("the commit's file\n")
+    (repo / ".gitignore").write_text("*.tmp\nbuild/\n.bmad-loop/runs/\n!uncovered.tmp\n")
+    git(repo, "add", "-f", "--", "under-file", "becomes-dir.tmp/y", "at-incoming.tmp", ".gitignore")
+    git(repo, "commit", "-q", "-m", "integrated")
+    assert git(repo, "status", "--porcelain", "-uall") == "?? uncovered.tmp\n?? vendor/"
+    assert (
+        verify.integrated_ignored_additions(
+            repo, run_dir, evidence, tolerated=("vendor",), incoming=incoming
+        )
+        == ()
+    )
+
+    # the hook's deletions: an ignored file, a whole ignored directory with
+    # the nested repository in it, a file inside the tolerated repository
+    (repo / "dir" / "removed.tmp").unlink()
+    shutil.rmtree(repo / "build")
+    (repo / "vendor" / "tool.py").unlink()
+    assert git(repo, "status", "--porcelain", "-uall") == "?? uncovered.tmp\n?? vendor/"
+    assert git(repo, "diff", "--name-only", "HEAD") == ""
+
+    removed = verify.integrated_ignored_additions(
+        repo, run_dir, evidence, tolerated=("vendor",), incoming=incoming
+    )
+
+    assert removed == (
+        "build/nested/",
+        "build/nested/.git",
+        "build/nested/tool.py",
+        "build/old.o",
+        "dir/removed.tmp",
+        "vendor/tool.py",
+    )
+    # under a retained leftover the removal is the captured checkout's reading's
+    assert verify.integrated_ignored_additions(
+        repo,
+        run_dir,
+        evidence,
+        tolerated=("vendor",),
+        incoming=incoming,
+        retained_checkouts=("build",),
+    ) == ("dir/removed.tmp", "vendor/tool.py")
+    # the residue reading's shape: the recorded side is not read, so a
+    # named rewrite the operator deleted clears, and a named removal is theirs
+    (repo / "elsewhere.tmp").write_text("a hook's write, still an addition\n")
+    assert verify.integrated_ignored_additions(
+        repo, run_dir, evidence, tolerated=("vendor",), incoming=incoming, removals=False
+    ) == ("elsewhere.tmp",)
+    (repo / "elsewhere.tmp").unlink()
+    # and the incoming set is what keeps git's own clobbering unnamed: the
+    # entry beneath the file the commit put at `under-file` is gone, its
+    # ancestor no longer a directory; the tracked path and the directory
+    # the commit put where an ignored file stood are present, and not read
+    assert verify.integrated_ignored_additions(repo, run_dir, evidence, tolerated=("vendor",)) == (
+        "build/nested/",
+        "build/nested/.git",
+        "build/nested/tool.py",
+        "build/old.o",
+        "dir/removed.tmp",
+        "under-file/x.tmp",
+        "vendor/tool.py",
+    )
 
 
 def test_ignored_entries_receipt_names_a_nested_git_entry_git_lists_nowhere(project, tmp_path):
@@ -4899,21 +5074,22 @@ def test_integrated_submodule_ignored_additions_name_a_hooks_write_the_checkout_
         )
         == ()
     )
-    (checkout / "gone.log").unlink()
+    (checkout / "gone.log").unlink()  # a removal is named too (a later Codex round)
     (checkout / "hook.log").write_text("target hook output\n")
     assert git(checkout, "status", "--porcelain", "-uall") == ""
     assert git(repo, "status", "--porcelain", "-uall") == ""
 
     assert verify.integrated_submodule_ignored_additions(
         repo, run_dir, submodules, revision=integrated
-    ) == ("module/hook.log",)
+    ) == ("module/gone.log", "module/hook.log")
 
     (checkout / "hook.log").unlink()
+    (checkout / "gone.log").write_text("ignored before, removed during\n")
     with (checkout / "old.log").open("a") as stream:
         stream.write("target hook output\n")
     assert verify.integrated_submodule_ignored_additions(
         repo, run_dir, submodules, revision=integrated
-    ) == ("module/old.log",)
+    ) == ("module/gone.log", "module/old.log")
 
     # an older receipt's entry, no listing sealed: reads as it did
     legacy = [{key: value for key, value in captured.items() if key != "ignored"}]
