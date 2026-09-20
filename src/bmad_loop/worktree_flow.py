@@ -3658,9 +3658,13 @@ class WorktreeFlow:
                     )
                 # What status cannot list: an index flag word a hook flipped on
                 # a clean tracked file outside the incoming set, proved unchanged
-                # by the receipt's digest and named from its map (#796 review).
-                # After the stray reading, which owns an entry added or removed.
-                # Left in place by the restore, like unstaged dirt, and named.
+                # by the receipt's digest and named from its map — and the file
+                # behind an entry the index already trusted unread (assume-
+                # unchanged, skip-worktree), which a hook can overwrite with no
+                # word, blob, or status reading moving, named from the receipt's
+                # `lstat` identity of it (#796 review). After the stray reading,
+                # which owns an entry added or removed. Left in place by the
+                # restore, like unstaged dirt, and named.
                 if attempt.get("index_flags") is not None:
                     flipped = verify.integrated_index_flags_outside_drift(
                         repo,
@@ -3669,8 +3673,9 @@ class WorktreeFlow:
                     )
                     if flipped:
                         raise verify.IntegrationEvidenceError(
-                            "target hook changed index flags outside the incoming set "
-                            "after integration (left in place): " + ", ".join(flipped)
+                            "target hook changed index flags, or files the index trusts "
+                            "unread, outside the incoming set after integration (left in "
+                            "place): " + ", ".join(flipped)
                         )
                 # And the one place none of those list: a directory the commit
                 # created where the receipt proved nothing was — or proved a

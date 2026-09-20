@@ -4198,6 +4198,93 @@ def test_integrated_index_flags_outside_drift_names_a_hook_s_flip(project, tmp_p
     )
 
 
+@pytest.mark.parametrize("flag", ["assume-unchanged", "skip-worktree"])
+@pytest.mark.parametrize("write", ["overwrite", "remove"])
+def test_integrated_index_flags_outside_drift_names_a_write_under_a_pre_marked_entry(
+    project, tmp_path, flag, write
+):
+    """A clean tracked file outside the incoming set that is ALREADY
+    assume-unchanged or skip-worktree when the receipt is armed: a target hook
+    overwriting it changes no flag word and no blob, and `status --porcelain`
+    and `diff --name-only HEAD` both trust the flag and read it clean, so the
+    receipt's digest and `marked` map held and the integration recorded
+    `unit-merged` over the hook's bytes (Codex, #796 review). The receipt now
+    records the `lstat` identity of the file behind every such entry
+    (`unread`), and the reading names the path whose identity moved —
+    overwritten, or removed, which the flag hides from status the same way.
+
+    Ablation: drop `unread` from the capture and every row reds on the last
+    assertion."""
+    repo = project.project
+    (repo / "notes.txt").write_text("clean and outside the incoming set\n")
+    git(repo, "add", "--", "notes.txt")
+    git(repo, "commit", "-q", "-m", "notes.txt")
+    git(repo, "update-index", f"--{flag}", "--", "notes.txt")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    snapshots, _submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ("src.txt",))
+    exclude = [entry["path"] for entry in snapshots]
+    evidence = verify.capture_index_flags(repo, exclude=exclude)
+    assert set(evidence["unread"]) == {"notes.txt"}
+    assert evidence["unread"]["notes.txt"] == verify._lstat_identity(repo, "notes.txt")
+    assert verify.validate_index_flags_evidence(evidence) == evidence
+    (repo / "src.txt").write_text("incoming\n")
+    git(repo, "add", "--", "src.txt")
+    git(repo, "commit", "-q", "-m", "integrated")
+    assert verify.integrated_index_flags_outside_drift(repo, evidence, exclude=exclude) == ()
+    if write == "overwrite":
+        (repo / "notes.txt").write_text("a target hook's bytes\n")
+    else:
+        (repo / "notes.txt").unlink()
+    # git trusts the flag over the worktree: no reading of git's names it
+    assert git(repo, "status", "--porcelain", "-uall", "--ignored") == ""
+    assert git(repo, "diff", "--name-only", "HEAD") == ""
+    assert verify.integrated_stray_paths(repo, tolerated=(), incoming=("src.txt",)) == ()
+    after = verify.capture_index_flags(repo, exclude=exclude)
+    assert after["digest"] == evidence["digest"] and after["marked"] == evidence["marked"]
+
+    assert verify.integrated_index_flags_outside_drift(repo, evidence, exclude=exclude) == (
+        "notes.txt",
+    )
+    # and a receipt armed before the identity was recorded reads as it did
+    legacy = {"digest": evidence["digest"], "marked": evidence["marked"]}
+    assert verify.validate_index_flags_evidence(legacy) == legacy
+    assert verify.integrated_index_flags_outside_drift(repo, legacy, exclude=exclude) == ()
+    with pytest.raises(verify.IntegrationEvidenceError, match="malformed"):
+        verify.validate_index_flags_evidence({**evidence, "unread": {"notes.txt": "1:2"}})
+    with pytest.raises(verify.IntegrationEvidenceError, match="malformed"):
+        verify.validate_index_flags_evidence({**evidence, "unread": {"../x": None}})
+
+
+def test_integrated_index_flags_outside_drift_names_a_file_put_at_a_sparse_entry(project, tmp_path):
+    """A sparse target's out-of-cone entries are skip-worktree with no file on
+    disk: the receipt records each as unread and absent, and the untouched
+    target reads as before. A target hook putting a file there is named by
+    the identity — whatever status says: a sparse checkout re-reads a file
+    that appears at an out-of-cone entry and clears its bit (git 2.55 reports
+    `M`), where a plain skip-worktree entry stays trusted unread."""
+    repo = project.project
+    (repo / "keep").mkdir()
+    (repo / "keep" / "k.txt").write_text("in the cone\n")
+    (repo / "other").mkdir()
+    (repo / "other" / "o.txt").write_text("out of the cone\n")
+    git(repo, "add", "--", "keep/k.txt", "other/o.txt")
+    git(repo, "commit", "-q", "-m", "two dirs")
+    git(repo, "sparse-checkout", "set", "--cone", "keep")
+    assert not (repo / "other").exists()
+    evidence = verify.capture_index_flags(repo, exclude=["src.txt"])
+    assert evidence["marked"] == {}
+    assert evidence["unread"] == {"other/o.txt": None}
+    assert verify.integrated_index_flags_outside_drift(repo, evidence, exclude=["src.txt"]) == ()
+    (repo / "other").mkdir()
+    (repo / "other" / "o.txt").write_text("a target hook's bytes\n")
+
+    assert verify.integrated_index_flags_outside_drift(repo, evidence, exclude=["src.txt"]) == (
+        "other/o.txt",
+    )
+    git(repo, "sparse-checkout", "disable")
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="Win32 forbids newlines in filenames")
 def test_index_flag_readings_walk_debug_records_past_a_newline_in_a_path(project, tmp_path):
     """`ls-files --debug -z` NUL-terminates the path alone and follows it with

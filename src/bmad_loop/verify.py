@@ -2760,6 +2760,13 @@ def _index_flags_digest(words: Iterable[tuple[str, str]]) -> str:
     return digest.hexdigest()
 
 
+# The flag bits under which git trusts the index over the worktree —
+# assume-unchanged (CE_VALID) and skip-worktree: neither `status` nor `diff`
+# stats such an entry's file, so what the file holds is read by no git
+# reading at all.
+_UNREAD_INDEX_FLAG_BITS = 0x8000 | 0x40000000
+
+
 def capture_index_flags(repo: Path, *, exclude: Iterable[str]) -> dict[str, object]:
     """The receipt's evidence for the flag words of the index OUTSIDE the snapshot set.
 
@@ -2771,7 +2778,15 @@ def capture_index_flags(repo: Path, *, exclude: Iterable[str]) -> dict[str, obje
     after the hooks without persisting it; ``marked`` maps the entries among
     them carrying a word no fresh entry may (neither none nor skip-worktree),
     so a flip can be NAMED — a typical index holds none, and a sparse target's
-    out-of-cone entries, all skip-worktree, stay out of it.
+    out-of-cone entries, all skip-worktree, stay out of it. And ``unread``
+    maps every entry among them git trusts over its file — assume-unchanged
+    or skip-worktree already set when the receipt is armed — to the file's
+    ``lstat`` identity (`_lstat_identity`; ``None`` for one not on disk, a
+    sparse target's out-of-cone entries among them): a hook overwriting such
+    a file changes no word and no blob, and ``status`` and ``diff`` both trust
+    the flag and read it clean, so the digest and the map held and the
+    integration recorded ``unit-merged`` over the hook's bytes (#796 review).
+    The identity is what names it, as it names an ignored entry's overwrite.
     """
     excluded = {_portable_integration_path(path) for path in exclude}
     words = [(path, word) for path, word in _index_file_flag_words(repo) if path not in excluded]
@@ -2779,6 +2794,11 @@ def capture_index_flags(repo: Path, *, exclude: Iterable[str]) -> dict[str, obje
         "digest": _index_flags_digest(words),
         "marked": {
             path: word for path, word in words if word not in {"0", _SPARSE_INDEX_FLAG_WORD}
+        },
+        "unread": {
+            path: _lstat_identity(repo, path)
+            for path, word in words
+            if int(word, 16) & _UNREAD_INDEX_FLAG_BITS
         },
     }
 
@@ -2935,6 +2955,10 @@ def _tracked_beneath(repo: Path, rel: str) -> bool:
     if proc.returncode != 0:
         raise IntegrationEvidenceError("target tracked-path evidence is unavailable")
     return bool(proc.stdout)
+
+
+# The shape `_lstat_identity` writes: six integers, colon-joined.
+_LSTAT_IDENTITY = re.compile(r"-?[0-9]+(:-?[0-9]+){5}")
 
 
 def _lstat_identity(repo: Path, path: str) -> str | None:
@@ -3169,11 +3193,20 @@ def integrated_introduced_gitlinks(
 
 
 def validate_index_flags_evidence(value: object) -> dict[str, object]:
-    """Validate a persisted `capture_index_flags` record; the same dict back."""
-    if not isinstance(value, dict) or set(value) != {"digest", "marked"}:
+    """Validate a persisted `capture_index_flags` record; the same dict back.
+
+    ``unread`` is optional: a receipt armed before it was recorded reads
+    without that reading.
+    """
+    if not isinstance(value, dict) or not {"digest", "marked"} <= set(value) <= {
+        "digest",
+        "marked",
+        "unread",
+    }:
         raise IntegrationEvidenceError("persisted target index flag evidence is malformed")
     digest = value["digest"]
     marked = value["marked"]
+    unread = value.get("unread", {})
     if (
         not isinstance(digest, str)
         or not re.fullmatch(r"[0-9a-f]{64}", digest)
@@ -3182,9 +3215,15 @@ def validate_index_flags_evidence(value: object) -> dict[str, object]:
             not isinstance(word, str) or not re.fullmatch(r"[0-9a-f]{1,8}", word)
             for word in marked.values()
         )
+        or not isinstance(unread, dict)
+        or any(
+            identity is not None
+            and (not isinstance(identity, str) or not re.fullmatch(_LSTAT_IDENTITY, identity))
+            for identity in unread.values()
+        )
     ):
         raise IntegrationEvidenceError("persisted target index flag evidence is malformed")
-    for path in marked:
+    for path in (*marked, *unread):
         _portable_integration_path(path)
     return value
 
@@ -3192,7 +3231,8 @@ def validate_index_flags_evidence(value: object) -> dict[str, object]:
 def integrated_index_flags_outside_drift(
     repo: Path, evidence: object, *, exclude: Iterable[str], require_named: bool = True
 ) -> tuple[str, ...]:
-    """Paths outside the snapshot set whose index flag word a hook changed.
+    """Paths outside the snapshot set whose index flag word a hook changed —
+    or whose file, trusted unread by the index, it wrote.
 
     The digest of `capture_index_flags`, recomputed over the same set, proves
     the rest of the index unchanged; on a mismatch each entry is read against
@@ -3203,24 +3243,37 @@ def integrated_index_flags_outside_drift(
     sparse target, where both words are fresh) is reported as such rather
     than passed, unless ``require_named`` is off: the re-arm reading
     (`refused_integration_residue`) takes the index as the operator left it
-    and asks only what it can name. Path-only evidence, sorted.
+    and asks only what it can name. Whatever the digest reads, every entry
+    the receipt recorded as trusted unread (``unread``: assume-unchanged or
+    skip-worktree when armed) is read at its file's ``lstat`` identity against
+    the captured one — the one reading of a file git itself never stats
+    (#796 review). Path-only evidence, sorted.
     """
     validated = validate_index_flags_evidence(evidence)
     marked = validated["marked"]
     assert isinstance(marked, dict)
+    unread = validated.get("unread", {})
+    assert isinstance(unread, dict)
     excluded = {_portable_integration_path(path) for path in exclude}
+    # the file behind an entry git trusts unread: overwritten, truncated,
+    # removed or put on disk, its word and blob unchanged and status silent
+    rewritten = {
+        path
+        for path, identity in unread.items()
+        if path not in excluded and _lstat_identity(repo, path) != identity
+    }
     words = [(path, word) for path, word in _index_file_flag_words(repo) if path not in excluded]
     if _index_flags_digest(words) == validated["digest"]:
-        return ()
+        return tuple(sorted(rewritten))
     fresh = _fresh_index_flag_words(repo)
     drift = sorted(
         path for path, word in words if word != marked.get(path, word if word in fresh else None)
     )
-    if not drift and require_named:
+    if not drift and not rewritten and require_named:
         raise IntegrationEvidenceError(
             "target hook changed index flag words outside the incoming set; no path named"
         )
-    return tuple(drift)
+    return tuple(sorted({*drift, *rewritten}))
 
 
 def refused_integration_residue(

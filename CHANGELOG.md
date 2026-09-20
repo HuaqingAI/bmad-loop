@@ -494,7 +494,11 @@ breaking changes may land in a minor release.
   resume) — and a hook's `update-index --assume-unchanged` on a clean
   tracked file outside the incoming set, which status never lists, is
   refused by the receipt's digest of every other index entry's flag word
-  and named from its map of the marked ones (a rename's source is incoming
+  and named from its map of the marked ones — and a hook's overwrite of a
+  file the index already trusted unread when the receipt was armed
+  (assume-unchanged or skip-worktree), which moves no word, no blob and no
+  status or diff reading, is refused by the receipt's `lstat` identity of
+  that file, the way an ignored file's overwrite is (a rename's source is incoming
   too — `diff --name-only` had named the destination alone — so a renaming
   bundle is not refused over the entry its merge deletes), and a hook's
   gitignored write anywhere — beside an incoming path in a directory the
