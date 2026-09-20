@@ -3697,8 +3697,12 @@ class WorktreeFlow:
                 # was already there, which no reading above lists — and a
                 # nested `.git` anywhere, which git lists in no reading at
                 # all, a checkout the submodule reading accepted at a gitlink
-                # the commit introduced excepted (#796 review). Left in place
-                # by the restore, like unstaged dirt, and named.
+                # the commit introduced excepted, and a write inside a nested
+                # repository git tracks nothing under (the tolerated `vendor`
+                # among them), which git never descends into; the leftover of
+                # a deleted gitlink is the captured checkout's reading's
+                # below (#796 review). Left in place by the restore, like
+                # unstaged dirt, and named.
                 if attempt.get("ignored") is not None:
                     added = verify.integrated_ignored_additions(
                         repo,
@@ -3711,6 +3715,7 @@ class WorktreeFlow:
                             attempt["submodules"],
                             revision=expected_revision,
                         ),
+                        retained_checkouts=retained_checkouts,
                     )
                     if added:
                         raise verify.IntegrationEvidenceError(

@@ -4427,17 +4427,22 @@ def test_ignored_entries_receipt_names_a_nested_git_entry_git_lists_nowhere(proj
     review). The receipt's whole-tree listing now walks the tree for every
     nested `.git` entry — directory, gitfile, symlink — and after the hooks
     one it did not record is named, wherever it stands: under a populated
-    tracked directory, under an ignored one. What it does not name: a
-    nested repository that was already there (recorded at its identity, one
-    entry per repository boundary, nothing inside it read), the run's own
-    worktrees under the automator directory, and the `.git` of a checkout
-    the submodule reading accepts at a gitlink the commit introduced
-    (`integrated_introduced_gitlinks`, tolerated by the caller).
+    tracked directory, under an ignored one. A nested repository git tracks
+    nothing under — the one in the ignored directory here — is walked like
+    the ignored directory it stands in, every entry at its identity, so a
+    hook's write inside it is named too (a second Codex round, #796 review);
+    a boundary git tracks something beneath is that reading's, and the walk
+    stops there. What it does not name: an entry that was already there,
+    the run's own worktrees under the automator directory, and the `.git`
+    of a checkout the submodule reading accepts at a gitlink the commit
+    introduced (`integrated_introduced_gitlinks`, tolerated by the caller).
 
     Ablation: return `{}` from `_nested_git_entries` and every named row
-    reds; drop the boundary stop and the pre-existing nested repository's
-    own entries are named; drop the introduced-gitlink tolerance and the
-    accepted checkout's `.git` is named."""
+    reds; stop at every boundary and the pre-existing nested repository's
+    inner `.git` and the write over `cache.o` go unnamed; descend past a
+    tracked boundary and `dir/keep` is named beside `dir/.git`; drop the
+    introduced-gitlink tolerance and the accepted checkout's `.git` is
+    named."""
     repo = project.project
     run_dir = repo / ".bmad-loop" / "runs" / "r1"
     run_dir.mkdir(parents=True)
@@ -4458,7 +4463,11 @@ def test_ignored_entries_receipt_names_a_nested_git_entry_git_lists_nowhere(proj
     evidence = verify.capture_ignored_entries(repo, run_dir, "d" * 32)
 
     recorded = (run_dir / str(evidence["sidecar"])).read_bytes().split(b"\0")[::2]
-    assert recorded == [b"build/vendored/", b"build/vendored/.git"]
+    assert recorded == [
+        b"build/vendored/",
+        b"build/vendored/.git",
+        b"build/vendored/src/cache.o",
+    ]
     assert verify.integrated_ignored_additions(repo, run_dir, evidence) == ()
 
     origin = tmp_path / "new-origin"
@@ -4490,20 +4499,36 @@ def test_ignored_entries_receipt_names_a_nested_git_entry_git_lists_nowhere(proj
     (repo / "dir" / "keep2" / ".git").write_text("gitdir: /elsewhere\n")
     (repo / "build" / "tool").mkdir()
     (repo / "build" / "tool" / ".git").symlink_to(repo / ".git")
-    (repo / "build" / "vendored" / "src" / ".git").mkdir()  # inside a recorded boundary
+    (repo / "build" / "vendored" / "src" / ".git").mkdir()  # inside a walked boundary
     assert git(repo, "status", "--porcelain", "-uall", "--ignored", "--", "dir") == ""
 
     assert verify.integrated_ignored_additions(
         repo, run_dir, evidence, introduced_checkouts=introduced
-    ) == ("build/tool/.git", "dir/.git")
-    # `dir` holds a `.git` now, so the walk stops there — its `.git` is the
-    # one entry and everything beneath is that repository's own reading's;
-    # without it, `dir/keep2`, which git passes over, is read
+    ) == ("build/tool/.git", "build/vendored/src/.git", "dir/.git")
+    # `dir` holds a `.git` now, and git tracks `dir/keep` beneath it, so the
+    # walk stops there — its `.git` is the one entry, `dir/keep` stays the
+    # diff readings'; without it, `dir/keep2`, which git passes over, is read
     (repo / "dir" / ".git" / "config").unlink()
     (repo / "dir" / ".git").rmdir()
     assert verify.integrated_ignored_additions(
         repo, run_dir, evidence, introduced_checkouts=introduced
-    ) == ("build/tool/.git", "dir/keep2/.git")
+    ) == ("build/tool/.git", "build/vendored/src/.git", "dir/keep2/.git")
+    # a hook's write over a file inside the nested repository, in place, and
+    # a file it adds there: neither is in any git listing, and both are named
+    (repo / "build" / "vendored" / "src" / ".git").rmdir()
+    (repo / "build" / "vendored" / "src" / "cache.o").write_text("rewritten by a hook\n")
+    (repo / "build" / "vendored" / "src" / "hook.log").write_text("hook\n")
+    assert git(repo, "status", "--porcelain", "-uall", "--ignored", "--", "build/vendored") == (
+        "!! build/vendored/"
+    )
+    assert verify.integrated_ignored_additions(
+        repo, run_dir, evidence, introduced_checkouts=introduced
+    ) == (
+        "build/tool/.git",
+        "build/vendored/src/cache.o",
+        "build/vendored/src/hook.log",
+        "dir/keep2/.git",
+    )
 
 
 def test_integrated_submodule_ignored_additions_name_a_hooks_write_the_checkout_ignores(
@@ -4670,16 +4695,22 @@ def test_tolerated_nested_repository_passes_every_receipt_reading(project, incom
     malformed, and again at each resume (Codex, #796 review). The plan now
     tolerates it as `vendor`; the capture passes it over (an operator's
     repository, no file of the target's to snapshot); the ignored listing
-    seals its `.git` at its identity; and after the hooks the stray reading
-    and the ignored reading both leave it alone — a `.gitignore` the commit
-    brings that turns it ignored included — while a hook that replaces its
-    `.git` is named. It is never cleaned: an incoming *file* `vendor` is a
-    shape clash for git's pre-flight, not an Editor leak.
+    seals its `.git` and every entry of its tree at its identity — the
+    tolerance covers the repository's presence, which the guard read, not
+    its contents, which no other reading captures (a second Codex round,
+    #796 review); and after the hooks the stray reading and the ignored
+    reading both leave it alone — a `.gitignore` the commit brings that
+    turns it ignored included — while a hook that replaces its `.git`,
+    overwrites `vendor/tool.py` in place, or adds a file there is named. It
+    is never cleaned: an incoming *file* `vendor` is a shape clash for git's
+    pre-flight, not an Editor leak.
 
     Ablation: drop the `rstrip` in `plan_incoming_collisions` and both rows
     raise malformed at the capture; drop the nested-repository arm in the
     capture and both raise "not a file"; drop the `rstrip` in
-    `integrated_ignored_additions` and the turned-ignored row is named."""
+    `integrated_ignored_additions` and the turned-ignored row is named; stop
+    the walk at the boundary and the overwrite and the added file go
+    unnamed."""
     repo = project.project
     run_dir = repo / ".bmad-loop" / "runs" / "r1"
     run_dir.mkdir(parents=True)
@@ -4707,7 +4738,10 @@ def test_tolerated_nested_repository_passes_every_receipt_reading(project, incom
     # the nested repository is passed over — under the clash it IS the incoming operand
     assert [entry["path"] for entry in snapshots] == ([] if incoming == "vendor" else [incoming])
     evidence = verify.capture_ignored_entries(repo, run_dir, "d" * 32)
-    assert (run_dir / str(evidence["sidecar"])).read_bytes().split(b"\0")[::2] == [b"vendor/.git"]
+    assert (run_dir / str(evidence["sidecar"])).read_bytes().split(b"\0")[::2] == [
+        b"vendor/.git",
+        b"vendor/tool.py",
+    ]
     assert verify.integrated_stray_paths(repo, tolerated=plan.tolerated, incoming=(incoming,)) == ()
     assert (
         verify.integrated_ignored_additions(repo, run_dir, evidence, tolerated=plan.tolerated) == ()
@@ -4729,12 +4763,24 @@ def test_tolerated_nested_repository_passes_every_receipt_reading(project, incom
     )
     assert verify.integrated_ignored_additions(repo, run_dir, evidence) == ("vendor/",)
 
+    # a hook that overwrites a file of the repository in place, or adds one
+    # there, changes no git listing — `status` still collapses the repository
+    # to `vendor/` — and is named at the entry's identity
+    (vendor / "tool.py").write_text("rewritten by a hook\n")
+    (vendor / "hook.log").write_text("hook\n")
+    assert git(repo, "status", "--porcelain", "-uall", "--ignored", "--", "vendor") == "!! vendor/"
+    assert verify.integrated_stray_paths(repo, tolerated=plan.tolerated, incoming=(incoming,)) == ()
+    assert verify.integrated_ignored_additions(
+        repo, run_dir, evidence, tolerated=plan.tolerated
+    ) == ("vendor/hook.log", "vendor/tool.py")
+    (vendor / "hook.log").unlink()  # a removal is not read, by design
+
     # a hook that re-initialises the repository is read at its `.git`'s identity
     shutil.rmtree(vendor / ".git")
     git(vendor, "init", "-q")
     assert verify.integrated_ignored_additions(
         repo, run_dir, evidence, tolerated=plan.tolerated
-    ) == ("vendor/.git",)
+    ) == ("vendor/.git", "vendor/tool.py")
 
 
 def _integrate_new_directory(repo, run_dir):
@@ -5129,9 +5175,17 @@ def test_integrated_submodule_deletion_accepts_the_leftover_checkout(project, tm
     captured HEAD — and reported back so the absent-path probe leaves it to
     this reading; a checkout git did remove is simply absent.
 
+    The tree's ignored-entry reading leaves the leftover to this reading the
+    same way: git tracks nothing under `module` once the gitlink is gone, so
+    the walk descends into it like any nested repository and would name
+    every file of the checkout, which the receipt recorded under no such
+    identity (a second Codex round, #796 review) — `retained_checkouts`
+    leaves it out by prefix, as `integrated_stray_paths` does.
+
     Ablation: drop the deleted-gitlink arm and the leftover row reds on the
     raise; drop `retained_checkouts` from the probe and it reds on `module`
-    reported as drift."""
+    reported as drift; drop the prefix exclusion from
+    `integrated_ignored_additions` and it reds on the checkout's files."""
     repo = project.project
     _origin, checkout, old_submodule = _add_test_submodule(repo, tmp_path)
     run_dir = tmp_path / "run"
@@ -5139,6 +5193,7 @@ def test_integrated_submodule_deletion_accepts_the_leftover_checkout(project, tm
     snapshots, submodules = verify.capture_integration_state(
         repo, run_dir, "d" * 32, ("module", ".gitmodules")
     )
+    ignored = verify.capture_ignored_entries(repo, run_dir, "d" * 32)
     assert submodules == [
         {
             "path": "module",
@@ -5162,6 +5217,11 @@ def test_integrated_submodule_deletion_accepts_the_leftover_checkout(project, tm
         verify.integrated_paths_drift(repo, integrated, incoming, retained_checkouts=retained) == ()
     )
     assert verify.integrated_paths_drift(repo, integrated, incoming) == ("module",)
+    assert (
+        verify.integrated_ignored_additions(repo, run_dir, ignored, retained_checkouts=retained)
+        == ()
+    )
+    assert verify.integrated_ignored_additions(repo, run_dir, ignored) == ("module/payload.txt",)
 
 
 def test_integrated_submodule_deletion_accepts_a_removed_checkout(project, tmp_path):

@@ -527,7 +527,14 @@ breaking changes may land in a minor release.
   restore's own;
   an untracked nested repository in the target — the one entry `status`
   still collapses, `vendor/` — is tolerated as `vendor` and passed over by
-  the capture, its `.git` sealed at its identity, where its spelling had
+  the capture, its `.git` and every entry of its tree sealed at their
+  identities (the listing walks a nested repository git tracks nothing
+  under — that one, or an ignored one — like the ignored directory it
+  stands in, since no git listing descends into it and no reading captured
+  it, so a hook's write over `vendor/tool.py`, which changes no listing,
+  is named after the hooks; a boundary git tracks something beneath stays
+  that reading's, and the leftover of a deleted gitlink the captured
+  checkout's), where its spelling had
   paused every receipt-bearing integration before the merge as malformed
   and again at each resume; the restore reverts what
   the hook staged and leaves unstaged, untracked and ignored entries in place, named
