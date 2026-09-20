@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-09-20
+
 ### Added
 
 - Restore and normalize attempt-owned specs on Windows through NT handle-relative
@@ -6114,7 +6116,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.12.0
 [0.11.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.11.1
 [0.11.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.11.0
 [0.10.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.10.0
