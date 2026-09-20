@@ -478,7 +478,8 @@ breaking changes may land in a minor release.
   only when the baseline commit proves the ledger was never tracked: a ledger a rival
   commit deleted after the baseline was taken refuses publication instead of being
   silently re-added on top of that commit, the committed twin of the staged deletion
-  the publisher already refuses.
+  the publisher already refuses; a ledger the transition itself published that a later
+  commit removed refuses its replay the same way.
 
 - Refuse no-descriptor attempt-owned spec restoration before staging or lifecycle
   normalization, preserving the existing target bytes for manual recovery (DW-310).

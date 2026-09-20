@@ -10015,7 +10015,14 @@ def _preflight_bound_tree_blob(
         raise GitError("committed publication target holds rival content")
 
 
-def _preflight_bound_absence(repo: Path, baseline_commit: str | None, rel: str) -> None:
+def _preflight_bound_absence(
+    repo: Path,
+    head: str,
+    baseline_commit: str | None,
+    rel: str,
+    accepted_oid: str,
+    baseline_oid: str,
+) -> None:
     """Accept an absent committed target only on proof it was never tracked.
 
     The baseline text was read beside `baseline_commit`. A target that commit
@@ -10025,11 +10032,19 @@ def _preflight_bound_absence(repo: Path, baseline_commit: str | None, rel: str) 
     the committed twin of the staged deletion the real-index check below
     refuses. Absence at the baseline commit is the one durable proof the
     ledger was originally untracked; no baseline commit is no authority.
+
+    An originally untracked ledger has a second way to go absent: this very
+    transition published it and a later commit removed it, which a COMMITTING
+    replay would otherwise re-add. The accepted transition is still in
+    first-parent ancestry then, so its presence beneath an absent HEAD is the
+    same rival decision and refuses the same way.
     """
     if baseline_commit is None:
         raise GitError("committed publication target absence has no baseline authority")
     if _bound_tree_entry(repo, baseline_commit, rel) is not None:
         raise GitError("committed publication target was deleted after the accepted baseline")
+    if _accepted_bound_transition(repo, head, rel, accepted_oid, baseline_oid) is not None:
+        raise GitError("committed publication target was deleted after its accepted publication")
 
 
 def _bound_changed_paths(repo: Path, parent: str, revision: str) -> set[str]:
@@ -10313,7 +10328,9 @@ def commit_path_bound(
     head_blob = _bound_tree_blob(repo_root, captured.oid, rel)
     _preflight_bound_tree_blob(head_blob, baseline_oid, accepted_oid)
     if head_entry is None:
-        _preflight_bound_absence(repo_root, baseline_commit, rel)
+        _preflight_bound_absence(
+            repo_root, captured.oid, baseline_commit, rel, accepted_oid, baseline_oid
+        )
     accepted = (
         _accepted_bound_transition(repo_root, captured.oid, rel, accepted_oid, baseline_oid)
         if head_blob == accepted_oid

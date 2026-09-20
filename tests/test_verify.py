@@ -8275,6 +8275,49 @@ def test_commit_path_bound_publishes_a_target_proven_untracked_at_the_baseline(p
     assert git(repo, "show", f"{sha}:{path.name}") == accepted.rstrip("\n")
 
 
+def test_commit_path_bound_refuses_replay_over_a_committed_deletion_of_its_own_publication(
+    project,
+):
+    """The originally-untracked arm of the deletion refusal: the transition
+    published the ledger, a rival then committed its removal, and a COMMITTING
+    replay arrives with the accepted text still live. The baseline commit
+    proves nothing here (it never tracked the ledger), so the accepted
+    transition beneath the absent HEAD is what refuses. Ablation: drop the
+    ancestry probe in `_preflight_bound_absence` and the replay publishes a
+    second child that re-adds the ledger over the deletion."""
+    repo = project.project
+    path = repo / "new-ledger.md"
+    accepted = "accepted migration ledger\n"
+    path.write_text(accepted, encoding="utf-8")
+    baseline_commit = verify.rev_parse_head(repo)
+    published = verify.commit_path_bound(
+        repo,
+        "chore: bound ledger",
+        path,
+        accepted_text=accepted,
+        baseline_text="legacy\n",
+        baseline_commit=baseline_commit,
+    )
+    assert published == verify.rev_parse_head(repo)
+    git(repo, "rm", "--cached", "-q", "--", path.name)
+    git(repo, "commit", "-q", "-m", "rival: drop the published ledger")
+    deleting_head = verify.rev_parse_head(repo)
+    assert path.read_text(encoding="utf-8") == accepted
+
+    with pytest.raises(verify.GitError, match="deleted after its accepted publication"):
+        verify.commit_path_bound(
+            repo,
+            "chore: bound ledger",
+            path,
+            accepted_text=accepted,
+            baseline_text="legacy\n",
+            baseline_commit=baseline_commit,
+        )
+
+    assert verify.rev_parse_head(repo) == deleting_head
+    assert git(repo, "ls-files", "--", path.name) == ""
+
+
 def test_commit_path_bound_terminal_ref_cas_preserves_concurrent_head(project, monkeypatch):
     repo, path, baseline, accepted = _bound_publish_inputs(project)
     real_run_git = verify._run_git
