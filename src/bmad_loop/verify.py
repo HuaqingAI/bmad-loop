@@ -1753,9 +1753,17 @@ def _run_git(
             responses: queue.Queue[str | None] = queue.Queue()
 
             def read_responses() -> None:
+                # `stop_child` closes the reply stream on every abort, timeout
+                # and failure arm; a reader still iterating it then raises on
+                # its next line, and a daemon thread's escape lands on
+                # `threading.excepthook` as stderr noise over a failure the
+                # caller is already handling. Same classes `discard_stderr`
+                # swallows; the sentinel still lands so `expect` never hangs.
                 try:
                     for line in child_stdout:
                         responses.put(line)
+                except (OSError, ValueError):
+                    pass
                 finally:
                     responses.put(None)
 
