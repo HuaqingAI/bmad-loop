@@ -3606,12 +3606,16 @@ class WorktreeFlow:
                 # incoming path (`update-index --assume-unchanged`, which hides
                 # later edits from git) changes none, so the post-hook flag word
                 # of every incoming entry is read against what a fresh entry may
-                # carry or what the receipt captured (#796 review).
+                # carry or what the receipt captured — and an entry git trusts
+                # unread under an accepted word is read from disk against the
+                # integrated commit, the diff reading above having trusted the
+                # bit (#796 review).
                 flagged = verify.integrated_index_flags_drift(
                     repo,
                     self.run_dir,
                     attempt["snapshots"],
                     prospective_paths,
+                    revision=expected_revision,
                     operation_identity=attempt["operation_identity"],
                 )
                 if flagged:

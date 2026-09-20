@@ -2675,9 +2675,11 @@ def integrated_index_flags_drift(
     snapshots: object,
     paths: Iterable[str],
     *,
+    revision: str,
     operation_identity: str | None = None,
 ) -> tuple[str, ...]:
-    """Incoming ``paths`` whose post-hook index entry carries a flag word a hook set.
+    """Incoming ``paths`` whose post-hook index entry carries a flag word a hook
+    set, or one git trusts over a file that is not what ``revision`` holds.
 
     ``update-index --assume-unchanged`` or ``--skip-worktree`` on an incoming
     path changes no blob: both diff readings stay empty, ``status`` shows
@@ -2687,10 +2689,25 @@ def integrated_index_flags_drift(
     same argv reason as the diffs) is filtered to the incoming set, and each
     stage-0 file entry there may carry only what a fresh entry may on this
     target (`_fresh_index_flag_words`) or the word the receipt captured for
-    the path — a fast-forward or squash keeps an operator's assume-unchanged
-    bit on the entry it updates, where ``git merge`` writes it anew (git
-    2.55). Gitlinks are the submodule reading's, unmerged stages the diff
-    readings'. Path-only evidence, sorted.
+    the path — whether an operator's assume-unchanged bit survives the leg is
+    git's (a fast-forward writes the entry anew on git 2.55), and the receipt
+    does not refuse a target for keeping released index configuration.
+
+    An accepted word is not the end of the reading. A word carrying a bit git
+    trusts over the file (`_UNREAD_INDEX_FLAG_BITS`) is exactly the shape a
+    hook can hide bytes behind: overwrite the incoming file, then put the
+    captured bit back — the word matches the receipt, the index entry matches
+    the commit, and every git reading of the checkout (`integrated_paths_drift`
+    among them) trusts the bit and reads the path clean (#796 review; probed
+    on git 2.55, where the bit also hides a missing file, a retargeted link,
+    and a flipped exec bit). So each such entry is read from disk here, with
+    no git reading in between: what stands at the path must be what the
+    integrated commit holds — the same entry type, the same blob id under
+    the path's own attributes, the exec bit where ``core.fileMode`` honors
+    it — or, under skip-worktree alone, nothing, the checkout a sparse target
+    leaves out of the cone. Gitlinks are the submodule reading's, unmerged
+    stages the diff readings'. Path-only evidence, sorted; an unreadable
+    probe raises rather than answering.
     """
     selected = {_portable_integration_path(path) for path in paths}
     if not selected:
@@ -2709,13 +2726,82 @@ def integrated_index_flags_drift(
                 captured[str(entry["path"])] = str(item["flags"])
     fresh = _fresh_index_flag_words(repo)
     drift: list[str] = []
+    inventory: dict[str, tuple[bytes, bytes, str]] | None = None
     for path, word in _index_file_flag_words(repo):
         if path not in selected:
             continue
         accepted = fresh if path not in captured else fresh | {captured[path]}
         if word not in accepted:
             drift.append(path)
+            continue
+        if not int(word, 16) & _UNREAD_INDEX_FLAG_BITS:
+            continue
+        if inventory is None:
+            inventory = _revision_inventory(repo, revision)
+        if not _unread_entry_holds_revision(repo, path, word, inventory.get(path)):
+            drift.append(path)
     return tuple(sorted(drift))
+
+
+def _unread_entry_holds_revision(
+    repo: Path, path: str, word: str, row: tuple[bytes, bytes, str] | None
+) -> bool:
+    """Whether the checkout at ``path`` — an index entry git trusts unread — is
+    what the integrated commit's ``row`` (`_revision_inventory`) holds.
+
+    Read from disk, never through git's index: ``lstat`` for the entry's
+    type, the exec bit and presence; the blob id from the file's bytes under
+    ``path``'s own attributes (`_blob_oid_for_file`, the clean-filter-aware
+    identity every content guard here uses) or from a link's target, which
+    git stages unfiltered. A missing entry is the sparse checkout's shape
+    under skip-worktree and drift under assume-unchanged alone. A row the
+    commit does not hold is the cached diff's to refuse; here it is drift.
+    """
+    if row is None or row[1] != b"blob":
+        return False
+    mode, _kind, oid = row
+    _validated, candidate = _confined_repo_operand(repo, path)
+    try:
+        entry = os.lstat(os.fsencode(candidate))
+    except FileNotFoundError:
+        return bool(int(word, 16) & 0x40000000)
+    except OSError as exc:
+        raise IntegrationEvidenceError(
+            "target post-hook content on an incoming path git trusts unread could not be read"
+        ) from exc
+    try:
+        if stat.S_ISLNK(entry.st_mode):
+            if mode != b"120000":
+                return False
+            with tempfile.TemporaryDirectory() as tmp:
+                shadow = Path(tmp) / "target"
+                shadow.write_bytes(os.fsencode(os.readlink(candidate)))
+                proc = git_bytes(
+                    repo, "hash-object", "-t", "blob", "--no-filters", "--", str(shadow)
+                )
+            if proc.returncode != 0:
+                raise IntegrationEvidenceError(
+                    "target post-hook content on an incoming path git trusts unread "
+                    "could not be read"
+                )
+            return proc.stdout.decode("ascii", "strict").strip() == oid
+        if not stat.S_ISREG(entry.st_mode) or mode not in {b"100644", b"100755"}:
+            return False
+        if _honors_file_mode(repo) and bool(entry.st_mode & stat.S_IXUSR) != (mode == b"100755"):
+            return False
+        return _blob_oid_for_file(repo, path, candidate) == oid
+    except (OSError, GitError) as exc:
+        raise IntegrationEvidenceError(
+            "target post-hook content on an incoming path git trusts unread could not be read"
+        ) from exc
+
+
+def _honors_file_mode(repo: Path) -> bool:
+    """Whether git on ``repo`` reads the exec bit (``core.fileMode``; git's
+    default is true, and ``git init`` writes false where the filesystem
+    cannot carry one)."""
+    rc, value, _detail = _git_out(repo, "config", "--type=bool", "core.fileMode")
+    return rc != 0 or value != "false"
 
 
 def _index_file_flag_words(repo: Path) -> list[tuple[str, str]]:

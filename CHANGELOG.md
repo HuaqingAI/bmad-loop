@@ -582,7 +582,11 @@ breaking changes may land in a minor release.
   sparse target only, git stripping a hook's bit from an in-pattern entry
   and a hook alone setting it elsewhere — and a hook's `update-index
   --assume-unchanged` or `--skip-worktree` on an incoming file, which no
-  diff reading sees, refused by its index flag word; an
+  diff reading sees, refused by its index flag word, and an incoming entry
+  that word leaves git trusting unread — the captured bit a hook puts back
+  over its own bytes, which every git reading of the checkout then trusts —
+  read from disk against the integrated commit (type, blob, exec bit, or
+  absence under skip-worktree alone); an
   operator's assume-unchanged bit on a captured gitlink is recorded and
   preserved — every modern integration into a target holding one paused,
   even of a bundle that never touched the submodule — a hook's flip of the

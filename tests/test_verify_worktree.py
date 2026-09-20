@@ -4148,7 +4148,12 @@ def test_integrated_index_flags_drift_reports_a_hook_s_flag_on_an_incoming_path(
     )
 
     assert verify.integrated_index_flags_drift(
-        repo, run_dir, snapshots, ("src.txt", "newdir/tracked"), operation_identity="e" * 32
+        repo,
+        run_dir,
+        snapshots,
+        ("src.txt", "newdir/tracked"),
+        revision=integrated,
+        operation_identity="e" * 32,
     ) == (path,)
 
 
@@ -4447,12 +4452,128 @@ def test_integrated_index_flags_drift_accepts_git_s_own_words(project, tmp_path,
 
     assert (
         verify.integrated_index_flags_drift(
-            repo, run_dir, snapshots, incoming, operation_identity="e" * 32
+            repo,
+            run_dir,
+            snapshots,
+            incoming,
+            revision=verify.rev_parse_head(repo),
+            operation_identity="e" * 32,
         )
         == ()
     )
     if shape == "sparse-out-of-cone":
         git(repo, "sparse-checkout", "disable")
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "overwritten",
+        "deleted",
+        pytest.param(
+            "retargeted-link",
+            marks=pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink"),
+        ),
+        pytest.param(
+            "exec-bit",
+            marks=pytest.mark.skipif(sys.platform == "win32", reason="no exec bit"),
+        ),
+    ],
+)
+def test_integrated_index_flags_drift_reads_an_unread_incoming_entry_from_disk(
+    project, tmp_path, shape
+):
+    """A target post-merge hook that overwrites an incoming file and puts the
+    assume-unchanged bit the receipt captured BACK on its entry leaves an
+    accepted word over hook bytes: the entry matches the commit, git trusts
+    the bit over the file, and `diff`, `diff --cached`, and `status` all read
+    the path clean — the run recorded `unit-merged` and retired the receipt
+    over them (Codex, #796 review; the same bit hides a missing file, a
+    retargeted link, and a flipped exec bit, probed on git 2.55). An entry
+    git trusts unread is read from disk here against the integrated commit.
+
+    Ablation: skip the disk read for an accepted word and every row reds
+    while the diff reading, asserted blind below, stays green."""
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    incoming = "lnk" if shape == "retargeted-link" else "src.txt"
+    if shape == "retargeted-link":
+        os.symlink("src.txt", repo / "lnk")
+        git(repo, "add", "--", "lnk")
+        git(repo, "commit", "-q", "-m", "link")
+        _branch_with(repo, tmp_path, modifies={"src.txt": "incoming\n"})
+    else:
+        _branch_with(repo, tmp_path, modifies={"src.txt": "incoming\n"})
+    git(repo, "checkout", "-q", "--", "src.txt")
+    git(repo, "update-index", "--assume-unchanged", "--", incoming)
+    snapshots, _submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, (incoming,))
+    git(repo, "merge", "-q", "--ff-only", "feat")
+    integrated = verify.rev_parse_head(repo)
+    # the hook: touch the checkout, then put the captured bit back
+    if shape == "overwritten":
+        (repo / "src.txt").write_text("hooked\n")
+    elif shape == "deleted":
+        (repo / "src.txt").unlink()
+    elif shape == "retargeted-link":
+        (repo / "lnk").unlink()
+        os.symlink("elsewhere", repo / "lnk")
+    else:
+        (repo / "src.txt").chmod(0o755)
+    git(repo, "update-index", "--assume-unchanged", "--", incoming)
+    assert git(repo, "ls-files", "-v", "--", incoming) == f"h {incoming}"
+    # every git reading of the checkout trusts the bit
+    assert git(repo, "status", "--porcelain") == ""
+    assert verify.integrated_paths_drift(repo, integrated, (incoming,)) == ()
+
+    assert verify.integrated_index_flags_drift(
+        repo, run_dir, snapshots, (incoming,), revision=integrated, operation_identity="e" * 32
+    ) == (incoming,)
+
+    # the bit put back over the commit's own bytes is released configuration
+    git(repo, "update-index", "--no-assume-unchanged", "--", incoming)
+    if shape == "exec-bit":
+        (repo / "src.txt").chmod(0o644)
+    else:
+        git(repo, "checkout", "-q", "--", incoming)
+    git(repo, "update-index", "--assume-unchanged", "--", incoming)
+    assert (
+        verify.integrated_index_flags_drift(
+            repo, run_dir, snapshots, (incoming,), revision=integrated, operation_identity="e" * 32
+        )
+        == ()
+    )
+
+
+def test_integrated_index_flags_drift_accepts_a_skip_worktree_entry_s_absence(project, tmp_path):
+    """Under skip-worktree alone a missing checkout is git's own shape — a
+    sparse target holds every out-of-cone entry that way — so an incoming
+    entry the receipt captured with the bit reads clean absent, and drift
+    the moment something else stands there."""
+    repo = project.project
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _branch_with(repo, tmp_path, modifies={"src.txt": "incoming\n"})
+    git(repo, "checkout", "-q", "--", "src.txt")
+    git(repo, "update-index", "--skip-worktree", "--", "src.txt")
+    snapshots, _submodules = verify.capture_integration_state(repo, run_dir, "e" * 32, ("src.txt",))
+    git(repo, "merge", "-q", "--ff-only", "feat")
+    integrated = verify.rev_parse_head(repo)
+    git(repo, "update-index", "--skip-worktree", "--", "src.txt")
+    (repo / "src.txt").unlink()
+
+    assert (
+        verify.integrated_index_flags_drift(
+            repo, run_dir, snapshots, ("src.txt",), revision=integrated, operation_identity="e" * 32
+        )
+        == ()
+    )
+
+    (repo / "src.txt").write_text("hooked\n")
+    assert git(repo, "status", "--porcelain") == ""
+    assert verify.integrated_index_flags_drift(
+        repo, run_dir, snapshots, ("src.txt",), revision=integrated, operation_identity="e" * 32
+    ) == ("src.txt",)
 
 
 @pytest.mark.parametrize("shape", ["file-to-directory", "directory-to-file"])
