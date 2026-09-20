@@ -267,8 +267,12 @@ if sys.platform == "win32":
         attributes: int = _FILE_ATTRIBUTE_NORMAL,
     ) -> int:
         buf = ctypes.create_unicode_buffer(name)
-        length = len(name) * 2
-        unicode = _UNICODE_STRING(length, length + 2, ctypes.cast(buf, wt.LPWSTR))
+        # UNICODE_STRING counts bytes of UTF-16 code units, not code points: a
+        # non-BMP character (an emoji in a spec name) is a surrogate pair, two
+        # WCHARs. The buffer is sized that way already; `len(name) * 2` is not.
+        maximum = ctypes.sizeof(buf)
+        length = maximum - ctypes.sizeof(ctypes.c_wchar)
+        unicode = _UNICODE_STRING(length, maximum, ctypes.cast(buf, wt.LPWSTR))
         attrs = _OBJECT_ATTRIBUTES(
             ctypes.sizeof(_OBJECT_ATTRIBUTES),
             root_handle,
@@ -435,13 +439,20 @@ if sys.platform == "win32":
             },
         )
 
+    # FILE_RENAME_INFORMATION: union{BOOLEAN ReplaceIfExists; ULONG Flags};
+    # HANDLE RootDirectory; ULONG FileNameLength; WCHAR FileName[]. The HANDLE
+    # is pointer-aligned, so the layout follows the interpreter's pointer width:
+    # 64-bit pads the union to 8 and puts the name at offset 20; 32-bit packs
+    # the three fields and puts it at 12.
+    _RENAME_HEADER = "<I4xQI" if ctypes.sizeof(wt.HANDLE) == 8 else "<III"
+
     def _rename_information(flags: int, root_handle: int, name: str) -> bytes:
-        # FILE_RENAME_INFORMATION: union{BOOLEAN ReplaceIfExists; ULONG Flags};
-        # <pad to 8>; HANDLE RootDirectory; ULONG FileNameLength; WCHAR FileName[].
         # A ULONG 1 in the union reads as ReplaceIfExists=TRUE for the classic
         # class and as REPLACE_IF_EXISTS for the Ex one, so one buffer serves both.
-        encoded = name.encode("utf-16-le")
-        return struct.pack("<I4xQI", flags, root_handle, len(encoded)) + encoded + b"\0\0"
+        # `surrogatepass` keeps a lone surrogate NTFS admits, as `_nt_open`'s
+        # buffer does.
+        encoded = name.encode("utf-16-le", "surrogatepass")
+        return struct.pack(_RENAME_HEADER, flags, root_handle, len(encoded)) + encoded + b"\0\0"
 
     def _set_information(handle: int, info_class: int, payload: bytes, name: str) -> int:
         buf = ctypes.create_string_buffer(payload, len(payload))

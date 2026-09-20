@@ -100,6 +100,35 @@ def test_open_at_walks_components_relative_to_the_handle_above(tmp_path):
 
 
 @WINDOWS
+def test_open_at_measures_the_name_in_utf16_code_units(tmp_path):
+    """A non-BMP character (an emoji in a spec or artifacts name) is a surrogate
+    pair — two WCHARs — so ``UNICODE_STRING.Length`` counts more bytes than
+    ``len(name) * 2``. Ablation: measure by code points and every open, stat and
+    exclusive create of such a name lands on a name one WCHAR short: the read
+    is ``FileNotFoundError`` for a file that exists, and the create plants a
+    truncated entry beside it."""
+    name = "spec-\U0001f680.md"  # U+1F680 ROCKET, outside the BMP
+    assert len(name.encode("utf-16-le")) == len(name) * 2 + 2
+    (tmp_path / name).write_bytes(b"payload")
+    with _directory(tmp_path) as root:
+        fd = win32_at.open_at(root, name, os.O_RDONLY | win32_at.AT_NOFOLLOW)
+        try:
+            assert os.read(fd, 16) == b"payload"
+            assert os.path.samestat(os.fstat(fd), (tmp_path / name).stat())
+        finally:
+            os.close(fd)
+        assert os.path.samestat(win32_at.stat_at(root, name), (tmp_path / name).stat())
+        with pytest.raises(FileExistsError):
+            win32_at.open_at(root, name, os.O_RDWR | os.O_CREAT | os.O_EXCL)
+        staged = "staged-\U0001f680.tmp"
+        os.close(win32_at.open_at(root, staged, os.O_RDWR | os.O_CREAT | os.O_EXCL))
+        assert sorted(p.name for p in tmp_path.iterdir()) == sorted([name, staged])
+        win32_at.replace_at(root, staged, root, name)
+        win32_at.unlink_at(root, name)
+    assert list(tmp_path.iterdir()) == []
+
+
+@WINDOWS
 def test_open_at_refuses_anything_but_a_single_component():
     for name in ("", ".", "..", "a\\b", "a/b", "a\x00b"):
         with pytest.raises(ValueError, match="single path component"):
@@ -267,6 +296,35 @@ def test_replace_at_moves_across_directories_relative_to_both_handles(tmp_path):
         win32_at.replace_at(src, "a", dst, "b")
     assert list(src_dir.iterdir()) == []
     assert (dst_dir / "b").read_bytes() == b"a"
+
+
+@WINDOWS
+def test_rename_information_follows_the_native_pointer_width():
+    """``FILE_RENAME_INFORMATION`` places ``RootDirectory`` at pointer alignment,
+    so the name begins at offset 20 on a 64-bit interpreter and 12 on a 32-bit
+    one. The layout is held against ctypes' own native alignment of the header,
+    not a second copy of the arithmetic. Ablation: pack the 64-bit shape
+    unconditionally and a 32-bit Python hands the kernel its padding as
+    ``RootDirectory`` — every ``replace_at`` fails."""
+    import ctypes
+    import ctypes.wintypes as wt
+
+    class Header(ctypes.Structure):
+        _fields_ = (
+            ("Flags", wt.ULONG),
+            ("RootDirectory", wt.HANDLE),
+            ("FileNameLength", wt.ULONG),
+        )
+
+    name_offset = Header.FileNameLength.offset + ctypes.sizeof(wt.ULONG)
+    encoded = "spec-\U0001f680.md".encode("utf-16-le")
+    payload = win32_at._rename_information(0x3, 0x1234, "spec-\U0001f680.md")
+    header = Header.from_buffer_copy(payload[: ctypes.sizeof(Header)])
+    assert header.Flags == 0x3
+    assert header.RootDirectory == 0x1234
+    assert header.FileNameLength == len(encoded)
+    assert payload[name_offset : name_offset + len(encoded)] == encoded
+    assert payload[name_offset + len(encoded) :] == b"\0\0"
 
 
 @WINDOWS
