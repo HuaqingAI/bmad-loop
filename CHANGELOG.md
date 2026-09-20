@@ -7,6 +7,8 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-09-20
+
 ### Added
 
 - Restore and normalize attempt-owned specs on Windows through NT handle-relative
@@ -477,6 +479,13 @@ breaking changes may land in a minor release.
   previously-loading config.
 
 ### Fixed
+
+- Bound the GitHub release body `scripts/release.py publish` sends at GitHub's
+  125,000-character limit, cutting at an entry boundary and linking the full
+  `CHANGELOG.md` section. An oversize section was rejected with HTTP 422 only after
+  `gh release create` had pushed the tag, stranding a tag with no release that the
+  next publish then treated as already published. `prepare` warns when a section
+  will be truncated.
 
 - Bind legacy migration dispatch and publication to the ledger bytes actually accepted
   (DW-311, DW-316). Retire stale recovery authority when the ledger changes before
@@ -6114,7 +6123,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.12.0
 [0.11.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.11.1
 [0.11.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.11.0
 [0.10.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.10.0
