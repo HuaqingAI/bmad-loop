@@ -1,6 +1,7 @@
 """RunState serialization + lifecycle-flag tests."""
 
 import binascii
+import errno
 import json
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from bmad_loop.model import (
     StoryTask,
     TokenUsage,
     VerifyOutcome,
+    result_mapping,
 )
 
 
@@ -39,6 +41,18 @@ def test_run_state_stories_fields_default_and_round_trip():
     back = RunState.from_dict(stories.to_dict())
     assert back.source == "stories"
     assert back.spec_folder == "_bmad-output/epic-1"
+
+
+def test_run_state_sweep_options_version_round_trips_and_defaults_legacy():
+    state = _state(run_type="sweep", sweep_options_version=2, sweep_options_digest="a" * 64)
+    round_tripped = RunState.from_dict(state.to_dict())
+    assert round_tripped.sweep_options_version == 2
+    assert round_tripped.sweep_options_digest == "a" * 64
+    legacy = state.to_dict()
+    del legacy["sweep_options_version"]
+    del legacy["sweep_options_digest"]
+    assert RunState.from_dict(legacy).sweep_options_version == 0
+    assert RunState.from_dict(legacy).sweep_options_digest == ""
 
 
 def test_run_state_code_root_restamp_pending_round_trips_and_defaults_false():
@@ -108,6 +122,121 @@ def test_sweeps_refused_defaults_when_absent_from_dict():
     d = _state().to_dict()
     del d["sweeps_refused"]
     assert RunState.from_dict(d).sweeps_refused == {}
+
+
+def test_sweep_decision_quarantines_round_trip():
+    """DW-124. The two dispositions a sweep run reaches about a decision — skipped
+    unattended, and answer dropped — are the run's own, so they ride `state.json`
+    and a pause/resume of the SAME run does not re-announce them. `list[str]` and
+    not `set[str]` because `save_state` serializes through `json.dumps`, which
+    cannot encode a set; `sweeps_triggered` beside them already has that shape.
+
+    `sweep_unlanded_decisions` (DW-200) rides the same way for a different reason,
+    and is deliberately not folded into either: it records a VERDICT — this `build`
+    answer's `decision:` line never landed — observed in the decision phase and
+    consumed in materialization, so an interruption between those two phases must
+    not lose it. The drop that announces it clears it, so the two lists never both
+    hold an id.
+
+    The dumps/loads here is the point: a set would raise on the way out."""
+    state = _state()
+    assert state.sweep_skipped_decisions == [] and state.sweep_dropped_decisions == []
+    assert state.sweep_unlanded_decisions == []
+    state.sweep_skipped_decisions.append("DW-1")
+    state.sweep_dropped_decisions.extend(["DW-2", "DW-3"])
+    state.sweep_unlanded_decisions.append("DW-4")
+    back = RunState.from_dict(json.loads(json.dumps(state.to_dict())))
+    assert back.sweep_skipped_decisions == ["DW-1"]
+    assert back.sweep_dropped_decisions == ["DW-2", "DW-3"]
+    assert back.sweep_unlanded_decisions == ["DW-4"]
+
+
+def test_sweep_decision_quarantines_default_when_absent_from_dict():
+    """A `state.json` written before DW-124 carries neither key, and must resume
+    exactly as it does today: both quarantines empty, every decision re-evaluated.
+
+    A `state.json` written before DW-200 is the same case for the third list, and
+    the default matters more there than for a quarantine: reading it absent as
+    empty means an old paused run resumes with no unlanded verdicts, which is
+    exactly what it had.
+
+    Ablation: change from_dict's `d.get("sweep_dropped_decisions", [])` to
+    `d["sweep_dropped_decisions"]` (or the same for `sweep_unlanded_decisions`)
+    and this fails with KeyError while the round-trip above stays green — to_dict
+    always writes all three keys, so the two tests cover disjoint halves."""
+    d = _state().to_dict()
+    del d["sweep_skipped_decisions"]
+    del d["sweep_dropped_decisions"]
+    del d["sweep_unlanded_decisions"]
+    back = RunState.from_dict(d)
+    assert back.sweep_skipped_decisions == [] and back.sweep_dropped_decisions == []
+    assert back.sweep_unlanded_decisions == []
+
+
+def test_sweep_decision_quarantines_coerce_their_elements():
+    """Coerced with `str()` like `sweeps_triggered`'s elements: a hand-edited or
+    foreign state file is reachable, and every consumer membership-tests these
+    lists against a DW id string.
+
+    Ablation: drop any `str()` in from_dict and the matching half fails."""
+    d = _state().to_dict()
+    d["sweep_skipped_decisions"] = [1]
+    d["sweep_dropped_decisions"] = [2]
+    d["sweep_unlanded_decisions"] = [3]
+    back = RunState.from_dict(d)
+    assert back.sweep_skipped_decisions == ["1"] and back.sweep_dropped_decisions == ["2"]
+    assert back.sweep_unlanded_decisions == ["3"]
+
+
+def test_sweep_ledger_in_doubt_round_trips():
+    """DW-218/219. The sweep's ledger-publication doubt is CYCLE-scoped on the
+    engine instance (`_ledger_in_doubt`, `_close_ledger_in_doubt`) and so is lost
+    the moment the process ends — which is precisely what a stop request observed
+    in the withheld branch, or a crash between the arming site and the dispatch
+    gate's report, does. The RUN's copy of the verdict rides `state.json` so the
+    resume withholds instead of dispatching.
+
+    A plain bool, so `json.dumps` encodes it directly; the dumps/loads here is the
+    same round-trip discipline the three lists above carry.
+
+    Ablation: delete `"sweep_ledger_in_doubt"` from `to_dict` and this fails while
+    the absent-key row below stays green — to_dict always writes the key, so the
+    two rows cover disjoint halves."""
+    state = _state()
+    assert state.sweep_ledger_in_doubt is False
+    state.sweep_ledger_in_doubt = True
+    back = RunState.from_dict(json.loads(json.dumps(state.to_dict())))
+    assert back.sweep_ledger_in_doubt is True
+
+
+def test_sweep_ledger_in_doubt_defaults_when_absent_from_dict():
+    """A `state.json` written before DW-218/219 carries no such key, and reading it
+    absent as False is what makes an old paused run resume with no doubt — which is
+    exactly what it had. The default is the SAFE direction only because no such run
+    ever armed the latch; a True default would withhold every bundle of every
+    resumed sweep in the archive.
+
+    Ablation: change from_dict's `d.get("sweep_ledger_in_doubt", False)` to
+    `d["sweep_ledger_in_doubt"]` and this fails with KeyError."""
+    d = _state().to_dict()
+    del d["sweep_ledger_in_doubt"]
+    assert RunState.from_dict(d).sweep_ledger_in_doubt is False
+
+
+def test_sweep_ledger_in_doubt_coerces_a_hand_edited_value():
+    """Coerced with `bool()` the way `finished`/`stopped`/`crashed` are, so every
+    reader of `_ledger_unfit_to_publish()` sees a bool rather than whatever a
+    hand-edited or foreign state file put there. The gate is an `or` chain, so a
+    truthy non-bool would work by accident today and stop working the moment a
+    reader asserts identity.
+
+    Ablation: drop the `bool()` in from_dict and the `is True` / `is False` below
+    fail on the coerced values."""
+    d = _state().to_dict()
+    d["sweep_ledger_in_doubt"] = 1
+    assert RunState.from_dict(d).sweep_ledger_in_doubt is True
+    d["sweep_ledger_in_doubt"] = ""
+    assert RunState.from_dict(d).sweep_ledger_in_doubt is False
 
 
 def test_sweeps_refused_coerces_both_halves():
@@ -201,6 +330,18 @@ def test_followup_review_recommended_defaults_false_for_legacy_state():
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
     del doc["followup_review_recommended"]  # state.json from before the field existed
     assert StoryTask.from_dict(doc).followup_review_recommended is False
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_salvage_refile_pending_round_trips(pending):
+    task = StoryTask(story_key="1-1-a", epic=1, salvage_refile_pending=pending)
+    assert StoryTask.from_dict(task.to_dict()).salvage_refile_pending is pending
+
+
+def test_salvage_refile_pending_defaults_false_for_legacy_state():
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["salvage_refile_pending"]
+    assert StoryTask.from_dict(doc).salvage_refile_pending is False
 
 
 def test_legacy_park_eligible_state_loads_but_is_not_persisted():
@@ -468,6 +609,48 @@ def test_resolution_fault_accepted_spec_is_unchanged(tmp_path, monkeypatch):
 
     task.relativize_project_local_accepted_spec(project)
 
+    assert task.spec_file == raw
+
+
+def test_probe_fault_accepted_spec_is_unchanged_and_does_not_raise(tmp_path, monkeypatch):
+    """The regular-file probe may not raise out of the relativizer (DW-116).
+
+    `worktree_flow.run_isolated` calls this method BEFORE its first `try`, so an
+    `OSError` here kills the whole run rather than leaving the spelling alone.
+
+    The injected errno is deliberately NOT EACCES. An unsearchable parent cannot
+    reach this probe at all: the `strict=True` resolve two lines above raises EACCES
+    first, and the `except` already covers that. What CAN reach the probe is a TOCTOU
+    between those two syscalls, or a non-EACCES `OSError` from the stat itself — so
+    EIO is what this row injects. An EACCES injection would grade a shape that never
+    occurs here.
+
+    Ablation: move the probe back BELOW the `except` block and this row reddens with
+    the `OSError` escaping the call.
+    """
+    project = tmp_path / "project"
+    spec = project / "artifacts" / "spec.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("spec\n", encoding="utf-8")
+    raw = str(spec)
+    resolved = spec.resolve()
+    real_is_file = Path.is_file
+    faulted: list[Path] = []
+
+    def fake(self, *a, **kw):
+        if Path(self) == resolved:
+            faulted.append(Path(self))
+            raise OSError(errno.EIO, "Input/output error")
+        return real_is_file(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "is_file", fake)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=raw)
+
+    task.relativize_project_local_accepted_spec(project)
+
+    # the fault really fired on the arm this row grades — a path-identity predicate
+    # would otherwise go green while probing nothing
+    assert faulted == [resolved]
     assert task.spec_file == raw
 
 
@@ -891,3 +1074,180 @@ def test_release_spec_paths_from_mount_keeps_an_out_of_mount_spec_verbatim():
     task.release_spec_paths_from_mount()
 
     assert task.spec_file == "/shared-artifacts/spec.md"
+
+
+# ------------------------------------------------------- result_mapping
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        None,
+        # truthy non-mappings: the shapes that RAISED out of `.get` before
+        # DW-206, because `(doc or {})` substituted only on a falsy value
+        ["nope"],
+        "escalations",
+        7,
+        3.5,
+        ("nope",),
+        {"a", "b"},
+        object(),
+        # falsy non-mappings: the shapes the old idiom already absorbed
+        [],
+        "",
+        0,
+        False,
+        (),
+    ],
+)
+def test_result_mapping_answers_empty_for_every_non_mapping(document):
+    """The one shape predicate every read of a session result document goes
+    through. A result document is parsed JSON, so its top level can be any JSON
+    value, while every consumer reads it with `.get` — so each truthy row here
+    raised `AttributeError` at whichever frame touched it first (DW-206:
+    `Engine._run_session`, one frame upstream of DW-181's own guards). All of
+    them now refuse through the empty-document channel the absent-document row
+    already takes.
+
+    Ablation: replace the body with `result_json or {}` and every truthy
+    non-mapping row reddens (it is returned as itself), while `None` and the
+    falsy rows stay green — which is exactly why the falsy rows are here."""
+    assert result_mapping(document) == {}
+
+
+def test_result_mapping_returns_a_mapping_by_identity_never_a_copy():
+    """Returning the caller's OWN object is load-bearing, not incidental:
+    `Engine._reconcile_generic_terminal_status` mutates the document in place
+    under its own `isinstance` guard, and `_dev_phase` / the review loop bind
+    the result and pass it on. A copy would silently strand every such write.
+
+    Ablation: return `dict(result_json)` instead and the `is` assertions redden
+    while an `==` -only test would not notice."""
+    document = {"spec_file": "x.md"}
+
+    assert result_mapping(document) is document
+
+    empty: dict = {}
+    assert result_mapping(empty) is empty
+
+
+def test_result_mapping_falsy_mapping_answers_identically_to_the_old_substitute():
+    """`{}` is the one input the replaced `(doc or {})` idiom substituted for
+    while the input was already the right shape. `isinstance` lets it fall
+    through to `.get`, which answers the same thing the substitute would have —
+    the equivalence that preserves field-read behavior at the converted sites."""
+    assert result_mapping({}).get("spec_file") is None
+    assert result_mapping(None).get("spec_file") is None
+
+
+def test_result_mapping_absorbs_the_unchecked_session_record_rehydration():
+    """`SessionRecord.from_dict` takes `result_json` off state.json with no shape
+    check, so a hand-edited or corrupted run state is one of the two named
+    producers of a non-mapping document. Reading that record through the
+    predicate is total; reading it with `.get` is not."""
+    record = SessionRecord.from_dict(
+        {
+            "task_id": "1-1-a-dev-1",
+            "role": "dev",
+            "status": "completed",
+            "result_json": ["nope"],
+        }
+    )
+
+    assert record.result_json == ["nope"]  # rehydrated verbatim, unchecked
+    assert result_mapping(record.result_json) == {}
+
+
+def test_artifact_publication_state_round_trips_and_releases_with_mount():
+    task = StoryTask(story_key="dw-fix", epic=0)
+    old = StoryTask.from_dict({"story_key": "dw-fix", "epic": 0, "phase": "pending"})
+    assert old.artifact_baseline is None and old.artifact_payload is None
+    assert old.artifact_source_digests is None
+    assert old.artifact_tracked_source_oids is None
+    assert old.artifact_acceptance_identity is None
+    assert old.artifact_publication_complete is False
+    assert old.integration_attempt is None
+    task.artifact_baseline = {"report.bin": "before"}
+    task.artifact_destination = "/project/artifacts"
+    task.artifact_source_digests = {"report.bin": "accepted"}
+    task.artifact_tracked_source_oids = {"tracked.bin": "blob-id"}
+    task.artifact_acceptance_identity = "review:2"
+    task.artifact_payload = {"report.bin": "AP8="}
+    task.artifact_publication_complete = True
+    task.integration_attempt = {
+        "target_ref": "refs/heads/main",
+        "strategy": "merge",
+        "source_revision": "source",
+        "operation_identity": "operation",
+        "pre_target_revision": "before",
+        "old_revision": "actual-before",
+        "new_revision": "integrated",
+    }
+    loaded = StoryTask.from_dict(task.to_dict())
+    assert loaded.artifact_baseline == task.artifact_baseline
+    assert loaded.artifact_payload == task.artifact_payload
+    assert loaded.artifact_destination == task.artifact_destination
+    assert loaded.artifact_source_digests == task.artifact_source_digests
+    assert loaded.artifact_tracked_source_oids == task.artifact_tracked_source_oids
+    assert loaded.artifact_acceptance_identity == "review:2"
+    assert loaded.artifact_publication_complete
+    assert loaded.integration_attempt == task.integration_attempt
+    loaded.release_mount_owned_state()
+    assert loaded.artifact_baseline is None and loaded.artifact_payload is None
+    assert loaded.artifact_source_digests is None
+    assert loaded.artifact_tracked_source_oids is None
+    assert loaded.artifact_acceptance_identity is None
+    assert loaded.artifact_destination is None and not loaded.artifact_publication_complete
+    assert loaded.integration_attempt is None
+
+
+# ------------------------------------ the artifact-only receipt's snapshot (DW-273)
+
+
+def test_story_task_baseline_artifacts_round_trips_and_defaults_none():
+    """`baseline_artifacts` — path -> `[mtime_ns, size]` or `None` for an entry
+    listed but unmeasurable at attempt start — survives `to_dict`/`from_dict`
+    byte-for-byte, and a pre-upgrade record with no key reads as `None` (no
+    snapshot), on which the receipt refuses rather than guesses."""
+    task = StoryTask(story_key="dw-bundle", epic=0, dw_ids=["DW-1"])
+    assert task.baseline_artifacts is None
+    task.baseline_artifacts = {
+        "_bmad-output/impl/spec.md": [1_700_000_000_123_456_789, 42],
+        "_bmad-output/impl/gone.md": None,
+    }
+
+    rehydrated = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+
+    assert rehydrated.baseline_artifacts == task.baseline_artifacts
+    legacy = task.to_dict()
+    del legacy["baseline_artifacts"]
+    assert StoryTask.from_dict(legacy).baseline_artifacts is None
+
+
+@pytest.mark.parametrize(
+    "mangled",
+    [
+        "not a mapping",
+        ["_bmad-output/impl/spec.md"],
+        {"_bmad-output/impl/spec.md": [1]},
+        {"_bmad-output/impl/spec.md": "1700000000:42"},
+        {"_bmad-output/impl/spec.md": [1, 2, 3]},
+        {"_bmad-output/impl/spec.md": ["bad", 42]},
+        {"_bmad-output/impl/spec.md": [None, 42]},
+        {"_bmad-output/impl/spec.md": [1.5, 42]},
+        {"_bmad-output/impl/spec.md": [True, 42]},
+    ],
+)
+def test_story_task_baseline_artifacts_mangled_shape_reads_as_no_snapshot(mangled):
+    """A hand-edited state.json whose snapshot is not path -> 2-int list (or None)
+    is not partially trusted: the whole field reads as `None`, so the receipt
+    refuses for want of a snapshot instead of crediting entries against a
+    baseline half of which was dropped — and a non-integer element never RAISES
+    out of `from_dict`, which would keep the whole run state (and `bmad-loop
+    resume`) from loading over one mangled fingerprint.
+
+    Ablation: convert with `int(value[0])` and the `"bad"`/`None` rows raise."""
+    d = StoryTask(story_key="dw-bundle", epic=0).to_dict()
+    d["baseline_artifacts"] = mangled
+
+    assert StoryTask.from_dict(d).baseline_artifacts is None

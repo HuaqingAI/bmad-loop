@@ -361,17 +361,103 @@ def test_publish_passes_check_false_so_the_swallow_inspects_the_rc(monkeypatch, 
     assert seen["check"] is False
 
 
+# --- publish bounds the release body -------------------------------------- #
+# GitHub rejects a body over 125,000 chars with HTTP 422 *after* `gh` has created the
+# tag, which strands a tag with no release (v0.12.0's first publish). The body is a
+# view of the CHANGELOG, so it is the body that yields, at an entry boundary.
+def _long_section(entries: int, *, width: int = 200) -> str:
+    return "### Fixed\n\n" + "\n".join(f"- Entry {i:05d}. " + "x" * width for i in range(entries))
+
+
+def test_bound_release_notes_returns_short_notes_untouched():
+    notes = "### Fixed\n\n- **A thing.** It no longer breaks."
+    assert release.bound_release_notes(notes, "0.5.0", REPO_URL) is notes
+
+
+def test_bound_release_notes_cuts_at_an_entry_boundary_and_links_the_changelog():
+    notes = _long_section(40)
+    out = release.bound_release_notes(notes, "0.5.0", REPO_URL, limit=2_000)
+    assert len(out) <= 2_000
+    body, _, footer = out.partition("\n\n---\n\n")
+    # Every surviving line is a whole entry — none sliced mid-sentence.
+    assert all(line.startswith("- Entry ") and line.endswith("x") for line in body.splitlines()[2:])
+    assert "- Entry 00000." in body
+    assert f"{REPO_URL}/blob/v0.5.0/CHANGELOG.md" in footer
+    assert "truncated at GitHub's 2,000-character limit" in footer
+
+
+def test_bound_release_notes_drops_a_heading_left_with_no_entries():
+    notes = "### Added\n\n- " + "a" * 400 + "\n\n### Fixed\n\n- " + "b" * 400
+    out = release.bound_release_notes(notes, "0.5.0", REPO_URL, limit=700)
+    body = out.partition("\n\n---\n\n")[0]
+    assert "### Added" in body
+    assert "### Fixed" not in body  # its only entry did not fit, so the heading goes too
+
+
+def test_bound_release_notes_hard_cuts_when_even_the_first_entry_overflows():
+    notes = "- " + "z" * 5_000
+    out = release.bound_release_notes(notes, "0.5.0", REPO_URL, limit=600)
+    assert len(out) <= 600
+    assert out.startswith("- zzz")
+
+
+def test_publish_sends_a_bounded_body_and_says_so(monkeypatch, capsys, tmp_path):
+    cl = tmp_path / "CHANGELOG.md"
+    cl.write_text(SAMPLE.replace("- **A thing.** It no longer breaks.", _long_section(1_000)))
+    monkeypatch.setattr(release, "CHANGELOG", cl)
+    monkeypatch.setattr(release.sync_version, "read_canonical", lambda: "0.5.0")
+    monkeypatch.setattr(release, "tag_exists", lambda tag: False)
+    monkeypatch.setattr(release, "repo_url", lambda: REPO_URL)
+    monkeypatch.setattr(release, "_git_out", lambda *a: "deadbeef" * 5)
+    monkeypatch.setattr(release.shutil, "which", lambda name: f"/usr/bin/{name}")
+    seen: dict[str, object] = {}
+
+    def fake_run(*a, **kw):
+        seen.update(kw)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(release.subprocess, "run", fake_run)
+    rc = release.cmd_publish(SimpleNamespace(dry_run=False))
+    assert rc == 0
+    sent = seen["input"]
+    assert isinstance(sent, str) and len(sent) <= release.GITHUB_NOTES_LIMIT
+    assert f"{REPO_URL}/blob/v0.5.0/CHANGELOG.md" in sent
+    assert "over GitHub's 125,000 limit" in capsys.readouterr().out
+
+
+def test_prepare_warns_on_a_release_star_branch(monkeypatch, capsys, tmp_path):
+    # `_prepare_dry_run` pins the branch to `release/0.5.0`, the shape release.yml publishes
+    # from on push — the warning is what tells a PR author they are about to self-publish.
+    assert _prepare_dry_run(monkeypatch, tmp_path, PROMOTED) == 0
+    out = capsys.readouterr().out
+    assert "matches release.yml's `release/*` trigger" in out
+
+
+def test_prepare_stays_quiet_on_a_chore_branch(monkeypatch, capsys, tmp_path):
+    assert _prepare_dry_run(monkeypatch, tmp_path, PROMOTED, branch="chore/release-0.5.0") == 0
+    assert "release/*" not in capsys.readouterr().out
+
+
+def test_prepare_warns_when_the_section_will_be_truncated(monkeypatch, capsys, tmp_path):
+    long_promoted = PROMOTED.replace("- **A thing.** It no longer breaks.", _long_section(1_000))
+    assert _prepare_dry_run(monkeypatch, tmp_path, long_promoted) == 0
+    out = capsys.readouterr().out
+    assert "warning:" in out and "will truncate the release body" in out
+
+
 # --- prepare refuses an unpromoted changelog -------------------------------- #
 # `--dry-run` still runs every precondition before returning, so it drives the guard
 # without mutating anything; `no_assets` + an absent `trunk` keep the whole path
 # subprocess-free.
-def _prepare_dry_run(monkeypatch, tmp_path, changelog_text, *, version="0.5.0"):
+def _prepare_dry_run(
+    monkeypatch, tmp_path, changelog_text, *, version="0.5.0", branch="release/0.5.0"
+):
     cl = tmp_path / "CHANGELOG.md"
     cl.write_text(changelog_text)
     monkeypatch.setattr(release, "CHANGELOG", cl)
     monkeypatch.setattr(release.sync_version, "read_canonical", lambda: "0.4.3")
     monkeypatch.setattr(release, "repo_url", lambda: REPO_URL)
-    monkeypatch.setattr(release, "current_branch", lambda: "release/0.5.0")
+    monkeypatch.setattr(release, "current_branch", lambda: branch)
     monkeypatch.setattr(release, "last_release_tag", lambda: "v0.4.3")
     monkeypatch.setattr(release, "tag_exists", lambda tag: False)
     monkeypatch.setattr(release, "dirty_paths", lambda: ["CHANGELOG.md"])

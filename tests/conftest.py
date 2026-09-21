@@ -3,18 +3,24 @@ that simulate the side effects skill sessions would have on disk."""
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
+import os
 import shutil
+import signal
+import stat
 import subprocess
 import sys
+import warnings
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 import yaml
 
-from bmad_loop import cli, documents, envvars, platform_util, runs
+from bmad_loop import cli, documents, envvars, platform_util, runs, win32_at
 from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.bmadconfig import ProjectPaths, load_paths
 from bmad_loop.checks import ValidationReport
@@ -67,6 +73,228 @@ needs_strict_codec = pytest.mark.skipif(
     reason="host codec decodes 0xff (e.g. an ISO-8859-x locale), so nothing here "
     "would exercise the strict decode this fix is about",
 )
+
+
+# The single xdist scheduling group every real-multiplexer E2E joins. Spelled once
+# here so the two E2E modules and the guard in tests/test_conftest.py read the same
+# constant; a second spelling is a group that silently does not collide with this one.
+REAL_MUX_XDIST_GROUP = "real_mux_e2e"
+
+# Pin every test that spawns a REAL tmux server onto one xdist worker (DW-95). These
+# E2Es are the suite's only wall-clock-sensitive tests: each waits on a live session
+# reaching a hook event, so when several land on different workers at once they
+# contend for the same box and starve each other past their waits — the 2026-09-02
+# py3.13 CI leg failed exactly that way. `loadgroup` schedules every test sharing a
+# group name onto a single worker, so they serialize against each other while the
+# rest of the suite still fans out.
+#
+# INERT WITHOUT `--dist loadgroup`: under the default `load` scheduler xdist ignores
+# the mark entirely and no error is raised, which is why pyproject.toml declares the
+# flag in `addopts` (so local runs and CI schedule identically) and why the guard in
+# tests/test_conftest.py asserts that declaration alongside the marks.
+real_mux_e2e = pytest.mark.xdist_group(REAL_MUX_XDIST_GROUP)
+
+# Hang ceiling for a real-tmux wait. Four consumer classes ride it: the hook-completion
+# waits; the window-death wait in `test_tmux_crash_detected`, which reaches its verdict
+# through a dead window rather than a hook event; the descendant-reap poll deadlines
+# in `tests/test_stories_e2e.py` (DW-108), which wait on a killed child disappearing
+# rather than on any session event; and the detached-fake readiness gate (DW-159) that
+# both `setsid` fakes in that module splice between `child=$!` and publication, which
+# waits inside bash on the child's own setsid(2) transition completing.
+#
+# This is a HANG DETECTOR, not a performance budget: it answers "is this session
+# wedged?" and nothing else. It is deliberately NOT tuned to observed runtimes — never
+# lower it to make a slow test loud, and never read a passing run as evidence about
+# how fast the work is.
+#
+# Sized from both ends. Floor: the waits measure ~1.0s locally and 3.4-4.2s on the CI
+# runner, and the worst starvation ever observed was 30.14s, so 90s is ~21x the CI
+# work and ~3x that starvation — far outside anything the scheduler can do to it.
+# Ceiling: `--dist loadgroup` now serializes every one of these onto ONE worker, so a
+# SYSTEMIC regression pays the wait once per test rather than in parallel, and the
+# Linux test job is capped at `timeout-minutes: 15` — 900s (.github/workflows/ci.yml).
+# Eleven sites (five hook-completion cases, one crash case, the three stories reap polls,
+# and the readiness gate in each of the two detached fakes) nominally total 990s for
+# these waits alone — sites, not collected instances: several sit in parametrized rows.
+# The two gate sites cannot actually add their 180s on top: each is bounded from OUTSIDE
+# by the `_run(..., timeout=120)` wall its row runs under. The gate usually fires first;
+# the outer wall wins only when earlier work has used enough of that shared budget. The
+# stories subprocess budgets (`_run(..., timeout=90/120)`) and other overhead sit
+# OUTSIDE this constant and are additional, so this ceiling does not guarantee the whole
+# job fits within its cap.
+REAL_MUX_HANG_CEILING_S = 90.0
+
+
+# --------------------------------------------------- reap-identity helpers (Linux)
+# The identity model DW-126/DW-127 put behind every signal a test sends to a process
+# it did not spawn itself: never trust a bare pid, which the kernel is free to recycle
+# the instant the process is reaped. A child is named by the pair (pid, /proc start
+# time) captured at spawn; a signal goes out only through a pidfd bound while that
+# pair still matched. Shared here because two modules now need one model — the stories
+# reap E2Es and the opencode detached-descendant row — and conftest is this suite's
+# only proven cross-module import target (`tests/` has no `__init__.py`; pytest's
+# prepend import mode is what puts it on sys.path).
+#
+# Every function below is Linux-only AT CALL TIME (/proc, os.pidfd_open). Nothing here
+# touches either at import time, because this file also loads on Windows.
+
+
+def positive_ascii_decimal(token: str) -> bool:
+    return bool(token) and token.isascii() and token.isdecimal() and any(ch != "0" for ch in token)
+
+
+def proc_starttime(pid: int) -> str | None:
+    """Return /proc stat field 22, or ``None`` only when the process is gone."""
+    try:
+        stat = Path("/proc", str(pid), "stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+    # The comm field is parenthesized and may itself contain spaces and parens, so
+    # split after the last close-paren exactly as process_host does. Malformed records
+    # are observation failures, not evidence that the child disappeared.
+    starttime = stat[stat.rindex(")") + 1 :].split()[19]
+    if not positive_ascii_decimal(starttime):
+        raise ValueError(f"malformed start time in /proc/{pid}/stat: {starttime!r}")
+    return starttime
+
+
+def recorded_child(pid_file: Path) -> tuple[int, str]:
+    """Parse the fake CLI's exact positive-ASCII ``<pid> <starttime>`` identity."""
+    raw = pid_file.read_text(encoding="utf-8")
+    fields = raw[:-1].split(" ") if raw.endswith("\n") else []
+    diagnostic = (
+        f"{pid_file} must hold exactly two positive ASCII-decimal tokens "
+        f"('<pid> <starttime>'), got {raw!r}"
+    )
+    valid = (
+        raw.count("\n") == 1
+        and len(fields) == 2
+        and all(positive_ascii_decimal(field) for field in fields)
+    )
+    assert valid, diagnostic
+    try:
+        pid = int(fields[0])
+    except ValueError:
+        raise AssertionError(diagnostic) from None
+    return pid, fields[1]
+
+
+def preflight_pidfd_support() -> None:
+    """Fail before a fake child is spawned if pidfd open or signalling is unavailable."""
+    fd = os.pidfd_open(os.getpid())
+    try:
+        signal.pidfd_send_signal(fd, 0)
+    finally:
+        os.close(fd)
+
+
+def bind_recorded_child(pid: int, starttime: str) -> int | None:
+    """Bind a pidfd to the authenticated child, or return ``None`` once it is gone."""
+    if proc_starttime(pid) != starttime:
+        return None
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return None
+
+    # Authenticate -> bind -> re-authenticate. Once this second check agrees, the
+    # pidfd names the recorded process even if its numeric pid is later recycled.
+    try:
+        still_matches = proc_starttime(pid) == starttime
+    except BaseException:
+        os.close(fd)
+        raise
+    if not still_matches:
+        os.close(fd)
+        return None
+    return fd
+
+
+def kill_recorded_child(fd: int | None) -> None:
+    """SIGKILL through a bound pidfd and close it; ignore only proven disappearance."""
+    if fd is None:
+        return
+    try:
+        try:
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    finally:
+        os.close(fd)
+
+
+# Where a fake CLI records `<pid> <starttime>` for the child a teardown must reap:
+# one file per task directory, under the run tree the E2E's sandbox root owns.
+RECORDED_CHILD_GLOB = ".bmad-loop/runs/*/tasks/*/fake-child.pid"
+
+
+@contextlib.contextmanager
+def recorded_children_swept(root: Path, *, glob: str = RECORDED_CHILD_GLOB) -> Iterator[None]:
+    """Reap recorded children a block abandoned before it could bind their pidfds.
+
+    The window this closes is exactly the one in which NO fd exists yet: a test
+    spawns its child inside a subprocess run and can only bind an identity after the
+    run directory and its `fake-child.pid` have been discovered, so a run timeout or
+    any assertion in between used to leave an otherwise valid recorded child alive.
+    Cleanup there must rediscover identities from disk and authenticate them again,
+    exactly as the happy path would have. Missing or malformed identities remain
+    unsignalled by design because they cannot safely identify a process.
+
+    ``glob`` names the channel the caller published on, relative to ``root``.
+    It defaults to ``RECORDED_CHILD_GLOB``; callers publishing elsewhere must name
+    that channel so the pre-bind cleanup can find their identities.
+
+    Fires on exception ONLY. On a clean exit the block has already bound the fds and
+    its own ``finally`` owns them; sweeping there would re-bind the same identity and
+    duplicate the kill, so unwinding-only keeps exactly one owner per identity. A
+    just-killed zombie can still carry its recorded start time, so a sweep that races
+    an inner ``finally`` binds a zombie and SIGKILLs it — bound, therefore harmless.
+
+    Cleanup never masks the failure that triggered it: a per-file parse or bind
+    failure is downgraded to a warning naming the path left unswept, and the original
+    exception always propagates.
+    """
+    try:
+        yield
+    except BaseException:
+        pid_files: list[Path] = []
+        try:
+            pid_files.extend(root.glob(glob))
+        except Exception as exc:
+            _warn_unswept_child(root, exc)
+        for pid_file in sorted(pid_files):
+            try:
+                kill_recorded_child(bind_recorded_child(*recorded_child(pid_file)))
+            # Deliberately the widest net short of BaseException, against the repo's
+            # usual typed-escalation doctrine: this is a best-effort cleanup running
+            # DURING someone else's unwind, so anything it raises would REPLACE the
+            # in-flight exception (demoting it to __context__) and abandon the
+            # remaining identity files. The reachable failures alone already span
+            # AssertionError (the strict parser), UnicodeDecodeError/ValueError (a
+            # non-UTF-8 or malformed record, and proc_starttime's own raise),
+            # IndexError (a truncated /proc line) and OSError (bind/kill); enumerating
+            # them invites the next unlisted one to abort the sweep. BaseException
+            # still passes, so a KeyboardInterrupt is never swallowed here.
+            except Exception as exc:
+                _warn_unswept_child(pid_file, exc)
+        raise
+
+
+def _warn_unswept_child(path: Path, exc: Exception) -> None:
+    """Report best-effort cleanup failure without replacing an active exception."""
+    try:
+        warnings.warn(
+            f"unauthenticated survivor left at {path}: {exc!r}",
+            # 4, not 2: the helper and @contextmanager generator frames precede
+            # contextlib's __exit__, so the warning should name the leaking `with`.
+            stacklevel=4,
+        )
+    except Exception:
+        # Warning filters may promote UserWarning to an exception, and custom warning
+        # hooks can fail too. Cleanup is already handling somebody else's exception;
+        # neither may replace it or prevent later identities from being swept.
+        pass
 
 
 def assert_run_state_lock_held(run_dir: Path) -> None:
@@ -343,6 +571,70 @@ def git(repo: Path, *args: str) -> str:
         ["git", "-C", str(repo), *args], capture_output=True, text=True, check=True
     )
     return proc.stdout.strip()
+
+
+def remove_tree(path: Path) -> None:
+    """``shutil.rmtree`` that also removes a tree holding READ-ONLY files.
+
+    Git writes every loose object ``0444``, and on Windows ``DeleteFile`` refuses a
+    file carrying the READONLY attribute (``WinError 5``), so a bare
+    ``shutil.rmtree(repo / ".git")`` — the way a test turns a sandbox into "not a git
+    repository" — dies on the first object it reaches there. POSIX never takes that
+    arm: unlink consults the parent directory's mode, never the entry's own. The bit
+    is cleared file by file up front rather than through ``rmtree``'s ``onerror``,
+    which 3.12 deprecates in favour of an ``onexc`` that 3.11 does not have.
+
+    Symlinks are not followed: ``os.walk`` lists a linked directory under ``dirs``
+    without descending (``followlinks=False``), and a linked file is skipped, so a
+    link out of the tree never passes the write bit through to its target."""
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            entry = os.path.join(root, name)
+            if not os.path.islink(entry):
+                os.chmod(entry, stat.S_IREAD | stat.S_IWRITE)
+    shutil.rmtree(path)
+
+
+_REAL_OS_REPLACE = os.replace
+_REAL_WIN32_REPLACE_AT = win32_at.replace_at
+
+
+def real_publish_rename(src, dst, *, src_dir_fd=None, dst_dir_fd=None) -> None:
+    """The rename a :func:`patch_publish_rename` interceptor falls through to.
+
+    ``os.replace``'s shape, routed to the syscall the arm actually publishes with:
+    a path-based rename is ``os.replace``, a dir_fd-relative one is ``os.replace``
+    on POSIX and ``win32_at.replace_at`` on Windows (where ``os.replace`` refuses
+    ``dir_fd`` outright). Bound to the ORIGINALS at import, so calling it from
+    inside the interceptor never re-enters the patch."""
+    if src_dir_fd is None and dst_dir_fd is None:
+        _REAL_OS_REPLACE(src, dst)
+    elif platform_util.DIR_FD_ANCHORED_WRITES:
+        _REAL_OS_REPLACE(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+    else:
+        _REAL_WIN32_REPLACE_AT(src_dir_fd, src, dst_dir_fd, dst)
+
+
+def patch_publish_rename(monkeypatch: pytest.MonkeyPatch, fn) -> None:
+    """Route every rename a writer publishes with through ``fn``, on either arm.
+
+    ``fn(src, dst, *, src_dir_fd=None, dst_dir_fd=None)`` — ``os.replace``'s shape,
+    because on POSIX that IS the floor every publish reaches: the path-based
+    ``atomic_replace`` and the confined writer's anchored arm (a bare
+    dir_fd-relative ``os.replace``, #593) alike, so one patch covers both the
+    row's ablation and a reversion to the hand-rolled ``tmp + atomic_replace``.
+    Windows' anchored arm renames through ``win32_at.replace_at`` (handle-relative
+    ``NtSetInformationFile``; ``os.replace`` is never called), so a test patching
+    only ``os.replace`` fires on nothing there and passes having faulted nobody.
+    That name is patched too, with the argument order adapted, on the arm where
+    it is live. ``fn`` falls through with :func:`real_publish_rename`."""
+    monkeypatch.setattr(os, "replace", fn)
+    if win32_at.AVAILABLE:
+
+        def _at(src_dir_fd: int, src: str, dst_dir_fd: int, dst: str) -> None:
+            fn(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        monkeypatch.setattr(win32_at, "replace_at", _at)
 
 
 NOISY_GIT_KEY = "core.fsyncMethod"
@@ -771,14 +1063,117 @@ def nested_repo_root_paths(paths: ProjectPaths) -> ProjectPaths:
     return load_paths(project)
 
 
+OUTER_DECOY_LEDGER = b"# outer ledger\n"
+
+
+def seed_outer_decoy_ledger(paths: ProjectPaths) -> tuple[Path, bytes]:
+    """Seed the OUTER project's decoy ledger under `nested_repo_root_paths`' shape.
+
+    The companion half of `nested_repo_root_paths`. Under the nested shape the
+    ledger's project-relative tail (``_bmad-output/implementation-artifacts/
+    deferred-work.md``) re-rooted at `repo_root` is *precisely* the real file a
+    `project`-rooted pathspec silently names once git resolves it in the code tree
+    — the "not merely wrong, it is SILENTLY wrong" failure the consumer rows grade.
+    So the decoy is DERIVED from `paths.deferred_work`, never re-spelled: the
+    helper's derivation and `engine._harvest_gate_exclude`'s rule move together if
+    the artifact layout ever changes.
+
+    Returns ``(path, bytes)`` rather than bare bytes because every consumer needs
+    the path too — for `is_file`/`resolve` claims and for its own `git add` seed
+    list — and a bytes-only return would leave each row re-deriving the identity by
+    hand, which is the duplication this helper exists to remove.
+
+    SEEDS ONLY: it writes the file and stops — it never stages, commits, or touches
+    the decoy again. The consumer rows turn on the decoy being left ALONE afterwards,
+    and whether it ends up tracked is each row's own premise to establish and to
+    pin, not something this helper may decide on their behalf.
+
+    The content is fixed and the path always derives from `paths`; neither is an
+    additional helper argument. Consumers share that seed while the decoy's location
+    follows the artifact layout.
+
+    Refuses input it cannot honor, and BOTH refused shapes fail silently rather than
+    loudly — which is why they are asserted rather than left to fall over on their
+    own. On COLLAPSED paths (``project == repo_root``, the plain `project` fixture)
+    the "decoy" would BE `paths.deferred_work`, so the helper would overwrite the
+    very ledger the consumer rows exclude. On DISJOINT paths (`repo_root` not an
+    ancestor of `project`, the sibling shape) nothing raises either: both operands of
+    ``paths.deferred_work.relative_to(paths.project)`` are independent of `repo_root`,
+    so the tail still resolves and the helper would happily seed a file into a tree
+    that has no outer project at all — a decoy no pathspec spelling can name, making
+    the consumer's claim vacuous instead of false. A decoy already on disk is refused
+    rather than overwritten: the consumer rows create it deliberately so the claim is
+    graded by value, and silently absorbing an inherited one would turn that premise
+    into a setup accident. All three guards fail before anything is written.
+    """
+    assert paths.project != paths.repo_root and paths.project.is_relative_to(paths.repo_root), (
+        "seed_outer_decoy_ledger needs the NESTED shape from `nested_repo_root_paths`: "
+        "`repo_root` a strict ancestor of `project`. Collapsed roots would make the "
+        "'decoy' the ledger itself, and disjoint roots have no outer ledger at all."
+    )
+    decoy = paths.repo_root / paths.deferred_work.relative_to(paths.project)
+    decoy.parent.mkdir(parents=True, exist_ok=True)
+    assert not decoy.exists(), (
+        "this row creates the outer ledger deliberately so the 'silently wrong' "
+        "claim is graded by value; inheriting one from the sandbox template would "
+        "make that premise a setup accident"
+    )
+    decoy.write_bytes(OUTER_DECOY_LEDGER)
+    return decoy, OUTER_DECOY_LEDGER
+
+
 UNRESOLVABLE = "stubbed: the provider is registered but not serving"
 
+# The two `ValueError`-family faults `Path.resolve()` raises on CPython 3.11-3.14 POSIX
+# (DW-275), spelled once for the three publisher rows that drive them through
+# `refuse_to_resolve(..., error=)`: an embedded NUL in the path raises `ValueError`
+# with CPython's own `lstat: embedded null character in path` wording (3.12+; 3.11
+# says `embedded null byte`), and a lone surrogate OUTSIDE the `surrogateescape`
+# range (`\ud800`; a `\udcff` round-trips through `os.fsencode` and does not raise)
+# raises `UnicodeEncodeError`, a `ValueError` subclass, which `refuse_to_resolve`
+# reconstructs faithfully from its five args. INJECTED rather than driven with a
+# real path because `ntpath.realpath` tolerates a NUL, so a real NUL path is not a
+# cross-platform driver at the publisher. `Path.stat()` bottoms out in the same
+# `os.stat` and raises the same two, so the observation-arm rows that grade the
+# `stat` + `S_ISREG` presence probe (DW-266/267) drive them through
+# `fault_metadata_probe(..., "stat", error=)`; a real lone surrogate is not a
+# cross-platform driver there either (the Windows W-API accepts it).
+NUL_PATH_RESOLVE_FAULTS = [
+    pytest.param(ValueError("lstat: embedded null character in path"), id="nul"),
+    pytest.param(
+        UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogates not allowed"),
+        id="lone-surrogate",
+    ),
+]
 
-def refuse_to_resolve(monkeypatch, *targets: Path) -> None:
-    """Make ``Path.resolve()`` raise WinError 64 for exactly ``targets`` — the answer
-    a registered-but-not-serving WSL UNC provider gives (#529/#536), and one CPython's
-    non-strict ``ntpath`` allow-list does not absorb, so ``resolve()`` fails outright
-    instead of degrading to its own lexical walk. That is the #552 condition.
+
+def refuse_to_resolve(monkeypatch, *targets: Path, error: Exception | None = None) -> None:
+    """Make ``Path.resolve()`` fail for exactly ``targets``.
+
+    By DEFAULT it raises WinError 64 — the answer a registered-but-not-serving WSL UNC
+    provider gives (#529/#536), and one CPython's non-strict ``ntpath`` allow-list does
+    not absorb, so ``resolve()`` fails outright instead of degrading to its own lexical
+    walk. That is the #552 condition, and it is what every call site written before
+    DW-195 means; the keyword is optional precisely so none of them had to be edited.
+
+    ``error`` supplies a DIFFERENT resolve fault instead. A resolve can fail in more than
+    one exception class — POSIX ``Path.resolve()`` raises ``RuntimeError`` on a symlink
+    loop, not ``OSError`` — and a caller grading a handler that catches several classes
+    needs to drive each class separately. Passing the exception here rather than
+    hand-rolling a second local ``Path.resolve`` stub keeps one shared fault seam: a
+    private stub beside this helper is the hand-rolled duplicate these conversions remove.
+
+    ``Exception``, not ``BaseException``: no production handler catches
+    ``KeyboardInterrupt``/``SystemExit``/``GeneratorExit``, so a per-class ablation driven
+    with one of those would be vacuous by construction — the arm under test could be
+    deleted and the row would still red.
+
+    The exception is RE-CONSTRUCTED from its class and args on every matching resolve
+    rather than re-raised as one object. With ~43 call sites this is a shared seam, and a
+    consumer that resolves the same target twice would otherwise accumulate
+    ``__traceback__`` frames and ``__context__`` chaining on a single instance, so the
+    second fault would carry the first one's frames. The class must therefore accept its
+    own ``args`` back, which every plain ``Exception(message)`` does.
 
     Scoped to named paths on purpose: a blanket stub would break every unrelated
     resolve in the process, and a row asserting "the command survived" would then pass
@@ -790,7 +1185,9 @@ def refuse_to_resolve(monkeypatch, *targets: Path) -> None:
 
     def stub(self, strict: bool = False):
         if str(self) in wanted:
-            raise OSError(0, UNRESOLVABLE, None, 64)
+            if error is None:
+                raise OSError(0, UNRESOLVABLE, None, 64)
+            raise type(error)(*error.args)  # fresh per raise — see the docstring
         return real(self, strict=strict)
 
     monkeypatch.setattr(Path, "resolve", stub)
@@ -962,6 +1359,109 @@ def fault_read_text(monkeypatch, target: Path) -> None:
         return real(self, *a, **kw)
 
     monkeypatch.setattr(Path, "read_text", fake)
+
+
+def fault_locked_ledger_read(
+    monkeypatch, target: Path, operation: str, *, lock_target: Path | None = None
+) -> bytes:
+    """Refuse only the authoritative read inside the real ledger lock (DW-279).
+
+    Earlier probes remain healthy. Each wrap is independently ablatable by
+    selecting the stat or read_text rows. Return the target bytes that must survive.
+    `lock_target` permits an archive sibling read under the main ledger lock.
+    """
+    from bmad_loop import deferredwork
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists():
+        target.write_text("# Deferred Work\n", encoding="utf-8")
+    before = target.read_bytes()
+    lock_target = target if lock_target is None else lock_target
+    real_lock = deferredwork.ledger_lock
+    real_read = getattr(Path, operation)
+
+    def refuse(path, *args, **kwargs):
+        if path == target:
+            raise PermissionError(13, "Permission denied", str(target))
+        return real_read(path, *args, **kwargs)
+
+    @contextlib.contextmanager
+    def locked(path):
+        with real_lock(path):
+            with monkeypatch.context() as patch:
+                if path == lock_target:
+                    patch.setattr(Path, operation, refuse)
+                yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", locked)
+    return before
+
+
+def fault_metadata_probe(
+    monkeypatch, target: Path, probe: str, *, error: Exception | None = None
+) -> None:
+    """Make exactly ``target``'s ``probe`` metadata call raise PermissionError; every
+    other path still answers normally, and so does every other probe on ``target`` —
+    with the ``stat`` family the documented exception, see its own paragraph below.
+
+    ``error`` supplies a DIFFERENT fault instead, on the same terms as
+    ``refuse_to_resolve(..., error=)``: RE-CONSTRUCTED from its class and args on
+    every matching probe rather than re-raised as one object, so a consumer probing
+    the target twice does not see the first raise's frames on the second. Its use
+    is the ``ValueError`` family ``Path.stat`` raises for a path the OS cannot
+    encode (:data:`NUL_PATH_RESOLVE_FAULTS`), which no ``PermissionError`` row can
+    reach and no ``except OSError`` catches.
+
+    ``probe`` is one of ``exists`` / ``is_file`` / ``is_symlink`` / ``stat`` /
+    ``lstat`` — one probe at a time, which does NOT make one guard-per-probe
+    ablatable: a caller may well take several inside a single ``try``, where one
+    ``except`` covers the lot. What it buys is coverage of each ENTRY PATH into
+    that one guard — each probe is reached only after the ones before it answered
+    a particular way, so a row per probe proves every reachable arm is inside the
+    guard rather than only the first.
+
+    Selective monkeypatching rather than chmod, and here that is not merely the
+    ``fault_read_text`` convention: chmod is a no-op for root, carries no read bit
+    on Windows, and since Python 3.14 ``Path.is_file()`` suppresses OS errors
+    internally, so a permission bit cannot raise out of that probe on Python 3.14.
+
+    The point of the fault is that on Python 3.11–3.13 these calls do NOT swallow
+    everything: they absorb only ``pathlib``'s ignored errnos
+    (``ENOENT``/``ENOTDIR``/``EBADF``/``ELOOP``) and raise the rest, so ``EACCES``
+    is a real answer a caller must handle.
+    Python 3.14 suppresses all OS errors in them, so this helper INJECTS on every
+    version the fault only the older ones raise on their own — which is the point:
+    the handler under grade must exist for the versions that can reach it.
+
+    ``stat`` and ``lstat`` are the exception to that whole paragraph, and ``stat``
+    is why DW-221 moved the repair/write ledger reader onto it: neither suppresses
+    ANYTHING on any interpreter — CPython's pathlib docs name ``stat`` as the probe
+    that reports the error rather than answering False, which is exactly what
+    ``is_file()`` stopped doing in 3.14 when its body became ``os.path.isfile``, and
+    ``lstat`` is the same call declining to follow the last component. So a fault
+    injected on either is not a simulation of an older runtime the way the other
+    three are; it is the fault a real EACCES parent directory produces on 3.11
+    through 3.14 alike. DW-239 moved ``verify.commit_paths``' presence probe onto
+    ``lstat`` for exactly that reason, which is what makes that probe ablatable
+    here at all — on ``exists``/``is_symlink`` a 3.14 run could not reach the
+    handler under grade.
+
+    On Python 3.11–3.13, ``exists()``, ``is_file()`` and ``is_dir()`` call
+    ``self.stat()``, so this injection can affect sibling probes too. Their
+    default Python 3.14 implementations instead delegate to ``os.path`` and
+    bypass a ``Path.stat`` monkeypatch. A test simulating 3.14 suppression on an
+    older interpreter must also pin ``Path.is_file`` to return ``False``; see
+    ``test_read_for_write_propagates_a_refused_metadata_probe``."""
+    real = getattr(Path, probe)
+
+    def fake(self, *a, **kw):
+        if self == target:
+            if error is None:
+                raise PermissionError(13, "Permission denied")
+            raise type(error)(*error.args)  # fresh per raise — see the docstring
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, probe, fake)
 
 
 def write_sprint(paths: ProjectPaths, statuses: dict[str, str]) -> None:
@@ -1377,6 +1877,15 @@ def crash_at_merge_back(engine, *, after: str = "merge") -> None:
 # ----------------------------------------------------------- sweep helpers
 
 
+# The two ledger byte strings the DW-204/DW-229/DW-230 readable-ledger rows screen on,
+# shared by test_cli and test_tui_app so the CLI and TUI surfaces are provably graded on
+# the SAME bytes: 0xff is not a legal UTF-8 start byte in any position (the decode fault
+# the refusal itself reports), and the readable counterpart must actually decode, since
+# an ABSENT ledger takes a different arm of the probe and cannot stand in for it.
+UNDECODABLE_LEDGER = b"### DW-1: broken\n\xff\xfe not utf-8\n"
+READABLE_LEDGER = b"### DW-1: fine\nstatus: open\n"
+
+
 def write_ledger(paths: ProjectPaths, statuses: dict[str, str], commit: bool = True) -> None:
     """Write a DW-format deferred-work ledger; statuses maps id -> status
     value. Committed by default — sweeps start from a clean tree."""
@@ -1596,6 +2105,7 @@ def escalated_run(
     worktree_path: str = "",
     with_session: bool = False,
     git_project: bool = False,
+    run_type: str = "story",
 ) -> EscalatedRun:
     """A saved RunState paused at a CRITICAL escalation, with one ESCALATED task —
     the shared shape behind test_runs / test_resolve / test_cli, whose three local
@@ -1605,7 +2115,10 @@ def escalated_run(
     fixture-specific assertion is weakened by the dedup.
 
     ``with_session`` appends the completed review SessionRecord the resolve-context
-    builder reads. ``git_project`` makes ``state.project`` a REAL repo (spec files
+    builder reads. ``run_type`` defaults to the story pipeline; ``"sweep"`` builds the
+    escalated SWEEP run that `runs.unreadable_sweep_ledger` is scoped to (an escalated
+    sweep is a real state — the ledger gate at resolve's entry is graded on it).
+    ``git_project`` makes ``state.project`` a REAL repo (spec files
     already written are committed, run state is gitignored) so `rearm_escalation`'s
     baseline snapshot refresh actually runs and `baseline_commit` defaults to HEAD.
     That refresh reads `state.code_root`, not `state.project`; the two name the same
@@ -1649,6 +2162,7 @@ def escalated_run(
         run_id=run_id,
         project=str(project),
         started_at=started_at,
+        run_type=run_type,
         paused_reason=paused_reason,
         paused_stage=PAUSE_ESCALATION,
         paused_story_key=story_key,

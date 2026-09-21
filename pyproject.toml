@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bmad-loop"
-version = "0.11.1"
+version = "0.12.0"
 description = "Deterministic ralph-loop orchestrator for the BMAD implementation phase"
 readme = "README.md"
 license = "MIT"
@@ -63,6 +63,22 @@ exclude = ["/.trunk"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# DW-95: `xdist_group` marks are silently inert under xdist's default `load`
+# scheduler, so the flag lives here rather than in the CI workflow — local runs and
+# CI then schedule identically, and `--dist` is accepted with or without `-n`. It
+# pins the real-tmux E2Es (tests/conftest.py `real_mux_e2e`) onto one worker so they
+# stop starving each other. Correctness, not speed: measured on a 12-vCPU box,
+# `-n logical` over three interleaved runs each, the suite takes 58.4/47.6/57.5s under
+# plain `load` and 56.5/57.1/56.8s under `loadgroup` — indistinguishable. Serializing
+# ~23 E2Es (~49s of work) onto one worker is affordable because the other workers
+# still carry the remaining ~8100 tests; do not expect a timing signal either way.
+#
+# This makes pytest-xdist a hard prerequisite for EVERY pytest invocation, `-n`-less
+# ones included: without it the run aborts before collection with `unrecognized
+# arguments: --dist`, an error naming neither xdist nor this line. It is already a
+# `dev`-group dependency, so `uv sync` covers it; a bare `pytest` from outside the uv
+# environment is how you would hit that message.
+addopts = "--dist loadgroup"
 
 [tool.ruff]
 line-length = 100

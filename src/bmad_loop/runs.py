@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from . import devcontract, envvars, verify
+from . import bmadconfig, deferredwork, devcontract, envvars, verify
 from .adapters.multiplexer import (
     MultiplexerError,
     TerminalMultiplexer,
@@ -3045,6 +3045,211 @@ def runs_past_retention(
     return candidates
 
 
+# ------------------------------------------------------- resume-entry ledger gate
+
+
+def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
+    """The refusal a resume-shaped entry point owes a sweep run whose ledger cannot
+    be read — bytes that do not decode (DW-204) or a read the OS refuses (DW-234).
+
+    Returns the operator-facing message, or None to decline (DW-204).
+
+    A sweep run's whole job is reading and rewriting the deferred-work ledger, so
+    resuming one over a ledger nobody can read arms the run — pid publication,
+    policy re-stamp, a `run-resume` journal row — and only then meets the ledger.
+    The run's own read degrades rather than raising (`sweep._read_cycle_ledger`,
+    DW-197), so the cost is not a crash but a wasted arm and a stop whose repair
+    route this surface never offered: every repair steer in the product
+    (`sweep._notify_ledger_repair`, the ATTENTION line, docs/FEATURES.md) routes to
+    a fresh `bmad-loop sweep`, and `resume` was the one that silently accepted the
+    attempt instead.
+
+    Reachable domain — narrower than it looks. A sweep ENDED by a ledger fault
+    returns from `SweepEngine._loop`, and `Engine._run_inner` sets
+    `state.finished = True` on that return, so DW-204's own literal end state is
+    persisted finished and is refused by `_prepare_resume_locked`'s `already
+    finished`, which this gate declines to re-word. What is left, and what this
+    gate is for, is the UN-finished sweep runs — paused at an escalation, the
+    migrate gate or an in-flight bundle's intent-regeneration refusal (DW-243: the
+    recovery pass pauses at the story gate rather than stopping, precisely so the
+    task is re-driven by a resume this gate fronts), operator-stopped, or crashed
+    — whose ledger is unreadable at the moment someone resumes them.
+
+    Scope, all deliberate:
+
+    * `read_for_write`, never `read_for_observation` — this gates a run that will
+      WRITE the ledger, so it must ask the arm that refuses to publish from a text
+      nobody could read.
+    * `LedgerReadError` is caught BY NAME. It is a plain `Exception` on purpose
+      (DW-146) so that no OSError handler can swallow it; the flip side is that
+      nothing catches it implicitly either.
+    * `OSError` IS caught here too, with its own permissions-or-storage repair —
+      the RECORDED REVERSAL (DW-234). The arm was first written at `e609604c`,
+      then struck by the DW-204 human resolution on SCOPE grounds: that resolution
+      froze this gate to the decode fault so DW-204 could ship without
+      re-litigating the DW-146 reader contract, and two propagation rows pinned
+      the exclusion. The steer the exclusion lost was real — before this gate, an
+      OS-refused ledger armed the run and stopped through `_read_cycle_ledger`'s
+      `ledger-inaccessible` arm WITH `_notify_ledger_repair`'s route, and the gate
+      then let the same fault reach `main`'s tail as a routeless
+      `error: [Errno 13] …` naming no repair at all. DW-204 has shipped, DW-234
+      carries the accepted 2026-09-09 decision to add the arm back, and this is
+      that arm: it shares the `bmad-loop sweep` + clean-worktree ROUTE
+      `sweep._notify_ledger_repair` already gives the sweep run for the same
+      fault (that notice names the route and nothing about the fault's class),
+      and the permissions-or-storage attribution is this arm's own. The arm is a
+      CALLER's: since DW-279, `deferredwork.read_for_write` wraps OS failures
+      as `LedgerReadFault`, handled before the decode parent here to preserve
+      the original OS attribution. `tui.app._do_rearm` no longer wraps the probe
+      in its own `except OSError` — with the arm here the probe cannot raise one, so that
+      stopgap was dead code.
+    * Absence is NOT a refusal. `read_for_write` answers None, and `open_ids("")`
+      / `parse_ledger("")` answer identically for absent and empty — a resumed
+      sweep on an absent ledger ends cleanly at `sweep-nothing-open`, unless it
+      holds an in-flight bundle whose intent document must be regenerated: that
+      run re-pauses at the story gate under `sweep-intent-regen-refused`
+      `reason="ledger-absent"` (DW-243/252) before any cycle runs. A bundle close
+      paused at the same gate under `sweep-bundle-close-refused` — the mutator's
+      own locked read at the accepted-dev close, review-leg reclose or isolated
+      close carry (DW-280), plus either read site in the terminal post-merge
+      harvested append (DW-286) — resumes the same way once the ledger reads.
+      This gate fronts that resume for the MAIN checkout's ledger (the terminal
+      carry and the in-place close sites), and the existing recovery arms then
+      re-drive the write. Under `scm.isolation = "worktree"` the two in-worktree
+      close sites write the unit worktree's copy, which the pause notice names
+      and this gate does not probe, so an unrepaired copy simply re-pauses on
+      resume.
+    * Story runs are out of scope, and since DW-231 (undecodable bytes) and
+      DW-258 (a read the OS refuses) that is SAFE rather than merely decided at
+      the engine's four direct `read_for_write` sites. Its observation reads
+      (`_ledger_digest`, the pre-harvest and defer snapshots, the two restores)
+      degrade to a typed answer nothing can write back and journal
+      `ledger-read-degraded`; its two publish reads (the spec-deferral harvest
+      and the isolated carry) pause the run with an `ACTION REQUIRED` repair
+      notice and no phase change, so `bmad-loop resume` after the repair retries
+      the write — replaying the recorded session result where one exists,
+      re-driving the leg otherwise. The exception is a sweep's terminal
+      post-merge harvest carry: its caller-sensitive dispatch uses the sweep
+      story gate above, while a direct pre-terminal sweep defer carry retains the
+      engine escalation route. At those four sites a story run over an
+      undecodable OR OS-refused ledger therefore no longer dies as `run-crash`.
+      Since DW-259 the mutators' locked re-reads route the same way for decode
+      faults, and DW-279 extends that route to OS metadata/text-read faults:
+      every `deferredwork` mutator takes its own locked
+      `read_for_write` — after a routed pre-read at the harvest and the harvest
+      carry, after an observation snapshot at the commit-boundary close, and with
+      no pre-read at all at the review-timeout salvage refile
+      (`deferredwork.append_entry` in `engine._salvage_review_timeout`) and the
+      isolated close carry — so a `LedgerReadError` raised from the mutator call
+      itself (the harvest's mark and append, the commit-boundary close, the
+      salvage refile, the isolated carries' append and close) now pauses through
+      the same `ledger-read-refused` route under a site name ending in `-locked`,
+      with the phase untouched. `LedgerReadFault(LedgerReadError)` identifies
+      OS read failures with the original `OSError` chained; pre-lock presence
+      probes, lock acquisition and writes keep their raw `OSError` behavior.
+
+    Timing — a best-effort ENTRY SNAPSHOT, never a guarantee about the inputs the
+    run actually arms. The probe reads `load_state` / `bmadconfig.load_paths` at its
+    caller's entry, ahead of `_resume_paused_run`'s `state_lock`;
+    `_prepare_resume_locked` re-loads both UNDER that lock and publishes the pid
+    from ITS reads, so a config change landing in that window selects a ledger this
+    probe never saw. That race is ACCEPTED rather than closed, and the reason it
+    can be: its outcome is exactly pre-DW-204 behavior — the run arms and its own
+    read degrades to a `sweep-repeat-done` stop (DW-197) — so an entry snapshot can
+    only improve on what this surface did before, never regress it. **No under-lock
+    re-probe may be added**, and not for cost: `_prepare_resume_locked` /
+    `_resume_paused_run` are also `resolve`'s re-arm path, so a refusal sited there
+    lands after resolve's interactive session has run and its escalation is spent —
+    exactly the failure `cmd_resolve`'s own entry gate exists to prevent. That
+    deferral is now settled (DW-229, DW-230), and settled at the callers rather
+    than here: `cli.cmd_resolve` and the TUI's `_do_rearm` call THIS function at
+    their own entries — resolve at the end of its pre-side-effect gate block,
+    ahead of the interactive session and `rearm_escalation`; the TUI beside
+    its alias/liveness gates, ahead of the same re-arm and of the detached resume
+    whose refusal would land in a pane nobody opens. Three entry points, one
+    implementation, and still no probe under the lock: this function lives in
+    `runs` (the CLI+TUI shared-helper module) precisely so a second surface takes
+    the gate by CALLING it rather than by copying it or by sinking it into shared
+    machinery that runs too late. Each caller owns its own channel — stderr plus
+    `ExitCode.FAILURE` in the CLI, an error toast in the TUI — which is why the
+    probe stays pure `(project, run_dir) -> str | None` and answers with the
+    operator-facing string or declines.
+
+    What this gate defers to, precisely. It declines for a `finished` run and for a
+    control-session-alias id, so `_prepare_resume_locked` keeps `already finished`
+    and its "recover by hand, then `bmad-loop delete`" verbatim. It PRECEDES
+    `_reject_under_floor_git`, `_reject_isolation_conflict`, `_require_base_skills`
+    and the under-lock `runs.is_run` -> `no such run`, so a sweep run blocked by one
+    of those AND holding an undecodable ledger is told to fix the ledger first. That
+    ordering is deliberate and pinned by a row, not an accident of placement: this
+    refusal is the cheapest to produce and the most actionable of the set, and every
+    refusal it displaces is reachable again on the retry after the repair.
+    Reproducing those checks here would mean spawning git from a probe, which is why
+    they are not. At the `cmd_resolve` call site the displacement set is larger,
+    because the gate sits at the end of that command's pre-side-effect block: it
+    also precedes `policy_mod.load` and the whole `--restore-patch` validation, so
+    an operator who passes a bad patch path AND holds an undecodable ledger is told
+    about the ledger and only learns about the path on the retry. Same rationale —
+    the ledger blocks the gesture outright, while the patch path is only reportable
+    once the gesture can run at all.
+    """
+    try:
+        state = load_state(run_dir)
+        paths = bmadconfig.load_paths(project)
+    except Exception:
+        # Broad on purpose: a missing/corrupt state.json, a missing BMAD config and
+        # a run cleanup removed mid-command all already have owners downstream
+        # (`runs.is_run`, `_prepare_resume_locked`, `main`'s tail). The gate hands
+        # control on so the fault's own owner answers for it, instead of reporting a
+        # ledger this probe never managed to locate.
+        return None
+    if state.run_type != "sweep":
+        return None
+    if state.finished or run_id_aliases_control_session(run_dir.name):
+        return None  # `_prepare_resume_locked` owns these two refusals verbatim
+
+    ledger = paths.deferred_work
+    try:
+        deferredwork.read_for_write(ledger)
+    except (OSError, deferredwork.LedgerReadFault) as e:
+        if isinstance(e, deferredwork.LedgerReadFault) and isinstance(e.__cause__, OSError):
+            e = e.__cause__  # Preserve the original OS attribution.
+        # The OS refused the read (DW-234): a permissions or storage fault, not
+        # bytes that failed to decode. The class NAME rides along because the errno
+        # text alone ("[Errno 13] Permission denied") does not say what kind of
+        # refusal it was. The ROUTE (`bmad-loop sweep` in a clean worktree) is the
+        # one `sweep._notify_ledger_repair` gives the sweep run for the same fault;
+        # the permissions-or-storage attribution is this arm's own — that notice
+        # names the route and nothing about the fault's class. Every other clause
+        # is the decode refusal's, verbatim, for the same reasons.
+        return (
+            f"run {run_dir.name}: cannot resume this sweep — the deferred-work ledger "
+            f"{ledger} could not be read ({e.__class__.__name__}: {e}). Repair the "
+            "ledger's permissions or storage so it reads, then commit or stash any "
+            f"changes in {paths.repo_root} and run `bmad-loop sweep` (which requires "
+            "that worktree to be clean). This run stays resumable: `bmad-loop resume` "
+            "it again once the ledger reads, which keeps its in-flight bundle recovery "
+            "instead of starting the cycle over"
+        )
+    except deferredwork.LedgerReadError as e:
+        # `e` already names the file AND the codec fault; repeating either would only
+        # drift from it. The clean-worktree precondition rides along because
+        # `cmd_sweep` enforces it and this fault leaves the ledger DIRTY, so an
+        # unqualified "run `bmad-loop sweep`" sends the human into an exit-1 nobody
+        # warned them about. And this run is still resumable by construction (the
+        # gate declines for finished runs), so the message says so: following the
+        # sweep steer alone would abandon the paused run's in-flight bundle state,
+        # whose recovery includes a ledger restore.
+        return (
+            f"run {run_dir.name}: cannot resume this sweep — {e}. Repair the ledger by "
+            f"hand, then commit or stash any changes in {paths.repo_root} and run "
+            "`bmad-loop sweep` (which requires that worktree to be clean). This run "
+            "stays resumable: `bmad-loop resume` it again once the ledger reads, which "
+            "keeps its in-flight bundle recovery instead of starting the cycle over"
+        )
+    return None
+
+
 # ----------------------------------------------------------- escalation resolution
 
 
@@ -4078,8 +4283,9 @@ def _redrive_spec_status(state: RunState, task: StoryTask, *, isolated_redrive: 
 def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
     """Re-point a paused run's persisted code-root mirror at `repo_root` — the tree
     the caller is about to act in — and return the warning an operator must see when
-    that MOVED a root the run had recorded (`None` when it already agreed, or when the
-    run predates the field).
+    that MOVED a root the run had recorded (`None` when it already agreed, when the run
+    predates the field, or when this call only discharged a record an earlier call's
+    move still owed).
 
     Exists because `rearm_escalation` reads that mirror OUT OF PROCESS
     (`RunState.code_root`) and has no `ProjectPaths` to consult, while `repo_root:` is
@@ -4097,13 +4303,22 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
 
     The message names neither tree, like resume's: what an operator needs is that the
     run has changed repositories, and the paths are the half that would put an
-    attacker-controlled string on their terminal.
+    attacker-controlled string on their terminal. It names a move THIS call made, never
+    a record merely owed by an earlier one — `cli._prepare_resume_locked` draws the same
+    line on the same seam, so the re-arm surfaces and plain `resume` agree about when an
+    operator is warned.
     """
     with state_lock(run_dir):
         state = load_state(run_dir)
         new = str(repo_root)
         if state.repo_root == new and not state.code_root_restamp_pending:
             return None
+        # Whether THIS call re-pointed a root the run had RECORDED — deliberately not
+        # "re-pointed the field", which the empty→`new` legacy migration below also
+        # does: `bool(state.repo_root)` excludes that migration by design, because a
+        # missing value is not a divergent one. Distinct from the marker below, which
+        # only says a record is OWED — for this call's move or an earlier one's.
+        moved = False
         if state.repo_root != new:
             # Discharge an OWED record before the root it names is overwritten.
             # The marker is a bare bool, so the only surviving description of the
@@ -4146,24 +4361,59 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
         # diagnose registry (`diagnostics._JOURNAL_DROP_FIELDS`), so the path never
         # reaches a dump.
         #
+        # This line is ALSO reached with nothing moved, discharging a record owed by an
+        # EARLIER call's move whose own append failed. Two booleans, because one cannot
+        # say both things: `code_root_changed` keeps its THIS-CALL meaning on THIS append
+        # (so it writes `false` here, agreeing with resume's `run-resume` boolean in the
+        # same state — the two sibling discharge appends are a different shape and
+        # hardcode `true`), while `discharged_owed_move` carries the EARLIER move the row
+        # is settling. That path's row is the only durable trace that move ever leaves —
+        # call one raised instead of returning the warning, this call returns `None`,
+        # and a later plain `resume` computes `code_root_changed=false` too because the
+        # mirror already agrees — so without the second boolean the record reads as
+        # "nothing moved" (DW-128). Together the two make it complete.
+        #
+        # Stamped on THIS append alone, never on the two sibling discharge rows
+        # (`runs.py`'s pre-move discharge above, `cli._prepare_resume_locked`'s): those
+        # assert `code_root_changed=true` outright, so the move they settle is already
+        # named and a second boolean would be redundant. A consumer must therefore read
+        # an ABSENT key as "not stated", never as `false` — the kind has three producers
+        # and only one of them speaks to this.
+        #
         # AFTER the persisted move, never before it: a record written first would
         # assert a completed move that a failed save then never made. And the
         # marker is cleared only once the append has returned: an append that
         # fails leaves it set, so the retry re-enters here and writes the record
         # the move still owes — or, when the operator runs plain `resume` instead,
-        # `cli._prepare_resume_locked` reads the marker as a move, journals it on
-        # its own `run-resume` line and clears it on the same write that persists
-        # the resume. The one residual is a clearing save that fails after
-        # a successful append, which costs a duplicate — true — record on the
-        # retry; a duplicate is recoverable from the journal, a missing record and a
-        # false one are not.
+        # `cli._prepare_resume_locked` discharges it the same way this call does:
+        # its own `rearm-code-root-restamped` append naming the root the marker
+        # still describes, ahead of the re-stamp that overwrites it, cleared on the
+        # same write that persists the resume. The one residual is a clearing save
+        # that fails after a successful append, which costs a duplicate — true —
+        # record on the retry; a duplicate is recoverable from the journal, a
+        # missing record and a false one are not.
+        #
+        # `code_root_restamp_pending` is written `True` in exactly one place
+        # (`= moved`, off `bool(state.repo_root)`), so it is only ever opened by a
+        # genuine move; this append is reached only with it set. Hence `not moved`
+        # here is precisely "a record owed by an EARLIER call's real move" — no new
+        # state and no new read.
+        discharged_owed_move = not moved
         Journal(run_dir).append(
             "rearm-code-root-restamped",
             repo=new,
-            code_root_changed=True,
+            code_root_changed=moved,
+            discharged_owed_move=discharged_owed_move,
         )
         state.code_root_restamp_pending = False
         save_state(run_dir, state)
+    # Sits with the existing return below so the two exits read as one decision about
+    # what the caller is told. Reached only via the discharge above: the record was
+    # owed by an EARLIER call's move and has now landed, but nothing moved here, so
+    # there is nothing to warn an operator about — the same answer
+    # `cli._prepare_resume_locked` gives.
+    if not moved:
+        return None
     return (
         f"run {run_dir.name}: the code root in _bmad/bmm/config.yaml has changed since "
         "this run started — the re-drive works in the tree configured now, while the "

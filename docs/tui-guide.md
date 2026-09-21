@@ -321,15 +321,18 @@ A run driven on another host (shared checkout) always shows `unknown`, never
 falsely `interrupted`. Legacy runs without a pid file fall back to probing the
 per-run tmux session, which can prove `alive` but never `dead`.
 
-Journal kinds are styled by substring, first match wins:
+Journal kinds are styled by substring, first match wins — except the reader-minted
+marker below, which is matched by EQUALITY before the substring table runs, so a
+producer kind that merely contains its spelling is not restyled:
 
-| Substring                                       | Color  | Examples                                        |
-| ----------------------------------------------- | ------ | ----------------------------------------------- |
-| `escalat`, `failed`                             | red    | `preference-escalation`, `review-verify-failed` |
-| `done`, `complete`, `finished`                  | green  | `story-done`, `run-complete`                    |
-| `decision`, `deferred`, `boundary`, `truncated` | yellow | `decision-pending`, `epic-boundary`             |
-| `start`, `resume`                               | cyan   | `session-start`, `run-resume`                   |
-| anything else                                   | dim    |                                                 |
+| Match                                                 | Color  | Examples                                                                                                                                                                                                                    |
+| ----------------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `journal-line-unreadable` (exact kind, matched first) | red    | a journal line that could not be parsed; reader-minted, never written by the engine. Renders `bytes=<n>` and nothing else — deliberately no timestamp (unknowable) and no content from the line (it can carry session text) |
+| `escalat`, `failed`                                   | red    | `preference-escalation`, `review-verify-failed`                                                                                                                                                                             |
+| `done`, `complete`, `finished`                        | green  | `story-done`, `run-complete`                                                                                                                                                                                                |
+| `decision`, `deferred`, `boundary`, `truncated`       | yellow | `decision-pending`, `epic-boundary`                                                                                                                                                                                         |
+| `start`, `resume`                                     | cyan   | `session-start`, `run-resume`                                                                                                                                                                                               |
+| anything else                                         | dim    |                                                                                                                                                                                                                             |
 
 ## Key bindings
 
@@ -419,7 +422,18 @@ this run` when the original engine still appears to be running. Heed this
   one: two engines driving one run dir corrupt each other's state. It can also
   mean the pid was recycled by another process — verify before resuming.
 
-Confirming spawns `bmad-loop resume <run-id>` detached in `bmad-loop-ctl`,
+After the multiplexer and engine-liveness checks, confirming an unfinished sweep
+checks whether the main checkout's deferred-work ledger can be read. An undecodable ledger or a
+permissions/storage read failure shows an error toast with the same repair guidance
+as the CLI, and no detached window launches. Repair the ledger by hand (or fix its
+permissions or storage), then resume again to keep the in-flight bundle recovery.
+The toast also offers `bmad-loop sweep` after committing or stashing changes so the
+worktree is clean. Story runs and cases where the probe cannot locate the ledger
+retain the existing handoff, as does an absent ledger. The probe does not check an
+isolated unit worktree's ledger; an unreadable copy there may still re-pause the run
+after handoff until that copy is repaired.
+
+When these checks pass, confirming spawns `bmad-loop resume <run-id>` detached in `bmad-loop-ctl`,
 like any other launch. Resume drops any stale `bmad-loop-<run-id>` session a
 stopped or interrupted run left behind and spins up a fresh one, so the run
 never re-attaches to a dead session.
@@ -506,10 +520,13 @@ artifacts the engine already wrote.
   (view the finalized spec, then **Approve & resume**), so the pre-existing sprint-mode
   gate inherits the same richer surface — including the anchored read and the refusal
   of **Approve & resume** on a spec that cannot be read. Story-gate and epic-boundary pauses have no
-  spec to show — a story gate fires before the story is recorded, an epic boundary has
-  no story at all — so they open a compact pause-reason viewer instead: the reason names
-  the blocking entries and the remedy, and **Resume** re-picks the story and re-asks the
-  ledger, so a gate that is still open legitimately re-pauses.
+  spec to show — a story gate fires before the story is recorded, or on a sweep bundle
+  whose intent regeneration the ledger refused (its task may carry a spec file, but the
+  gate is about the ledger, not the spec), an epic boundary has no story at all — so
+  they open a compact pause-reason viewer instead: the reason names
+  the blocking entries and the remedy. **Resume** re-picks a gated sprint story;
+  for a bundle-regeneration pause, it recovers the same persisted bundle and regenerates
+  its intent document. Both re-ask the ledger, so an unresolved refusal re-pauses.
 
 `p` and `R` overlap for an escalation (both reach Resolve); `p` also exposes
 Re-arm & resume inline once a resolution exists. Pause badges in the run list and
@@ -567,7 +584,19 @@ from — press `d`. The Deferred Work pane title shows the outstanding count
 (question, context, and each option with its effect and the triage
 recommendation). Each answer is durable: a `close` is applied immediately, and
 a `build`/`keep-open` is saved to `.bmad-loop/decisions.json`, so the next sweep
-acts on it (build → bundle, keep-open → recorded) without asking again. Skip a
+acts on it (build → bundle, keep-open → recorded) without asking again. The
+ledger can take no `decision:` line, though — the entry retired by another
+writer while the modal was open, or the ledger file gone (DW-198). The modal
+says so in a `warning` toast (naming the id, and the store answer where one was
+still saved), the walk carries on to the next decision, and that answer is not
+counted in the `recorded N decision(s)` summary. A publication refusal is appended
+to that warning, or shown in its own `warning` toast when a ledger line landed.
+It says an answer that DID land on disk could not be published to git
+(DW-209/213): the modal's writer commits only the files that call actually
+wrote, and a file that vanished or went unreadable between the write and the
+staging is dropped from the commit and named here with its cause. That one does
+not change the count, which still depends only on whether a ledger line landed,
+and the walk carries on the same way. Skip a
 modal to leave that one for later. The same set is available on the CLI via
 `bmad-loop decisions` (`--list` to just view).
 
@@ -617,6 +646,8 @@ behavior.
 | `gates.retrospective`                 | select                 | `notify`           | `never` / `notify` / `auto`                                                                                                                                                                                                                                                                                                        |
 | `limits.max_review_cycles`            | int ≥ 1                | 3                  | review loop bound before plateau-defer                                                                                                                                                                                                                                                                                             |
 | `limits.max_dev_attempts`             | int ≥ 1                | 2                  | dev retry budget                                                                                                                                                                                                                                                                                                                   |
+| `limits.artifact_file_max_mb`         | int ≥ 1                | 5                  | raw-byte cap for each ignored file selected for isolated artifact publication; tracked declarations ride Git and do not count                                                                                                                                                                                                      |
+| `limits.artifact_payload_max_mb`      | int ≥ 1                | 10                 | aggregate raw-byte cap across selected ignored publication files, enforced before base64 encoding                                                                                                                                                                                                                                  |
 | `limits.max_followup_reviews`         | int ≥ 0                | 1                  | extra review rounds granted for a finalized pass's own follow-up before it converges + refiles instead of burning a cycle · 0 = never honor one                                                                                                                                                                                    |
 | `limits.session_timeout_min`          | int ≥ 1                | 90                 | per-session wall clock                                                                                                                                                                                                                                                                                                             |
 | `limits.git_timeout_s`                | int ≥ 1                | 120                | bound on any single git subprocess; exceeding it pauses/degrades, never crashes the run — raise on a loaded host or a very large worktree                                                                                                                                                                                          |

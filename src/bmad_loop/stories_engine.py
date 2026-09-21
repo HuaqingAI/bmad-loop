@@ -53,6 +53,7 @@ from .model import (
     PAUSE_STORY_CHECKPOINT,
     Phase,
     StoryTask,
+    result_mapping,
 )
 from .runs import graceful_stop_requested
 
@@ -455,7 +456,7 @@ class StoriesEngine(Engine):
 
     def _harvest_spec_path(self, task: StoryTask, result_json: dict | None) -> Path | None:
         """Resolve the same id-keyed story spec that verification will accept."""
-        if not (result_json or {}).get("spec_file"):
+        if not result_mapping(result_json).get("spec_file"):
             return None
         state = stories.resolve_story_spec(self._stories_folder(), task.story_key)
         return state.path if state.kind == stories.KIND_PRESENT else None
@@ -506,7 +507,7 @@ class StoriesEngine(Engine):
         # The adapter marks a plan-halt leg's synthesized result `plan_halt`; latch
         # it onto the task so _drive_story pauses for plan review (and clears it on
         # the leg-2 re-drive), and switch verify to the ready-for-dev plan gate.
-        plan_halt = bool((result_json or {}).get("plan_halt"))
+        plan_halt = bool(result_mapping(result_json).get("plan_halt"))
         task.plan_checkpoint_pending = plan_halt
         # Read-back detection: the just-run dev session HALTed pre-planning and left
         # a fixed-slug sentinel. Journal it (with its recorded blocking condition)
@@ -556,7 +557,7 @@ class StoriesEngine(Engine):
         # A plan-halt leg produced only the plan (spec at ready-for-dev); there is
         # no implementation yet, so skip the project build/test gate — it would
         # fail on a half-built tree before the human ever sees the plan.
-        return not bool((result_json or {}).get("plan_halt"))
+        return not bool(result_mapping(result_json).get("plan_halt"))
 
     def _verify_review(self, task: StoryTask):
         # Drop the sprint-status gate (stories mode has no board); the id-keyed

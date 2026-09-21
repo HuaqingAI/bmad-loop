@@ -12,6 +12,7 @@ import sys
 import time
 from enum import IntEnum
 from pathlib import Path
+from stat import S_ISREG
 from typing import TYPE_CHECKING, Any
 
 from . import (
@@ -69,7 +70,8 @@ from .documents import (
     status_document,
     validate_document,
 )
-from .engine import Engine
+from .engine import Engine, _publication_refusal
+from .escalation import display_pause_reason
 from .journal import Journal, load_state, save_state, state_lock
 from .model import RunState
 from .platform_util import (
@@ -93,7 +95,14 @@ from .runsetup import make_adapters as _make_adapters
 from .runsetup import mux_reason_label as _mux_reason_label
 from .runsetup import platform_preflight as _platform_preflight
 from .stories_engine import StoriesEngine
-from .sweep import SweepEngine
+from .sweep import (
+    DW_ID_RE,
+    SEVERITY_ORDER,
+    SweepEngine,
+    decimal_digits_key,
+    increment_decimal_digits,
+    select_entries,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1608,9 +1617,27 @@ def _validate_deferred_ledger(
     here, and swapping the two lines changes no severity and no exit code.
     """
     ledger = paths.deferred_work
+    # OBSERVATION arm of the ledger-read contract (DW-146), kept inline rather than
+    # routed through `read_for_observation`: `validate` writes nothing, but it has
+    # to REPORT the fault as a graded problem rather than degrade quietly to an
+    # empty ledger — see the reasoning below. Same classification, richer response.
+    # The presence probe is `stat` + `S_ISREG` INSIDE the `try` (DW-267): the
+    # `is_file()` it replaced suppresses every OS error on Python 3.14 and answers
+    # False, so a refused ledger read as an empty one and `validate` reported a
+    # clean deferred check with the finding below unreachable. Only absence
+    # (`ENOENT`/`ENOTDIR`, a present non-regular file) is the empty text; a
+    # refused probe takes the same arm a refused `read_text` does. `ValueError`,
+    # not `UnicodeDecodeError` (its subclass): `Path.stat` raises a plain
+    # `ValueError` for an embedded NUL in the configured path and a
+    # `UnicodeEncodeError` for a lone surrogate, neither an `OSError`, which
+    # `is_file()` had answered False for — an observation arm attributes those
+    # as a fault, never as absence, so they are the same graded problem.
     try:
-        text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
-    except (OSError, UnicodeDecodeError) as e:
+        try:
+            text = ledger.read_text(encoding="utf-8") if S_ISREG(ledger.stat().st_mode) else ""
+        except (FileNotFoundError, NotADirectoryError):
+            text = ""
+    except (OSError, ValueError) as e:
         # Split from the manifest read in the checks below, which is silent for a
         # good reason that does not apply here: nothing else in `validate` reads
         # the ledger, so returning quietly reported success for preflights that
@@ -2290,6 +2317,8 @@ def _start_sweep(
     repeat: bool | None = None,
     max_cycles: int | None = None,
     trigger: str,
+    only_ids: tuple[str, ...] | None = None,
+    min_severity: str | None = None,
     run_id: str | None = None,
     profiles=None,
     on_started: Callable[[], None] | None = None,
@@ -2317,6 +2346,8 @@ def _start_sweep(
         max_bundles=max_bundles,
         repeat=repeat,
         max_cycles=max_cycles,
+        only_ids=only_ids,
+        min_severity=min_severity,
         trigger=trigger,
         make_adapters=_make_adapters,
         sweep_engine_cls=SweepEngine,
@@ -2327,7 +2358,7 @@ def _start_sweep(
     print(f"sweep {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
     print(summary.render())
-    return 0
+    return ExitCode.FAILURE if summary.crashed and only_ids is not None else ExitCode.OK
 
 
 def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest: str):
@@ -2403,6 +2434,8 @@ def _sweep_factory(project: Path, paths: bmadconfig.ProjectPaths, trusted_digest
             decisions_only=False,
             max_bundles=None,
             trigger=trigger,
+            only_ids=None,
+            min_severity=None,
             profiles=profiles,
             on_started=started,
         )
@@ -2416,6 +2449,12 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     project = _project(args)
     paths = bmadconfig.load_paths(project)
 
+    only_arg = getattr(args, "only", None)
+    min_severity = getattr(args, "min_severity", None)
+    if only_arg is not None and min_severity is not None:
+        print("--only cannot combine with --min-severity", file=sys.stderr)
+        return ExitCode.FAILURE
+
     if args.before is not None and not args.archive:
         print("--before requires --archive", file=sys.stderr)
         return ExitCode.FAILURE
@@ -2428,19 +2467,28 @@ def cmd_sweep(args: argparse.Namespace) -> int:
             or args.max_cycles is not None
             or args.no_prompt
             or args.run_id is not None
+            or only_arg is not None
+            or min_severity is not None
         ):
             print(
                 "--archive cannot combine with --decisions-only, --repeat, "
-                "--max-bundles, --max-cycles, --no-prompt, or --run-id",
+                "--max-bundles, --max-cycles, --no-prompt, --run-id, --only, "
+                "or --min-severity",
                 file=sys.stderr,
             )
             return ExitCode.FAILURE
         return _sweep_archive(project, paths, args)
 
+    try:
+        only_ids = _parse_sweep_only(only_arg) if only_arg is not None else None
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return ExitCode.FAILURE
+
     pol = policy_mod.load(_policy_path(project))
 
     if args.dry_run:
-        return _sweep_dry_run(paths, pol)
+        return _sweep_dry_run(paths, pol, only_ids=only_ids, min_severity=min_severity)
 
     if (rc := _reject_under_floor_git(paths.project)) is not None:
         return rc
@@ -2466,6 +2514,8 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         max_bundles=args.max_bundles,
         repeat=args.repeat,
         max_cycles=args.max_cycles,
+        only_ids=only_ids,
+        min_severity=min_severity,
         trigger="cli",
         run_id=args.run_id,
     )
@@ -2512,32 +2562,44 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
     ledger = paths.deferred_work
     # Call the primitive BEFORE reporting a missing ledger, and report the
     # missing ledger from its empty result. `archive_closed` validates `before`
-    # ahead of its own `is_file` short-circuit precisely so a malformed date
-    # fails the same way whether or not a ledger exists; short-circuiting here
-    # first put that back, and `--before not-a-date` then exited 0 on a project
-    # that happens to have no ledger today and 1 on one that does — the same
+    # ahead of its own presence guard precisely so a malformed date fails the
+    # same way whether or not a ledger exists; short-circuiting here first put
+    # that back, and `--before not-a-date` then exited 0 on a project that
+    # happens to have no ledger today and 1 on one that does — the same
     # invocation graded by optional project data rather than by its own shape
     # (#711 review). The call is safe on a missing file: it short-circuits to
     # an empty list without writing.
+    #
+    # The post-report presence probe sits INSIDE the same `try`, as `stat` +
+    # `S_ISREG` (DW-265). It is reachable only in the window after
+    # `archive_closed`'s own guard answered without raising, but a probe that
+    # raised a traceback out of the CLI (Python 3.13, where `is_file()` raises
+    # EACCES) or reported "no deferred-work ledger" after a successful archive
+    # (3.14, where `is_file()` suppresses every OS error and answers False) is
+    # still wrong; a refused probe now reaches the FAILURE arm below, whose
+    # message already says the ledger could not be read.
     try:
         archived = deferredwork.archive_closed(
             ledger,
             before=args.before,
             dry_run=args.dry_run,
         )
+        try:
+            present = S_ISREG(ledger.stat().st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            present = False
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return ExitCode.FAILURE
-    except (OSError, runs.StateRootError) as exc:
+    except (OSError, deferredwork.LedgerReadFault, runs.StateRootError) as exc:
         # `archive_closed` serializes on the ledger's sidecar lock (#286/#469).
-        # THREE ways this arm is reached, not two: the acquisition raises
-        # `OSError` (a rival holder outlasting the blocking retry, or an
-        # unwritable locks dir); deriving the sidecar's path raises
+        # Acquisition raises `OSError` (a rival holder outlasting the blocking
+        # retry, or an unwritable locks dir); deriving the sidecar's path raises
         # `runs.StateRootError` — NOT an OSError — when the environment names no
-        # usable state root; and the archive's own I/O raises `OSError` too, for
-        # the ledger read and for either atomic write. Naming the lock is what
-        # makes the message actionable — a bare `error: [Errno 11] ...` from a
-        # command with no other lock in sight reads as a bug in the archive — but
+        # usable state root; pre-lock probes and atomic writes raise `OSError`,
+        # while the authoritative read wraps OS faults as `LedgerReadFault`
+        # (DW-279). Naming the lock makes the message actionable — a bare
+        # `error: [Errno 11] ...` from a command with no other lock in sight reads as a bug in the archive — but
         # the message must not ASSERT contention, or a full disk sends the
         # operator hunting a rival process that was never there. So it names both
         # possibilities and lets the carried cause decide between them. Existing
@@ -2549,7 +2611,7 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
             file=sys.stderr,
         )
         return ExitCode.FAILURE
-    if not ledger.is_file():
+    if not present:
         print(f"no deferred-work ledger at {ledger}")
         return ExitCode.OK
     archive_path = ledger.parent / deferredwork.ARCHIVE_REL
@@ -2569,33 +2631,162 @@ def _sweep_archive(project: Path, paths: bmadconfig.ProjectPaths, args: argparse
     return ExitCode.OK
 
 
-def _sweep_dry_run(paths: bmadconfig.ProjectPaths, pol) -> int:
+def _parse_sweep_only(value: str) -> tuple[str, ...]:
+    parts = [part.strip() for part in value.split(",")]
+    if not parts or any(not part for part in parts):
+        raise ValueError("--only requires a comma-separated list of DW-<n> ids")
+    malformed = [part for part in parts if not DW_ID_RE.fullmatch(part)]
+    if malformed:
+        raise ValueError("--only contains malformed ids: " + ", ".join(malformed))
+    return tuple(dict.fromkeys(parts))
+
+
+def _sweep_dry_run(
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    *,
+    only_ids: tuple[str, ...] | None = None,
+    min_severity: str | None = None,
+) -> int:
     # Before the no-ledger early return below: a broken install is worth saying so
     # about whether or not there is anything to sweep.
     _warn_preflight_would_abort(paths, pol)
     ledger = paths.deferred_work
-    if not ledger.is_file():
+    # OBSERVATION arm of the ledger-read contract (DW-146): this listing writes
+    # nothing, but it is an OPERATOR SURFACE, so degrading to an empty document
+    # would report "0 open" for a ledger nobody could read — a fabricated listing
+    # is worse than no listing. Say which file and which fault, and fail.
+    # Absence is taken from the reader's own `("", None)` answer rather than an
+    # `is_file()` pre-gate (DW-265): that gate suppressed every OS error on
+    # Python 3.14 and answered False, printing "no deferred-work ledger" for a
+    # refused one (and raised a traceback out of the CLI on 3.11–3.13), so the
+    # DW-254 attributed fault below was shadowed before the reader was asked. A
+    # 0-byte ledger answers the same empty text and is reported as absent too —
+    # deliberate, it holds nothing to list.
+    text, fault = deferredwork.read_for_observation(ledger)
+    if fault is not None:
+        print(f"error: {ledger} cannot be read ({fault})", file=sys.stderr)
+        return ExitCode.FAILURE
+    if not text:
+        if only_ids is not None:
+            try:
+                select_entries((), only_ids=only_ids, validate_only=True)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return ExitCode.FAILURE
         print(f"no deferred-work ledger at {ledger}")
         return 0
-    text = ledger.read_text(encoding="utf-8")
     entries = deferredwork.parse_ledger(text)
     open_entries = [e for e in entries if e.open]
+    legacy = deferredwork.parse_legacy(text)
+    highest_suffix = max(
+        (entry.id.removeprefix("DW-").lstrip("0") or "0" for entry in entries),
+        key=decimal_digits_key,
+        default="0",
+    )
+    next_suffix = increment_decimal_digits(highest_suffix)
+    projected_legacy = []
+    for entry in legacy:
+        projected_legacy.append((f"DW-{next_suffix}", entry))
+        next_suffix = increment_decimal_digits(next_suffix)
+    projected_open = [(dw_id, entry) for dw_id, entry in projected_legacy if not entry.done]
     closed = len(entries) - len(open_entries)
     print(f"{ledger}: {len(open_entries)} open, {closed} closed/non-open")
-    for entry in open_entries:
+    try:
+        selection = select_entries(
+            entries,
+            only_ids=only_ids,
+            min_severity=min_severity,
+            validate_only=only_ids is None,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return ExitCode.FAILURE
+    if only_ids is not None:
+        available = {entry.id for entry in open_entries} | {dw_id for dw_id, _ in projected_open}
+        unavailable = [dw_id for dw_id in only_ids if dw_id not in available]
+        if unavailable:
+            print(
+                "error: --only ids must exist and be open: " + ", ".join(unavailable),
+                file=sys.stderr,
+            )
+            return ExitCode.FAILURE
+    shown = selection.selected if only_ids is not None or min_severity is not None else open_entries
+    for entry in shown:
         print(f"  {entry.id:8s} {entry.title}")
-    legacy = deferredwork.parse_legacy(text)
+    if selection.excluded:
+        print("excluded by sweep selector:")
+        for entry in selection.excluded:
+            print(f"  {entry.id:8s} {entry.title}")
+    if selection.missing_severity:
+        print("excluded for missing or unrecognized severity:")
+        for entry in selection.missing_severity:
+            print(f"  {entry.id:8s} {entry.title}")
     legacy_open = [e for e in legacy if not e.done]
+    projected_selected = projected_open
+    projected_excluded: list[tuple[str, deferredwork.LegacyEntry]] = []
+    projected_missing_severity: list[tuple[str, deferredwork.LegacyEntry]] = []
+    if only_ids is not None:
+        requested = set(only_ids)
+        projected_selected = [item for item in projected_open if item[0] in requested]
+        projected_excluded = [item for item in projected_open if item[0] not in requested]
+    elif min_severity is not None:
+        floor = SEVERITY_ORDER[min_severity]
+        projected_selected = [
+            (dw_id, entry)
+            for dw_id, entry in projected_open
+            if entry.severity is not None and SEVERITY_ORDER[entry.severity] >= floor
+        ]
+        selected_keys = {entry.key for _, entry in projected_selected}
+        projected_excluded = [
+            (dw_id, entry)
+            for dw_id, entry in projected_open
+            if entry.severity is not None and entry.key not in selected_keys
+        ]
+        projected_missing_severity = [
+            (dw_id, entry) for dw_id, entry in projected_open if entry.severity is None
+        ]
     if legacy:
         print(
             f"plus {len(legacy)} legacy (pre-DW-format) entries, {len(legacy_open)} open"
             " — a sweep would first migrate them to DW format"
         )
-        for entry in legacy_open:
-            print(f"  {entry.id or '-':8s} {entry.title}")
-    if open_entries or legacy_open:
+        if projected_selected:
+            print("projected legacy selection (pre-migration; provisional ids):")
+        for dw_id, entry in projected_selected:
+            print(f"  {dw_id:8s} {entry.title}  [pre-migration projection]")
+        if min_severity is not None and projected_selected:
+            print(
+                f"{len(projected_selected)} matching legacy entr"
+                f"{'y' if len(projected_selected) == 1 else 'ies'} will be migrated then triaged"
+            )
+        if projected_excluded:
+            print("projected legacy entries excluded by sweep selector:")
+            for dw_id, entry in projected_excluded:
+                print(f"  {dw_id:8s} {entry.title}  [pre-migration projection]")
+        if projected_missing_severity:
+            print("projected legacy entries excluded for missing or unrecognized severity:")
+            for dw_id, entry in projected_missing_severity:
+                print(f"  {dw_id:8s} {entry.title}  [pre-migration projection]")
+    if selection.selected or projected_selected:
         print("a sweep would triage the open entries in one LLM session, then run bundles")
-        print(f"  triage: {_render_invocation(pol, paths.project, 'triage', '/bmad-loop-sweep')}")
+        if projected_selected and (only_ids is not None or min_severity is not None):
+            print(
+                "  triage: projected legacy ids are provisional; semantic duplicate merging may "
+                "compact them, and the real run revalidates --only against the actual "
+                "post-migration universe"
+            )
+            return 0
+        prompt = "/bmad-loop-sweep"
+        if only_ids is not None or min_severity is not None:
+            selected_ids = {entry.id for entry in selection.selected}
+            ordered = (
+                [dw_id for dw_id in only_ids if dw_id in selected_ids]
+                if only_ids is not None
+                else [entry.id for entry in selection.selected]
+            )
+            prompt += " --only " + ",".join(ordered)
+        print(f"  triage: {_render_invocation(pol, paths.project, 'triage', prompt)}")
     return 0
 
 
@@ -2631,6 +2822,22 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     if state.finished:
         print(f"run {run_dir.name} already finished", file=sys.stderr)
         return 1
+    sweep_options = None
+    if state.run_type == "sweep":
+        try:
+            runsetup.validate_sweep_options_version(state.sweep_options_version)
+            sweep_options = runsetup.load_sweep_resume_options(
+                run_dir,
+                required=state.sweep_options_version >= runsetup.SWEEP_OPTIONS_VERSION,
+                expected_digest=(
+                    state.sweep_options_digest
+                    if state.sweep_options_version == runsetup.SWEEP_OPTIONS_VERSION
+                    else None
+                ),
+            )
+        except runsetup.SweepOptionsError as exc:
+            print(f"cannot resume {run_dir.name}: {exc}", file=sys.stderr)
+            return 1
     pol = policy_mod.load(_policy_path(project))
     # Resume re-reads config.yaml and policy.toml from disk, so it is a second
     # entrypoint into the same engine and gets the same refusal — a run started
@@ -2748,16 +2955,18 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     # before the field existed, and read back as "" — out of the comparison: it is a
     # missing value, not a divergent one, and the re-stamp migrates it silently.
     #
-    # The `code_root_restamp_pending` half is a move `runs.restamp_code_root` already
-    # persisted whose `rearm-code-root-restamped` record never landed: the mirror then
-    # already agrees with config, so the compare alone would read "no move" on the one
-    # gesture that still owes the operator its record and its warning. This resume
-    # CONSUMES that outstanding re-stamp — the retry the marker keeps possible may
-    # arrive through plain `resume` rather than through `resolve`, and a run that
-    # finishes from here would otherwise leave the move unrecorded for good.
-    code_root_changed = (
-        bool(state.repo_root) and state.repo_root != str(paths.repo_root)
-    ) or state.code_root_restamp_pending
+    # `code_root_restamp_pending` is deliberately NOT part of this compare. That marker
+    # is a RECORD DEBT — a move `runs.restamp_code_root` already persisted whose
+    # `rearm-code-root-restamped` record never landed — and not a move of its own: the
+    # mirror it left behind already agrees with config, which is precisely why the
+    # compare reads "no move". Counting it as one made resume warn that "the code root
+    # has changed since this run started" on a resume whose tree IS the tree the run
+    # started in, and discharged the owed record with a `run-resume` boolean that
+    # carries no root at all — so an operator who edited `repo_root:` between the failed
+    # append and the resume had the owed A→B row answered by a row describing a
+    # different move, unreconstructable after the fact. The debt is discharged just
+    # below, on its own line, under the root the marker still names.
+    code_root_changed = bool(state.repo_root) and state.repo_root != str(paths.repo_root)
     fields: dict[str, object] = {
         # Scalars only, per the note above: a bool records THAT the pinned surface
         # moved without journaling a command, a binary path or a plugin name.
@@ -2778,6 +2987,28 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     prior_weight = state.cache_read_weight()
     if prior_weight != pol.limits.cache_read_weight:
         fields["cache_read_weight_was"] = prior_weight
+    # Discharge an OWED record FIRST — before the `run-resume` row, before the pin
+    # re-baseline below, and before `state.repo_root` is overwritten. The twin of
+    # `runs.restamp_code_root`'s own discharge, same shape and same field names, and
+    # the same at-least-once bargain: this is the FIRST fallible write of the resume,
+    # so an append that raises here leaves journal, pin and run state intact — no
+    # resume row to duplicate, no re-baselined pin to silence the host-exec advisory
+    # on the retry, and a root and marker still exactly as the retry needs them.
+    # First also puts it in
+    # chronological order: the owed move pre-dates this resume, so its row must
+    # pre-date the `run-resume` row too, the way the twin appends it. The marker is a
+    # bare bool, so `state.repo_root` here — still the pre-overwrite value — is the
+    # only surviving description of the root the unlanded record was owed for; once
+    # the re-stamp below re-points it, that record can never be reconstructed. The one
+    # residual is the twin's: a `save_state` that fails after a successful append
+    # costs a duplicate — but TRUE — record on the retry, and a duplicate is
+    # recoverable from the journal where a missing or a false record is not.
+    if state.code_root_restamp_pending:
+        journal.append(
+            "rearm-code-root-restamped",
+            repo=state.repo_root,
+            code_root_changed=True,
+        )
     journal.append("run-resume", **fields)
     if security_config_changed:
         # STATIC category names — the ones config_digest covers. A single sha256
@@ -2847,9 +3078,12 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     # is the tree `runs.rearm_escalation` must read back. Unconditional, so it also
     # migrates a pre-field state.json onto the root it was already using.
     state.repo_root = str(paths.repo_root)
-    # The `run-resume` record above IS the record an outstanding re-stamp owed, so the
-    # marker clears on the same write that persists the resume — never a separate
-    # one, which could land without it and leave the run owing a record it has.
+    # The debt the marker carried was discharged on its own line above, under its own
+    # root, ahead of the `run-resume` row — a `run-resume` boolean, which names no
+    # root, can no longer stand in for it. Unconditional, and on the same write that
+    # persists the resume: a separate write could land without the append and leave
+    # the run owing a record it has already written, or clear the marker for a record
+    # that never landed.
     state.code_root_restamp_pending = False
     state.clear_pause()
     runs.write_pid(run_dir)
@@ -2864,7 +3098,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path):
     # SweepEngine and _make_adapters are handed in from this module's namespace so
     # the test suite's `monkeypatch.setattr(cli, "SweepEngine"/"Engine"/..., ...)`
     # still applies.
-    return paths, state, pol, journal, new_digest, profiles
+    return paths, state, pol, journal, new_digest, profiles, sweep_options
 
 
 def _resume_paused_run(project: Path, run_dir: Path) -> int:
@@ -2889,7 +3123,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         prepared = _prepare_resume_locked(project, run_dir)
     if isinstance(prepared, int):
         return prepared
-    paths, state, pol, journal, new_digest, profiles = prepared
+    paths, state, pol, journal, new_digest, profiles, sweep_options = prepared
 
     # Adapter construction and the engine lifetime are deliberately outside the
     # state hold.  The pid/state publication above makes a rival control command
@@ -2907,10 +3141,15 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         stories_engine_cls=StoriesEngine,
         sweep_engine_cls=SweepEngine,
         profiles=profiles,
+        sweep_options=sweep_options,
     )
     summary = composed.engine.run()
     print(summary.render())
-    return 0
+    return (
+        ExitCode.FAILURE
+        if summary.crashed and sweep_options is not None and sweep_options.only_ids is not None
+        else ExitCode.OK
+    )
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
@@ -2939,6 +3178,22 @@ def cmd_resume(args: argparse.Namespace) -> int:
             "resuming could double-drive this run",
             file=sys.stderr,
         )
+    # DW-204: sweep runs only, for a ledger that cannot currently be read — bytes
+    # that do not decode, or (since DW-234) a read the OS refused; each names its
+    # own repair (see the helper). Gated HERE and not in `_resume_paused_run`, for
+    # the same reason the liveness block above is:
+    # that helper is also resolve's re-arm path, which has already run its
+    # interactive session and re-armed the escalation by the time it is reached, so
+    # a refusal there would be a refusal after the side effects. Deliberately AFTER
+    # the 'unknown' warning, so the recovery warning still prints; the live-engine
+    # refusal above still wins outright and never probes the ledger.
+    #
+    # The probe lives in `runs` because two more entry points take it at their own
+    # entries for that same reason (DW-229/DW-230): `cmd_resolve` below, and the
+    # TUI's `_do_rearm`. One implementation, so the three cannot drift.
+    if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
+        print(refusal, file=sys.stderr)
+        return ExitCode.FAILURE
     return _resume_paused_run(project, run_dir)
 
 
@@ -3028,7 +3283,7 @@ def _resolve_restore_patch(
     # answer here could pass containment on the wrong directory.
     try:
         patch = verify.resolve_restore_path(raw, project).resolve()
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         return None, (
             f"cannot canonicalize the restore patch path {raw!r}: {e} — whether it "
             "lies inside or outside the project tree cannot be determined, so the "
@@ -3171,6 +3426,19 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if story_key is None or task is None or task.phase != Phase.ESCALATED:
         print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
         return 1
+
+    # DW-204/DW-229: the same probe `cmd_resume` takes, taken here at resolve's own
+    # entry. `_resume_paused_run` cannot carry this gate for resolve — by the time
+    # this flow reaches it the interactive session has run and `runs.rearm_escalation`
+    # has spent the escalation, so a refusal there is a refusal after the side
+    # effects. LAST in this gate block, not first: the refusals above answer "this
+    # gesture does not apply to this run at all" (alias, not paused at an escalation,
+    # live engine, no escalated story) and must not be displaced by a ledger-repair
+    # steer that would not help. Mirrors `cmd_resume`, where the live-engine refusal
+    # also wins outright and the ledger gate follows it.
+    if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
+        print(refusal, file=sys.stderr)
+        return ExitCode.FAILURE
 
     pol = policy_mod.load(_policy_path(project))
 
@@ -3826,14 +4094,53 @@ def _land_confirmation(
         board_ignored = verify.path_ignored(paths.repo_root, paths.sprint_status)
     except verify.GitError:
         board_ignored = False  # uncertainty keeps the board in: the older behavior
-    try:
-        verify.commit_paths(
-            paths.repo_root,
-            f"chore(operator): confirm {story.story_key}",
-            [spec, record] if board_ignored else [spec, paths.sprint_status, record],
+    # THE PUBLISHABLE-TARGET GUARD (DW-237), per operand and before any git runs.
+    # `commit_paths` forces every operand LITERAL, so an operand replaced by a
+    # DIRECTORY is handed to `git add` as a pathspec and staged RECURSIVELY —
+    # an unrelated tree published under this `chore(operator):` message.
+    # Family `"store"` at all three: the family names the validation POLICY, not
+    # the file's role, and a spec, a board and a park record all want exactly
+    # "a regular file is there" and nothing about their bytes.
+    # PER OPERAND, like `decisions.apply_pre_answer`'s GATE TWO: a dropped one must
+    # not sink its siblings, which is the whole point of the `board_ignored` drop
+    # this joins.
+    operands: list[Path] = [spec, record] if board_ignored else [spec, paths.sprint_status, record]
+    survivors: list[Path] = []
+    for path in operands:
+        # The SAME resolve-then-guard the four carries take, imported rather than
+        # re-spelled: one rule, one place it can drift from. Its resolve fold matters
+        # here too — an operand `confirm` cannot even NAME must not be handed to git.
+        refusal = _publication_refusal(path, "store")
+        if refusal is None or refusal[0] == "target-absent":
+            # An ABSENT operand STAYS (#356): `record` was unlinked by the drop a few
+            # lines above, and its DELETION is exactly what must ride this commit —
+            # `commit_paths` keeps a missing-but-TRACKED path for that reason and
+            # drops one git has never seen. Only a present-but-wrong-TYPE or
+            # unreadable operand is a hazard to git, and only those are dropped.
+            survivors.append(path)
+            continue
+        cause, error = refusal
+        # ONE collapsed line per dropped operand: git's own text is multi-line
+        # where this prints on one, and the operator needs the full path (not the
+        # basename a journal row carries) to find what is sitting there.
+        detail = "" if error is None else f": {' '.join(error.split())}"
+        print(
+            f"warning: {path} was left out of the {story.story_key} confirm commit "
+            f"({cause}){detail} — the confirm's on-disk change landed before the path "
+            f"took this shape; inspect it and commit it by hand once the path is repaired.",
+            file=sys.stderr,
         )
-    except verify.GitError:
-        pass  # files are written; git history is best effort (as `decisions`)
+    if survivors:
+        # An empty list spawns no git at all, rather than handing `commit_paths`
+        # nothing and letting it decide what that means.
+        try:
+            verify.commit_paths(
+                paths.repo_root,
+                f"chore(operator): confirm {story.story_key}",
+                survivors,
+            )
+        except verify.GitError:
+            pass  # files are written; git history is best effort (as `decisions`)
     print(f"✓ {story.story_key} confirmed — spec and board are done")
     return 0
 
@@ -3846,10 +4153,36 @@ def cmd_decisions(args: argparse.Namespace) -> int:
 
     project = _project(args)
     try:
+        paths = bmadconfig.load_paths(project)
         pending = decisions.pending_missed_decisions(project)
     except bmadconfig.BmadConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    # The OBSERVATION arm's evidence, surfaced HERE because it cannot be surfaced
+    # where the degrade happens (DW-146). `pending_missed_decisions` reads the
+    # ledger through `read_for_observation` and discards the fault, because no
+    # journal is reachable from a module-level function handed only a project path
+    # — so an unreadable ledger yields no open ids and this command would print
+    # "no unanswered decisions from past sweeps" and exit 0. That is indisputably
+    # the WRONG silence: the answer is not "nothing is pending", it is "nothing
+    # could be read". The contract says an observation site degrades with an
+    # attributed fault, and for this one the operator's own terminal is the only
+    # place the attribution can land. Same probe the helper runs, so the two
+    # cannot disagree about whether the file is readable.
+    #
+    # stderr, never stdout: `--json` promises exactly one document on stdout, and
+    # a note there would corrupt the contract for every machine consumer. Exit
+    # stays 0 for the same reason `_sweep_dry_run` does NOT — nothing here is
+    # fabricated, the empty listing is honest once the note explains it, and an
+    # operator answering an unrelated decision must not be blocked by a ledger
+    # this command was not asked to repair.
+    _, ledger_fault = deferredwork.read_for_observation(paths.deferred_work)
+    if ledger_fault is not None:
+        print(
+            f"note: {paths.deferred_work} cannot be read ({ledger_fault}) — "
+            "no pending decisions could be resolved from it",
+            file=sys.stderr,
+        )
     if args.json:
         # Before the empty-set early return (nothing pending is a valid empty
         # document, not the text line), and regardless of --list: --json *is*
@@ -3876,8 +4209,14 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     for decision in pending:
         option = prompter.ask(decision)
         try:
-            decisions.apply_pre_answer(project, decision, option, date=today)
-        except (OSError, bmadconfig.BmadConfigError, ValueError, runs.StateRootError) as e:
+            result = decisions.apply_pre_answer(project, decision, option, date=today)
+        except (
+            OSError,
+            bmadconfig.BmadConfigError,
+            ValueError,
+            runs.StateRootError,
+            deferredwork.LedgerReadError,
+        ) as e:
             # What this buys is the `{decision.id}` in the message, and only
             # that: `main`'s tail catches BmadConfigError by name and everything
             # else through a bare `except Exception`, so none of these ever
@@ -3900,6 +4239,17 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             # or broken mid-prompt raises here even though the read at the top of
             # this command succeeded. Leaving it out gave the likelier failure the
             # worse message.
+            #
+            # LedgerReadError is the SAME reachable shape as BmadConfigError, and it
+            # is here for the same reason (DW-146). `prompter.ask` blocks on the
+            # human, so a ledger that goes undecodable while the prompt is open
+            # raises out of `record_decision`'s locked `read_for_write` — the exact
+            # failure this tuple used to catch as a bare `ValueError`, back when the
+            # codec error escaped untyped. Retyping it to a plain `Exception` is what
+            # dropped it out of this handler; naming it puts it back, so the
+            # attribution this arm exists for is not lost to the contract that made
+            # the fault attributable. Its `LedgerReadFault` subclass also covers
+            # OS metadata/text-read failures since DW-279.
             print(f"error: could not record {decision.id}: {e}", file=sys.stderr)
             return 1
         if option.effect == "close":
@@ -3908,6 +4258,51 @@ def cmd_decisions(args: argparse.Namespace) -> int:
             outcome = "queued — the next sweep will build it"
         else:
             outcome = "kept open (recorded)"
+        if not result.recorded:
+            # Replace success claims with what apply_pre_answer actually persisted.
+            # This later probe is only diagnostic: paths predates the prompt and
+            # may differ from the writer's reloaded config. A probe fault must not
+            # turn a completed non-write into a failed walk.
+            #
+            # The probe is the observation reader, not `is_file()` inside a
+            # `try/except OSError` (DW-282): `is_file()` answers False for a
+            # refused ledger on Python 3.14 — it suppresses every OS error there —
+            # so the fault never reached the `except` and a ledger sitting in
+            # place, unreadable, was reported as GONE, the sentence that says every
+            # `decision:` line already written went with it. The reader never
+            # raises: absence is its own `(None, None)` answer, and a refused ledger
+            # is an attributed fault on every interpreter, which keeps the
+            # "ledger state unavailable" wording.
+            #
+            # `observe_ledger`, not `read_for_observation`: this sentence says
+            # whether the FILE is there, and the text-only reader folds a present
+            # 0-byte ledger into the same `""` as a missing one, so testing the
+            # text reported a ledger that exists and holds no entry as GONE — the
+            # sentence that tells the operator every `decision:` line already
+            # written went with it (PR #794 review). `None` is absence; `""` is a
+            # present, empty ledger, which the recorder reached and found no entry
+            # in, the same news as any other missing entry.
+            outcome = "no decision line was written"
+            text, fault = deferredwork.observe_ledger(paths.deferred_work)
+            if fault is not None:
+                outcome += "; ledger state unavailable"
+            elif text is None:
+                outcome += ": the ledger file is gone"
+            else:
+                outcome += ": the ledger holds no entry for this id"
+            if option.effect != "close":
+                outcome += "; your answer was saved to the pre-answer store"
+        # A written operand that could not be published, in either of its two
+        # lanes: REFUSED before any git ran (DW-209/213), or FAILED once git ran
+        # and answered `GitError` (DW-225/226 — an operand in no repository, a
+        # gitignored path). Separate from the non-write above and reportable on TOP
+        # of a successful record: the operand list is already gated on what the
+        # call wrote, so either lane means an answer that really landed on disk is
+        # missing from git history. Neither is an error — the exit code, the walk
+        # and the outcome wording above are all unchanged by both.
+        note = result.publish_note()
+        if note is not None:
+            outcome += f"; {note}"
         print(f"  {decision.id}: {outcome}")
     print("\nrun `bmad-loop sweep` to act on any builds.")
     return 0
@@ -3947,7 +4342,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     if state.finished:
         print("status: finished")
     elif state.paused:
-        print(f"status: PAUSED ({state.paused_stage}) — {state.paused_reason}")
+        print(f"status: PAUSED ({state.paused_stage}) — {display_pause_reason(state)}")
     elif graceful_pending:
         print("status: in progress — graceful stop pending (will stop after the current item)")
     else:
@@ -5058,6 +5453,17 @@ def main(argv: list[str] | None = None) -> int:
         help="triage + answer decisions + record them; run no bundles",
     )
     sweep_p.add_argument("--max-bundles", type=int, help="override [sweep] max_bundles")
+    selectors = sweep_p.add_mutually_exclusive_group()
+    selectors.add_argument(
+        "--only",
+        metavar="DW-ID,...",
+        help="triage only the named open DW-<n> entries",
+    )
+    selectors.add_argument(
+        "--min-severity",
+        choices=("low", "medium", "high", "critical"),
+        help="triage open entries at this severity or higher",
+    )
     sweep_p.add_argument(
         "--repeat",
         action=argparse.BooleanOptionalAction,

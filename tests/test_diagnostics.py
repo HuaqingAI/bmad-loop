@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from bmad_loop import diagnostics, sanitize
-from bmad_loop.journal import Journal, load_state, save_state
+from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, load_state, save_state
 from bmad_loop.model import Phase, RunState, SessionRecord, StoryTask, TokenUsage
 from bmad_loop.policy import Policy
 
@@ -73,6 +73,7 @@ CANARIES = [
     "CANARY_RESULT",
     "CANARY_FEEDBACK",
     "CANARY_PATCH",
+    "cHJpdmF0ZSBhcnRpZmFjdCBieXRlcw==",
     SHA,
     "AcmeVaultRotation",
 ]
@@ -114,6 +115,11 @@ def _seed_run(
         baseline_untracked=["AcmeSecret.py", "src/secret/thing.py"],
         worktree_path=f"{HOME_PATH}/worktrees/{BRANCH}",
         dw_ids=["DW-1", "DW-2"],
+        artifact_destination=HOME_PATH,
+        artifact_baseline={"AcmeSecret.py": SHA},
+        artifact_source_digests={"AcmeSecret.py": SHA},
+        artifact_acceptance_identity="review:1",
+        artifact_payload={"AcmeSecret.py": "cHJpdmF0ZSBhcnRpZmFjdCBieXRlcw=="},
     )
     task.record_session(
         SessionRecord(
@@ -139,6 +145,7 @@ def _seed_run(
         paused_stage="escalation",
         paused_story_key=STORY_KEY,
         policy_snapshot={
+            "limits": {"artifact_file_max_mb": 5, "artifact_payload_max_mb": 10},
             "adapter": {
                 "name": "claude",
                 "model": "claude-opus-4-8",
@@ -228,6 +235,58 @@ def test_known_safe_values_survive(project):
     assert "20260627-120000-aaaa" in combined  # run id is opaque/safe
     assert "escalated" in combined  # phase enum survives
     assert "input_tokens" in combined  # token count keys survive
+    assert '"artifact_file_max_mb": 5' in combined
+    assert '"artifact_payload_max_mb": 10' in combined
+
+
+def test_artifact_size_refusal_keeps_counts_but_drops_path_and_error():
+    """Capacity diagnostics retain the closed cause and measured bounds only."""
+    secret_path = "/home/canaryuser/AcmeSecret/report.bin"
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "kind": "artifact-publication-refused",
+            "story_key": STORY_KEY,
+            "error": f"artifact too large: {secret_path}",
+            "publication_cause": "file-limit",
+            "measured_bytes": 5_242_881,
+            "limit_bytes": 5_242_880,
+            "measurement_is_lower_bound": True,
+        },
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+
+    assert scrubbed["publication_cause"] == "file-limit"
+    assert scrubbed["measured_bytes"] == 5_242_881
+    assert scrubbed["limit_bytes"] == 5_242_880
+    assert scrubbed["measurement_is_lower_bound"] is True
+    assert scrubbed["error_present"] is True
+    assert secret_path not in json.dumps(scrubbed)
+
+
+def test_artifact_size_refusal_rejects_malformed_safe_fields():
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "kind": "artifact-publication-refused",
+            "publication_cause": "AcmeSecret",
+            "measured_bytes": "AcmeSecret",
+            "limit_bytes": {"secret": "AcmeSecret"},
+            "measurement_is_lower_bound": "AcmeSecret",
+        },
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+
+    assert scrubbed == {
+        "kind": "artifact-publication-refused",
+        "publication_cause": None,
+        "measured_bytes": None,
+        "limit_bytes": None,
+        "measurement_is_lower_bound": None,
+    }
+    assert "AcmeSecret" not in json.dumps(scrubbed)
 
 
 def test_sweeps_refused_redacts_both_halves(project):
@@ -535,7 +594,8 @@ def test_verify_command_free_text_drops_to_presence_booleans():
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
-def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
+@pytest.mark.parametrize("located", [True, False])
+def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name(located):
     """The two records `runs.rearm_escalation` added must be routed by FIELD NAME,
     not left to the `scrub_json` fallback (#640, #716).
 
@@ -609,16 +669,17 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
     assert restamped["overwritten"] != restamped["baseline"]
     assert restamped["restore"] is False  # a plain flag still ships
 
-    # The OTHER four kinds the re-arm family journals `spec_file` on. Routing is
+    # The OTHER four kinds the re-arm family journals `spec_file` on, plus the TWO
+    # producers of the same pair of fields from OUTSIDE that family. Routing is
     # by field NAME, so these ride the same `_JOURNAL_ALIAS_FIELDS` entry as
     # `rearm-baseline-restamped` and are correct today for free — which is exactly why
     # they belong in the sweep: the canary is what catches a field added to one of
-    # these kinds later, and a sweep that covers two of five grades the routing of a
+    # these kinds later, and a sweep that covers two of six grades the routing of a
     # record shape nobody re-checks.
     #
-    # `rearm-aborted` is the fifth and the one written by a DIFFERENT function
-    # (`runs._rollback_rearm`, from the transaction guard's error path) rather than by
-    # `rearm_escalation` itself — the divergence that made the routing entry's own
+    # `rearm-aborted` is the fifth of the re-arm kinds and the one written by a
+    # DIFFERENT function (`runs._rollback_rearm`, from the transaction guard's error
+    # path) rather than by `rearm_escalation` itself — the divergence that made the routing entry's own
     # producer note undercount. It carries two fields the others do not: `error`, which
     # the free-text drop set reaches, and `rollback`, a literal enum string that is
     # declared benign rather than routed and must therefore still ship VERBATIM.
@@ -637,11 +698,33 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
                 "rearm-aborted",
                 {"error": f"OSError: cannot write {HOME_PATH}/spec.md", "rollback": "restored"},
             ),
+            # Not a re-arm record at all, and in the sweep for exactly that reason:
+            # `worktree_flow._warn_accepted_spec_superseded` writes the same two
+            # hazardous fields from a DIFFERENT module, mid-run, on the approval path
+            # rather than the escalation one. Routing is by field NAME, so it is
+            # correct today for free — and a sweep that grades only the family it was
+            # written for is how the next producer of these names gets missed.
+            (
+                "accepted-spec-write-unreachable",
+                {"target_branch": REARM_BRANCH, "compared": True},
+            ),
+            # The second non-re-arm producer of the same two hazardous fields, from
+            # the same module and for the mirror-image loss: DW-101 says the mount
+            # delivered the WRONG bytes, DW-104/DW-115 say delivery cannot be proven
+            # at all. Its own discriminator is `located`, a bare boolean for
+            # `compared`'s reason, and it is here because the layer that READS this
+            # record is the scrubber — a kind whose routing nobody grades is how the
+            # next leak ships.
+            (
+                "accepted-spec-delivery-unreachable",
+                {"target_branch": REARM_BRANCH, "located": located},
+            ),
         )
     ]
     # every one of them aliases to the SAME alias as the restamped record above: one
-    # spec, one alias, however many kinds carry it
-    assert [s["spec_file"] for s in siblings] == [alias, alias, alias, alias]
+    # spec, one alias, however many kinds carry it — six graded here plus
+    # `rearm-baseline-restamped` above, the seven producers of this field today
+    assert [s["spec_file"] for s in siblings] == [alias] * 6
     # the abort record's own two fields: the free-text one is dropped (it quotes a host
     # path back), the enum one is deliberately NOT aliased — both surfaces read the
     # record for `rollback`, so pseudonymizing it would destroy the field's whole point
@@ -664,9 +747,93 @@ def test_rearm_records_leak_neither_the_code_root_nor_a_spec_name():
         a for ns, orig, a in pseudo.entries() if ns == "branch" and orig == REARM_BRANCH
     )
     assert siblings[0]["target_branch"] == branch_alias != REARM_BRANCH
+    # The approval-path record says the same thing to the same operator — commit the
+    # corrected spec on THIS branch — so it is graded on the same routing, and its
+    # own `compared` discriminator must survive VERBATIM: a bare boolean declared
+    # benign, not aliased and not dropped, or the record stops telling a maintainer
+    # whether the comparison ran at all. Selected by KIND rather than by index: a row
+    # inserted above it would otherwise re-point the assertion at another record and
+    # grade nothing, silently.
+    superseded = next(s for s in siblings if s["kind"] == "accepted-spec-write-unreachable")
+    assert superseded["target_branch"] == branch_alias != REARM_BRANCH
+    assert superseded["compared"] is True
+    # The delivery record says the same thing to the same operator about the same two
+    # fields, so it is graded on the same routing — and its own `located`
+    # discriminator must survive VERBATIM for `compared`'s reason: aliased or dropped,
+    # the record stops saying WHICH silence it is ending (a containment refusal whose
+    # rel is known, or a swallowed filesystem fault where it is not). Selected by KIND
+    # rather than by index for the reason stated above.
+    unreachable = next(s for s in siblings if s["kind"] == "accepted-spec-delivery-unreachable")
+    assert unreachable["target_branch"] == branch_alias != REARM_BRANCH
+    assert unreachable["located"] is located
 
     rendered = json.dumps([advance_failed, restamped, *siblings])
     for canary in (SHA, other_sha, SPEC_NAME, PROPRIETARY, HOME_PATH, REARM_BRANCH, *CANARIES):
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_the_owed_code_root_discharge_row_keeps_both_of_its_booleans():
+    """`rearm-code-root-restamped` is the record whose ONLY surviving field is a
+    boolean: `repo` is in `_JOURNAL_DROP_FIELDS`, so a dump keeps a presence flag and
+    the tree the row names never reaches it. That made the discharge shape — call one
+    re-points the root and its append raises, the retry settles the record having moved
+    nothing — read as "nothing moved" in a dump, because `code_root_changed` is about
+    THIS call and correctly says `false` there (DW-128).
+
+    `discharged_owed_move` is the second boolean that closes it, and it must survive
+    VERBATIM for `compared`'s and `located`'s reason above: aliased or dropped, the row
+    stops saying the one thing it was added to say. Graded here rather than only at the
+    producer because the scrubber is the layer that can take it away — this kind has no
+    `_JOURNAL_KIND_SCHEMAS` entry, so both booleans reach `scrub_json` and ship as
+    themselves.
+
+    Ablation: give the kind a declared schema that names neither boolean and this
+    reddens while `tests/test_runs.py` stays green. Note WHICH way it reddens — the
+    fail-closed arm collapses every unnamed field, so BOTH booleans become `_present`
+    keys and the first tuple assertion dies on `KeyError: 'code_root_changed'`, not on
+    anything spelled `discharged_owed_move_present`. `repo_present` above survives that
+    ablation either way, since `_JOURNAL_DROP_FIELDS` reaches `repo` before the
+    declared-schema arm does.
+
+    Both shapes, because a field graded on one value grades nothing: the discharge row
+    inverts the pair, and the ordinary move row is the control that keeps the assertion
+    from passing on a hardcoded constant.
+    """
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    discharge = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "rearm-code-root-restamped",
+            "repo": HOME_PATH,
+            "code_root_changed": False,
+            "discharged_owed_move": True,
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+    own_move = diagnostics._scrub_entry(
+        {
+            "ts": 3.0,
+            "kind": "rearm-code-root-restamped",
+            "repo": HOME_PATH,
+            "code_root_changed": True,
+            "discharged_owed_move": False,
+        },
+        pseudo,
+        {},
+        1.0,
+    )
+
+    # the tree is still reduced to a presence flag — the new field buys no path
+    assert "repo" not in discharge and discharge["repo_present"] is True
+    assert "repo" not in own_move and own_move["repo_present"] is True
+    # ...while both booleans ship as themselves, inverted between the two shapes
+    assert (discharge["code_root_changed"], discharge["discharged_owed_move"]) == (False, True)
+    assert (own_move["code_root_changed"], own_move["discharged_owed_move"]) == (True, False)
+
+    rendered = json.dumps([discharge, own_move])
+    for canary in (HOME_PATH, PROPRIETARY, *CANARIES):
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
@@ -1190,6 +1357,179 @@ def test_remaining_journal_sanitization_contract_reaches_both_public_renders(pro
         assert canary not in legend_values, f"LEAK via legend: {canary!r}"
 
 
+@pytest.mark.parametrize("render_format", ["markdown", "json"])
+@pytest.mark.parametrize(
+    "refuse_cause",
+    ["target-absent", "target-unreadable", "target-not-a-file", "target-undecodable"],
+)
+@pytest.mark.parametrize(
+    "stop_cause",
+    [
+        "no-open",
+        "no-progress",
+        "max-cycles",
+        "legacy-appeared",
+        "ledger-unreadable",
+        "ledger-inaccessible",
+        "no-selected",
+    ],
+)
+def test_the_sweep_diagnostic_identity_fields_survive_both_public_renders(
+    project, render_format, stop_cause, refuse_cause
+):
+    """Each public render independently retains all FOUR publication identities,
+    the seven stop slugs, and the dropped fields' presence booleans.
+
+    The refusal row (DW-199/203/205) carries two surviving fields, not one: `file`
+    says WHICH of the two published files went unpublished and `refuse_cause` says
+    WHY, and the two are separate claims — the causes are a closed quartet
+    (`target-absent` | `target-unreadable` | `target-not-a-file` |
+    `target-undecodable`) whose natural spelling, `reason`, is dropped, so without
+    the minted field a scrubbed dump could not tell a ledger that vanished from one
+    nobody could decode, nor either of those from a store a directory replaced.
+
+    Ablation: remove Markdown's sweep-entry emission, drop
+    `sweep-ledger-commit-refused` from the collected kind set, or add
+    file/stop_cause/refuse_cause to _JOURNAL_DROP_FIELDS, and the corresponding
+    positive assertions fail. Remove message/error/repo/reason from that set and
+    the presence assertions fail.
+    """
+    run_dir = _seed_run(project.project)
+    repo_value = f"{HOME_PATH}/_bmad-output/implementation-artifacts"
+    error_value = "fatal: not a git repository"
+    message_value = "chore(sweep): close resolved deferred-work entries"
+    journal = Journal(run_dir)
+    journal.append(
+        "sweep-ledger-commit-unavailable",
+        message=message_value,
+        repo=repo_value,
+        error=error_value,
+        file="deferred-work.md",
+    )
+    journal.append("sweep-ledger-commit-clean", message=message_value, file="decisions.json")
+    journal.append(
+        "sweep-ledger-commit-refused",
+        message=message_value,
+        file="deferred-work.md",
+        refuse_cause=refuse_cause,
+        **(
+            {"error": error_value}
+            if refuse_cause in ("target-unreadable", "target-undecodable")
+            else {}
+        ),
+    )
+    journal.append(
+        "sweep-ledger-commit", message=message_value, commit="a" * 40, file="deferred-work.md"
+    )
+    journal.append("sweep-repeat-done", cycles=2, reason=stop_cause, stop_cause=stop_cause)
+
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    markdown = diagnostics.render_markdown(diag, pseudo=pseudo)
+    json_text = diagnostics.render_json(diag, pseudo=pseudo)
+    if render_format == "markdown":
+        # Assert against the Markdown body itself, not JSON rendered beside it.
+        blocks = re.findall(r"```json\n(.*?)\n```", markdown, flags=re.DOTALL)
+        assert len(blocks) == 1
+        entries = json.loads(blocks[0])
+    else:
+        entries = json.loads(json_text)["runs"][0]["journal"]["entries"]
+
+    failed = next(e for e in entries if e["kind"] == "sweep-ledger-commit-unavailable")
+    clean = next(e for e in entries if e["kind"] == "sweep-ledger-commit-clean")
+    refused = next(e for e in entries if e["kind"] == "sweep-ledger-commit-refused")
+    published = next(e for e in entries if e["kind"] == "sweep-ledger-commit")
+    stopped = next(e for e in entries if e["kind"] == "sweep-repeat-done")
+
+    # the whole point: these two survive verbatim, on every row that carries them
+    assert failed["file"] == "deferred-work.md"
+    assert clean["file"] == "decisions.json"
+    assert published["file"] == "deferred-work.md"
+    assert refused["file"] == "deferred-work.md"
+    assert refused["refuse_cause"] == refuse_cause
+    assert stopped["stop_cause"] == stop_cause
+    # ...while every field they were minted to replace still collapses
+    assert failed["repo_present"] is True and "repo" not in failed
+    assert failed["error_present"] is True and "error" not in failed
+    assert failed["message_present"] is True and "message" not in failed
+    assert clean["message_present"] is True and "message" not in clean
+    assert published["message_present"] is True and "message" not in published
+    assert refused["message_present"] is True and "message" not in refused
+    assert "error" not in refused
+    if refuse_cause in ("target-unreadable", "target-undecodable"):
+        assert refused["error_present"] is True
+    else:
+        assert "error_present" not in refused
+    assert published["commit"].startswith("commit-")  # aliased, not shipped
+    assert stopped["reason_present"] is True and "reason" not in stopped
+    assert stopped["cycles"] == 2  # the unrelated field is untouched
+
+    for rendered in (markdown, json_text):
+        for canary in (repo_value, error_value, message_value, HOME_PATH, *CANARIES):
+            assert canary not in rendered, f"LEAK: {canary!r}"
+    for canary in (repo_value, error_value, message_value):
+        assert canary not in set(pseudo.legend().values()), "LEAK via legend"
+
+
+def test_a_withheld_bundle_dispatch_keeps_its_count_through_a_dump(project):
+    """Markdown preserves the withheld cycle/count and scrubs the fixed reason.
+
+    Ablation: remove `sweep-bundles-withheld` from the Markdown collected-kind
+    set; the JSON entry block disappears. JSON rendering does not use that set.
+    """
+    run_dir = _seed_run(project.project)
+    journal = Journal(run_dir)
+    journal.append("sweep-bundles-withheld", cycle=3, bundles_not_run=2, reason="ledger-unreadable")
+
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    markdown = diagnostics.render_markdown(diag, pseudo=pseudo)
+    blocks = re.findall(r"```json\n(.*?)\n```", markdown, flags=re.DOTALL)
+    assert len(blocks) == 1
+    entries = json.loads(blocks[0])
+
+    withheld = next(e for e in entries if e["kind"] == "sweep-bundles-withheld")
+    # the point: the identity of the withhold survives, not just its kind
+    assert withheld["bundles_not_run"] == 2
+    assert withheld["cycle"] == 3
+    # ...while the free-text reason collapses exactly as it does on the stop row
+    assert withheld["reason_present"] is True and "reason" not in withheld
+
+
+def test_a_withheld_ledger_publish_keeps_its_file_through_a_dump(project):
+    """DW-246: `sweep-ledger-commit-withheld` — a publish the run declined over
+    its own ledger doubt — is collected into the Markdown dump beside its
+    `_commit_ledger` siblings, with `file` verbatim (the already-benign lexical
+    basename) and `message`/`reason` collapsed to presence booleans.
+
+    Ablation: remove `sweep-ledger-commit-withheld` from the Markdown
+    collected-kind set; the JSON entry block disappears. Add `file` to
+    `_JOURNAL_DROP_FIELDS` and the `file` assertion fails.
+    """
+    run_dir = _seed_run(project.project)
+    message_value = "chore(sweep): close resolved deferred-work entries"
+    journal = Journal(run_dir)
+    journal.append(
+        "sweep-ledger-commit-withheld",
+        message=message_value,
+        file="deferred-work.md",
+        reason="ledger-in-doubt",
+    )
+
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    markdown = diagnostics.render_markdown(diag, pseudo=pseudo)
+    blocks = re.findall(r"```json\n(.*?)\n```", markdown, flags=re.DOTALL)
+    assert len(blocks) == 1
+    entries = json.loads(blocks[0])
+
+    withheld = next(e for e in entries if e["kind"] == "sweep-ledger-commit-withheld")
+    assert withheld["file"] == "deferred-work.md"
+    assert withheld["message_present"] is True and "message" not in withheld
+    assert withheld["reason_present"] is True and "reason" not in withheld
+    assert message_value not in markdown
+
+
 def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
     """`target` is a BRANCH on the merge kinds and a sprint STATUS on `board-advance-*`.
 
@@ -1273,6 +1613,35 @@ def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
     rendered = json.dumps([*merges, board])
     for canary in (target_branch, unit_branch, *CANARIES):
         assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_integration_receipt_identities_are_pseudonymized_in_merge_records():
+    operation = "AcmeSecretOperation"
+    revision = "a" * 40
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+
+    scrubbed = []
+    for kind in ("unit-merge-started", "resume-unit-merge", "unit-merged"):
+        entry = {
+            "ts": 1.0,
+            "kind": kind,
+            "story_key": STORY_KEY,
+            "branch": "unit",
+            "target": "main",
+            "strategy": "merge",
+            "source": revision,
+            "operation_id": operation,
+        }
+        if kind == "unit-merge-started":
+            entry["pre_target_revision"] = revision
+        scrubbed.append(diagnostics._scrub_entry(entry, pseudo, {}, 1.0))
+
+    operation_aliases = [entry["operation_id"] for entry in scrubbed]
+    assert operation_aliases == [operation_aliases[0]] * 3
+    assert operation_aliases[0] != operation
+    assert scrubbed[0]["pre_target_revision"] != revision
+    assert any(ns == "operation" and original == operation for ns, original, _ in pseudo.entries())
+    assert any(ns == "commit" and original == revision for ns, original, _ in pseudo.entries())
 
 
 def test_stranded_bundle_story_keys_are_aliased_element_wise():
@@ -1360,6 +1729,62 @@ def test_scalar_story_keys_fails_closed_instead_of_shipping_verbatim():
     rendered = json.dumps(scrubbed)
     assert STORY_KEY not in rendered
     for canary in CANARIES:
+        assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_adopted_bundle_dw_ids_alias_into_the_same_namespace_as_dw_ids():
+    """`sweep-bundle-dwids-adopted` (DW-144) is the one record carrying TWO
+    deferred-work id lists: `dw_ids`, routed by name, and `previous_dw_ids`, routed
+    by KIND in `_JOURNAL_KIND_KEYLIST_FIELDS`. The kind-scoped table names a
+    namespace per field, and picking the wrong one is silent — the field is still
+    aliased, still element-wise, still nothing verbatim, so every canary sweep and
+    the portability guard's routed/benign decision stay green while one ledger
+    entry acquires TWO aliases and the record stops being readable as "these ids
+    became those ids".
+
+    So the namespace itself is what this grades, the way
+    `test_stranded_bundle_story_keys_are_aliased_element_wise` grades `story_keys`'.
+    The same id is journalled under `previous_dw_ids` here and under `dw_ids` on a
+    neighbouring `sweep-bundle-closed`, and the two must resolve to ONE alias.
+
+    Ablation: repoint the `previous_dw_ids` row from `"dw"` to `"story"` (or any
+    other namespace) and the cross-field identity assertion reddens; delete the row
+    and the ids come back verbatim."""
+    carried, adopted = "DW-41", "DW-42"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "ts": 2.0,
+            "kind": "sweep-bundle-dwids-adopted",
+            "story_key": STORY_KEY,
+            "previous_dw_ids": [carried],
+            "dw_ids": [adopted],
+        },
+        pseudo,
+        {STORY_KEY: 1},
+        1.0,
+    )
+    # the SAME ledger entry, journalled as `dw_ids` by a neighbouring record: the
+    # cross-field identity is the whole reason the previous ids are aliased into
+    # `dw` rather than into a namespace of their own
+    closed = diagnostics._scrub_entry(
+        {"ts": 3.0, "kind": "sweep-bundle-closed", "story_key": STORY_KEY, "dw_ids": [carried]},
+        pseudo,
+        {STORY_KEY: 1},
+        1.0,
+    )
+
+    assert scrubbed["previous_dw_ids"] == closed["dw_ids"]
+    # ...and the two lists on the one record stay DISTINGUISHABLE, so the record is
+    # still read as "these ids became those ids"
+    assert scrubbed["previous_dw_ids"] != scrubbed["dw_ids"]
+    assert all(a.startswith("dw-") for a in scrubbed["previous_dw_ids"] + scrubbed["dw_ids"])
+    # nothing landed in the `story` namespace, which is where a mis-pointed row
+    # would have put them — and where the epic-prefixed story aliases live
+    assert [orig for ns, orig, _a in pseudo.entries() if ns == "story"] == [STORY_KEY]
+
+    rendered = json.dumps([scrubbed, closed])
+    for canary in (carried, adopted, STORY_KEY, *CANARIES):
         assert canary not in rendered, f"LEAK: {canary!r}"
 
 
@@ -1507,6 +1932,42 @@ def test_decision_pending_question_is_dropped_not_scrubbed():
     rendered = json.dumps([one_token, empty])
     for canary in CANARIES:
         assert canary not in rendered, f"LEAK: {canary!r}"
+
+
+def test_unreadable_line_is_counted_but_does_not_move_the_clock(tmp_path):
+    """A journal with one unreadable line reports the reader-minted marker in
+    `kind_histogram` — the loss is COUNTED on the dump an operator ships — while
+    `first_ts`/`last_ts`/`duration_s` stay exactly what the real records say.
+
+    That separation is the whole reason `unreadable_line_entry` carries no `ts`: the
+    true write time of a torn line is unknowable, and a fabricated one would silently
+    stretch or shift the run's measured duration. `summarize_journal` skips a
+    `ts`-less entry for timestamps, so the omission is what keeps the clock honest.
+
+    The marker is also an UNDECLARED kind here, which exercises `_scrub_entry`'s
+    generic arm: it survives scrubbing intact rather than needing a routing row.
+
+    Ablation: give `unreadable_line_entry` a `ts` of `time.time()` and the
+    duration/last_ts assertions redden — verified."""
+    (tmp_path / "journal.jsonl").write_text(
+        '{"ts": 100.0, "kind": "run-start"}\n'
+        "not json at all\n"
+        '{"ts": 130.0, "kind": "run-complete"}\n',
+        encoding="utf-8",
+    )
+    entries = Journal(tmp_path).entries()
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    summary = diagnostics.summarize_journal(entries, pseudo, {}, cap=10)
+
+    assert summary.total_entries == 3
+    assert summary.kind_histogram[UNREADABLE_LINE_KIND] == 1
+    assert summary.first_ts == 100.0
+    assert summary.last_ts == 130.0
+    assert summary.duration_s == 30.0
+
+    scrubbed = next(e for e in summary.entries if e["kind"] == UNREADABLE_LINE_KIND)
+    assert "ts_offset" not in scrubbed  # no timestamp to offset from
+    assert scrubbed["bytes"] == len("not json at all")
 
 
 def test_structure_is_preserved(project):
@@ -1701,6 +2162,100 @@ def test_non_ascii_sensitive_value_reaches_the_guard(monkeypatch):
     assert json.loads(rendered)["mystery_ref"] == alias
     assert original not in rendered
     assert json.loads(rendered)["backstop_repairs"] == {f"story:{alias}": 1}
+
+
+def test_markdown_sweep_unknown_key_fails_closed_before_the_backstop(project):
+    """An unknown key on a Markdown sweep kind never reaches the egress backstop
+    with its VALUE: the declared schema collapses it to `<name>_present` in the
+    collector, so an identifier-shaped value — the one shape `scrub_json` ships
+    verbatim — is gone before the block is serialized, and the backstop has nothing
+    to repair. The key NAME still ships, suffixed, as the table's disclosed
+    residual; the suffix also puts it past the backstop's standalone match, which
+    is why the collector, not the backstop, has to be the guard here.
+
+    Driven through the real collector and render, not `_scrub_entry`, because the
+    claim is about what the pasted block contains.
+
+    Ablation: drop `sweep-ledger-commit-clean` from `_JOURNAL_KIND_SCHEMAS` and
+    `AcmeVault` reaches the block byte-identical."""
+    run_dir = _seed_run(project.project)
+    original = "café-user"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    Journal(run_dir).append(
+        "sweep-ledger-commit-clean", file="deferred-work.md", **{original: "AcmeVault"}
+    )
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    [entry] = [e for e in diag.runs[0].journal.entries if e["kind"] == "sweep-ledger-commit-clean"]
+    assert entry[f"{original}_present"] is True
+    assert original not in entry
+    repairs: list[tuple[str, int]] = []
+
+    rendered = diagnostics.render_markdown(diag, pseudo=pseudo, repairs=repairs)
+
+    [block] = re.findall(r"```json\n(.*?)\n```", rendered, flags=re.DOTALL)
+    [published] = json.loads(block)
+    assert published[f"{original}_present"] is True
+    assert "AcmeVault" not in block, "LEAK: off-schema value reached the Markdown block"
+    assert published["file"] == "deferred-work.md"
+    assert repairs == []  # nothing left for the backstop to repair
+    assert "Backstop repairs" not in rendered
+
+
+@pytest.mark.parametrize(
+    "kind, declared",
+    [
+        ("sweep-ledger-commit", {"message": "m", "commit": "a" * 40, "file": "deferred-work.md"}),
+        ("sweep-ledger-commit-clean", {"message": "m", "file": "decisions.json"}),
+        (
+            "sweep-ledger-commit-refused",
+            {"message": "m", "file": "deferred-work.md", "refuse_cause": "target-absent"},
+        ),
+        (
+            "sweep-ledger-commit-unavailable",
+            {"message": "m", "repo": HOME_PATH, "error": "fatal", "file": "deferred-work.md"},
+        ),
+        (
+            "sweep-ledger-commit-withheld",
+            {
+                "message": "m",
+                "file": "deferred-work.md",
+                "reason": "ledger-in-doubt",
+                "dw_ids": ["DW-7"],
+            },
+        ),
+        ("sweep-repeat-done", {"cycles": 2, "reason": "no-open", "stop_cause": "no-open"}),
+    ],
+)
+def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared):
+    """The six kinds `render_markdown` prints as a JSON block carry a declared
+    schema, so a field a future producer adds WITHOUT routing collapses to a
+    presence marker instead of riding `scrub_json` into the pasted dump. Graded
+    both ways, as the `preference-escalation` row is: the off-schema value is GONE
+    and the declared identity fields (`file`, `refuse_cause`, `stop_cause`,
+    `cycles`) are NOT — a schema that flattened the record would pass an
+    absence-only assertion while destroying what the block is rendered for.
+
+    Ablation: drop `kind`'s row from `_JOURNAL_KIND_SCHEMAS` and the `AcmeVault`
+    absence assertion reds — `scrub_json` is the identity on that string."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {"ts": 2.0, "kind": kind, **declared, "customer": "AcmeVault"}, pseudo, {}, 1.0
+    )
+
+    assert "customer" not in scrubbed
+    assert scrubbed["customer_present"] is True
+    assert "AcmeVault" not in json.dumps(scrubbed), "LEAK: off-schema sweep value"
+    for name in ("file", "refuse_cause", "stop_cause", "cycles"):
+        if name in declared:
+            assert scrubbed[name] == declared[name]
+    for name in ("message", "repo", "error", "reason"):
+        if name in declared:
+            assert name not in scrubbed and scrubbed[f"{name}_present"] is True
+    if "commit" in declared:
+        assert scrubbed["commit"].startswith("commit-")
+    if "dw_ids" in declared:
+        # the keylist route runs ahead of the schema: aliased, never collapsed
+        assert len(scrubbed["dw_ids"]) == 1 and "DW-7" not in json.dumps(scrubbed)
 
 
 def test_env_tmux_version_folds_a_multi_line_probe(monkeypatch):

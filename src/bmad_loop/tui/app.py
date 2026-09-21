@@ -24,7 +24,17 @@ from textual.app import App, SuspendNotSupported
 from textual.binding import Binding
 from tomlkit.exceptions import ParseError
 
-from .. import bmadconfig, decisions, devcontract, policy, resolve, runs, stories, verify
+from .. import (
+    bmadconfig,
+    decisions,
+    deferredwork,
+    devcontract,
+    policy,
+    resolve,
+    runs,
+    stories,
+    verify,
+)
 from ..adapters.multiplexer import MultiplexerError, mux_usable
 from ..journal import load_state, state_lock
 from ..model import (
@@ -389,18 +399,49 @@ class BmadLoopApp(App[None]):
         self.push_screen(DecisionModal(decision), on_choice)
 
     def _record_decision(self, decision: object, option: object) -> bool:
+        """Record one answered decision, answering whether `_walk_decisions` may
+        count it into `recorded N decision(s)`.
+
+        False means either a caught fault (which may follow a partial write) or
+        a ledger non-write. The toasts distinguish these by wording and severity;
+        the caller excludes both from its count and continues the walk.
+
+        An UNPUBLISHED operand is a third, orthogonal thing and does not touch the
+        boolean, in either of its lanes: a publish REFUSED before git ran
+        (DW-209/213), and a publish that reached git and FAILED (DW-225/226 — an
+        operand in no repository, a gitignored path). The operand list
+        `apply_pre_answer` commits is already gated on what that call wrote, so
+        either one means an answer that really landed on disk is missing from git
+        history — news worth a `warning` toast, but not a reason to stop counting
+        the answer as answered. Both arrive as the one `publish_note()` string,
+        which rides on the non-write toast where there is one and raises its own
+        otherwise.
+        """
         # decision/option cross the widget boundary as `object`; their runtime types
         # are the Decision/DecisionOption that apply_pre_answer and `.id` expect.
         try:
-            decisions.apply_pre_answer(
+            result = decisions.apply_pre_answer(
                 self.project,
                 decision,  # pyright: ignore[reportArgumentType]
                 option,  # pyright: ignore[reportArgumentType]
                 date=time.strftime("%Y-%m-%d"),
             )
-        except (OSError, bmadconfig.BmadConfigError, ValueError, runs.StateRootError) as e:
+        except (
+            OSError,
+            bmadconfig.BmadConfigError,
+            ValueError,
+            runs.StateRootError,
+            deferredwork.LedgerReadError,
+        ) as e:
             # ValueError is the ledger writers' date precondition; it cannot fire
-            # from the strftime above. StateRootError is reachable: the ledger
+            # from the strftime above. LedgerReadError is the one that IS reachable
+            # from the ledger read itself (DW-146): the modal blocks on the human,
+            # so a ledger that goes undecodable while it is open raises out of
+            # `record_decision`'s locked `read_for_write`. That fault used to arrive
+            # as a `ValueError` (a `UnicodeDecodeError` is one) and was caught here;
+            # retyping it to a plain `Exception` — deliberately, so no `except
+            # OSError` can swallow it — dropped it out of this tuple, and naming it
+            # puts it back. StateRootError is reachable too: the ledger
             # write now takes a cross-process lock whose sidecar lives under the
             # state root (#286/#469), and an environment that names no usable root
             # raises it — it is NOT an OSError, so the tuple has to say so.
@@ -414,6 +455,31 @@ class BmadLoopApp(App[None]):
                 severity="error",
             )
             return False
+        note = result.publish_note()
+        if not result.recorded:
+            # Report the persistence contract from apply_pre_answer, excluding
+            # the non-write from the walk's count. Path resolution can itself fail,
+            # so this toast does not distinguish missing files from retired ids.
+            saved = (
+                ""
+                if option.effect == "close"  # pyright: ignore[reportAttributeAccessIssue]
+                else "; your answer was saved to the pre-answer store"
+            )
+            unpublished = "" if note is None else f"; {note}"
+            self.notify(
+                f"{decision.id}: no decision line was written to the ledger{saved}{unpublished}",  # pyright: ignore[reportAttributeAccessIssue]
+                severity="warning",
+                markup=False,
+            )
+            return False
+        if note is not None:
+            # An otherwise-successful record whose written operand went
+            # unpublished. Its own toast, and the answer still counts.
+            self.notify(
+                f"{decision.id}: {note}",  # pyright: ignore[reportAttributeAccessIssue]
+                severity="warning",
+                markup=False,
+            )
         return True
 
     def action_resume_run(self) -> None:
@@ -638,7 +704,9 @@ class BmadLoopApp(App[None]):
 
     def _review_gate(self, run_id: str, run_dir: Path, state: RunState) -> None:
         label = widgets.pause_label(state.paused_stage or "")[0] or "gate"
-        spec_path, spec_text, readable = self._paused_spec(state)
+        spec_path, spec_text, readable = (
+            (None, "", True) if state.paused_stage == PAUSE_STORY_GATE else self._paused_spec(state)
+        )
 
         def done(verb: str | None) -> None:
             if verb == "resume":
@@ -648,6 +716,11 @@ class BmadLoopApp(App[None]):
             # Spec-less gates: story-gate fires before the story is registered in
             # state.tasks (deliberate, so a resume re-picks and re-asks the ledger)
             # and epic-boundary has no story key. The pause reason is the payload.
+            # A story gate is ALWAYS about the ledger, never a spec, so it takes
+            # this arm even when the task carries a spec_file (DW-243: a sweep
+            # bundle re-armed after a dev escalation keeps its spec_file, and its
+            # intent-regeneration refusal pauses at this stage) — the repair steer
+            # is in the reason, which the spec viewer would hide.
             subtitle = (
                 self._story_subtitle(state)
                 if state.paused_story_key
@@ -794,6 +867,12 @@ class BmadLoopApp(App[None]):
         if _engine_possibly_live(run_dir):
             self.notify(f"run {run_id} may still be live — stop it first", severity="warning")
             return
+        # Surface the shared ledger refusal here before it disappears into the
+        # detached CLI window. The probe owns the wording and scope (DW-270).
+        refusal = runs.unreadable_sweep_ledger(self.project, run_dir)
+        if refusal is not None:
+            self.notify(refusal, severity="error", markup=False)
+            return
         try:
             win_id = launch.resume_detached(self.project, run_id)
         except launch.LaunchError as e:
@@ -926,6 +1005,20 @@ class BmadLoopApp(App[None]):
         if self._blocked_by_control_alias(run_id):
             return
         if self._resolve_blocked_by_liveness(run_id, run_dir):
+            return
+        # DW-204/DW-230: the same probe `cli.cmd_resume` and `cli.cmd_resolve` take,
+        # taken here beside the two gates above. The detached child this gesture ends
+        # in would refuse for the same reason, but only AFTER `rearm_escalation` has
+        # spent the escalation, and it would refuse into a pane nobody opens — so the
+        # refusal is raised here, on screen, with the escalation still armed. The
+        # probe answers or declines; this surface owns the channel (a toast, where the
+        # CLI prints to stderr). `_do_resume` also probes before launching so plain
+        # resume shows the refusal on the dashboard too (DW-270).
+        # Since DW-234 the probe refuses an OS-refused read too, with the same
+        # repair route the CLI prints, so there is nothing left to catch here.
+        refusal = runs.unreadable_sweep_ledger(self.project, run_dir)
+        if refusal is not None:
+            self.notify(refusal, severity="error")
             return
         # The LIVE isolation mode, read once and used twice below. `runs.rearm_escalation`
         # requires it: how the re-drive WILL run is a policy question, and the recorded

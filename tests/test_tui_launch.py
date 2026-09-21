@@ -1967,6 +1967,31 @@ def test_decision_pending_false_when_empty(tmp_path: Path):
     assert launch.decision_pending(tmp_path / "missing") is False
 
 
+def test_decision_pending_false_once_an_unreadable_line_follows(tmp_path: Path):
+    """A reader-minted marker is a LATER entry, so it clears the pending decision —
+    the same way an answer does, and on the same documented ground (the prompter
+    blocks on input right after writing the announcement).
+
+    This is not cosmetic: `attach_plan` routes `a` to the ctl window only while this
+    is True, so a torn journal line after a `decision-pending` steers an operator to
+    the agent session instead of the blocked prompt. `data.pending_decision` is the
+    twin of this function and was already pinned; this pins the copy the CLI uses.
+
+    Ablation: restore `except json.JSONDecodeError: continue` in `Journal.entries`
+    and the second assertion reddens — the marker disappears and the stale
+    `decision-pending` stays last."""
+    from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal
+
+    rd = tmp_path / "run"
+    Journal(rd).append("decision-pending", dw_id="DW-90", question="?")
+    assert launch.decision_pending(rd) is True
+
+    with (rd / "journal.jsonl").open("a", encoding="utf-8") as f:
+        f.write("{not json\n")
+    assert Journal(rd).entries()[-1]["kind"] == UNREADABLE_LINE_KIND
+    assert launch.decision_pending(rd) is False
+
+
 def test_attach_plan_prefers_ctl_when_decision_pending(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.setattr(launch, "ctl_window_id", lambda proj, rid: "@2")

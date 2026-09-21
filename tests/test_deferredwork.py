@@ -1,12 +1,14 @@
 """Ledger parsing and editing: deferredwork.py."""
 
 import contextlib
+import errno
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import pytest
+from conftest import fault_read_text
 
 from bmad_loop import deferredwork, fences, platform_util, runs
 from bmad_loop.deferredwork import (
@@ -37,6 +39,7 @@ from bmad_loop.deferredwork import (
     parse_legacy,
     record_decision,
 )
+from bmad_loop.sweep import select_entries
 
 OPERATION_ID = "run-20260803T120000/dw-fix"
 
@@ -771,7 +774,7 @@ def test_the_date_pattern_itself_refuses_non_ascii_digits():
 
 
 def test_bad_date_raises_even_with_no_ledger_on_disk(tmp_path):
-    """Validated at function entry, ahead of the `is_file()` short-circuit: a
+    """Validated at function entry, ahead of the presence short-circuit: a
     guard that only fires when the ledger happens to exist is one an absent
     fixture hides."""
     missing = tmp_path / "nope.md"
@@ -1199,6 +1202,32 @@ def test_field_severity_forms():
     assert field_severity("priority: blocker") == "critical"
     assert field_severity("severity: n/a") is None
     assert field_severity("no field here") is None
+
+
+def test_canonical_severity_uses_the_whole_file_fence_index():
+    text = """\
+# Deferred Work
+
+### DW-1: live alias follows an example
+
+```markdown
+severity: critical
+```
+priority: minor
+status: open
+
+### DW-2: only an example
+
+~~~markdown
+priority: blocker
+~~~
+status: open
+"""
+
+    first, second = parse_ledger(text)
+
+    assert first.severity == "low"
+    assert second.severity is None
 
 
 # the generic bmad-dev-auto review appender flat shape (step-04 deferral)
@@ -1775,6 +1804,108 @@ def test_mark_done_many_is_all_or_nothing_on_a_write_failure(tmp_path, monkeypat
         mark_done_many(p, ["DW-1", "DW-3"], "2026-07-24", "note")
 
     assert p.read_bytes() == before  # nothing partially applied
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda p: mark_done_many(p, ["DW-1"], "2026-07-24", "note"), id="mark_done_many"
+        ),
+        pytest.param(
+            lambda p: record_decision(p, "DW-1", "2026-07-24", "Keep", "why"),
+            id="record_decision",
+        ),
+    ],
+)
+def test_a_failed_publish_leaves_as_a_typed_ledger_write_error(tmp_path, monkeypatch, mutate):
+    """The mutators' atomic write fails as `LedgerWriteError`: an `OSError` — so
+    every `except OSError` caller keeps its degrade — that a caller which must fail
+    loud on a lost publish can name AHEAD of that arm, where a bare `OSError` was
+    indistinguishable from the lock's. The original fault stays chained as
+    `__cause__` and named in the message, and nothing partial reaches disk.
+
+    Ablation: make `_publish` a bare `atomic_write_text` call and the
+    `isinstance(..., LedgerWriteError)` assertion reds while `OSError` still
+    passes — which is exactly the split the type exists to make."""
+    p = tmp_path / "deferred-work.md"
+    p.write_text(LEDGER, encoding="utf-8")
+    before = p.read_bytes()
+
+    def boom(path, text):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(deferredwork, "atomic_write_text", boom)
+
+    with pytest.raises(OSError) as exc:
+        mutate(p)
+
+    assert isinstance(exc.value, deferredwork.LedgerWriteError)
+    assert isinstance(exc.value.__cause__, OSError)
+    assert exc.value.__cause__.errno == 28
+    assert "No space left on device" in str(exc.value)
+    assert p.read_bytes() == before
+
+
+def test_a_release_fault_after_a_landed_publish_is_typed_and_the_bytes_stay(tmp_path, monkeypatch):
+    """`ledger_lock` releases AFTER the body published, and the release can fault
+    — Windows' `LK_UNLCK`, `os.close` anywhere. Before this, that reached callers
+    as the same bare `OSError` a failed `os.open` does, while the bytes were on
+    disk: a degrade arm read a landed close as one that never happened. It leaves
+    as `LedgerLockReleaseError` (an `OSError`, so degrade callers are unchanged),
+    with the release fault chained, and the ledger carries the closure.
+
+    The second half pins what the type is NOT, and what a double fault does: a
+    release fault on top of a body fault is not a landed publish, so it never
+    wears this type — and it does not get to REPLACE the body's fault either, the
+    way a `with` statement would. For a body that raised `LedgerWriteError` that
+    replacement would be a bare `OSError`, the very type the sweep's degrade arms
+    read as a lock never acquired. The body's fault leaves, with the release fault
+    chained as `__context__` and added as a note.
+
+    Ablation: restore `with file_lock(lock_path): yield` in `ledger_lock` and the
+    `isinstance(..., LedgerLockReleaseError)` assertion reds while `OSError` still
+    passes."""
+    import contextlib
+
+    p = tmp_path / "deferred-work.md"
+    p.write_text(LEDGER, encoding="utf-8")
+    real_file_lock = deferredwork.file_lock
+
+    @contextlib.contextmanager
+    def releasing_faults(path, **kwargs):
+        try:
+            with real_file_lock(path, **kwargs):
+                yield
+        finally:
+            raise OSError(9, "Bad file descriptor")  # the release, body done or not
+
+    monkeypatch.setattr(deferredwork, "file_lock", releasing_faults)
+
+    with pytest.raises(OSError) as exc:
+        mark_done_many(p, ["DW-1"], "2026-07-24", "note")
+    assert isinstance(exc.value, deferredwork.LedgerLockReleaseError)
+    assert isinstance(exc.value.__cause__, OSError) and exc.value.__cause__.errno == 9
+    assert "Bad file descriptor" in str(exc.value)
+    entries = {e.id: e for e in parse_ledger(p.read_text(encoding="utf-8"))}
+    assert not entries["DW-1"].open  # the publish landed
+
+    # a body fault under a faulting release: the body's fault leaves, not this type
+    # and not the bare release OSError — graded on the typed WRITE fault, since that
+    # is the one a downgrade would hand to a degrade arm
+    p.write_text(LEDGER, encoding="utf-8")
+    monkeypatch.setattr(
+        deferredwork,
+        "atomic_write_text",
+        lambda path, text: (_ for _ in ()).throw(OSError(28, "No space left on device")),
+    )
+    with pytest.raises(deferredwork.LedgerWriteError) as exc2:
+        mark_done_many(p, ["DW-1"], "2026-07-24", "note")
+    assert not isinstance(exc2.value, deferredwork.LedgerLockReleaseError)
+    assert isinstance(exc2.value.__cause__, OSError) and exc2.value.__cause__.errno == 28
+    assert isinstance(exc2.value.__context__, OSError) and exc2.value.__context__.errno == 9
+    assert any("release faulted" in note for note in exc2.value.__notes__)
+    assert p.read_text(encoding="utf-8") == LEDGER  # nothing published
 
 
 def test_mark_done_many_skips_an_already_done_entry(tmp_path):
@@ -2679,7 +2810,7 @@ def test_archive_validates_archive_date(tmp_path):
 
 
 def test_archive_bad_date_raises_even_with_no_ledger(tmp_path):
-    """Validated at function entry, ahead of the is_file short-circuit."""
+    """Validated at function entry, ahead of the presence short-circuit."""
     path = tmp_path / "nope.md"
     with pytest.raises(ValueError, match="date must be YYYY-MM-DD"):
         archive_closed(path, before="nope")
@@ -2925,6 +3056,46 @@ def test_archive_stub_preserves_reopenable_undo_tail(tmp_path):
     # ...and mark_open can still undo it (the tail is intact and adjacent)
     assert mark_open(path, "DW-1", "sweep bundle", "op-1") is True
     assert "DW-1" in open_ids(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    ("live_field", "normalized", "floor"),
+    [
+        ("severity: high", "high", "high"),
+        ("- **Priority:** blocker", "critical", "critical"),
+    ],
+    ids=["severity", "priority-alias"],
+)
+def test_archived_reopenable_stub_preserves_live_severity_for_selection(
+    tmp_path, live_field, normalized, floor
+):
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: severity survives archive\n\n"
+        "origin: test\n"
+        "```markdown\nseverity: low\npriority: minor\n```\n"
+        f"{live_field}\n"
+        "status: open\n"
+    )
+    path = write_ledger(tmp_path, text)
+    assert mark_done_many_reopenable(
+        path, ["DW-1"], "2026-05-25", "sweep bundle", OPERATION_ID
+    ) == ["DW-1"]
+    assert archive_closed(path, archive_date="2026-08-24") == ["DW-1"]
+    stub = parse_ledger(path.read_text(encoding="utf-8"))[0]
+    assert live_field in stub.body
+    assert "severity: low" not in stub.body and "priority: minor" not in stub.body
+    archive_before = (path.parent / ARCHIVE_REL).read_bytes()
+    assert archive_closed(path, archive_date="2026-08-25") == []
+    assert (path.parent / ARCHIVE_REL).read_bytes() == archive_before
+
+    assert mark_open(path, "DW-1", "sweep bundle", OPERATION_ID) is True
+    reopened = parse_ledger(path.read_text(encoding="utf-8"))[0]
+
+    assert reopened.severity == normalized
+    assert live_field in reopened.body
+    selection = select_entries([reopened], min_severity=floor)
+    assert [entry.id for entry in selection.selected] == ["DW-1"]
 
 
 def test_archive_hand_written_archived_line_still_archives(tmp_path):
@@ -3455,6 +3626,127 @@ def test_append_entries_matches_serial_append_entry_bytes(tmp_path):
     )
 
 
+CROSS_SPEC_ORIGIN = "spec-deferred abc123"
+
+CROSS_SPEC_SEED = """\
+# Deferred Work
+
+### DW-1: Retry loop has no ceiling
+origin: spec-deferred abc123
+location: src/retry.py:88
+source_spec: `spec-9-9-z.md`
+reason: harvested from another spec.
+status: {status}
+"""
+
+
+def _cross_spec_spec(source_spec: str = "spec-1-1-a.md", **over) -> EntrySpec:
+    return EntrySpec(
+        title="Retry loop has no ceiling",
+        origin=CROSS_SPEC_ORIGIN,
+        location="src/retry.py:88",
+        source_spec=source_spec,
+        reason="harvested here too",
+        **over,
+    )
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [pytest.param(True, [None], id="on"), pytest.param(False, ["DW-2"], id="off")],
+)
+def test_cross_spec_dedupe_suppresses_an_open_twin_only_when_opted_in(tmp_path, flag, expected):
+    """An open cross-spec twin suppresses only the opted-in producer.
+
+    Ablation: remove the origin-only flag arm and the ``on`` row files DW-2;
+    force the arm for every producer and the ``off`` row suppresses DW-2."""
+    path = write_ledger(tmp_path, CROSS_SPEC_SEED.format(status="open"))
+
+    assert append_entries(path, [_cross_spec_spec(cross_spec_dedupe=flag)]) == expected
+    assert [entry.id for entry in parse_ledger(path.read_text(encoding="utf-8"))] == (
+        ["DW-1"] if flag else ["DW-1", "DW-2"]
+    )
+
+
+@pytest.mark.parametrize("flag", [True, False], ids=["on", "off"])
+def test_cross_spec_dedupe_stays_open_only(tmp_path, flag):
+    """A closed cross-spec twin files fresh with the flag on or off.
+
+    Ablation: remove the open-entry guard and the opted-in row returns ``None``
+    instead of minting DW-2."""
+    path = write_ledger(tmp_path, CROSS_SPEC_SEED.format(status="done 2026-06-01"))
+
+    assert append_entries(path, [_cross_spec_spec(cross_spec_dedupe=flag)]) == ["DW-2"]
+    entries = parse_ledger(path.read_text(encoding="utf-8"))
+    assert [entry.id for entry in entries] == ["DW-1", "DW-2"]
+    assert not entries[0].open and entries[1].open
+
+
+@pytest.mark.parametrize("flag", [True, False], ids=["on", "off"])
+def test_cross_spec_dedupe_leaves_same_spec_replays_unchanged(tmp_path, flag):
+    """The existing exact-pair replay suppresses with either flag value.
+
+    Ablation: replace widening with flag-selected matching and the default row
+    files a duplicate instead of returning ``None``."""
+    path = write_ledger(tmp_path, CROSS_SPEC_SEED.format(status="open"))
+    spec = _cross_spec_spec(source_spec="spec-9-9-z.md", cross_spec_dedupe=flag)
+
+    assert append_entries(path, [spec]) == [None]
+    assert [entry.id for entry in parse_ledger(path.read_text(encoding="utf-8"))] == ["DW-1"]
+
+
+def test_cross_spec_dedupe_collapses_two_source_specs_inside_one_batch(tmp_path):
+    """The second spec sees and suppresses the first spec's evolving-text row.
+
+    Ablation: fold both specs over the original preimage and this mints two rows
+    rather than ``[DW-1, None]``."""
+    path = write_ledger(tmp_path, "# Deferred Work\n")
+
+    minted = append_entries(
+        path,
+        [
+            _cross_spec_spec(source_spec="spec-1-1-a.md", cross_spec_dedupe=True),
+            _cross_spec_spec(source_spec="spec-2-2-b.md", cross_spec_dedupe=True),
+        ],
+    )
+
+    assert minted == ["DW-1", None]
+    entries = parse_ledger(path.read_text(encoding="utf-8"))
+    assert [entry.id for entry in entries] == ["DW-1"]
+    assert "source_spec: `spec-1-1-a.md`" in entries[0].body
+
+
+def test_cross_spec_advisory_suppression_is_rechecked_under_the_lock(tmp_path, monkeypatch):
+    """A twin closed after the advisory probe no longer suppresses recurrence.
+
+    The initial open twin makes the advisory fold return ``None``. Opted-in
+    batches must still acquire the lock and re-fold after the scripted close.
+
+    Ablation: restore the unconditional all-deduped early return and no lock is
+    acquired, the result stays ``None``, and both assertions fail."""
+    path = write_ledger(tmp_path, CROSS_SPEC_SEED.format(status="open"))
+    real_lock = deferredwork.ledger_lock
+    acquisitions = []
+
+    @contextlib.contextmanager
+    def close_twin_before_lock(p):
+        acquisitions.append(p)
+        p.write_text(
+            p.read_text(encoding="utf-8").replace("status: open", "status: done 2026-06-01", 1),
+            encoding="utf-8",
+        )
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", close_twin_before_lock)
+
+    assert append_entries(path, [_cross_spec_spec(cross_spec_dedupe=True)]) == ["DW-2"]
+    assert acquisitions == [path]
+    entries = parse_ledger(path.read_text(encoding="utf-8"))
+    assert [entry.id for entry in entries] == ["DW-1", "DW-2"]
+    assert not entries[0].open and entries[1].open
+
+
 def test_append_entries_validates_all_specs_before_writing(tmp_path, monkeypatch):
     """A bad spec anywhere in the sequence writes nothing — and is caught before
     the lock is even taken.
@@ -3537,8 +3829,8 @@ def test_archive_closed_takes_no_lock_for_a_missing_ledger(tmp_path, monkeypatch
     behavior changed by a lock taken for a file that is not there. The guard under
     the hold stays, deletion being able to race this one.
 
-    Ablation: move the `is_file` guard back below `with ledger_lock(path):` — the
-    spy fires and this reds."""
+    Ablation: move the presence guard (`_ledger_present`, since DW-255) back below
+    `with ledger_lock(path):` — the spy fires and this reds."""
     path = tmp_path / "deferred-work.md"  # deliberately never created
     acquisitions = []
 
@@ -3698,6 +3990,89 @@ def test_record_decision_records_a_decision_on_an_already_done_entry(tmp_path):
     assert entry.status == "done 2026-05-25"  # untouched: the close half no-ops
     assert "decision: 2026-06-11 keep — already fixed" in entry.body
     assert "resolution:" not in entry.body
+
+
+def test_record_decision_require_open_refuses_a_done_entry(tmp_path, monkeypatch):
+    """`require_open=True` adds a THIRD non-write state to the two documented ones:
+    the entry is present and no longer open. It returns False having written
+    nothing, exactly as a missing file and a missing entry do, so the one caller
+    that passes it — the sweep's DW-167 replay walk, which re-applies a `close` an
+    earlier run never got onto the ledger — needs no new return shape for it.
+
+    The refusal is taken UNDER the lock, on the same text the write would edit.
+    That is the whole point: the walk takes an open-set snapshot before it calls,
+    and a snapshot read outside the lock cannot enforce a promise across the write
+    it authorizes — a rival writer closing the entry in between produced a second
+    `decision:` line over a close already recorded.
+
+    Three claims: False; the entry's bytes are untouched (no decision line, status
+    unchanged); and NO write is published, so the refusal cannot cost a rewrite.
+
+    Ablation, RUN: drop the `require_open and not _entry_is_open(...)` guard and
+    this reds on all three — the line lands on the done entry, which is exactly
+    what the default behavior above still does."""
+    path = write_ledger(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    writes = []
+    _counting_write(monkeypatch, writes)
+
+    assert (
+        record_decision(path, "DW-2", "2026-06-11", "keep", "already fixed", require_open=True)
+        is False
+    )
+
+    assert writes == []
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_record_decision_require_open_refuses_an_unparseable_status(tmp_path, monkeypatch):
+    """`entry.open`, not `not entry.done`. A status the format cannot read is
+    NEITHER, and `DWEntry.done`'s docstring exists to stop exactly this derivation:
+    deriving the guard from `not done` would let `status: opne` satisfy a
+    still-open premise, take a `decision:` line and — for a `close` — a status flip
+    the caller believed it was applying to an open entry.
+
+    The caller's question is "is this entry still open", so the predicate has to be
+    the caller's. A broken status line is a repair for a human, not an entry to
+    write through.
+
+    Ablation, RUN: substitute `return entry is not None and not entry.done` in
+    `_entry_is_open` and this reds — the decision line lands and a write is
+    published — while every other row in this file and in `test_sweep.py` stays
+    green."""
+    path = write_ledger(tmp_path, LEDGER.replace("status: open\n\n", "status: opne\n\n", 1))
+    before = path.read_text(encoding="utf-8")
+    entry = deferredwork._find_entry(before, "DW-1")
+    assert entry is not None and not entry.open and not entry.done  # neither, by design
+    writes = []
+    _counting_write(monkeypatch, writes)
+
+    assert record_decision(path, "DW-1", "2026-06-11", "close", "moot", require_open=True) is False
+
+    assert writes == []
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_record_decision_require_open_still_records_on_an_open_entry(tmp_path):
+    """The other half: `require_open` refuses only what it names. An entry the
+    ledger still lists as open records exactly as it does without the flag, which
+    is what makes the replay walk a repair rather than a no-op.
+
+    Ablation: negate the guard (`if require_open and _entry_is_open(...)`) and this
+    reds with False and no decision line."""
+    path = write_ledger(tmp_path)
+
+    assert (
+        record_decision(
+            path, "DW-1", "2026-06-11", "close", "moot", close_note="moot", require_open=True
+        )
+        is True
+    )
+
+    entry = deferredwork._find_entry(path.read_text(encoding="utf-8"), "DW-1")
+    assert entry is not None
+    assert entry.status.startswith("done ")
+    assert "decision: 2026-06-11 close — moot" in entry.body
 
 
 def test_record_decision_returns_false_for_a_missing_entry(tmp_path, monkeypatch):
@@ -3971,6 +4346,63 @@ def test_ledger_lock_is_not_reentrant(tmp_path, monkeypatch):
     assert len(acquired) == 2
 
 
+def test_ledger_lock_refuses_to_nest_across_two_different_paths(tmp_path, monkeypatch):
+    """The guard is PATH-AGNOSTIC: nesting on a DIFFERENT file is refused too, and
+    refused before the OS lock is reached.
+
+    The row above nests the same path, where a refusal is indistinguishable from
+    the POSIX self-deadlock the guard exists to convert — two spellings of one
+    file rendezvous on one sidecar, so the OS lock alone would already wedge.
+    Different paths take DIFFERENT sidecars (`lock_path_for` keys each on
+    `sha256(resolved path)[:16]`), so the kernel would happily grant the second
+    acquisition and nothing but this guard refuses it. That refusal is what
+    `ledger_lock`'s docstring now claims as the benefit of the pre-answer store
+    reusing this helper instead of minting its own (DW-161): the two files share
+    no OS lock, only this guard, and its whole consequence is that no caller may
+    hold both at once, in either order.
+
+    The counter is what says it refused ABOVE the kernel rather than after a
+    successful acquire — the same oracle, and the same reason, as the same-path
+    row: a guard that raised after acquiring would leave the second sidecar held
+    and this process holding two locks it can never release in order.
+
+    Ablation is deliberately NOT run, exactly as above: dropping the depth guard
+    makes this pass silently (the kernel grants both), so the row grades the
+    guard's PRESENCE and the same-path row grades the deadlock conversion.
+
+    The tail runs the OTHER order, which is the half a one-way test cannot see:
+    a guard keyed on the first path rather than on the thread would refuse
+    ledger-then-store and permit store-then-ledger, which is precisely the
+    lock-ordering hazard the shared guard is claimed to remove."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    first = write_ledger(tmp_path / "a")
+    second = write_ledger(tmp_path / "b")
+    assert runs.lock_path_for(first) != runs.lock_path_for(second)  # different sidecars
+    real_file_lock = deferredwork.file_lock
+    acquired = []
+
+    @contextlib.contextmanager
+    def counting(lock_path, **kwargs):
+        acquired.append(lock_path)
+        with real_file_lock(lock_path, **kwargs):
+            yield
+
+    monkeypatch.setattr(deferredwork, "file_lock", counting)
+
+    with deferredwork.ledger_lock(first):
+        with pytest.raises(RuntimeError, match="not reentrant"):
+            with deferredwork.ledger_lock(second):
+                pass  # pragma: no cover — the guard raises on entry
+    assert len(acquired) == 1  # the nested entry never reached the OS lock
+
+    with deferredwork.ledger_lock(second):  # the reverse order is refused too
+        with pytest.raises(RuntimeError, match="not reentrant"):
+            with deferredwork.ledger_lock(first):
+                pass  # pragma: no cover — the guard raises on entry
+    assert len(acquired) == 2
+
+
 def test_a_failed_acquisition_does_not_leak_the_reentrancy_guard(tmp_path, monkeypatch):
     """An acquisition that raises must still leave this thread unmarked.
 
@@ -4101,6 +4533,51 @@ def test_lock_acquisition_failure_raises_and_writes_nothing(tmp_path, monkeypatc
 
     assert path.read_text(encoding="utf-8") == before
     assert (archive.read_text(encoding="utf-8") if archive.is_file() else None) == archive_before
+
+
+def test_record_decision_require_open_rechecks_the_entry_under_the_lock(tmp_path, monkeypatch):
+    """`require_open`'s whole claim is that the predicate and the mutation are ONE
+    critical section. A rival writer that closes the entry BEFORE the call is
+    entered proves nothing about that — any pre-lock read would refuse it too. The
+    window the flag exists for opens after the caller's own open-set snapshot and
+    closes when the lock is taken, so the rival has to land inside that window.
+
+    `close_twin_before_lock`'s idiom is what reaches it without threads: the
+    patched `ledger_lock` flips DW-1 to done and only then yields the real lock, so
+    the mutation runs against a ledger this call has already seen as open and the
+    only read that can catch it is the one under the hold.
+
+    Three claims: False; no `decision:` line on the closed entry; and nothing
+    published at all, so the refusal cannot cost a rewrite of the rival's bytes.
+
+    Ablation, RUN: hoist the check above `with ledger_lock(path):` — read the file
+    and return False there — and this reds on all three, while every other row in
+    this file and in `test_sweep.py` stays green. That is the point: a pre-lock
+    check satisfies every OTHER test of the flag and only this one names the
+    difference."""
+    path = write_ledger(tmp_path)
+    real_lock = deferredwork.ledger_lock
+    writes = []
+    _counting_write(monkeypatch, writes)
+
+    @contextlib.contextmanager
+    def close_entry_before_lock(p):
+        p.write_text(
+            p.read_text(encoding="utf-8").replace("status: open", "status: done 2026-06-01", 1),
+            encoding="utf-8",
+        )
+        with real_lock(p):
+            yield
+
+    monkeypatch.setattr(deferredwork, "ledger_lock", close_entry_before_lock)
+
+    assert record_decision(path, "DW-1", "2026-06-11", "close", "moot", require_open=True) is False
+
+    assert writes == []
+    entry = deferredwork._find_entry(path.read_text(encoding="utf-8"), "DW-1")
+    assert entry is not None
+    assert entry.status == "done 2026-06-01"  # the rival's close, untouched
+    assert "decision:" not in entry.body
 
 
 # --------------------------- read-dependent no-ops take no lock (#736)
@@ -4287,12 +4764,12 @@ def test_mutators_take_no_lock_for_a_missing_ledger(tmp_path, monkeypatch, call,
     kept by its three siblings too.
 
     These ids are real and these arguments are valid, so nothing but the absent
-    file can be answering: it is the `is_file` guard under test, not the probe
-    beneath it (which would fault on the same missing file and fall through).
-    The recheck under the hold stays in each body, creation being able to race
-    this answer.
+    file can be answering: it is the presence guard (`_ledger_present`, since
+    DW-255) under test, not the probe beneath it (which would fault on the same
+    missing file and fall through). The recheck under the hold stays in each
+    body, creation being able to race this answer.
 
-    Ablation: move that mutator's `is_file` guard back below its
+    Ablation: move that mutator's presence guard back below its
     `with ledger_lock(path):` — the spy fires and the row reds."""
     path = tmp_path / "deferred-work.md"  # deliberately never created
     acquisitions = []
@@ -4302,6 +4779,250 @@ def test_mutators_take_no_lock_for_a_missing_ledger(tmp_path, monkeypatch, call,
 
     assert acquisitions == []
     assert not path.exists()  # and nothing was created on the way past
+
+
+# The five write-bearing mutators, each seeded and called so that it WOULD write
+# against the plain fixture (plus one reopenable close for `mark_open_many`), and
+# the value each answers when its presence guard says "no ledger". The seed runs
+# before any spy is installed.
+WRITING_MUTATORS = {
+    "archive_closed": (
+        None,
+        # DW-2 closed 2026-05-25, strictly before the cutoff.
+        lambda p: archive_closed(p, before="2026-06-01", archive_date="2026-08-24"),
+        [],
+    ),
+    "mark_done_many": (None, lambda p: mark_done_many(p, ["DW-1"], "2026-06-11", "fixed"), []),
+    "mark_open_many": (
+        lambda p: close_reopenable(p, "DW-1", "by dw-a"),
+        lambda p: mark_open_many(p, ["DW-1"], "by dw-a", OPERATION_ID),
+        [],
+    ),
+    "mark_seen_again_many": (
+        None,
+        lambda p: mark_seen_again_many(p, ["DW-1"], "2026-06-11", "again"),
+        ([False], None, ["DW-1"], None),
+    ),
+    "record_decision": (
+        None,
+        lambda p: record_decision(p, "DW-1", "2026-06-11", "keep", "x"),
+        False,
+    ),
+}
+
+
+def _refuse_metadata_like_3_14(monkeypatch, path: Path) -> OSError:
+    """Simulate a Python 3.14 refusal at `path`: `Path.stat` raises EACCES while
+    `Path.is_file` answers False — what 3.14's `os.path.isfile` body does with the
+    same refusal. Returns the injected instance so a row can assert identity."""
+    fault = PermissionError(errno.EACCES, "metadata refused", str(path))
+    real_stat, real_is_file = Path.stat, Path.is_file
+
+    def refused_stat(self, *a, **kw):
+        if self == path:
+            raise fault
+        return real_stat(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "stat", refused_stat)
+    monkeypatch.setattr(
+        Path,
+        "is_file",
+        lambda self, *a, **kw: False if self == path else real_is_file(self, *a, **kw),
+    )
+    return fault
+
+
+@pytest.mark.parametrize("arm", ["pre-lock", "under-lock"])
+@pytest.mark.parametrize("name", sorted(WRITING_MUTATORS))
+def test_a_refused_ledger_raises_out_of_every_mutator(tmp_path, monkeypatch, name, arm):
+    """DW-255. The five write-bearing mutators each carried a bare `if not
+    path.is_file()` guard both before and under `ledger_lock`, directly above an
+    `or ""` read — so on Python 3.14, where `is_file()` suppresses every OS error
+    and answers False, an EACCES ledger took the mutator's NO-OP return:
+    `sweep --archive` reported success having archived nothing, `record_decision`
+    answered "no such entry", and the DW-221-fixed reader under the lock was never
+    reached. Now the pre-lock guard is `_ledger_present` (`stat` + `S_ISREG`,
+    propagating every non-absence `OSError`) and the under-lock guard is
+    `read_for_write`'s own `None`, so the refusal RAISES out of the mutator on
+    every interpreter and nothing is written.
+
+    The ledger is valid, the entry is open and the arguments WOULD write — the
+    seed is what says the no-op value can only be coming from a guard that
+    mistook a refusal for absence. The 3.14 CONTRACT is simulated rather than the
+    3.14 interpreter (the `test_read_for_write_propagates_a_refused_metadata_probe`
+    idiom): `Path.is_file` is pinned False for the ledger while `Path.stat`
+    carries the refusal, which is what makes the ablation real on the 3.13 dev
+    interpreter. `pre-lock` installs the refusal before the call and asserts no
+    acquisition; `under-lock` installs it on `ledger_lock` entry, so the pre-lock
+    guard and the advisory probe both see a healthy file and the locked read is
+    the arm that has to refuse.
+
+    Ablation: restore that mutator's bare `if not path.is_file(): return <no-op>`
+    guard — before the lock for `pre-lock`, under it (with the `or ""` read) for
+    `under-lock` — and that row reds with the no-op value returned where the
+    injected `OSError` was expected."""
+    seed, call, noop = WRITING_MUTATORS[name]
+    path = write_ledger(tmp_path)
+    if seed is not None:
+        seed(path)
+    before = path.read_text(encoding="utf-8")
+    acquisitions, writes = [], []
+    _counting_write(monkeypatch, writes)
+    real_lock = deferredwork.ledger_lock
+    fault_box: list[OSError] = []
+
+    @contextlib.contextmanager
+    def lock_then_refuse(p):
+        acquisitions.append(p)
+        with real_lock(p):
+            fault_box.append(_refuse_metadata_like_3_14(monkeypatch, path))
+            yield
+
+    if arm == "pre-lock":
+        fault_box.append(_refuse_metadata_like_3_14(monkeypatch, path))
+    monkeypatch.setattr(deferredwork, "ledger_lock", lock_then_refuse)
+
+    error_type = OSError if arm == "pre-lock" else deferredwork.LedgerReadFault
+    with pytest.raises(error_type) as raised:
+        result = call(path)
+        pytest.fail(f"no-op value {result!r} returned where the refusal should raise")
+
+    assert fault_box
+    observed = raised.value if arm == "pre-lock" else raised.value.__cause__
+    assert observed is fault_box[0]
+    assert writes == []
+    assert acquisitions == ([] if arm == "pre-lock" else [path])
+    assert path.read_text(encoding="utf-8") == before  # `read_text` takes no `stat`
+
+
+@pytest.mark.parametrize("shape", ["directory", "enotdir-parent"])
+@pytest.mark.parametrize("name", sorted(WRITING_MUTATORS))
+def test_a_directory_at_the_ledger_is_absence_for_every_mutator(tmp_path, monkeypatch, name, shape):
+    """The absence half of the DW-255 classification, kept exactly — the two
+    shapes `_ledger_present` must keep answering False for. The helper shares
+    `probe_absence` with the reader by construction since DW-256, so these rows
+    pin the classification itself, not the guard's agreement with the reader —
+    the winerror and NUL shapes are
+    `test_an_absorbed_probe_fault_is_absence_for_every_mutator`. `directory`: a DIRECTORY
+    standing at the ledger's name is a present target of the wrong TYPE, which
+    `is_file()` answered False for and `S_ISREG` answers False for too.
+    `enotdir-parent`: a regular file where the ledger's parent directory should
+    be, which `stat` reports as `NotADirectoryError` where `is_file()` absorbed
+    the errno. Both: the no-op value, no lock (#736), nothing raised.
+
+    Ablations: make `_ledger_present` answer `True` for anything `stat` reports
+    and the `directory` rows red — the spy fires, and the row that reaches the
+    locked read raises where a no-op value was expected; drop
+    `NotADirectoryError` from `probe_absence` and the `enotdir-parent` rows red
+    with it escaping."""
+    seed, call, noop = WRITING_MUTATORS[name]
+    if shape == "directory":
+        path = tmp_path / "deferred-work.md"
+        path.mkdir()
+    else:
+        (tmp_path / "not-a-dir").write_text("x", encoding="utf-8")
+        path = tmp_path / "not-a-dir" / "deferred-work.md"
+    acquisitions = []
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert call(path) == noop
+
+    assert acquisitions == []
+    if shape == "directory":
+        assert path.is_dir() and not any(path.iterdir())
+    else:
+        assert (tmp_path / "not-a-dir").read_text(encoding="utf-8") == "x"
+
+
+ABSORBED_PROBE_FAULTS = ["winerror-21", "winerror-123", "winerror-1921", "nul-path"]
+"""The four probe-fault shapes `deferredwork.probe_absence` absorbs beyond
+`ENOENT`/`ENOTDIR` (DW-256/DW-268): pathlib's `_IGNORED_WINERRORS` — 21
+`ERROR_NOT_READY`, 123 `ERROR_INVALID_NAME`, 1921 `ERROR_CANT_RESOLVE_FILENAME`
+— and the `ValueError` a non-encodable path raises. Exactly what `is_file()`
+absorbed before DW-221 replaced it with `stat()` + `S_ISREG`."""
+
+
+def _absorbed_probe_fault(
+    monkeypatch, tmp_path: Path, shape: str, probe: str = "stat", *, seed=None
+) -> Path:
+    """Install shape `shape` at a ledger path and return that path.
+
+    The winerror shapes are Windows-only in the wild and simulated here the
+    `tests/test_install.py` way: `Path.<probe>` raises an `OSError(errno.EIO)` with
+    `.winerror` set, for this path only, on every platform. The `nul-path` shape
+    is a REAL embedded NUL, which `Path.stat`/`lstat` refuse with `ValueError` on
+    every platform, so nothing is patched for it."""
+    if shape == "nul-path":
+        return Path(str(tmp_path) + "/bad\0name.md")
+    path = write_ledger(tmp_path)
+    if seed is not None:
+        seed(path)
+    fault = OSError(errno.EIO, "metadata refused", str(path))
+    fault.winerror = int(shape.removeprefix("winerror-"))
+    real = getattr(Path, probe)
+
+    def faulting(self, *a, **kw):
+        if self == path:
+            raise fault
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, probe, faulting)
+    return path
+
+
+@pytest.mark.parametrize("shape", ABSORBED_PROBE_FAULTS)
+def test_ledger_present_answers_false_for_an_absorbed_probe_fault(tmp_path, monkeypatch, shape):
+    """`_ledger_present` itself, not inferred through a mutator: the four shapes
+    `probe_absence` absorbs (DW-256/DW-268) are False here, where the narrow
+    tuple DW-255 shipped let them raise.
+    Ablation: restore `except (FileNotFoundError, NotADirectoryError)` in
+    `_ledger_present` and every row reds with the fault escaping."""
+    path = _absorbed_probe_fault(monkeypatch, tmp_path, shape)
+
+    assert deferredwork._ledger_present(path) is False
+
+
+def test_ledger_present_raises_a_refused_probe(tmp_path, monkeypatch):
+    """The fault side of the same guard, asserted directly: `EACCES` raises the
+    injected instance out of `_ledger_present` (the mutator-level twin is
+    `test_a_refused_ledger_raises_out_of_every_mutator`).
+    Ablation: make `probe_absence` answer True for any `OSError` and this reds."""
+    path = write_ledger(tmp_path)
+    fault = _refuse_metadata_like_3_14(monkeypatch, path)
+
+    with pytest.raises(OSError) as raised:
+        deferredwork._ledger_present(path)
+    assert raised.value is fault
+
+
+@pytest.mark.parametrize("shape", ABSORBED_PROBE_FAULTS)
+@pytest.mark.parametrize("name", sorted(WRITING_MUTATORS))
+def test_an_absorbed_probe_fault_is_absence_for_every_mutator(tmp_path, monkeypatch, name, shape):
+    """DW-256/DW-268 at the mutators' pre-lock guard. `_ledger_present` asks
+    `probe_absence`, the same classification `read_for_write` answers `None` for,
+    so a ledger on a disconnected mapped drive (winerror 21), at a lexically
+    invalid Windows path (123 / 1921), or at a path the OS cannot encode (an
+    embedded NUL) takes each mutator's no-op return with no lock acquired and
+    nothing written — where the narrow `(FileNotFoundError, NotADirectoryError)`
+    tuple DW-255 shipped let the `OSError`/`ValueError` escape every mutator.
+
+    The winerror rows seed a VALID ledger whose entry WOULD write, so the no-op
+    value can only be coming from the guard; the `nul-path` row cannot seed
+    (no such file can exist) and pins the `ValueError` arm alone.
+
+    Ablation: restore `except (FileNotFoundError, NotADirectoryError)` in
+    `_ledger_present` and every row reds with the injected `OSError` (or the
+    `ValueError`) escaping where the no-op value was expected."""
+    seed, call, noop = WRITING_MUTATORS[name]
+    path = _absorbed_probe_fault(monkeypatch, tmp_path, shape, seed=seed)
+    acquisitions, writes = [], []
+    _counting_write(monkeypatch, writes)
+
+    with _counting_lock(monkeypatch, acquisitions):
+        assert call(path) == noop
+
+    assert acquisitions == []
+    assert writes == []
 
 
 @pytest.mark.parametrize("name", sorted(NOOP_MUTATORS))
@@ -4424,3 +5145,505 @@ def test_two_processes_append_concurrently_produce_distinct_ids(tmp_path):
     reported = [line for d in dones for line in d.read_text(encoding="utf-8").splitlines()]
     assert "None" not in reported  # no append was silently deduped away
     assert sorted(reported) == sorted(e.id for e in entries)
+
+
+# ------------------------------------------- ledger-read contract (DW-146)
+
+
+def test_read_for_write_returns_none_for_an_absent_ledger(tmp_path):
+    """Absence is the REPAIR/WRITE arm's `None`, never a fault: the sites that
+    treat a missing ledger like an empty one spell that `or ""` themselves."""
+    assert deferredwork.read_for_write(tmp_path / "nope" / "deferred-work.md") is None
+
+
+def test_read_for_write_returns_the_text_verbatim(tmp_path):
+    path = write_ledger(tmp_path)
+    assert deferredwork.read_for_write(path) == LEDGER
+
+
+def test_read_for_write_retypes_undecodable_bytes(tmp_path):
+    """The whole point of the REPAIR/WRITE arm (DW-146). `UnicodeDecodeError` is a
+    `ValueError`, so it slipped past every `except OSError` in the repo and reached
+    callers as an unattributable codec error from somewhere. It is now
+    `LedgerReadError`, naming the ledger, with the codec error chained as
+    `__cause__` so the byte offset is still recoverable.
+    Ablation: revert the body to a bare `path.read_text(encoding="utf-8")` and this
+    reddens with `UnicodeDecodeError` where `LedgerReadError` was expected."""
+    path = tmp_path / "deferred-work.md"
+    path.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
+
+    with pytest.raises(deferredwork.LedgerReadError) as excinfo:
+        deferredwork.read_for_write(path)
+
+    assert str(path) in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, UnicodeDecodeError)
+
+
+def test_ledger_read_error_is_not_caught_by_an_existing_handler():
+    """`LedgerReadError` is a plain `Exception` deliberately: an `OSError` or
+    `ValueError` subclass would be swallowed by the very `except` arms this fault
+    escaped — `verify.verify_review_bundle` and `tui.data.deferred_entries`, which
+    caught `OSError` alone until DW-146 widened them, and
+    `Engine._refuse_gated_story` and `cli._validate_deferred_ledger`, which already
+    caught the pair. That silence is exactly what DW-146 exists to end.
+    Ablation: derive it from `OSError` (or `ValueError`) and this reddens."""
+    assert not issubclass(deferredwork.LedgerReadError, OSError)
+    assert not issubclass(deferredwork.LedgerReadError, ValueError)
+
+
+def test_read_for_write_wraps_oserror(tmp_path, monkeypatch):
+    """DW-279: refused repair reads preserve the original OS fault as cause.
+
+    Removing the corresponding OS wrap must fail this regression.
+    """
+    path = write_ledger(tmp_path)
+    fault_read_text(monkeypatch, path)
+
+    with pytest.raises(deferredwork.LedgerReadFault) as raised:
+        deferredwork.read_for_write(path)
+
+    assert isinstance(raised.value.__cause__, PermissionError)
+    assert str(path) in str(raised.value)
+
+
+@pytest.mark.parametrize("error_number", [errno.EACCES, errno.EIO, errno.ESTALE, errno.EBADF])
+def test_read_for_write_propagates_a_refused_metadata_probe(tmp_path, monkeypatch, error_number):
+    """Refused metadata is a fault, never absence (DW-221/253/279).
+
+    Pin is_file() False to simulate Python 3.14's OS-error suppression on any
+    interpreter while stat() raises EACCES/EIO/ESTALE/EBADF. Restoring the
+    convenience probe returns None; removing the OS wrap loses the exact cause
+    carried by LedgerReadFault. Both regressions fail these assertions.
+    """
+    path = write_ledger(tmp_path)
+    fault = OSError(error_number, "metadata refused", str(path))
+    real_stat = Path.stat
+
+    def refused_stat(self, *args, **kwargs):
+        if self == path:
+            raise fault
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", refused_stat)
+    real_is_file = Path.is_file
+    monkeypatch.setattr(
+        Path,
+        "is_file",
+        lambda self, *a, **kw: False if self == path else real_is_file(self, *a, **kw),
+    )
+
+    with pytest.raises(deferredwork.LedgerReadFault) as raised:
+        deferredwork.read_for_write(path)
+    assert raised.value.__cause__ is fault
+
+
+@pytest.mark.parametrize("shape", ABSORBED_PROBE_FAULTS)
+def test_read_for_write_absorbs_pathlibs_ignored_probe_faults(tmp_path, monkeypatch, shape):
+    """DW-256 (the 2026-09-10 decision) and DW-268. DW-221 swapped `is_file()` for
+    `stat()` + `S_ISREG` and kept only `ENOENT`/`ENOTDIR` as absence, but
+    `is_file()` had also absorbed pathlib's `_IGNORED_WINERRORS` (21 NOT_READY,
+    123 INVALID_NAME, 1921 CANT_RESOLVE_FILENAME) and the `ValueError` a
+    non-encodable path raises — so a ledger on a disconnected mapped drive or at
+    a lexically invalid Windows path crashed `Engine._ledger_digest`, `runs`'
+    resume entry gate and every write-bearing mutator. `probe_absence` restores
+    exactly that set, and nothing wider: `EACCES`/`EIO`/`ESTALE`/`EBADF` still
+    raise (`test_read_for_write_propagates_a_refused_metadata_probe`), and so
+    does winerror 5 (`test_read_for_write_propagates_an_unabsorbed_winerror`).
+
+    Ablation: restore `except (FileNotFoundError, NotADirectoryError)` in
+    `read_for_write` and every row reds with the fault escaping."""
+    path = _absorbed_probe_fault(monkeypatch, tmp_path, shape)
+
+    assert deferredwork.read_for_write(path) is None
+
+
+def test_read_for_write_propagates_an_unabsorbed_winerror(tmp_path, monkeypatch):
+    """Windows access denied stays outside the absorbed absence set (DW-256/279).
+
+    Synthetic winerror 5 exercises that boundary on every host: unlike ignored
+    21/123/1921, it raises LedgerReadFault with the original OS fault chained.
+    Absorbing all winerrors returns None and fails the expected exception.
+    """
+    path = write_ledger(tmp_path)
+    fault = OSError(errno.EACCES, "metadata refused", str(path))
+    fault.winerror = 5
+    real_stat = Path.stat
+
+    def refused_stat(self, *a, **kw):
+        if self == path:
+            raise fault
+        return real_stat(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "stat", refused_stat)
+
+    with pytest.raises(deferredwork.LedgerReadFault) as raised:
+        deferredwork.read_for_write(path)
+    assert raised.value.__cause__ is fault
+
+
+def _winerror(exc: OSError, winerror: int) -> OSError:
+    """Set `.winerror` on an already-built `OSError` so the attribute exists before
+    parametrization — the errno subclass is whatever CPython's errmap would pick."""
+    exc.winerror = winerror
+    return exc
+
+
+@pytest.mark.parametrize(
+    "exc, expected",
+    [
+        (FileNotFoundError(errno.ENOENT, "gone"), True),
+        (NotADirectoryError(errno.ENOTDIR, "file in the way"), True),
+        (PermissionError(errno.EACCES, "refused"), False),
+        (OSError(errno.EIO, "io"), False),
+        (OSError(errno.ELOOP, "loop"), False),
+        (OSError(errno.EBADF, "bad fd"), False),
+        # CPython's errmap: winerror 21 arrives as a `PermissionError`, 123/1921 as
+        # `EINVAL` — the test is on `.winerror` alone, the subclass is irrelevant.
+        (_winerror(PermissionError(errno.EACCES, "not ready"), 21), True),
+        (_winerror(OSError(errno.EINVAL, "invalid name"), 123), True),
+        (_winerror(OSError(errno.EINVAL, "cannot resolve"), 1921), True),
+        (_winerror(OSError(errno.EACCES, "access denied"), 5), False),
+        (ValueError("embedded null byte"), True),
+        (UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogates not allowed"), True),
+        (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), False),
+        (RuntimeError("not a probe fault"), False),
+    ],
+)
+def test_probe_absence_classifies_exactly_the_is_file_set(exc, expected):
+    """The helper's table, one row per class it must decide: `ENOENT`/`ENOTDIR`,
+    pathlib's three winerrors regardless of errno subclass, a plain `ValueError`
+    (embedded NUL) and a `UnicodeEncodeError` (a lone-surrogate path — the other
+    non-encodable shape `is_file()` absorbed) are absence; every refusal errno,
+    `ELOOP`/`EBADF` (DW-221's call, unchanged), winerror 5 and a
+    `UnicodeDecodeError` — a `ValueError` too, but `read_text`'s fault and not
+    the probe's, which must stay `LedgerReadError` — are not.
+
+    Ablation: exclude `UnicodeError` instead of `UnicodeDecodeError` and the
+    `UnicodeEncodeError` row reds."""
+    assert deferredwork.probe_absence(exc) is expected
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_read_for_write_follows_noncyclic_symlinks(tmp_path, present):
+    """Characterize preserved regular-target and missing-target symlink reads."""
+    target = tmp_path / "target.md"
+    if present:
+        target.write_text("ledger text", encoding="utf-8")
+    link = tmp_path / "ledger.md"
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+    assert deferredwork.read_for_write(link) == ("ledger text" if present else None)
+
+
+# How each OS spells "a symlink cycle at this name". POSIX raises ELOOP, whose
+# strerror is the message the observation arm attributes. Windows has no ELOOP
+# at the filesystem: a reparse-point cycle fails `CreateFileW` with
+# ERROR_CANT_RESOLVE_FILENAME (winerror 1921), which `PC/errmap.h` folds onto a
+# generic errno, so only `.winerror` and the `[WinError 1921]` prefix name the
+# condition there. Both symlink-loop pins assert the CLASSIFICATION (a refusal
+# at the write arm — absence on win32, where DW-256 absorbs 1921 — and an
+# attributed `OSError:` fault at the observation arm) and then this platform's
+# spelling, never the POSIX message alone.
+_WINERROR_CANT_RESOLVE_FILENAME = 1921
+_SYMLINK_LOOP_MESSAGE = (
+    f"[WinError {_WINERROR_CANT_RESOLVE_FILENAME}]"
+    if sys.platform == "win32"
+    else "Too many levels of symbolic links"
+)
+
+
+def _assert_is_a_symlink_loop_refusal(exc: OSError) -> None:
+    if sys.platform == "win32":
+        assert exc.winerror == _WINERROR_CANT_RESOLVE_FILENAME
+    else:
+        assert exc.errno == errno.ELOOP
+
+
+def test_read_for_write_raises_on_a_symlink_loop(tmp_path):
+    """A real symlink cycle is refused rather than absent (DW-221/279) — on POSIX.
+
+    is_file() historically suppressed ELOOP on every supported interpreter;
+    stat() exposes it. Restoring that probe returns None, while removing the
+    metadata wrap loses LedgerReadFault. Its cause must preserve errno ELOOP.
+
+    Windows is the documented exception, not a gap: a reparse-point cycle fails
+    with winerror 1921, one of `ABSENCE_WINERRORS` — pathlib's own ignored set —
+    which DW-256 absorbs as ABSENCE at the write arm, so there `read_for_write`
+    answers `None` exactly as `is_file()` always did. Ablation on win32: drop 1921
+    from `ABSENCE_WINERRORS` and this row reds with `LedgerReadFault`.
+    """
+    path, other = tmp_path / "deferred-work.md", tmp_path / "ledger-loop"
+    try:
+        path.symlink_to(other)
+        other.symlink_to(path)
+    except OSError as e:
+        pytest.skip(f"symlinks unavailable: {e}")
+
+    if sys.platform == "win32":
+        assert _WINERROR_CANT_RESOLVE_FILENAME in deferredwork.ABSENCE_WINERRORS
+        assert deferredwork.read_for_write(path) is None
+        return
+
+    with pytest.raises(deferredwork.LedgerReadFault) as excinfo:
+        deferredwork.read_for_write(path)
+
+    assert isinstance(excinfo.value.__cause__, OSError)
+    _assert_is_a_symlink_loop_refusal(excinfo.value.__cause__)
+
+
+def test_read_for_write_returns_none_for_a_path_under_a_non_directory(tmp_path):
+    """ENOTDIR stays ABSENCE, beside ENOENT. `stat` raises `NotADirectoryError`
+    where `is_file()` absorbed the same errno, so the switch must name it or a
+    project whose `implementation_artifacts` points through a regular file would
+    start raising out of every repair/write site.
+    Ablation: drop `NotADirectoryError` from the absorbed tuple and this reddens."""
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("a regular file standing where a directory is expected\n")
+
+    assert deferredwork.read_for_write(blocker / "deferred-work.md") is None
+
+
+def test_read_for_write_returns_none_for_a_non_regular_file(tmp_path):
+    """`S_ISREG` preserves the meaning `is_file()` had for a present target of the
+    wrong TYPE: a directory at the ledger's own name is the absence arm, not a
+    fault. Without it the directory would reach `read_text` as an
+    `IsADirectoryError` — and a FIFO would BLOCK there forever.
+
+    `verify.unpublishable_target` is what turns this `None` into an operator-
+    facing cause, and since DW-238 it discriminates the shape — see
+    `test_unpublishable_target_refuses_a_ledger_replaced_by_a_directory`.
+    Ablation: drop the `S_ISREG` test and this reddens with `IsADirectoryError`."""
+    ledger = tmp_path / "deferred-work.md"
+    ledger.mkdir()
+
+    assert deferredwork.read_for_write(ledger) is None
+
+
+def test_read_for_observation_reports_absence_as_no_fault(tmp_path):
+    assert deferredwork.read_for_observation(tmp_path / "gone.md") == ("", None)
+
+
+def test_read_for_observation_reports_a_non_regular_file_as_absence(tmp_path):
+    """`S_ISREG` preserves the meaning `is_file()` had for a present target of the
+    wrong TYPE at the observation arm too (DW-254): a directory at the ledger's
+    name is absence, `("", None)`, not a fault — the twin of
+    `test_read_for_write_returns_none_for_a_non_regular_file`. Without it the
+    directory would reach `read_text` and be attributed as an
+    `IsADirectoryError:` fault (and a FIFO would block there).
+    Ablation: drop the `S_ISREG` test and this reds with an attributed fault."""
+    ledger = tmp_path / "deferred-work.md"
+    ledger.mkdir()
+
+    assert deferredwork.read_for_observation(ledger) == ("", None)
+
+
+def test_read_for_observation_attributes_a_non_encodable_path(tmp_path):
+    """`Path.stat` raises `ValueError` for a path the OS cannot encode (an
+    embedded NUL), which `is_file()` absorbed on every interpreter. The
+    never-raises contract keeps it an attributed fault rather than an escape.
+    Ablation: drop `ValueError` from the except tuple and this reds with it
+    escaping."""
+    text, fault = deferredwork.read_for_observation(Path(str(tmp_path) + "/bad\0name.md"))
+
+    assert text == ""
+    assert fault is not None and fault.startswith("ValueError: ")
+
+
+def test_read_for_observation_returns_the_text_verbatim(tmp_path):
+    path = write_ledger(tmp_path)
+    assert deferredwork.read_for_observation(path) == (LEDGER, None)
+
+
+@pytest.mark.parametrize(
+    "shape, expected",
+    [
+        pytest.param("absent", (None, None), id="absent"),
+        pytest.param("directory", (None, None), id="directory-is-absence"),
+        pytest.param("empty", ("", None), id="present-0-byte"),
+        pytest.param("text", (LEDGER, None), id="present-text"),
+    ],
+)
+def test_observe_ledger_keeps_a_present_empty_ledger_distinct_from_absence(
+    tmp_path, shape, expected
+):
+    """The presence-aware OBSERVATION reader: `None` text is absence — ENOENT, or a
+    present non-regular file, the same classification `read_for_observation`
+    reports as `""` — and `""` is a ledger that EXISTS and holds nothing. The two
+    sentence-writing sites (`cli.cmd_decisions`' non-write outcome and
+    `SweepEngine._non_write_state`) took absence from the text-only reader's
+    empty text and so called a present 0-byte ledger "gone" (PR #794 review);
+    this is the reader they ask instead. The `present-0-byte` row is the one the
+    text-only projection cannot carry.
+    Ablation: `return "" , None` for absence (or `text or ""` in the body) and
+    the `absent`/`directory` rows red against the `present-0-byte` row."""
+    path = tmp_path / "deferred-work.md"
+    if shape == "directory":
+        path.mkdir()
+    elif shape == "empty":
+        path.write_text("")
+    elif shape == "text":
+        path = write_ledger(tmp_path)
+
+    assert deferredwork.observe_ledger(path) == expected
+
+
+def test_observe_ledger_attributes_a_fault_with_no_text(tmp_path, monkeypatch):
+    """A fault answers `None` text, not `""`: the caller cannot tell a refused
+    ledger's contents, so the reader must not hand back a value that reads as a
+    present, empty one. `read_for_observation` projects the same fault to `""`,
+    which is the contract its parsing callers already hold.
+    Ablation: return `""` on the fault arm and the `None` assertion reds."""
+    path = write_ledger(tmp_path)
+    fault_read_text(monkeypatch, path)
+
+    text, fault = deferredwork.observe_ledger(path)
+    projected_text, projected_fault = deferredwork.read_for_observation(path)
+
+    assert text is None
+    assert fault is not None and fault.startswith("PermissionError: ")
+    assert (projected_text, projected_fault) == ("", fault)
+
+
+def test_read_for_observation_degrades_on_undecodable_bytes(tmp_path):
+    """The OBSERVATION arm never raises — it hands back an empty text plus an
+    ATTRIBUTED fault, so a caller holding a journal records which fault it degraded
+    on rather than reporting an empty ledger.
+    Ablation: drop `UnicodeDecodeError` from the except tuple and this reddens with
+    that exception escaping instead of a `("", fault)` pair."""
+    path = tmp_path / "deferred-work.md"
+    path.write_bytes(b"\xff")
+
+    text, fault = deferredwork.read_for_observation(path)
+
+    assert text == ""
+    assert fault is not None and fault.startswith("UnicodeDecodeError: ")
+
+
+def test_read_for_observation_degrades_on_oserror(tmp_path, monkeypatch):
+    """The other half of the OBSERVATION arm's tuple, and the reason it is a tuple
+    rather than a bare `str`: an unreadable LOCATION degrades the same way as
+    unreadable bytes, attributed by class so the two are distinguishable downstream.
+    Ablation: drop `OSError` from the except tuple and this reddens."""
+    path = write_ledger(tmp_path)
+    fault_read_text(monkeypatch, path)
+
+    text, fault = deferredwork.read_for_observation(path)
+
+    assert text == ""
+    assert fault is not None and fault.startswith("PermissionError: ")
+
+
+def test_read_for_observation_degrades_on_a_metadata_fault(tmp_path, monkeypatch):
+    """DW-254. The OBSERVATION arm promises that a refused ledger degrades to an
+    ATTRIBUTED fault, and until DW-254 that was true only on Python 3.11–3.13,
+    where its `is_file()` probe raised EACCES into the guard; on 3.14 the probe
+    suppressed the refusal and answered False, so a present-but-refused ledger
+    read as `("", None)` — silent absence. The probe is `stat` + `S_ISREG` now,
+    inside the same `try`, so the refusal reaches the guard on every interpreter.
+
+    The 3.14 CONTRACT is simulated rather than the 3.14 interpreter: `Path.is_file`
+    is pinned False for the ledger while `Path.stat` carries the refusal, which is
+    what makes the ablation real on the 3.13 dev interpreter.
+    Ablation: restore `if not path.is_file(): return "", None` as the probe and this
+    reds with `("", None)` where an attributed `PermissionError:` was expected."""
+    path = write_ledger(tmp_path)
+    _refuse_metadata_like_3_14(monkeypatch, path)
+
+    text, fault = deferredwork.read_for_observation(path)
+
+    assert text == ""
+    assert fault is not None and fault.startswith("PermissionError: ")
+
+
+@pytest.mark.parametrize("shape", ["enotdir-parent", "symlink-loop"])
+def test_read_for_observation_classifies_the_ignored_errnos(tmp_path, shape):
+    """Which of `pathlib`'s ignored errnos stay ABSENCE at the observation arm and
+    which changed sides under DW-254, observed rather than only described. Both
+    arms share one classification now: `ENOTDIR` — a ledger path whose parent is a
+    regular file — is `NotADirectoryError`, absorbed beside ENOENT, so it stays
+    `("", None)`. `ELOOP` — a symlink cycle at the ledger's name — is a path that
+    EXISTS and cannot be read, so it is an attributed `OSError:` fault now, the
+    same side change DW-221 made at the write arm (see
+    `test_read_for_write_raises_on_a_symlink_loop`), where `is_file()` absorbed
+    errno 40 on every interpreter and called it a clean empty read.
+
+    Ablation: restore `if not path.is_file(): return "", None` and the
+    `symlink-loop` row reds with `("", None)`; drop `NotADirectoryError` from the
+    absorbed tuple and the `enotdir-parent` row reds with an attributed fault."""
+    if shape == "enotdir-parent":
+        (tmp_path / "not-a-dir").write_text("x", encoding="utf-8")
+        path = tmp_path / "not-a-dir" / "deferred-work.md"
+        assert deferredwork.read_for_observation(path) == ("", None)
+        return
+    path, other = tmp_path / "loop-a", tmp_path / "loop-b"
+    try:
+        path.symlink_to(other)
+        other.symlink_to(path)
+    except OSError as e:
+        pytest.skip(f"symlinks unavailable: {e}")
+
+    text, fault = deferredwork.read_for_observation(path)
+
+    assert text == ""
+    assert fault is not None and fault.startswith("OSError: ")
+    assert _SYMLINK_LOOP_MESSAGE in fault
+
+
+def test_mark_done_many_raises_on_an_undecodable_ledger_and_writes_nothing(tmp_path):
+    """The REPAIR/WRITE row of the DW-146 matrix at a real mutator. The pre-lock
+    advisory probe swallows the codec error by design (it decides nothing), so the
+    LOCKED read is what must escalate — and it must escalate rather than publish,
+    because a mutator that read no text would otherwise write a ledger built from
+    `""`, silently erasing every entry it could not decode.
+    Ablation: revert `_mark_done_many`'s locked read to
+    `path.read_text(encoding="utf-8")` and this reddens with `UnicodeDecodeError`
+    where `LedgerReadError` was expected."""
+    path = tmp_path / "deferred-work.md"
+    raw = b"# Deferred Work\n\n### DW-1: bad \xff byte\n\nstatus: open\n"
+    path.write_bytes(raw)
+
+    with pytest.raises(deferredwork.LedgerReadError):
+        mark_done_many(path, ["DW-1"], "2026-06-11", "fixed")
+
+    assert path.read_bytes() == raw
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        PermissionError(errno.EACCES, "refused"),
+        OSError(errno.EIO, "read failed"),
+        FileNotFoundError(errno.ENOENT, "vanished after stat"),
+        NotADirectoryError(errno.ENOTDIR, "parent changed after stat"),
+        IsADirectoryError(errno.EISDIR, "target changed after stat"),
+        _winerror(OSError(errno.EIO, "drive vanished after stat"), 21),
+    ],
+)
+def test_read_for_write_wraps_text_read_faults_even_when_the_probe_would_absorb_them(
+    tmp_path, monkeypatch, fault
+):
+    """A successful regular-file probe never licenses synthesizing empty text.
+
+    Ablation: remove the text-read wrap; every row raises the original OSError.
+    Reusing probe_absence here also fails the disappearance/type-change rows.
+    """
+    path = write_ledger(tmp_path)
+    before = path.read_bytes()
+    real_read = Path.read_text
+
+    def refuse(target, *args, **kwargs):
+        if target == path:
+            raise fault
+        return real_read(target, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", refuse)
+    with pytest.raises(deferredwork.LedgerReadFault) as raised:
+        deferredwork.read_for_write(path)
+
+    assert raised.value.__cause__ is fault
+    assert isinstance(raised.value, deferredwork.LedgerReadError)
+    assert not isinstance(raised.value, OSError)
+    assert str(path) in str(raised.value)
+    assert path.read_bytes() == before

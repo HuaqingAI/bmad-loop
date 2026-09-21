@@ -41,25 +41,49 @@ zero-token real-tmux success path.
 (11) runs that complete renderer project under worktree isolation after removing
 the renderer script unit and central config from the index. The real tmux session
 can start only if runtime provisioning reconstructs the ignored `_bmad` surface.
+
+(12) injects a detached-child identity publication failure (DW-149). An independent
+`observed-child.id` channel lets the row prove the recorder hit the poisoned
+temporary directory, the orchestrator reaped that exact child, and the worktree
+teardown remained clean despite the missing normal identity record.
+
+Alongside those scenarios the file also holds local-process `/proc`+pidfd harness
+rows covering the reap-identity helpers the three teardown E2Es depend on, plus the
+DW-159 rows that drive the detached fakes' bash session-readiness gate directly
+rather than any helper. Those rows
+spawn and reap their own short-lived children, but run no tmux or orchestrator session.
 """
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 
+import conftest
 import pytest
 import yaml
 from conftest import (
+    REAL_MUX_HANG_CEILING_S,
+    RECORDED_CHILD_GLOB,
     RENDERER_SCRIPT_IMPORTING_SIBLING,
+    bind_recorded_child,
     install_build_auto_skill,
     install_dev_base_skills,
+    kill_recorded_child,
+    preflight_pidfd_support,
+    proc_starttime,
+    real_mux_e2e,
+    recorded_child,
+    recorded_children_swept,
 )
 
 from bmad_loop import runs
@@ -76,7 +100,12 @@ from bmad_loop.install import (
 # (`date +%s%N`; the detached-writer fake also needs setsid(1)) — BSD/macOS date
 # has no %N and macOS ships no setsid utility, so skipping honestly beats failing.
 HAVE_TMUX = sys.platform.startswith("linux") and shutil.which("tmux") is not None
-pytestmark = pytest.mark.skipif(not HAVE_TMUX, reason="stories E2E needs real tmux on Linux")
+# A LIST, not a single mark: every real-tmux test here joins the serialized real-mux
+# xdist group (DW-95). The local-process identity rows below inherit the same marks.
+pytestmark = [
+    pytest.mark.skipif(not HAVE_TMUX, reason="stories E2E needs real tmux on Linux"),
+    real_mux_e2e,
+]
 
 # The fake CLI: reads the story id + spec folder from the session env (as the real
 # folder+id adapter does), writes the id-keyed story spec BEFORE the Stop event so
@@ -224,12 +253,22 @@ events = {{ SessionStart = "SessionStart", Stop = "Stop" }}
 SPEC_FOLDER = "_bmad-output/epic-1"
 CLI = [sys.executable, "-m", "bmad_loop.cli"]
 
+# Shared verbatim by both fake CLIs and exercised directly below. Pure bash reads
+# field 22 from /proc/<pid>/stat by stripping through the last ") " and taking index
+# 19 of the remaining fields, then records the identity captured at spawn.
+RECORD_CHILD_IDENTITY_SH = r"""cstat=$(<"/proc/$child/stat")
+read -r -a cfields <<< "${cstat##*) }"
+printf '%s %s\n' "$child" "${cfields[19]}" > "$idfile.tmp"
+mv -f "$idfile.tmp" "$idfile"
+"""
+
 # A fake CLI that writes SessionStart and then sleeps forever — it NEVER fires a
 # Stop hook, so the dev session can only end via the orchestrator's own timeout
 # fire + bounded teardown (#157). Because the session never ends a turn, the
 # result-less-Stop stall machinery never engages either, exactly the wedged-in-a-
 # tool-call shape the issue reported.
-TIMEOUT_FAKE_CLI = r"""#!/usr/bin/env bash
+TIMEOUT_FAKE_CLI = (
+    r"""#!/usr/bin/env bash
 set -e
 rd="$BMAD_LOOP_RUN_DIR"; tid="$BMAD_LOOP_TASK_ID"
 ts=$(date +%s%N)
@@ -238,12 +277,50 @@ mkdir -p "$ed"
 printf '{"ts": %s, "event": "SessionStart", "task_id": "%s", "session_id": "fake-1"}' \
     "$ts" "$tid" > "$ed/$ts-$tid-SessionStart.json"
 # Background + wait keeps the same process group as a foreground sleep, but
-# records the child's pid so the test can prove teardown reaped descendants,
-# not just this shell (whose cmdline is all the pgrep check can see).
+# records the child's pid plus /proc start time so the test can prove teardown reaped
+# this exact descendant, not just this shell (whose cmdline is all pgrep can see).
 sleep 100000 &
 child=$!
-printf '%s\n' "$child" > "$rd/tasks/$tid/fake-child.pid"
-wait "$child"
+idfile="$rd/tasks/$tid/fake-child.pid"
+"""
+    + RECORD_CHILD_IDENTITY_SH
+    + r"""wait "$child"
+"""
+)
+
+# DW-159: publication must not precede the session transition. `$!` names the child
+# the instant fork(2) returns, but `setsid(2)` runs in that child AFTERWARDS, so an
+# identity published straight off `$!` merely ASSUMES the escape it is supposed to
+# prove — under a scheduler delay the consumer can harvest and grade a straggler still
+# inside the pane's session, and the row silently covers the weaker same-pgid case
+# (#183/#139) it was written to exclude. This gate turns detachment into an established
+# fact: bounded-poll the child's OBSERVED session id until it differs from this shell's
+# own, then let publication proceed; a child that never detaches fails loudly instead.
+#
+# Expects `$child` and `$detach_ack_ceiling_s` to be set already, and mirrors the
+# recorder's `") "`-strip parse convention: after `${stat##*) }`, index 3 is the session
+# id (index 19 is the start time the recorder reads). Deliberately NOT folded into
+# RECORD_CHILD_IDENTITY_SH: that snippet is shared verbatim with TIMEOUT_FAKE_CLI, whose
+# child is intentionally same-session, where a session-differs gate would never return.
+# On refusal, kill the owned child before exiting: it could otherwise detach later
+# without an identity record for the E2E cleanup sweep. The fake can wait on its child;
+# a direct harness shell cannot, so only that wait status is ignored under `set -e`.
+AWAIT_DETACHED_SESSION_SH = r"""sstat=$(<"/proc/$$/stat")
+read -r -a sfields <<< "${sstat##*) }"
+own_session="${sfields[3]}"
+detach_deadline=$(( SECONDS + detach_ack_ceiling_s ))
+while :; do
+    cstat=$(<"/proc/$child/stat")
+    read -r -a cfields <<< "${cstat##*) }"
+    if [[ ${cfields[3]} != "$own_session" ]]; then break; fi
+    if (( SECONDS >= detach_deadline )); then
+        printf 'child %s never left session %s\n' "$child" "$own_session" >&2
+        kill -KILL "$child"
+        wait "$child" 2>/dev/null || :
+        exit 1
+    fi
+    sleep 0.05
+done
 """
 
 # A fake CLI that ends CLEANLY (writes a `done` spec + Stop, then idles like a real
@@ -252,7 +329,8 @@ wait "$child"
 # escapes the pane pgid entirely — the #183/#139 repro the pre-harvest descendant
 # reap must cover before the worktree is merged and removed. Sprint mode: writes the
 # id-keyed done spec + a real code change so the run merges and tears the worktree down.
-DETACHED_WRITER_FAKE_CLI = r"""#!/usr/bin/env bash
+DETACHED_WRITER_FAKE_CLI = (
+    r"""#!/usr/bin/env bash
 set -e
 rd="$BMAD_LOOP_RUN_DIR"; tid="$BMAD_LOOP_TASK_ID"; story="$BMAD_LOOP_STORY_KEY"
 ts=$(date +%s%N)
@@ -267,8 +345,16 @@ baseline=$(git rev-parse HEAD)
 # fork) — it now leads its own session and survives the pane pgid's SIGHUP.
 setsid sleep 100000 &
 child=$!
-printf '%s\n' "$child" > "$rd/tasks/$tid/fake-child.pid"
-
+"""
+    # The fake pins the shared hang ceiling (int for bash arithmetic) rather than a bare
+    # literal, per DW-95/DW-108; the assert below is what holds that spelling. It is
+    # `_run_detach_gate`, not this line, that varies the budget for the direct rows.
+    + f"detach_ack_ceiling_s={int(REAL_MUX_HANG_CEILING_S)}\n"
+    + AWAIT_DETACHED_SESSION_SH
+    + r"""idfile="$rd/tasks/$tid/fake-child.pid"
+"""
+    + RECORD_CHILD_IDENTITY_SH
+    + r"""
 # Sprint-mode result: a real code change + the id-keyed done spec the dev synthesis
 # reads back (written under the worktree cwd in isolation mode).
 impl="_bmad-output/implementation-artifacts"
@@ -287,6 +373,61 @@ printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \
 # nothing) — else the shell could exit first, reparenting the child to init.
 sleep 600
 """
+)
+
+
+# The publication-fault fake records its child outside the normal channel so the
+# test can authenticate it even when fake-child.pid cannot be published.
+OBSERVED_CHILD_GLOB = ".bmad-loop/runs/*/tasks/*/observed-child.id"
+
+_PUBLICATION_FAULT_FRAGMENT = (
+    r"""idfile="$rd/tasks/$tid/observed-child.id"
+"""
+    + RECORD_CHILD_IDENTITY_SH
+    + r"""idfile="$rd/tasks/$tid/fake-child.pid"
+mkdir -p "$idfile.tmp"
+# A plain subshell preserves its own errexit. Using (...) || true would suppress
+# errexit inside and let mv rename the poison directory into the normal channel.
+set +e
+(
+export LC_ALL=C
+set -e
+"""
+    + RECORD_CHILD_IDENTITY_SH
+    + r""") 2> "$rd/tasks/$tid/recorder.stderr"
+recorder_status=$?
+set -e
+printf '%s\n' "$recorder_status" > "$rd/tasks/$tid/recorder.status"
+"""
+)
+
+# Substitute only the identity step; the detached fake and recorder stay unchanged.
+assert DETACHED_WRITER_FAKE_CLI.count(RECORD_CHILD_IDENTITY_SH) == 1
+PUBLICATION_FAULT_FAKE_CLI = DETACHED_WRITER_FAKE_CLI.replace(
+    RECORD_CHILD_IDENTITY_SH, _PUBLICATION_FAULT_FRAGMENT, 1
+)
+assert PUBLICATION_FAULT_FAKE_CLI.count(RECORD_CHILD_IDENTITY_SH) == 2
+# The gate sits ahead of the substituted `idfile=` line, so the publication-fault fake
+# inherits it for free — correct, since it detaches the same way. ORDER is the whole
+# property, not presence: a gate spliced AFTER the recorder would publish the identity
+# first and re-establish exactly the race DW-159 closes, so pin the index too. The
+# ceiling assignment is respelled rather than shared, so swapping the splice for a bare
+# SHORT literal fails here.
+#
+# These asserts compare rendered TEXT, which on its own cannot tell the splice apart from
+# a hardcoded `90` — the two render byte-identically. That is graded elsewhere (DW-174):
+# `_scan_detach_ceiling_splices` in `tests/test_conftest.py` reads THIS module's own AST
+# and requires the module-level `detach_ack_ceiling_s=` fragment to be followed by
+# `int(<conftest REAL_MUX_HANG_CEILING_S>)`, under either import form, against a named
+# expected-site inventory. Keep both halves: that scan observes only the EXPRESSION, while
+# the splice ORDER pinned below and the derived `PUBLICATION_FAULT_FAKE_CLI` inheritance
+# (a `str.replace` result, which holds no fragment of its own) are text properties no AST
+# scan of this module sees.
+for _fake in (DETACHED_WRITER_FAKE_CLI, PUBLICATION_FAULT_FAKE_CLI):
+    assert _fake.count(AWAIT_DETACHED_SESSION_SH) == 1
+    assert _fake.count(f"detach_ack_ceiling_s={int(REAL_MUX_HANG_CEILING_S)}\n") == 1
+    assert _fake.index(AWAIT_DETACHED_SESSION_SH) < _fake.index(RECORD_CHILD_IDENTITY_SH)
+del _fake
 
 
 def _git(root: Path, *args: str) -> None:
@@ -826,11 +967,751 @@ def test_e2e_sprint_intent_gap_patch_restore(tmp_path):
     assert any(str(spec) in p for p in prompts)
 
 
+# These harness rows spawn only local `sleep` processes and are the contract tests for
+# the reap-identity helpers, which now live in tests/conftest.py because a second
+# consumer on a different host gate needs them (tests/test_opencode_http.py's detached
+# -descendant row, Linux-gated but tmux-free). They keep the module's Linux+tmux gate
+# and xdist group: tmux is stricter than the helpers require, so the rows still run
+# wherever the E2E consumers here do. No row below launches tmux or the orchestrator.
+
+
+def _reap(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=10)
+
+
+def _live_child() -> tuple[subprocess.Popen, str]:
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        starttime = proc_starttime(proc.pid)
+        assert starttime is not None, f"spawned child {proc.pid} has no /proc identity"
+        return proc, starttime
+    except BaseException:
+        _reap(proc)
+        raise
+
+
+def test_recorded_identity_bash_and_python_agree(tmp_path):
+    proc, starttime = _live_child()
+    try:
+        pid_file = tmp_path / "fake-child.pid"
+        publication_target = tmp_path / "direct-write-target"
+        pid_file.symlink_to(publication_target)
+        subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"set -e\nchild={proc.pid}\nidfile={shlex.quote(str(pid_file))}\n"
+                + RECORD_CHILD_IDENTITY_SH,
+            ],
+            check=True,
+            timeout=30,
+        )
+        assert not pid_file.is_symlink(), "the recorder must replace, not write through, the name"
+        assert recorded_child(pid_file) == (proc.pid, starttime)
+    finally:
+        _reap(proc)
+
+
+def _observed_session(pid: int) -> str:
+    """The session id the detached-fake gate reads: index 3 after the `") "` strip."""
+    stat = Path("/proc", str(pid), "stat").read_text(encoding="utf-8")
+    return stat[stat.rindex(")") + 1 :].split()[3]
+
+
+def _run_detach_gate(
+    child: int, ceiling_s: int, *, head: str = "", tail: str = ""
+) -> subprocess.CompletedProcess:
+    """Drive AWAIT_DETACHED_SESSION_SH itself — the same text the fakes splice in.
+
+    The subprocess wall is derived from the injected ceiling, never fixed: a fixed wall
+    below a caller's budget would report `TimeoutExpired` from the harness instead of
+    the gate's own bounded refusal, inverting which layer the row is grading.
+    """
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"set -e\nchild={child}\ndetach_ack_ceiling_s={ceiling_s}\n"
+            + head
+            + AWAIT_DETACHED_SESSION_SH
+            + tail,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=ceiling_s + 30,
+    )
+
+
+def test_detach_gate_returns_only_once_the_child_left_the_runner_session():
+    """DW-159: the gate is what makes detachment a FACT before the identity is published.
+
+    A `setsid` child spawned the way the fake spawns one (not a process-group leader, so
+    setsid(1) execs rather than forks and the pid is preserved). The gate may return only
+    when the observed session differs from the runner shell's — and for a setsid child
+    that session is the child's own pid, which is what the consumers' escaped-straggler
+    premise rests on.
+    """
+    proc = subprocess.Popen(["setsid", "sleep", "30"])
+    try:
+        done = _run_detach_gate(proc.pid, 10, tail='printf %s "$own_session"\n')
+        assert done.returncode == 0, done.stderr
+        runner_session = done.stdout
+        assert runner_session, done.stderr
+        observed = _observed_session(proc.pid)
+        assert observed != runner_session
+        assert observed == str(proc.pid), f"setsid child {proc.pid} does not lead its session"
+    finally:
+        _reap(proc)
+
+
+def test_detach_gate_retries_until_a_late_child_detaches(tmp_path):
+    """Release the same-session child only when the gate reaches its retry sleep.
+
+    A shell-local sleep function signals the child, then delegates to real sleep.
+    The unmodified gate must observe the original session before it can release the
+    child; parent scheduling cannot consume the delay before observation starts.
+    The child execs setsid, preserving its pid just as the detached fake does.
+    """
+    release_file = tmp_path / "detach-release"
+    release = shlex.quote(str(release_file))
+    proc = subprocess.Popen(
+        ["bash", "-c", f"while [[ ! -e {release} ]]; do sleep 0.05; done; exec setsid sleep 100000"]
+    )
+    try:
+        done = _run_detach_gate(
+            proc.pid,
+            int(REAL_MUX_HANG_CEILING_S),
+            head=f'sleep() {{ : > {release}; command sleep "$@"; }}\n',
+            tail='printf %s "$own_session"\n',
+        )
+        assert done.returncode == 0, done.stderr
+        assert release_file.exists(), "the gate never reached its retry sleep"
+        assert _observed_session(proc.pid) != done.stdout
+        assert _observed_session(proc.pid) == str(proc.pid)
+    finally:
+        _reap(proc)
+
+
+@pytest.mark.parametrize("process_group", [None, 0], ids=["same-pgrp", "new-pgrp"])
+@pytest.mark.parametrize("virtual_clock", [False, True], ids=["real-clock", "virtual-clock"])
+def test_detach_gate_refuses_a_child_that_never_left_the_session(
+    tmp_path, process_group, virtual_clock
+):
+    """Refuse and kill a same-session child, even if it leads a different group.
+
+    Real-clock cases exercise bash's deadline; virtual-clock cases count retries
+    against the injected budget without making a scheduler-sensitive timing claim.
+    Unsetting SECONDS removes its special clock behavior for that shell, so each
+    retry advances an ordinary variable by exactly one second.
+    """
+    proc = subprocess.Popen(["sleep", "100000"], process_group=process_group)
+    try:
+        assert os.getsid(proc.pid) == os.getsid(0)
+        if process_group == 0:
+            assert os.getpgid(proc.pid) == proc.pid
+            assert os.getpgid(proc.pid) != os.getpgrp()
+        pid_file = tmp_path / "fake-child.pid"
+        ticks_file = tmp_path / "ticks"
+        head = ""
+        if virtual_clock:
+            head = (
+                "unset SECONDS\nSECONDS=0\n"
+                f"sleep() {{ printf x >> {shlex.quote(str(ticks_file))}; "
+                "SECONDS=$((SECONDS + 1)); }\n"
+            )
+        done = _run_detach_gate(
+            proc.pid,
+            2,
+            head=head,
+            tail=f"idfile={shlex.quote(str(pid_file))}\n" + RECORD_CHILD_IDENTITY_SH,
+        )
+        assert done.returncode != 0
+        assert f"child {proc.pid} never left session {os.getsid(0)}" in done.stderr
+        assert not pid_file.exists(), "an ungraded identity must never be published"
+        assert proc.wait(timeout=30) == -signal.SIGKILL
+        if virtual_clock:
+            assert ticks_file.read_text() == "xx", "the gate did not honor its two-second budget"
+    finally:
+        _reap(proc)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "123\n",
+        "123 456 789\n",
+        "0 456\n",
+        "123 0\n",
+        "-123 456\n",
+        "１２３ 456\n",
+        "123 ٤٥٦\n",
+        "123 456",
+        "123\n456\n",
+        "123\t456\n",
+        "123\N{NO-BREAK SPACE}456\n",
+        f'{"9" * 5000} 456\n',
+    ],
+)
+def test_recorded_child_rejects_malformed_zero_and_non_ascii_identities(tmp_path, raw):
+    pid_file = tmp_path / "fake-child.pid"
+    pid_file.write_text(raw, encoding="utf-8")
+    with pytest.raises(AssertionError, match="positive ASCII-decimal"):
+        recorded_child(pid_file)
+
+
+def test_reap_identity_binds_a_live_child(tmp_path):
+    proc, starttime = _live_child()
+    try:
+        pid_file = tmp_path / "fake-child.pid"
+        pid_file.write_text(f"{proc.pid} {starttime}\n", encoding="utf-8")
+        assert recorded_child(pid_file) == (proc.pid, starttime)
+        fd = bind_recorded_child(proc.pid, starttime)
+        assert fd is not None
+        try:
+            signal.pidfd_send_signal(fd, 0)
+        finally:
+            kill_recorded_child(fd)
+    finally:
+        _reap(proc)
+
+
+def test_reap_identity_returns_none_for_a_reaped_child():
+    proc, starttime = _live_child()
+    _reap(proc)
+    assert proc_starttime(proc.pid) != starttime
+    assert bind_recorded_child(proc.pid, starttime) is None
+
+
+def test_reap_identity_refuses_a_start_time_mismatch(monkeypatch):
+    proc, starttime = _live_child()
+    try:
+        opened: list[int] = []
+        real_open = os.pidfd_open
+
+        def spy_open(pid: int) -> int:
+            opened.append(pid)
+            return real_open(pid)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "pidfd_open", spy_open)
+            assert bind_recorded_child(proc.pid, str(int(starttime) + 1)) is None
+        assert opened == [], "a mismatched process must not be bound"
+        assert proc.poll() is None, "a mismatched process must not be signalled"
+    finally:
+        _reap(proc)
+
+
+def test_reap_identity_closes_the_fd_when_the_pid_is_recycled_around_the_bind(monkeypatch):
+    proc, starttime = _live_child()
+    try:
+        answers = iter([starttime, str(int(starttime) + 1)])
+        closed: list[int] = []
+        real_close = os.close
+
+        def spy_close(fd: int) -> None:
+            closed.append(fd)
+            real_close(fd)
+
+        with monkeypatch.context() as patch:
+            # conftest, not this module: bind_recorded_child resolves proc_starttime in
+            # conftest's globals now, so a patch aimed here would silently no-op and the
+            # row would pass without ever steering the re-authentication it is about.
+            patch.setattr(conftest, "proc_starttime", lambda pid: next(answers))
+            patch.setattr(os, "close", spy_close)
+            assert bind_recorded_child(proc.pid, starttime) is None
+        assert len(closed) == 1, "the pidfd must close after re-authentication fails"
+    finally:
+        _reap(proc)
+
+
+def test_reap_identity_closes_the_fd_when_reauthentication_raises(monkeypatch):
+    proc, starttime = _live_child()
+    try:
+        reads = 0
+        closed: list[int] = []
+        real_close = os.close
+
+        def read_starttime(_pid: int) -> str:
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                return starttime
+            raise PermissionError(errno.EACCES, "denied")
+
+        def spy_close(fd: int) -> None:
+            closed.append(fd)
+            real_close(fd)
+
+        with monkeypatch.context() as patch:
+            # conftest, not this module — see the recycled-pid row above.
+            patch.setattr(conftest, "proc_starttime", read_starttime)
+            patch.setattr(os, "close", spy_close)
+            with pytest.raises(PermissionError):
+                bind_recorded_child(proc.pid, starttime)
+        assert reads == 2
+        assert len(closed) == 1, "the pidfd must close when re-authentication raises"
+        assert proc.poll() is None
+    finally:
+        _reap(proc)
+
+
+def test_reap_identity_returns_none_when_pidfd_open_loses_the_process(monkeypatch):
+    proc, starttime = _live_child()
+    try:
+
+        def disappeared(_pid: int) -> int:
+            raise ProcessLookupError
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "pidfd_open", disappeared)
+            assert bind_recorded_child(proc.pid, starttime) is None
+        assert proc.poll() is None, "the simulated open race must not signal the child"
+    finally:
+        _reap(proc)
+
+
+@pytest.mark.parametrize("case", ["permission", "short", "delimiter", "nondigit"])
+def test_proc_starttime_propagates_non_disappearance_and_malformed_failures(monkeypatch, case):
+    def read_stat(_self, **_kwargs):
+        if case == "permission":
+            raise PermissionError(errno.EACCES, "denied")
+        if case == "short":
+            return "1 (sleep) S 0"
+        if case == "delimiter":
+            return "not a proc stat record"
+        return "1 (sleep) " + " ".join(["S", *(["1"] * 18), "not-decimal"])
+
+    expected = (
+        PermissionError if case == "permission" else (IndexError if case == "short" else ValueError)
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_text", read_stat)
+        with pytest.raises(expected):
+            proc_starttime(123)
+
+
+def test_kill_recorded_child_actually_kills_through_the_fd():
+    proc, starttime = _live_child()
+    try:
+        fd = bind_recorded_child(proc.pid, starttime)
+        assert fd is not None
+        kill_recorded_child(fd)
+        assert proc.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        _reap(proc)
+
+
+def test_kill_recorded_child_propagates_signal_failure_and_closes_fd(monkeypatch):
+    proc, starttime = _live_child()
+    try:
+        fd = bind_recorded_child(proc.pid, starttime)
+        assert fd is not None
+
+        def denied(_fd: int, _sig: int) -> None:
+            raise PermissionError(errno.EPERM, "denied")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(signal, "pidfd_send_signal", denied)
+            with pytest.raises(PermissionError):
+                kill_recorded_child(fd)
+        with pytest.raises(OSError) as excinfo:
+            os.fstat(fd)
+        assert excinfo.value.errno == errno.EBADF
+        assert proc.poll() is None, "failed cleanup signalling must not imply disappearance"
+    finally:
+        _reap(proc)
+
+
+def test_kill_recorded_child_ignores_disappearance_and_closes_fd(monkeypatch):
+    fd = os.pidfd_open(os.getpid())
+
+    def disappeared(_fd: int, _sig: int) -> None:
+        raise ProcessLookupError
+
+    with monkeypatch.context() as patch:
+        patch.setattr(signal, "pidfd_send_signal", disappeared)
+        kill_recorded_child(fd)
+    with pytest.raises(OSError) as excinfo:
+        os.fstat(fd)
+    assert excinfo.value.errno == errno.EBADF
+
+
+def test_live_child_reaps_its_process_when_identity_observation_fails(monkeypatch):
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def spy_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    def denied(_pid: int) -> str:
+        raise PermissionError(errno.EACCES, "denied")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(subprocess, "Popen", spy_popen)
+        patch.setattr(sys.modules[__name__], "proc_starttime", denied)
+        with pytest.raises(PermissionError):
+            _live_child()
+    assert len(spawned) == 1
+    assert spawned[0].poll() == -signal.SIGKILL
+
+
+def test_reap_identity_fails_loudly_when_pidfd_is_unsupported(monkeypatch):
+    proc, starttime = _live_child()
+    try:
+
+        def unsupported(_pid: int) -> int:
+            raise OSError(errno.ENOSYS, "pidfd_open not supported")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "pidfd_open", unsupported)
+            with pytest.raises(OSError) as bind_error:
+                bind_recorded_child(proc.pid, starttime)
+            with pytest.raises(OSError) as preflight_error:
+                preflight_pidfd_support()
+        assert bind_error.value.errno == errno.ENOSYS
+        assert preflight_error.value.errno == errno.ENOSYS
+
+        preflight_fds: list[int] = []
+
+        def blocked_signal(fd: int, _sig: int) -> None:
+            preflight_fds.append(fd)
+            raise PermissionError(errno.EPERM, "pidfd signalling blocked")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(signal, "pidfd_send_signal", blocked_signal)
+            with pytest.raises(PermissionError):
+                preflight_pidfd_support()
+        assert len(preflight_fds) == 1
+        with pytest.raises(OSError) as excinfo:
+            os.fstat(preflight_fds[0])
+        assert excinfo.value.errno == errno.EBADF
+    finally:
+        _reap(proc)
+
+
+def _plant_recorded_identity(
+    root: Path, raw: str, task: str = "t0", *, filename: str = "fake-child.pid"
+) -> Path:
+    """Write ``raw`` where a fake CLI would record ``task``'s child identity.
+
+    ``task`` is a parameter because the sweeper's central promise is that ONE bad
+    file does not end the sweep; proving that needs two identities under one root,
+    and `sorted()` over the glob makes the task-dir name the sweep order.
+    ``filename`` selects an observation channel without changing existing callers.
+    """
+    pid_file = root / ".bmad-loop" / "runs" / "r0" / "tasks" / task / filename
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text(raw, encoding="utf-8")
+    return pid_file
+
+
+def _warned_paths(record) -> str:
+    return "\n".join(str(w.message) for w in record)
+
+
+def test_recorded_children_swept_leaves_a_clean_block_alone(tmp_path):
+    proc, starttime = _live_child()
+    try:
+        _plant_recorded_identity(tmp_path, f"{proc.pid} {starttime}\n")
+        with recorded_children_swept(tmp_path):
+            pass
+        assert proc.poll() is None, "a clean exit must leave the fd owner's child alone"
+    finally:
+        _reap(proc)
+
+
+def test_recorded_children_swept_reaps_a_recorded_child_and_reraises(tmp_path):
+    proc, starttime = _live_child()
+    try:
+        _plant_recorded_identity(tmp_path, f"{proc.pid} {starttime}\n")
+        with pytest.raises(RuntimeError, match="pre-bind boom"):
+            with recorded_children_swept(tmp_path):
+                raise RuntimeError("pre-bind boom")
+        assert proc.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        _reap(proc)
+
+
+def test_recorded_children_swept_warns_past_a_malformed_identity_and_keeps_sweeping(tmp_path):
+    """One unparseable file must not end the sweep, nor get its number signalled.
+
+    Two identities under one root, ordered by task dir so the malformed one is swept
+    FIRST: `t0` holds bytes no parser accepts while a live process sits at that very
+    number, and `t1` holds a valid live identity. The `t1` reap is what proves the
+    loop reached past the failure — asserting only that `t0`'s process survived would
+    pass just as well if the glob had matched nothing at all.
+    """
+    doomed, doomed_start = _live_child()
+    survivor, _survivor_start = _live_child()
+    try:
+        bad = _plant_recorded_identity(tmp_path, f"{survivor.pid} garbage\n", task="t0")
+        _plant_recorded_identity(tmp_path, f"{doomed.pid} {doomed_start}\n", task="t1")
+        with pytest.warns(UserWarning, match="unauthenticated survivor") as record:
+            with pytest.raises(RuntimeError, match="pre-bind boom"):
+                with recorded_children_swept(tmp_path):
+                    raise RuntimeError("pre-bind boom")
+        assert doomed.wait(timeout=10) == -signal.SIGKILL, "the sweep stopped at the bad file"
+        assert survivor.poll() is None, "an unparseable identity must not be signalled"
+        assert str(bad) in _warned_paths(record), _warned_paths(record)
+    finally:
+        _reap(doomed)
+        _reap(survivor)
+
+
+def test_recorded_children_swept_never_signals_a_stale_start_time(tmp_path):
+    """A start-time mismatch refuses the bind — silently, since nothing failed to parse.
+
+    The second, valid identity is the control: it is reaped, so the sweep demonstrably
+    ran and reached these files, which a bare "the stale process is still alive" check
+    could not distinguish from a glob that matched nothing.
+    """
+    stale, stale_start = _live_child()
+    doomed, doomed_start = _live_child()
+    try:
+        _plant_recorded_identity(tmp_path, f"{stale.pid} {int(stale_start) + 1}\n", task="t0")
+        _plant_recorded_identity(tmp_path, f"{doomed.pid} {doomed_start}\n", task="t1")
+        with pytest.raises(RuntimeError, match="pre-bind boom"):
+            with recorded_children_swept(tmp_path):
+                raise RuntimeError("pre-bind boom")
+        assert doomed.wait(timeout=10) == -signal.SIGKILL, "the sweep never reached the files"
+        assert stale.poll() is None, "a start-time mismatch must refuse the bind, not kill"
+    finally:
+        _reap(stale)
+        _reap(doomed)
+
+
+def test_recorded_children_swept_warns_when_the_bind_itself_fails(tmp_path, monkeypatch):
+    """The OSError arm: a parseable identity whose bind raises something that is NOT
+    proven disappearance. Without this row the handler could narrow to AssertionError
+    alone and every other sweeper row would stay green."""
+    proc, starttime = _live_child()
+    try:
+        pid_file = _plant_recorded_identity(tmp_path, f"{proc.pid} {starttime}\n")
+
+        def unsupported(_pid: int) -> int:
+            raise OSError(errno.ENOSYS, "pidfd_open not supported")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "pidfd_open", unsupported)
+            with pytest.warns(UserWarning, match="unauthenticated survivor") as record:
+                with pytest.raises(RuntimeError, match="pre-bind boom"):
+                    with recorded_children_swept(tmp_path):
+                        raise RuntimeError("pre-bind boom")
+        assert str(pid_file) in _warned_paths(record), _warned_paths(record)
+        assert proc.poll() is None, "a failed bind must not fall back to signalling the pid"
+    finally:
+        _reap(proc)
+
+
+def test_recorded_children_swept_warns_past_undecodable_bytes_and_keeps_sweeping(tmp_path):
+    """A non-UTF-8 record raises UnicodeDecodeError out of `read_text`, not
+    AssertionError — a handler listing only parse-shaped types would let it REPLACE
+    the in-flight exception and abandon every later file."""
+    doomed, doomed_start = _live_child()
+    try:
+        bad = tmp_path / ".bmad-loop" / "runs" / "r0" / "tasks" / "t0" / "fake-child.pid"
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_bytes(b"\xff\xfe 123\n")
+        _plant_recorded_identity(tmp_path, f"{doomed.pid} {doomed_start}\n", task="t1")
+        with pytest.warns(UserWarning, match="unauthenticated survivor") as record:
+            with pytest.raises(RuntimeError, match="pre-bind boom"):
+                with recorded_children_swept(tmp_path):
+                    raise RuntimeError("pre-bind boom")
+        assert doomed.wait(timeout=10) == -signal.SIGKILL, "the sweep stopped at the bad file"
+        assert str(bad) in _warned_paths(record), _warned_paths(record)
+    finally:
+        _reap(doomed)
+
+
+def test_recorded_children_swept_keeps_the_original_error_when_warnings_are_errors(tmp_path):
+    doomed, doomed_start = _live_child()
+    try:
+        _plant_recorded_identity(tmp_path, "garbage\n", task="t0")
+        _plant_recorded_identity(tmp_path, f"{doomed.pid} {doomed_start}\n", task="t1")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(RuntimeError, match="pre-bind boom"):
+                with recorded_children_swept(tmp_path):
+                    raise RuntimeError("pre-bind boom")
+        assert doomed.wait(timeout=10) == -signal.SIGKILL, "warning failure stopped the sweep"
+    finally:
+        _reap(doomed)
+
+
+def test_recorded_children_swept_warns_past_signal_failure_and_keeps_sweeping(
+    tmp_path, monkeypatch
+):
+    survivor, survivor_start = _live_child()
+    doomed, doomed_start = _live_child()
+    try:
+        first = _plant_recorded_identity(tmp_path, f"{survivor.pid} {survivor_start}\n", task="t0")
+        _plant_recorded_identity(tmp_path, f"{doomed.pid} {doomed_start}\n", task="t1")
+        real_send_signal = signal.pidfd_send_signal
+        calls = 0
+
+        def fail_first_signal(fd: int, sig: int) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise PermissionError(errno.EPERM, "denied")
+            real_send_signal(fd, sig)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(signal, "pidfd_send_signal", fail_first_signal)
+            with pytest.warns(UserWarning, match="unauthenticated survivor") as record:
+                with pytest.raises(RuntimeError, match="pre-bind boom"):
+                    with recorded_children_swept(tmp_path):
+                        raise RuntimeError("pre-bind boom")
+        assert calls == 2
+        assert str(first) in _warned_paths(record), _warned_paths(record)
+        assert survivor.poll() is None, "failed signalling must not imply disappearance"
+        assert doomed.wait(timeout=10) == -signal.SIGKILL, "signal failure stopped the sweep"
+    finally:
+        _reap(survivor)
+        _reap(doomed)
+
+
+def test_recorded_children_swept_preserves_partial_glob_results(tmp_path, monkeypatch):
+    doomed, doomed_start = _live_child()
+    try:
+        pid_file = _plant_recorded_identity(tmp_path, f"{doomed.pid} {doomed_start}\n")
+        real_glob = Path.glob
+
+        def interrupted_glob(path: Path, pattern: str):
+            if path == tmp_path and pattern == RECORDED_CHILD_GLOB:
+                yield pid_file
+                raise OSError(errno.EIO, "traversal interrupted")
+            yield from real_glob(path, pattern)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "glob", interrupted_glob)
+            with pytest.warns(UserWarning, match="traversal interrupted"):
+                with pytest.raises(RuntimeError, match="pre-bind boom"):
+                    with recorded_children_swept(tmp_path):
+                        raise RuntimeError("pre-bind boom")
+        assert doomed.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        _reap(doomed)
+
+
+def test_recorded_children_swept_is_a_noop_without_identity_files(tmp_path):
+    with pytest.raises(RuntimeError, match="pre-bind boom"):
+        with recorded_children_swept(tmp_path):
+            raise RuntimeError("pre-bind boom")
+
+
+@pytest.mark.parametrize(
+    "surface_name",
+    [
+        "test_e2e_session_timeout_teardown",
+        "test_e2e_detached_writer_reaped_before_worktree_teardown",
+        "test_e2e_detached_writer_publication_fault_still_reaped",
+    ],
+)
+def test_reap_e2e_preflight_failure_prevents_run(tmp_path, monkeypatch, surface_name):
+    run_called = False
+
+    def unsupported() -> None:
+        raise OSError(errno.ENOSYS, "pidfd unavailable")
+
+    def unexpected_run(*_args, **_kwargs):
+        nonlocal run_called
+        run_called = True
+        raise AssertionError("_run must not be reached after preflight failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sys.modules[__name__], "_scaffold_sprint", lambda *_args, **_kwargs: None)
+        patch.setattr(sys.modules[__name__], "preflight_pidfd_support", unsupported)
+        patch.setattr(sys.modules[__name__], "_run", unexpected_run)
+        with pytest.raises(OSError, match="pidfd unavailable"):
+            globals()[surface_name](tmp_path, monkeypatch, False)
+    assert not run_called
+
+
+@pytest.mark.parametrize(
+    "surface_name",
+    [
+        "test_e2e_session_timeout_teardown",
+        "test_e2e_detached_writer_reaped_before_worktree_teardown",
+    ],
+)
+def test_reap_e2e_sweeps_a_recorded_child_when_the_run_fails(tmp_path, monkeypatch, surface_name):
+    """DW-137: a failure anywhere in the pre-bind window must not leak the child.
+
+    Both surfaces spawn their fake child inside `_run` but can only bind a pidfd after
+    the run directory and its `fake-child.pid` are discovered. Driving `_run` straight
+    into a raise reproduces that window exactly; delete either `recorded_children_swept`
+    wrap and the planted child survives this row.
+    """
+    proc, starttime = _live_child()
+    try:
+        _plant_recorded_identity(tmp_path / "sbx", f"{proc.pid} {starttime}\n")
+
+        def failing_run(*_args, **_kwargs):
+            raise RuntimeError("run refused")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(sys.modules[__name__], "_scaffold_sprint", lambda *_a, **_kw: None)
+            patch.setattr(sys.modules[__name__], "_run", failing_run)
+            with pytest.raises(RuntimeError, match="run refused"):
+                globals()[surface_name](tmp_path, monkeypatch, False)
+        assert proc.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        _reap(proc)
+
+
+def test_recorded_children_swept_sweeps_only_the_named_channel(tmp_path):
+    observed, observed_start = _live_child()
+    recorded, recorded_start = _live_child()
+    try:
+        _plant_recorded_identity(
+            tmp_path, f"{observed.pid} {observed_start}\n", filename="observed-child.id"
+        )
+        _plant_recorded_identity(tmp_path, f"{recorded.pid} {recorded_start}\n")
+        with pytest.raises(RuntimeError, match="pre-bind boom"):
+            with recorded_children_swept(tmp_path, glob=OBSERVED_CHILD_GLOB):
+                raise RuntimeError("pre-bind boom")
+        assert observed.wait(timeout=10) == -signal.SIGKILL
+        assert recorded.poll() is None, "the unnamed channel must remain unswept"
+    finally:
+        _reap(observed)
+        _reap(recorded)
+
+
+def test_reap_e2e_sweeps_an_observed_child_when_the_run_fails(tmp_path, monkeypatch):
+    proc, starttime = _live_child()
+    try:
+        _plant_recorded_identity(
+            tmp_path / "sbx", f"{proc.pid} {starttime}\n", filename="observed-child.id"
+        )
+
+        def failing_run(*_args, **_kwargs):
+            raise RuntimeError("run refused")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(sys.modules[__name__], "_scaffold_sprint", lambda *_a, **_kw: None)
+            patch.setattr(sys.modules[__name__], "_run", failing_run)
+            with pytest.raises(RuntimeError, match="run refused"):
+                test_e2e_detached_writer_publication_fault_still_reaped(
+                    tmp_path, monkeypatch, False
+                )
+        assert proc.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        _reap(proc)
+
+
 def _tmux_has_session(name: str) -> bool:
     return subprocess.run(["tmux", "has-session", "-t", name], capture_output=True).returncode == 0
 
 
-def test_e2e_session_timeout_teardown(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "force_live_reap_assertion", [False, True], ids=["reaped", "live-assertion"]
+)
+def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_assertion):
     """#157 end to end through the real binary + real tmux: a dev session wedged
     forever (SessionStart, then sleep — never a Stop) is bounded only by the
     session timeout, and the fix makes that firing timely and observable. The
@@ -847,63 +1728,140 @@ def test_e2e_session_timeout_teardown(tmp_path, monkeypatch):
     # inherited by the `bmad-loop run` subprocess (_run passes no env=)
     monkeypatch.setenv("BMAD_LOOP_SESSION_TIMEOUT_S", "3")
 
-    proc = _run(root, "run", timeout=90)
-    assert proc.returncode == 0, proc.stderr or proc.stdout
+    preflight_pidfd_support()
+    # Initialized BEFORE the try so the finally below stays correct no matter how
+    # early the setup region raises.
+    recorded_fd: int | None = None
+    poll_fd: int | None = None
+    injected_child: subprocess.Popen | None = None
+    poll_failure: AssertionError | None = None
+    injected_exit: int | None = None
+    try:
+        # Everything up to the bind is the pre-bind window: the fake CLI's child is
+        # already running but no fd names it yet, so a `_run` timeout or any assertion
+        # in here would leave it alive and uncleanable. The sweeper rediscovers and
+        # authenticates the recorded identities from disk on the way out.
+        with recorded_children_swept(root):
+            proc = _run(root, "run", timeout=90)
+            assert proc.returncode == 0, proc.stderr or proc.stdout
 
-    run_id = _run_id(root)
-    run_dir = root / ".bmad-loop" / "runs" / run_id
+            run_id = _run_id(root)
+            run_dir = root / ".bmad-loop" / "runs" / run_id
 
-    # (1) session-end status=timeout, journaled promptly, with the fire forensics
-    journal = [
-        json.loads(ln)
-        for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
-        if ln.strip()
-    ]
-    ends = [j for j in journal if j["kind"] == "session-end" and j.get("status") == "timeout"]
-    assert ends, f"no session-end status=timeout: {[j['kind'] for j in journal]}"
-    end = ends[0]
-    assert end.get("fired_at"), end
-    assert end["teardown_s"] < 15.0, f"teardown gap not small (kill hung?): {end['teardown_s']}"
-    assert end.get("expired_clock") in ("monotonic", "wall", "both"), end
-    task_id = end["task_id"]
+            # (1) session-end status=timeout, journaled promptly, with the fire forensics
+            journal = [
+                json.loads(ln)
+                for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+                if ln.strip()
+            ]
+            ends = [
+                j for j in journal if j["kind"] == "session-end" and j.get("status") == "timeout"
+            ]
+            assert ends, f"no session-end status=timeout: {[j['kind'] for j in journal]}"
+            end = ends[0]
+            assert end.get("fired_at"), end
+            assert (
+                end["teardown_s"] < 15.0
+            ), f"teardown gap not small (kill hung?): {end['teardown_s']}"
+            assert end.get("expired_clock") in ("monotonic", "wall", "both"), end
+            task_id = end["task_id"]
 
-    # (2) the fire moment left a timeout-fired breadcrumb, distinct from teardown
-    tdir = run_dir / "tasks" / task_id
-    life = [
-        json.loads(ln)
-        for ln in (tdir / "session-lifecycle.jsonl").read_text(encoding="utf-8").splitlines()
-        if ln.strip()
-    ]
-    assert any(ln.get("event") == "timeout-fired" for ln in life), life
+            tdir = run_dir / "tasks" / task_id
+            pid_file = tdir / "fake-child.pid"
+            assert pid_file.is_file(), "fake CLI never recorded its sleep child"
+            # The fake builds this path from $BMAD_LOOP_RUN_DIR/$BMAD_LOOP_TASK_ID
+            # while the sweeper rediscovers it through RECORDED_CHILD_GLOB. Pin the
+            # two together: a producer-side layout change would otherwise make the
+            # sweeper a silent no-op with every row still green.
+            assert pid_file in set(root.glob(RECORDED_CHILD_GLOB)), (
+                f"{pid_file} is outside RECORDED_CHILD_GLOB ({RECORDED_CHILD_GLOB}), so the "
+                f"pre-bind sweeper could never find it"
+            )
+            recorded_pid, recorded_start = recorded_child(pid_file)
+            recorded_fd = bind_recorded_child(recorded_pid, recorded_start)
+            if recorded_fd is None:
+                assert proc_starttime(recorded_pid) != recorded_start, (
+                    f"bind returned None while pid {recorded_pid} still carries the recorded "
+                    f"start time {recorded_start}: the reap poll would be skipped without evidence"
+                )
 
-    # (3) the wait loop's proof-of-life exists and is recent (not the frozen gap)
-    hb = json.loads((tdir / "heartbeat.json").read_text(encoding="utf-8"))
-    assert time.time() - hb["ts"] < 120, hb
+        poll_pid = recorded_pid
+        if force_live_reap_assertion:
+            # Verify the real fake-CLI child first. If it is still signalable, safely
+            # clean that exact process before substituting the fault-injection child.
+            real_fd, recorded_fd = recorded_fd, None
+            kill_recorded_child(real_fd)
+            injected_child, injected_start = _live_child()
+            poll_pid = injected_child.pid
+            poll_fd = bind_recorded_child(poll_pid, injected_start)
+            assert poll_fd is not None, "the forced-live child must bind before the reap poll"
+        else:
+            poll_fd, recorded_fd = recorded_fd, None
 
-    # (4) teardown actually reaped the session — no orphan tmux session/process
-    assert not _tmux_has_session(f"bmad-loop-{run_id}")
-    if shutil.which("pgrep"):
-        pg = subprocess.run(["pgrep", "-af", "fake-cli.sh"], capture_output=True, text=True)
-        assert not [ln for ln in pg.stdout.splitlines() if str(root) in ln], pg.stdout
-    # The pgrep filter can only see the shell's cmdline; probe the recorded sleep
-    # descendant directly — the escalation force-kills pane-root pids, so a
-    # regression there would leak exactly this child while pgrep stays clean.
-    # Poll briefly: a just-killed child can linger as a zombie (kill 0 succeeds)
-    # until init reaps it after the shell died.
-    pid_file = tdir / "fake-child.pid"
-    assert pid_file.is_file(), "fake CLI never recorded its sleep child"
-    fake_pid = int(pid_file.read_text(encoding="utf-8"))
-    deadline = time.monotonic() + 10
-    while True:
+        # (2) the fire moment left a timeout-fired breadcrumb, distinct from teardown
+        life = [
+            json.loads(ln)
+            for ln in (tdir / "session-lifecycle.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        assert any(ln.get("event") == "timeout-fired" for ln in life), life
+
+        # (3) the wait loop's proof-of-life exists and is recent (not the frozen gap)
+        hb = json.loads((tdir / "heartbeat.json").read_text(encoding="utf-8"))
+        assert time.time() - hb["ts"] < 120, hb
+
+        # (4) teardown actually reaped the session — no orphan tmux session/process
+        assert not _tmux_has_session(f"bmad-loop-{run_id}")
+        if shutil.which("pgrep"):
+            pg = subprocess.run(["pgrep", "-af", "fake-cli.sh"], capture_output=True, text=True)
+            assert not [ln for ln in pg.stdout.splitlines() if str(root) in ln], pg.stdout
+
+        # The identity is a pidfd authenticated against the start time captured at
+        # spawn, so a recycled pid can neither fake a survivor nor receive cleanup.
+        # Signal 0 remains zombie-tolerant: it succeeds until the exact child is reaped.
+        # A just-killed zombie can linger until init runs, and scheduler starvation can
+        # stretch that wait, so use the shared hang ceiling rather than a tight budget;
+        # a merely slow reaper gets more time, while a broken one still fails.
+        with monkeypatch.context() as clock_patch:
+            if force_live_reap_assertion:
+                moments = iter([0.0, REAL_MUX_HANG_CEILING_S])
+                clock_patch.setattr(time, "monotonic", lambda: next(moments))
+            try:
+                deadline = time.monotonic() + REAL_MUX_HANG_CEILING_S
+                while poll_fd is not None:
+                    try:
+                        signal.pidfd_send_signal(poll_fd, 0)
+                    except ProcessLookupError:
+                        break  # dead and reaped — teardown covered the descendant
+                    assert time.monotonic() < deadline, f"sleep child {poll_pid} survived teardown"
+                    time.sleep(0.1)
+            except AssertionError as exc:
+                poll_failure = exc
+                if not force_live_reap_assertion:
+                    raise
+    finally:
         try:
-            os.kill(fake_pid, 0)
-        except ProcessLookupError:
-            break  # dead and reaped — teardown covered the descendant
-        assert time.monotonic() < deadline, f"sleep child {fake_pid} survived teardown"
-        time.sleep(0.1)
+            try:
+                kill_recorded_child(poll_fd)
+                if injected_child is not None:
+                    injected_exit = injected_child.wait(timeout=10)
+            finally:
+                kill_recorded_child(recorded_fd)
+        finally:
+            if injected_child is not None and injected_child.poll() is None:
+                _reap(injected_child)
+
+    if force_live_reap_assertion:
+        assert str(poll_failure).splitlines()[0] == f"sleep child {poll_pid} survived teardown"
+        assert injected_exit == -signal.SIGKILL
 
 
-def test_e2e_detached_writer_reaped_before_worktree_teardown(tmp_path):
+@pytest.mark.parametrize(
+    "force_live_reap_assertion", [False, True], ids=["reaped", "live-assertion"]
+)
+def test_e2e_detached_writer_reaped_before_worktree_teardown(
+    tmp_path, monkeypatch, force_live_reap_assertion
+):
     """#183/#139 end to end: a dev session `setsid`-detaches a straggler into its own
     session (escaping the pane pgid tmux's SIGHUP reaps), then ends CLEANLY via a
     Stop + done spec. The verified-kill reap must chase the harvested descendant tree
@@ -921,13 +1879,51 @@ def test_e2e_detached_writer_reaped_before_worktree_teardown(tmp_path):
             "[limits]\nmax_dev_attempts = 1\nteardown_grace_s = 10\n"
         ),
     )
-    detached_pid: int | None = None
+    preflight_pidfd_support()
+    # Initialized BEFORE the try so the finally below stays correct no matter how
+    # early the setup region raises.
+    recorded_fd: int | None = None
+    poll_fd: int | None = None
+    injected_child: subprocess.Popen | None = None
+    poll_failure: AssertionError | None = None
+    injected_exit: int | None = None
     try:
-        proc = _run(root, "run", timeout=120)
-        assert proc.returncode == 0, proc.stderr or proc.stdout
+        # The pre-bind window: the setsid'd straggler exists but no fd names it until
+        # the glob below finds its identity file, so a `_run` timeout or a missing
+        # record used to leak it. The sweeper covers exactly that stretch.
+        with recorded_children_swept(root):
+            proc = _run(root, "run", timeout=120)
+            assert proc.returncode == 0, proc.stderr or proc.stdout
 
-        run_id = _run_id(root)
-        run_dir = root / ".bmad-loop" / "runs" / run_id
+            run_id = _run_id(root)
+            run_dir = root / ".bmad-loop" / "runs" / run_id
+            pid_files = list((run_dir / "tasks").glob("*/fake-child.pid"))
+            assert pid_files, "fake CLI never recorded its setsid child"
+            # Same producer/consumer pin as the timeout E2E above.
+            assert pid_files[0] in set(root.glob(RECORDED_CHILD_GLOB)), (
+                f"{pid_files[0]} is outside RECORDED_CHILD_GLOB ({RECORDED_CHILD_GLOB}), so the "
+                f"pre-bind sweeper could never find it"
+            )
+            recorded_pid, recorded_start = recorded_child(pid_files[0])
+            recorded_fd = bind_recorded_child(recorded_pid, recorded_start)
+            if recorded_fd is None:
+                assert proc_starttime(recorded_pid) != recorded_start, (
+                    f"bind returned None while pid {recorded_pid} still carries the recorded "
+                    f"start time {recorded_start}: the reap poll would be skipped blind"
+                )
+
+        poll_pid = recorded_pid
+        if force_live_reap_assertion:
+            # Verify or safely clean the real straggler before the injected child takes
+            # over the protected poll; keep the two identities distinct throughout.
+            real_fd, recorded_fd = recorded_fd, None
+            kill_recorded_child(real_fd)
+            injected_child, injected_start = _live_child()
+            poll_pid = injected_child.pid
+            poll_fd = bind_recorded_child(poll_pid, injected_start)
+            assert poll_fd is not None, "the forced-live child must bind before the reap poll"
+        else:
+            poll_fd, recorded_fd = recorded_fd, None
 
         # (1) clean end: the story landed done and merged, not a timeout/stall
         assert _sprint_status(root, story) == "done"
@@ -950,25 +1946,196 @@ def test_e2e_detached_writer_reaped_before_worktree_teardown(tmp_path):
         mounts = [ln for ln in wt.stdout.splitlines() if ln.startswith("worktree ")]
         assert len(mounts) == 1, wt.stdout  # only the primary checkout remains
 
-        # (4) the detached straggler was reaped within the grace: kill-0 -> gone.
-        pid_files = list((run_dir / "tasks").glob("*/fake-child.pid"))
-        assert pid_files, "fake CLI never recorded its setsid child"
-        detached_pid = int(pid_files[0].read_text(encoding="utf-8").strip())
-        deadline = time.monotonic() + 10
-        while True:
+        # (4) poll the start-time-authenticated pidfd. Signal 0 preserves the old
+        # alive-or-zombie semantics, while the bound identity cannot follow pid reuse.
+        # A zombie can linger until init runs and a starved scheduler can stretch that
+        # wait, so the shared hang ceiling remains deliberately distinct from the 10s
+        # teardown_grace_s; a reap that never happens still fails at the ceiling.
+        with monkeypatch.context() as clock_patch:
+            if force_live_reap_assertion:
+                moments = iter([0.0, REAL_MUX_HANG_CEILING_S])
+                clock_patch.setattr(time, "monotonic", lambda: next(moments))
             try:
-                os.kill(detached_pid, 0)
-            except ProcessLookupError:
-                break  # reaped by the descendant sweep before teardown
-            assert time.monotonic() < deadline, f"detached child {detached_pid} survived teardown"
-            time.sleep(0.1)
+                deadline = time.monotonic() + REAL_MUX_HANG_CEILING_S
+                while poll_fd is not None:
+                    try:
+                        signal.pidfd_send_signal(poll_fd, 0)
+                    except ProcessLookupError:
+                        break  # reaped by the descendant sweep before teardown
+                    assert (
+                        time.monotonic() < deadline
+                    ), f"detached child {poll_pid} survived teardown"
+                    time.sleep(0.1)
+            except AssertionError as exc:
+                poll_failure = exc
+                if not force_live_reap_assertion:
+                    raise
     finally:
-        # never leak the detached sleep if the test fails before the reap check
-        if detached_pid is not None:
+        try:
             try:
-                os.kill(detached_pid, signal.SIGKILL)
-            except OSError:
-                pass
+                kill_recorded_child(poll_fd)
+                if injected_child is not None:
+                    injected_exit = injected_child.wait(timeout=10)
+            finally:
+                kill_recorded_child(recorded_fd)
+        finally:
+            if injected_child is not None and injected_child.poll() is None:
+                _reap(injected_child)
+
+    if force_live_reap_assertion:
+        assert str(poll_failure).splitlines()[0] == (f"detached child {poll_pid} survived teardown")
+        assert injected_exit == -signal.SIGKILL
+
+
+@pytest.mark.parametrize(
+    "force_live_reap_assertion", [False, True], ids=["reaped", "live-assertion"]
+)
+def test_e2e_detached_writer_publication_fault_still_reaped(
+    tmp_path, monkeypatch, force_live_reap_assertion
+):
+    """DW-149: failed identity publication still permits exact-child reap attribution.
+
+    The test owns a separate observer record, so it can grade child death and the
+    straggler-reap breadcrumb despite the normal recorder's demonstrated failure.
+    """
+    root = tmp_path / "sbx"
+    story = "1-1-pubfault"
+    _scaffold_sprint(
+        root,
+        story,
+        fake_cli=PUBLICATION_FAULT_FAKE_CLI,
+        extra_policy=(
+            '\n[scm]\nisolation = "worktree"\n\n'
+            "[limits]\nmax_dev_attempts = 1\nteardown_grace_s = 10\n"
+        ),
+    )
+    preflight_pidfd_support()
+    # Initialized BEFORE the try so the finally below stays correct no matter how
+    # early the setup region raises.
+    recorded_fd: int | None = None
+    poll_fd: int | None = None
+    injected_child: subprocess.Popen | None = None
+    poll_failure: AssertionError | None = None
+    injected_exit: int | None = None
+    try:
+        # Sweep the channel this fake actually publishes before any fd owns it.
+        with recorded_children_swept(root, glob=OBSERVED_CHILD_GLOB):
+            proc = _run(root, "run", timeout=120)
+            assert proc.returncode == 0, proc.stderr or proc.stdout
+
+            run_id = _run_id(root)
+            run_dir = root / ".bmad-loop" / "runs" / run_id
+            pid_files = list(root.glob(OBSERVED_CHILD_GLOB))
+            assert len(pid_files) == 1, f"expected exactly one observation record: {pid_files}"
+            tdir = pid_files[0].parent
+            assert tdir.parent == run_dir / "tasks"
+            assert (tdir / "fake-child.pid.tmp").is_dir(), "publication poison is missing"
+            assert not set(
+                root.glob(RECORDED_CHILD_GLOB)
+            ), "normal publication unexpectedly succeeded"
+            assert not list(run_dir.rglob("fake-child.pid"))
+
+            # Persisted evidence of the actual invocation: an unexecuted recorder
+            # with a poison directory and an absent record must not satisfy the row.
+            recorder_status = int((tdir / "recorder.status").read_text(encoding="utf-8"))
+            recorder_stderr = (tdir / "recorder.stderr").read_text(encoding="utf-8")
+            assert recorder_status != 0, "publication recorder did not fail"
+            assert (
+                f"{tdir / 'fake-child.pid.tmp'}: Is a directory" in recorder_stderr
+            ), f"publication recorder did not hit the poisoned directory: {recorder_stderr!r}"
+            recorded_pid, recorded_start = recorded_child(pid_files[0])
+            recorded_fd = bind_recorded_child(recorded_pid, recorded_start)
+            if recorded_fd is None:
+                assert proc_starttime(recorded_pid) != recorded_start, (
+                    f"bind returned None while pid {recorded_pid} still carries the recorded "
+                    f"start time {recorded_start}: the reap poll would be skipped blind"
+                )
+
+        poll_pid = recorded_pid
+        if force_live_reap_assertion:
+            # Verify or safely clean the real straggler before the injected child takes
+            # over the protected poll; keep the two identities distinct throughout.
+            real_fd, recorded_fd = recorded_fd, None
+            kill_recorded_child(real_fd)
+            injected_child, injected_start = _live_child()
+            poll_pid = injected_child.pid
+            poll_fd = bind_recorded_child(poll_pid, injected_start)
+            assert poll_fd is not None, "the forced-live child must bind before the reap poll"
+        else:
+            poll_fd, recorded_fd = recorded_fd, None
+
+        # (1) clean end: the story landed done and merged, not a timeout/stall
+        assert _sprint_status(root, story) == "done"
+        journal = [
+            json.loads(ln)
+            for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        kinds = [j["kind"] for j in journal]
+        assert "unit-merged" in kinds, kinds
+        # (2) the #139 failure signature is ABSENT — the worktree teardown was clean
+        assert "worktree-teardown-degraded" not in kinds, kinds
+
+        # (3) no unit worktree survives (git sees only the main checkout)
+        wt = subprocess.run(
+            ["git", "-C", str(root), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+        )
+        mounts = [ln for ln in wt.stdout.splitlines() if ln.startswith("worktree ")]
+        assert len(mounts) == 1, wt.stdout  # only the primary checkout remains
+
+        # (4) poll the start-time-authenticated pidfd. Signal 0 preserves the old
+        # alive-or-zombie semantics, while the bound identity cannot follow pid reuse.
+        # A zombie can linger until init runs and a starved scheduler can stretch that
+        # wait, so the shared hang ceiling remains deliberately distinct from the 10s
+        # teardown_grace_s; a reap that never happens still fails at the ceiling.
+        with monkeypatch.context() as clock_patch:
+            if force_live_reap_assertion:
+                moments = iter([0.0, REAL_MUX_HANG_CEILING_S])
+                clock_patch.setattr(time, "monotonic", lambda: next(moments))
+            try:
+                deadline = time.monotonic() + REAL_MUX_HANG_CEILING_S
+                while poll_fd is not None:
+                    try:
+                        signal.pidfd_send_signal(poll_fd, 0)
+                    except ProcessLookupError:
+                        break  # reaped by the descendant sweep
+                    assert (
+                        time.monotonic() < deadline
+                    ), f"detached child {poll_pid} survived teardown"
+                    time.sleep(0.1)
+            except AssertionError as exc:
+                poll_failure = exc
+                if not force_live_reap_assertion:
+                    raise
+
+        # (5) Require attribution to this exact child. kill-escalated identifies
+        # pane roots and cannot prove the observed descendant was reaped.
+        lifecycle = [
+            json.loads(line)
+            for line in (tdir / "session-lifecycle.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert any(
+            event.get("event") == "straggler-reap" and recorded_pid in event.get("pids", [])
+            for event in lifecycle
+        ), f"no straggler-reap names observed child {recorded_pid}: {lifecycle}"
+    finally:
+        try:
+            try:
+                kill_recorded_child(poll_fd)
+                if injected_child is not None:
+                    injected_exit = injected_child.wait(timeout=10)
+            finally:
+                kill_recorded_child(recorded_fd)
+        finally:
+            if injected_child is not None and injected_child.poll() is None:
+                _reap(injected_child)
+
+    if force_live_reap_assertion:
+        assert str(poll_failure).splitlines()[0] == (f"detached child {poll_pid} survived teardown")
+        assert injected_exit == -signal.SIGKILL
 
 
 def test_e2e_sweep_intent_gap_patch_restore(tmp_path):

@@ -25,6 +25,8 @@ from textual.widgets.option_list import Option
 from textual.widgets.tree import TreeNode
 
 from .. import policy
+from ..escalation import display_pause_reason
+from ..journal import UNREADABLE_LINE_KIND
 from ..model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_ESCALATION,
@@ -226,7 +228,7 @@ class RunHeader(Static):
                 text.append("  ")
                 text.append(f"[{label}]", style=f"bold {badge_style}")
             if state.paused_reason:
-                text.append(f" — {state.paused_reason}", style="yellow")
+                text.append(f" — {display_pause_reason(state)}", style="yellow")
             # p opens the stage-appropriate review viewer; e resumes; R resolves
             # an escalation (the header only hints the common paths).
             text.append("\n  press p to review · e to resume", style="dim")
@@ -256,6 +258,12 @@ class RunHeader(Static):
 
 
 # ------------------------------------------------------------ journal lines
+
+# Applied by EQUALITY, before the substring table below runs — see
+# `journal.UNREADABLE_LINE_KIND` for why. The detail local to this file: four PRODUCER
+# kinds end in "-unreadable" (`story-gate-unreadable`, `stories-manifest-unreadable`, …),
+# so any substring rule here would restyle them too.
+_UNREADABLE_LINE_STYLE = "red"
 
 # kind substrings -> style, first match wins; anything else renders dim
 _JOURNAL_STYLES = (
@@ -289,7 +297,10 @@ _JOURNAL_COL_PAD = 1  # per-column right pad in the row grid
 
 def journal_line(entry: dict[str, Any]) -> Table:
     kind = str(entry.get("kind", "?"))
-    style = next((s for sub, s in _JOURNAL_STYLES if sub in kind), "dim")
+    if kind == UNREADABLE_LINE_KIND:
+        style = _UNREADABLE_LINE_STYLE
+    else:
+        style = next((s for sub, s in _JOURNAL_STYLES if sub in kind), "dim")
     ts = entry.get("ts")
     clock = ""
     if isinstance(ts, (int, float)):

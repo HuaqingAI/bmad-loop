@@ -7,17 +7,157 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-09-20
+
 ### Added
 
+- Restore and normalize attempt-owned specs on Windows through NT handle-relative
+  opens instead of pausing for manual adoption. `win32_at` binds `NtCreateFile` with a
+  `RootDirectory` handle plus `FileRenameInformationEx`/`FileDispositionInformationEx`
+  (POSIX semantics, classic classes as the fallback) and refuses a symlink or junction
+  as `O_NOFOLLOW` refuses a link; `platform_util.HANDLE_ANCHORED_WRITES` joins that arm
+  to the POSIX `dir_fd` one behind `open_at`/`stat_at`/`replace_at`/`unlink_at`, so the
+  confined spec writers and `open_dir_confined` anchor at a handle on both hosts. The
+  DW-309/DW-310 refusal now fires only on a host with neither arm; its journaled
+  `problem` reads `lacks handle-anchored writes`.
+
+- Accept a session-asserted artifact-only sweep bundle at the dev proof-of-work gate
+  (DW-273). A bundle whose only deliverable lives under a gitignored
+  `implementation_artifacts` (a spec-only erratum) burned every attempt on
+  `no changes in worktree since baseline commit`. The bundle dev session may assert
+  `Artifact only: true` in its `## Auto Run Result` marker (`Artifact only`,
+  `artifact_only` or `Artifact-only` — at least one separator between the words, so
+  the fused `Artifactonly` asserts nothing), and `verify_dev_bundle` —
+  the bundle path alone — then accepts ignored entries under the artifacts dir once
+  the ordinary probe found nothing, journaling `bundle-artifact-only-accepted`. Only
+  artifacts this attempt created or changed count; residue that predates the attempt
+  or cannot be measured refuses the receipt, and a fault taking the attempt's
+  snapshot degrades to `bundle-artifact-baseline-unavailable` with the attempt still
+  driven. Under `scm.isolation = "worktree"` the accepted ignored spec and its
+  declared `artifact_deliverables` are published to the main checkout before the
+  success teardown (DW-283); undeclared ignored residue is not copied. The review
+  gate's every-id-`done` check is unchanged.
+
+- Announce a ledger publish that publishes nothing (`sweep-ledger-commit-clean`), for every
+  outcome that publishes nothing. An ignored path reads clean, so a project
+  that gitignores its `implementation_artifacts` skipped every ledger commit with no
+  journal row at all (DW-191).
+
+- Name the published file on every `_commit_ledger` journal row with a `file` field —
+  the lexical basename, never the resolved symlink target's name — so a scrubbed
+  `bmad-loop diagnose` dump still says which of the two published files went
+  uncommitted, where `repo`, `message` and `error` all collapse to presence booleans
+  (DW-192).
+
+- Write each repeat-loop stop's token as a closed-slug `stop_cause` beside
+  `sweep-repeat-done`'s existing `reason`, so a diagnostics dump tells the five stops
+  apart instead of rendering one `reason_present` boolean (DW-201).
+
+- Declare a journal schema for the five sweep kinds `bmad-loop diagnose` prints as a JSON
+  block in the default Markdown dump (`sweep-ledger-commit`, `-clean`, `-refused`,
+  `-unavailable`, `sweep-repeat-done`), so a field a future producer adds without
+  routing collapses to `<name>_present` instead of riding the generic scrub into the
+  pasted block.
+
+- Give each declared journal `**splat` hole a COUNT of the unresolved `**` keyword
+  arguments it holds — not write calls, so `append(kind, **a, **b)` counts 2 — and a
+  second unresolvable splat inside an already-declared position now reddens instead of
+  being waived on arrival, whether it arrives as a new call or as a second `**` on an
+  existing one; the field inventory moves to a sibling `JOURNAL_SPLAT_FIELDS` table
+  (DW-150).
+
+- Enforce the bare-function-name key the five journal position tables rest on: the
+  scan emits each journal write's enclosing def identity and a guard reddens if one
+  module ever holds two same-named journal-writing functions. The property is exactly a
+  pair of WRITERS, which is what the four position tables need — not full name safety
+  for the fifth, `JOURNAL_FORWARDERS`, whose row makes any call to that name in that
+  file read as a journal write, so a same-named twin that never journals still routes
+  its callers' keywords into the field inventory and, emitting nothing, stays invisible
+  to the guard. Qualifying those keys to `class.method` stays deliberately deferred;
+  the guard is what makes the writer-pair half of that deferral safe (DW-152).
+
+- Grade the real harvest exclusion producer through the stories plan-halt observation (DW-153).
+
+- Name the three harvest exclusion grading rows in the producer docstring (DW-154).
+
+- Grade the real harvest exclusion producer through the sweep bundle proof-of-work gate (DW-168).
+
+- Correct the harvest exclusion docstring to name both `repo_root` override shapes (DW-169).
+
+- Prove real-tmux teardown reaps the exact detached child after identity publication fails (DW-149).
+
+- Pin dynamically generated journal kind spellings in `recovery_flow` and detect
+  renames independently of write counts (DW-151).
+
+- **The accepted-park arm's `_harvest_gate_exclude` join is now graded engine-side**
+  (DW-139). `tests/test_verify.py::test_verify_dev_park_zero_diff_excludes_the_orchestrators_own_writes`
+  hand-spells its `engine_written`, so the producer is never invoked and re-rooting it
+  left that row green. `tests/test_engine.py` gains
+  `test_accepted_park_observation_excludes_the_nested_ledger_under_the_monorepo_shape`,
+  driving an asserted park through `Engine._verify_dev_artifacts` under the nested
+  monorepo shape — where the orchestrator's own append to the NESTED ledger is the only
+  unexcluded residue and a `project`-rooted spelling silently names the outer project's
+  real ledger. Its control trips the producer's stand-down disjunct through the same
+  join, so `park_zero_diff is True` is attributable to the pathspec.
+
+- **The `_usage` stash is now pinned to survive teardown** (DW-129) — the invariant
+  DW-117's cap placement rests on, since `read_usage(result)` runs after `run()`/`kill()`
+  return. `tests/test_opencode_http.py` gains a row that stashes a session's usage,
+  drives a real `kill()` -> `_teardown()` (nothing stubbed) over a live child process and
+  a real log handle, and asserts `read_usage` still resolves that session id. Until now
+  the invariant was only observed incidentally, by three fake-binary E2E rows that happen
+  to read usage after teardown; this one pins it directly at the kill seam.
+
+- **Verify-command seam coverage for the legs the earlier passes left unpinned**
+  (DW-55). `tests/test_verify.py` gains a row driving all three exits of
+  `run_verify_commands`' loop body — completed, timed out, never spawned — in a single
+  call with a further command after each fault, so the timeout arm's `continue` is
+  load-bearing and the two "no exit status" sentinels (`-1` vs `SPAWN_FAULT_RC`) are
+  shown to stay distinguishable when the legs occur together. `tests/test_cli.py` gains
+  three rows calling `cli._reverify` directly with a two-command policy: the first pins
+  that `env_fault_reason` is read ahead of the return code and that a later offender is
+  never what the operator is shown, the second pins the same for an ordinary failure,
+  and an all-green control keeps their absence assertions honest.
+
+- **A fresh mount that supersedes an accepted-but-uncommitted spec now journals
+  `accepted-spec-write-unreachable`** (DW-101). The `pause_after_spec` gate hands the
+  operator a spec that is uncommitted by construction; a re-drive's worktree is a
+  checkout of a commit, so for a tracked artifacts dir it delivers the pre-approval
+  bytes and the existing delivery probe passes on existence alone. The mount's copy is
+  now byte-compared against the main checkout's, and a difference — or a read that
+  fails, recorded as `compared: false` — is journalled with the main-checkout spec path
+  and the target branch to commit it on. Advisory only: the record refuses nothing,
+  pauses nothing and overwrites nothing.
+
+- **A mount that cannot be shown to carry the accepted spec at all now journals
+  `accepted-spec-delivery-unreachable`** (DW-104, DW-115). Fires only for a spec the
+  task already spells project-relative — the spelling a resume persists, and the one
+  leg with no escalating guard above it — when the mounted parent escapes the
+  worktree, or the spec could not be resolved at all (a swallowed filesystem fault,
+  or a spelling that no longer resolves). Carries the main-checkout spec path, the
+  target branch, and `located`, a bare boolean saying which of the two silences it
+  ended: `true` the spec was resolved and the mount could not be shown to carry it,
+  `false` the spec itself could not be resolved. Advisory only: nothing reads it as a
+  gate, and the relocated leg still escalates instead of recording.
+- **Target deferred-work sweeps.** `bmad-loop sweep --only DW-1,DW-3` selects an
+  exact open-id set, while `--min-severity low|medium|high|critical` selects the
+  named severity and higher. Selection happens before triage, bundle formation,
+  and `--max-bundles`; dry-run and resume preserve the same contract, excluded
+  and missing-severity ids are journaled, and selectors are incompatible with
+  each other and with archive mode. Named dry-runs over mixed legacy ledgers
+  project and label provisional post-migration ids, while real runs revalidate
+  after semantic duplicate merging assigns the actual universe.
+
 - **Journal-kind and refusal-site coverage gates.** `tests/test_portability_guard.py` gains
-  three enumerate-vs-declare inventories: the 204 literal journal kinds (`JOURNAL_KINDS`,
+  three enumerate-vs-declare inventories: the literal journal kinds (`JOURNAL_KINDS`,
   fed by a literal-kind emit that also sees kind-only writes, constructor-inline
   `Journal(run_dir).append(...)` writes — a receiver spelling the journal scan was blind
   to — and every literal reaching a declared dynamic-kind position, by keyword, by
-  POSITION, or as the parameter default; a `kind` argument such a position cannot read —
-  a variable, or a `*args` splat over the slot — fails loud rather than passing as "no
-  literal here", which is the one way an undeclared kind could still reach the journal
-  with the inventory green), the `_refuse_*`/`_reject_*` helper definitions counted with
+  POSITION, through a `**` splat, or as the parameter default; a `kind` argument such a
+  position cannot read — a variable, a `*args` splat over the slot, or a `**` splat the
+  scan cannot read into — fails loud rather than passing as "no literal here", which is
+  the one way an undeclared kind could still reach the journal with the inventory
+  green), the `_refuse_*`/`_reject_*` helper definitions counted with
   multiplicity (`REFUSAL_HELPER_DEFS`), and the eleven #414-family isolation-refusal call
   sites counted with multiplicity (`ISOLATION_CONFLICT_CALLERS`). A new kind, refusal
   helper, or refusal call site reddens CI until its row lands; the row is the PR-time
@@ -83,7 +223,7 @@ breaking changes may land in a minor release.
 - **`bmad-loop sweep --archive`** moves closed (`status: done <ISO date>`) deferred-work entries to
   a sibling `deferred-work-archive.md`, replacing each with a stub that preserves the DW- id for
   grep and `closes_deferred` cross-references plus the load-bearing field lines (`gate:`,
-  `origin:`/`source_spec:`, reopenable-close undo markers). The live ledger then carries open
+  `origin:`/`source_spec:`, live `severity:`/`priority:`, reopenable-close undo markers). The live ledger then carries open
   entries in full and archived ones as compact stubs, rather than every closed body forever.
   Supports `--before DATE` to archive only entries closed before a cutoff, and `--dry-run` to
   preview. Reopening an archived stub leaves an `archived-body:` line pointing at the archive
@@ -106,6 +246,56 @@ breaking changes may land in a minor release.
 ### Changed
 
 - Register this fork as the collision-free `huaqing-bmad-loop` custom BMAD module so URL-backed custom-source installs and Quick Updates retain the fork, and make `/bmad-loop-setup` reinstall the orchestrator from the exact manifest URL or local path instead of falling back to the official repository.
+
+- Organize decision-answer and publication documentation into navigable operator sections
+  for stale answers, store validation, publication refusals and recovery (DW-240).
+
+- Display scrubbed sweep publication and repeat-stop details in the default Markdown diagnostic report.
+
+- Pin the real-tmux xdist grouping guard at EXACT per-module gated-def counts instead of
+  floors: `_EXPECTED_E2E_FLOORS` becomes `_EXPECTED_E2E_DEF_COUNTS` and the assertion is
+  equality, so adding a tmux-gated def now fails the guard just as deleting one does
+  rather than letting the pin silently start trailing again (DW-173).
+
+- Grade `tests/test_stories_e2e.py`'s own module-level AST for the detach-ceiling splice:
+  a third `tests/test_conftest.py` scanner requires the `detach_ack_ceiling_s=` fragment
+  to be followed by `int(<conftest REAL_MUX_HANG_CEILING_S>)` under either import form,
+  with a named expected-site inventory that fails a scan finding nothing. A hardcoded
+  `90` renders byte-identically to the splice and passed the existing rendered-text
+  assert unnoticed; `_run_detach_gate`'s deliberately varying in-def budget stays out of
+  scope because the scan is module-level only (DW-174).
+
+- **The deferred-work ledger-read contract is settled repo-wide** (DW-146).
+  `deferredwork` now owns both arms as named readers — `read_for_write` (repair/write:
+  absence is `None`, OS metadata/text-read faults raise `LedgerReadFault`
+  with the original `OSError` chained (DW-279), undecodable bytes raise
+  `LedgerReadError` with the codec error chained) and `read_for_observation`
+  (observation: never raises, degrading to an empty text plus an attributed fault) —
+  documented once in the module docstring alongside the advisory pre-lock probes that
+  are neither arm. Every deferred-work ledger read in `src/bmad_loop` now names its
+  arm or carries a comment classifying it. Three sites change behavior:
+  `decisions.pending_missed_decisions` no longer aborts `bmad-loop decisions` and
+  `bmad-loop status` on a ledger that is not valid UTF-8, `sweep --dry-run` refuses
+  such a ledger with an attributed `error:` naming the file instead of an anonymous
+  traceback (never a fabricated empty listing), and `verify.verify_review_bundle`
+  plus the TUI's deferred pane reach their existing degrade arms for it. Pre-lock
+  presence probes, lock acquisition and writes retain raw `OSError`; authoritative
+  reads now distinguish OS faults through `LedgerReadFault` (DW-279).
+  Observation sites degrade on OS faults as well as on undecodable bytes, so an
+  `OSError` that used to escape `decisions.pending_missed_decisions` or abort
+  `sweep --dry-run` with a bare traceback now yields an empty result or an
+  attributed `error:` instead. The observation arm probes with `stat` + `S_ISREG`
+  inside its own guard (DW-254), so a metadata refusal — `EACCES` on every
+  supported interpreter, Python 3.14 included — becomes an attributed fault;
+  only `ENOENT`/`ENOTDIR` and a present non-regular file still mean absence, and a
+  symlink loop at the ledger is an attributed fault rather than a clean empty
+  read. A ledger that goes undecodable while a
+  decision prompt is open still names the decision that did not land — in
+  `bmad-loop decisions` and in the TUI's decision modal, which keeps degrading to a
+  per-decision toast instead of taking the dashboard down. And a sweep whose ledger
+  cannot be read at a graceful stop journals `sweep-remaining-estimate-unreadable`
+  next to the `run-stop` row, so a withheld estimate says why it was withheld.
+
 - **`bmad-loop diagnose --json` reports `schema_version: 4`.** Journal `path` values
   become `path_present`; stale-restore and merge filename lists become counts.
 
@@ -290,6 +480,1281 @@ breaking changes may land in a minor release.
   previously-loading config.
 
 ### Fixed
+
+- Bound the GitHub release body `scripts/release.py publish` sends at GitHub's
+  125,000-character limit, cutting at an entry boundary and linking the full
+  `CHANGELOG.md` section. An oversize section was rejected with HTTP 422 only after
+  `gh release create` had pushed the tag, stranding a tag with no release that the
+  next publish then treated as already published. `prepare` warns when a section
+  will be truncated.
+
+- Bind legacy migration dispatch and publication to the ledger bytes actually accepted
+  (DW-311, DW-316). Retire stale recovery authority when the ledger changes before
+  the true post-hook adapter-launch boundary, then publish a validated one-path,
+  clean-filter-normalized candidate through a prepared expected-old transaction on
+  the captured terminal direct branch. Resolve lost commit acknowledgements by
+  deterministic replay, and reconcile the target index against bounded stable checkout
+  observations while preserving unrelated stages. An absent committed target is accepted
+  only when the baseline commit proves the ledger was never tracked: a ledger a rival
+  commit deleted after the baseline was taken refuses publication instead of being
+  silently re-added on top of that commit, the committed twin of the staged deletion
+  the publisher already refuses; a ledger the transition itself published that a later
+  commit removed refuses its replay the same way. The candidate carries the live ledger's
+  own bytes, read once they are proven to decode to the accepted text, so the committed
+  blob is what `git add` of the validated file stages under any line-ending configuration
+  and a CRLF checkout is not left dirty beside an LF commit; every later validation
+  re-reads those bytes and holds the target's size, mtime and ctime with its inode, so a
+  rewrite in place — rival bytes, or the same text under other line endings — is refused
+  before the transaction commits rather than noticed after it. The baseline's identity
+  is the blob its commit holds, bound to the baseline text under the ledger readers'
+  universal-newline decoding, rather than the LF blob re-encoding that text names: a
+  tracked legacy ledger Git preserves with CRLF bytes (`core.autocrlf=false`, the
+  shape every Windows-written ledger takes) was refused as rival content and left the
+  migration in COMMITTING for good.
+
+- Refuse no-descriptor attempt-owned spec restoration before staging or lifecycle
+  normalization, preserving the existing target bytes for manual recovery (DW-310).
+
+- Fail closed after no-descriptor attempt-owned spec publication and pause for
+  manual adoption instead of trusting a path-based readback (DW-309).
+
+- Refuse attempt-owned spec recovery when final prepublication validation observes an
+  existing target was edited in place, preserving the competing bytes (DW-308).
+
+- Restore the accepted commit chain and index when the post-squash HEAD identity
+  probe fails, retaining the probe fault if rollback also fails (DW-305).
+
+- Preserve accepted tracked artifact identities through target merge, squash,
+  fast-forward, hooks, and crash replay; snapshot the complete target transaction
+  into aggregate-limited streamed sidecars, preserve exact index/worktree and
+  cleanup-phase state, and refuse drift with verified, retained-source recovery
+  when ref, index, worktree, ignored-path, topology, or submodule evidence is unsafe
+  (DW-302/DW-303). The incoming paths are held to the integrated commit too — a
+  target hook's rewrite of an ordinary incoming source file, staged, left in the
+  checkout, or sealed into the squash leg's own commit, is refused and restored
+  rather than recorded as `unit-merged`; so is an incoming path the unit deletes
+  that a target hook recreates unstaged, which no index reading can see; and so
+  is any change a target hook leaves outside every receipt-owned set — a clean
+  tracked file edited, staged, deleted or renamed, a new file written beside it
+  — which a whole-tree reading names (after the hooks the target may hold only
+  the strays the guard tolerated before the merge), the orchestrator's own
+  `.bmad-loop/` included — the hook relay script, a committed `policy.toml`,
+  a profile overlay — with only the run's own records left out, and the
+  pre-merge guard tolerating or blocking a stray there on the same terms as
+  any other (and cleaning one the unit's commit also changes: the cleanup
+  re-read the tree without `.bmad-loop/`, so a planned path there was
+  "missing" and every attempt refused before its merge, and again on each
+  resume) — and a hook's `update-index --assume-unchanged` on a clean
+  tracked file outside the incoming set, which status never lists, is
+  refused by the receipt's digest of every other index entry's flag word
+  and named from its map of the marked ones — and a hook's overwrite of a
+  file the index already trusted unread when the receipt was armed
+  (assume-unchanged or skip-worktree), which moves no word, no blob and no
+  status or diff reading, is refused by the receipt's `lstat` identity of
+  that file, the way an ignored file's overwrite is (a rename's source is incoming
+  too — `diff --name-only` had named the destination alone — so a renaming
+  bundle is not refused over the entry its merge deletes), and a hook's
+  gitignored write anywhere — beside an incoming path in a directory the
+  target already held populated, which no reading listed, over an
+  ignored file that was already there, which leaves the path set unchanged
+  and `status` and `diff` silent, or its deletion of one, which they are as
+  silent about — is refused by the receipt's sealed
+  listing of the whole tree's ignored entries, each with its `lstat`
+  identity (a sidecar under the operation's capture root; bytes never
+  read; a tolerated stray an incoming `.gitignore` change turned ignored
+  left out, and an entry beneath an incoming path git's own write clobbered;
+  the refused receipt's residue reading skips the recorded side, so
+  deleting a named rewrite clears it and a named removal is the operator's
+  to weigh before resuming) and named — a listing that also walks
+  the tree for every nested `.git` entry, which git lists in no reading at
+  all, so a hook's `git init` beneath a populated tracked directory, or a
+  repository it puts in an ignored one, is refused the same way (each
+  repository boundary one entry; the `.git` of a checkout the submodule
+  reading accepts at a gitlink the unit introduced tolerated) — and a
+  hook's write a captured populated submodule's own `.gitignore` covers,
+  which that listing never descends to, the checkout reading never asked
+  for, and the superproject's `status` never reports, is refused by the
+  listing the receipt seals of each such checkout's ignored entries beside
+  its HEAD — into a submodule the unit leaves alone, one whose gitlink it
+  rewrites, or the leftover git could not remove, the unit's own paths
+  written into a replaced leftover left out, and a `.bmad-loop/` the
+  checkout's own rules ignore read like any other path there (the run's
+  records are the target's alone, left out of the target's listing only);
+  a hook's plain write into a captured checkout the unit leaves alone —
+  which the superproject's `status` reports only as `submodule.<name>.ignore`
+  allows, and a tracked `.gitmodules` setting `dirty` or `all` to quiet
+  that noise hid from every whole-tree reading — is refused by the
+  checkout's own `status`, the reading the capture required empty, and the
+  restore's own;
+  an untracked nested repository in the target — the one entry `status`
+  still collapses, `vendor/` — is tolerated as `vendor` and passed over by
+  the capture, its `.git` and every entry of its tree sealed at their
+  identities (the listing walks a nested repository git tracks nothing
+  under — that one, or an ignored one — like the ignored directory it
+  stands in, since no git listing descends into it and no reading captured
+  it, so a hook's write over `vendor/tool.py`, which changes no listing,
+  is named after the hooks; a boundary git tracks something beneath stays
+  that reading's, and the leftover of a deleted gitlink the captured
+  checkout's), where its spelling had
+  paused every receipt-bearing integration before the merge as malformed
+  and again at each resume; the restore reverts what
+  the hook staged and leaves unstaged, untracked and ignored entries in place, named
+  for the operator — and a resume over that residue is refused until it is
+  cleared (a resume after the hook was disabled read the restore complete,
+  which it is for the receipt's own paths, and re-armed over the target as it
+  stood: the untracked write a tolerated stray, the ignored one an entry of
+  the new listing, the flipped word a marked entry, and the retry recorded
+  `unit-merged` with the refused output still there); the refused receipt's
+  readings are taken again before either re-arm, at the restored epoch or
+  after a commit the operator made since, with the receipt's own paths left
+  to the restore's reading, and name what stands — the residue, or work of
+  the operator's since, which they cannot tell apart and say so; and the
+  `ls-files --debug` flag reading walks its records — path to the NUL, then
+  the five fixed lines — instead of scanning the output for `flags:`, which
+  read a tracked path holding a newline followed by that text as one flag
+  word more than the index has entries and paused every integration into
+  that target as malformed; and a directory the unit creates, where the receipt
+  proved nothing was — or proved an empty untracked directory, which git
+  never tracks and no reading lists — or where the receipt captured a
+  tracked file, a symlink, or an unpopulated gitlink the unit replaced — is
+  walked on disk
+  against the integrated commit, so a hook's gitignored write or nested
+  `.git` there — which no `status` reading lists — is refused too (that
+  restore is the proved-absent directory's existing doctrine: it removes
+  nothing it cannot attribute, and pauses as not safely restorable with the
+  path named; the replaced file's restore goes through its own path, git
+  taking the directory with it, and the replaced gitlink's puts the empty
+  directory back once git has taken the commit's files, refusing over
+  anything else left there). A unit
+  that deletes a populated target submodule integrates: git leaves the checkout
+  behind (`?? path/`), which is accepted only as the exact captured checkout
+  and otherwise refused, with the refusal's restore undoing a hook's writes
+  into a captured submodule checkout rather than pausing unrestored; a unit
+  that replaces a populated submodule with a tracked directory integrates the
+  same way — git writes the commit's files into the checkout it could not
+  remove, and that leftover is accepted only owned, at the captured HEAD, and
+  holding nothing beyond what the integrated tree holds under it. A gitlink
+  the unit adds is read the same way as a captured one — index at the gitlink
+  (skip-worktree accepted on a sparse target's out-of-cone gitlink — on a
+  sparse target only, git stripping a hook's bit from an in-pattern entry
+  and a hook alone setting it elsewhere — and a hook's `update-index
+  --assume-unchanged` or `--skip-worktree` on an incoming file, which no
+  diff reading sees, refused by its index flag word, and an incoming entry
+  that word leaves git trusting unread — the captured bit a hook puts back
+  over its own bytes, which every git reading of the checkout then trusts —
+  read from disk against the integrated commit (type, blob, exec bit, or
+  absence under skip-worktree alone); an
+  operator's assume-unchanged bit on a captured gitlink is recorded and
+  preserved — every modern integration into a target holding one paused,
+  even of a bundle that never touched the submodule — a hook's flip of the
+  captured word is drift, and the restore puts the word back where
+  `git restore` cleared it; a crash replay of a `cleanup-pending` receipt
+  takes a cleaned tracked collision for the planned result only with the
+  captured index entry still there, flag word included — the two content
+  probes read clean over an assume-unchanged or skip-worktree entry
+  whatever the worktree holds, so a flag an operator set after the host
+  died, and any edit under it, read as the planned result and the resume
+  put the captured entry back over them; every flag-word reading masks to
+  the bits the index file holds — on a `core.fsmonitor` target git's
+  in-process fsmonitor-valid bit read as identity, refusing the rollback
+  that recreated an entry without it and reading every fresh entry as a
+  hook's),
+  a populated checkout this repository's, clean (ignored entries included, the
+  path having been proved absent), at the gitlink — since an
+  incoming `.gitmodules` with `ignore = all` hides a hook's `submodule update
+--init` and everything it writes from every `git diff` reading; the restore
+  removes such a hook-made checkout at a receipt-proved-absent path — and the
+  accepted artifact paths are
+  resolved before the receipt is armed, so a resolver refusal pauses ahead of any
+  target mutation instead of snapshotting short of them. A collision-cleanup fault
+  restores only the paths the cleanup touched, never a planned path it had not
+  reached. Restoration completeness reads the receipt-attributable inventory, so an
+  operator's unstaged edit elsewhere during the merge window no longer fails a
+  completed restore or blocks its replay; a refused no-ref-update attempt records
+  its unchanged revision so the receipt stays replayable instead of reading as
+  malformed on resume. A unit that turns a tracked file into a directory
+  (`a` deleted, `a/b` added) integrates — the capture read the leaf beneath
+  the file as a fault rather than as absent, pausing before the merge and
+  again on every resume — and its refusal restores the old shape through the
+  parent path alone, git refusing the pair (a symlink it turns into a
+  directory — a dangling one too, whose leaf beneath is absent by topology
+  rather than "an unavailable parent", and one that resolves, into the
+  repository or out of it, to a directory holding the leaf's own name,
+  which the capture dereferenced and refused as a redirected parent or an
+  escaped path: git tracks no path through a symlink, so a leaf beneath a
+  link the incoming set replaces is absent by topology wherever the link
+  points, the link captured and put back as bytes under its own path and
+  every receipt reading confining the leaf by the link's parent rather than
+  reading through it — the checked-path restore refusing a parent swapped
+  for a link before its first write — and the reverse transition, a tracked
+  directory the commit turns into such a link, no longer read as a deleted
+  leaf recreated — and a leaf it puts deeper beneath the file, restore the same
+  way: the restore refused the put-back symlink as a redirection and crashed
+  opening the restored file as the deeper leaf's parent); a target cloned without
+  `--recurse-submodules`, every gitlink an empty directory, integrates too —
+  the capture probed each one for its superproject and called it foreign —
+  and the receipt records such a gitlink unpopulated, so a checkout a target
+  hook's `submodule update --init` makes there is the refusal's to remove
+  (a repository of any other kind there refuses the restore) rather than
+  the next capture's baseline. Receipt paths are held to the Win32 name
+  rules — reserved characters, device aliases, a drive prefix, a backslash —
+  on a Windows host alone: on POSIX git permits `:`, `?`, `*`, `\` and
+  control characters in a name, every reading round-trips them
+  NUL-delimited, and holding them everywhere paused each modern bundle that
+  touched such a file as malformed (containment — absolute, `..`, `.git`, NUL —
+  holds on every host); an ignored file that was already there and that an
+  incoming `.gitignore` change uncovers — `??` after the merge, never in
+  the tolerated set since the pre-merge guard never listed it — is no
+  longer named as a hook's stray when the receipt's ignored listing holds
+  it at the identity it still has (it used to pause every retry until the
+  operator deleted it), while one the listing holds under another identity
+  is still named; and the receipt's absent-parent topology is read by
+  git's slash hierarchy, the one the capture wrote: the Windows reading took
+  `a:` for a drive and a backslash for a separator, so a POSIX receipt naming
+  such a parent was refused as malformed at the replay that needed it. No
+  record retires a live receipt or stands for a modern bundle's
+  completion: a coding session holds the writable run directory and can
+  append a `unit-merged` row under its own key — the receipt's operation
+  identity included — and it holds the shared repository, so the target
+  reflog transition under that identity is its to write too (`git
+  update-ref -m bmad-loop-integrate:<id>`, on a branch checked out in
+  another worktree as well); reading the pair as the validated completion
+  skipped the deterministic target validation after a host loss (receipt
+  gone, merge skipped, publication over whatever the session had put on
+  the target). A live receipt always replays the merge, which finds the
+  moved ref under the receipt and validates it, or pauses with evidence;
+  with no live receipt — a host lost before one was armed, or after a
+  successful integration retired it — the merge replays while the unit's
+  source is still mounted (it stages nothing again over a landed result,
+  re-validates the target's bytes and re-records — an integration that
+  made no ref update, an artifact-only bundle's squash, the same way), and
+  once the completed integration has consumed the source (worktree torn
+  down, branch gone) the completion stands only on the target as it is
+  now — the unit's commit in its history, or, since a squash seals a
+  commit of its own and never that one, every change the unit made over
+  its baseline folded into the target's tree (mode and object id per added
+  or rewritten path, or — where the target had moved the same file before
+  the squash resolved it, so the sealed blob holds both sides' edits — the
+  three-way merge of the unit's change over its baseline that stages
+  nothing over the held blob; each deleted path absent) — and
+  every accepted artifact blob in its tree and index — or pauses naming
+  the reason (the released legacy payload integrates without a receipt
+  and keeps its bare row).
+
+- Recover sweep migration publication faults without persisting unearned `DONE`
+  state (DW-296/DW-297). Persist accepted baseline/rewrite records, clear a
+  pre-dispatch baseline after publication refusal, restore result-faulted ledgers
+  by compare-and-set, and resume a durable `COMMITTING` task through the commit-only
+  tail.
+
+- Bind tracked and pending-tracked isolated bundle deliverables to their accepted
+  Git-normalized bytes and validate their exact staged entries before commit (DW-300).
+  Drift now pauses with path-only recovery evidence and retains the source mount;
+  the validated index is committed without a second working-tree staging pass. The
+  no-op arm is validated too: an index reset to baseline after the staged validation
+  (a concurrent writer) no longer reads as "nothing to commit" with the accepted chain
+  orphaned and baseline recorded as the bundle's commit — the committed-tree validator
+  runs against baseline, the original chain and index are restored, and the run pauses.
+  The integrated target commit and post-hook index are validated ahead of `unit-merged`
+  as well, so a target-side hook rewriting a tracked deliverable in the integration's own
+  commit never lands it under the bundle's name (the receipt-backed refusal and restore
+  are DW-302/DW-303's, below).
+
+- Sample destination pathname identity after streamed artifact probes, refusing observed
+  detachment while retaining checked-fallback races (DW-301).
+
+- Stream artifact destination hashing and equality checks in fixed-size chunks, bounding
+  baseline-capture and publication memory even when operator-owned files are large or grow
+  during validation (DW-298/DW-299).
+
+- Restore attempt-owned specs through descriptor-capable parent-anchored publication and
+  verification on POSIX, preventing late parent substitution from redirecting bytes; retain
+  checked path-based restoration on no-descriptor platforms (DW-295).
+
+- Bind explicitly published ignored bundle deliverables to the exact bytes accepted by final
+  dev, repair, or review verification (DW-290). Preparation now refuses post-verification byte
+  or declaration drift before freezing a payload, retains the source mount and evidence for
+  recovery, and cannot refresh authority by replaying the same accepted result after a crash.
+  It re-derives the tracked declaration set too, so a spec outside `implementation_artifacts`
+  cannot swap one tracked deliverable for another after acceptance (Codex P1 on #795).
+
+- Bound isolated artifact publication payload preparation (DW-289) to measured raw-byte
+  defaults of 5 MiB per ignored file and 10 MiB aggregate. Preflight now rejects an
+  oversize selection before any base64 encoding, bounded reads catch file-growth races,
+  and the existing refusal pause retains the source for a no-redispatch resume. Tracked
+  declarations do not count, exact limits remain legal, and frozen legacy payloads still
+  replay idempotently.
+
+- Refuse concatenated `Artifactonly: true` assertions while preserving accepted
+  separated spellings (DW-291). The artifact-only line's gaps now take the same
+  horizontal-whitespace class as `Status:` (DW-285), so a vertical separator such as
+  `\x0b` between the label and `true` no longer mints the receipt.
+
+- Preserve attempt binding and seed-delivery observer fallbacks when named path
+  resolution guards receive embedded-NUL or lone-surrogate faults (DW-292/DW-294).
+
+- Distinguish ownership-path resolution faults from proven-external paths at the
+  residual deferred-work and sprint-board probes, preserving conservative recovery
+  and carry behavior (DW-293).
+
+- Handle embedded-NUL and lone-surrogate faults at the named observation,
+  configuration, stories, worktree, restore, and recovery resolution guards (DW-287).
+
+- Route terminal isolated sweep harvest-carry read faults through the sweep
+  story-gate repair pause while preserving the engine route for direct defer and
+  ordinary story carries (DW-286).
+
+- Parse independently bold Auto Run `Status` values without allowing bare labels
+  to consume next-line tokens (DW-285).
+
+- Preserve explicit ignored bundle artifacts before isolated worktree teardown; capture
+  destination baselines, refuse conflicting edits, and replay interrupted publication
+  without losing recoverable sources (DW-283). This lifts the interim refusal of the
+  artifact-only receipt for an artifacts dir rebased into a unit worktree: the
+  accepted spec is carried by publication, so the receipt stands under isolation.
+
+- Advertise conditional artifact-only receipts in all bundle prompts and sweep
+  triage guidance, including verification gates and isolated-publication limits (DW-284).
+
+- Show unreadable sweep-ledger refusals and repair guidance on dashboard resume
+  before launching a detached window (DW-270).
+
+- Pause existing engine and sweep locked-read repair routes on OS metadata and
+  text-read faults, preserving task phase, pending work and ledger bytes (DW-279).
+  Wrap these faults as `LedgerReadFault(LedgerReadError)` with the original
+  `OSError` chained; retain absence/decode handling, OS refusal attribution, and
+  raw `OSError` from pre-lock probes, lock acquisition and writes.
+
+- Resume a pending review-timeout salvage refile over the preserved product after
+  ledger repair, rerunning verification without rebuilding or new dev/review sessions
+  under either rollback policy; retain ordinary commit gates (DW-278). The latch is
+  set at every salvage's handoff save — the first, fault-free salvage included, not
+  only the repair-pause arm — so a host lost between that save and the commit
+  (notification, a `pre_commit_gate` workflow) replays the salvage with zero sessions
+  instead of restart recovery, which erased the published refile under rollback and
+  paused without it. A sweep bundle has no replay arm and restarts instead; its
+  restart now clears the latch, which otherwise rode onto the replacement attempt and
+  forced a review the fresh attempt never asked for.
+
+- Notify operators when a ledger snapshot outage leaves story-declared deferred
+  closes unapplied, naming the story, every declared ID, and the fault (DW-277).
+
+- Fold a `ValueError` from the publisher target resolve into `target-unreadable` at
+  the three publisher arms — `engine._publication_refusal`, `SweepEngine._commit_ledger`,
+  `decisions.apply_pre_answer` — instead of letting it escape best-effort bookkeeping
+  (DW-275). `Path.resolve()` raises `ValueError` for an embedded NUL, and its
+  `UnicodeEncodeError` subclass for a lone surrogate, on CPython 3.11-3.14 POSIX; the
+  arms caught `(OSError, RuntimeError)` only. The refusal row, journal row and cause
+  are unchanged; the fault text rides in `error`.
+
+- Pause at the story gate under `sweep-bundle-close-refused` with a `-locked` site,
+  instead of `run-crash`, when a deferred-work ledger turns undecodable inside the
+  locked window of one of the sweep's three bundle-close mutator calls — the
+  accepted-dev close, the review-leg reclose, the isolated close carry (DW-280,
+  the DW-259 residual). The task's phase and recorded close intent are left
+  untouched, so `bmad-loop resume` re-drives the close — with no session spent at
+  the accepted-dev close and the carry; through the sweep's restart arm (the
+  bundle re-driven from dev) at the reclose. DW-279 extends the same locked-read
+  route to OS metadata/text-read faults, and the row keeps that classification:
+  `reason="ledger-inaccessible"` with a permissions-or-storage steer for an OS
+  refusal, `reason="ledger-unreadable"` with a UTF-8 steer for undecodable bytes,
+  never the decode token for both; lock/write failures remain raw `OSError`.
+
+- Pause for repair under `ledger-read-refused` with a `-locked` site, instead of
+  `run-crash`, when a deferred-work ledger turns undecodable inside a mutator's own
+  locked window — the harvest's seen-again mark and append, the commit-boundary
+  `closes_deferred:` close, the review-timeout salvage refile, the isolated harvest
+  and close carries (DW-259). `bmad-loop resume` retries the write; the notice now
+  names a declared close. DW-279 extends the same locked-read route to OS
+  metadata/text-read faults; lock/write failures remain raw `OSError`.
+
+- Route a deferred-work ledger read the OS refuses (EACCES, EIO, ELOOP) at the
+  engine's four direct `read_for_write` sites the way DW-231 routes a decode fault
+  (DW-258), instead of ending the run as `run-crash` with the completed session's
+  work on disk. The observation reads (proof-of-work digest, pre-harvest and defer
+  snapshots, both restores) degrade to a typed `_UnreadableLedger` that carries no
+  digest and journal `ledger-read-degraded`; the two publish reads (spec-deferral
+  harvest, isolated carry) journal `ledger-read-refused`, notify `ACTION REQUIRED`
+  (now naming both repairs: valid UTF-8; permissions or storage) and pause without
+  changing the task's phase, so `bmad-loop resume` after the repair replays the
+  recorded session result. The attribution digest of a refused read is the
+  `<unreadable>` sentinel, and `_ledger_changed_since_baseline` treats a sentinel
+  on either side as unknown — never credited — so the engine's own harvest append
+  after the repair cannot pass a session that wrote nothing.
+- Arm the sweep's persisted ledger doubt when the ledger's path cannot be resolved,
+  so the cycle's bundles are withheld instead of crashing at the bundle intent's
+  own ledger read (DW-260). A git-fault degrade after a successful resolve stays
+  un-armed; the `sweep-ledger-commit-unavailable` row is unchanged on both arms.
+- Make a resumed sweep honour and announce its own persisted ledger doubt (DW-246,
+  DW-244, DW-251). The three ledger publishers that run on a resume ahead of the
+  dispatch gate — the already-resolved close's own publish, its stranded-close
+  republish, and the publisher above the loop body (the post-recovery publish, and
+  the persisted commit-debt settle it shares — the only trigger that still reaches
+  it under doubt, since the recovery pass itself is withheld whole) — now read
+  `_ledger_unfit_to_publish()` and journal `sweep-ledger-commit-withheld`
+  (`message`, `file`, `reason="ledger-in-doubt"`) instead of committing a ledger
+  the run already holds unfit, or silently skipping the settle; a ledger-family `sweep-ledger-commit-refused` arms the persisted doubt after
+  its row, so a refusal after a landed decision effect withholds the cycle's bundles
+  instead of crashing at the bundle intent's own ledger read (store refusals arm
+  nothing; a refusal at the cycle-boundary publisher, which sits below the unfit
+  stop, is honoured one cycle later — cycle N+1 withholds and ends on the unfit stop
+  unless one of its own effects lands and releases the arm); and the nothing-open
+  exit writes the ledger-repair ATTENTION notice when the doubt is armed — the
+  arming class never wrote one, so the run that withheld said nothing — with its
+  rows and return unchanged.
+- Gate the nothing-open exit's stranded-close publisher whole on the run's persisted
+  ledger doubt, and probe its decision ids individually (DW-250, DW-249).
+  `_publish_stranded_close` now reads `_ledger_unfit_to_publish()` once, above BOTH of
+  its probes, after the triage cache validates and the plan names at least one id:
+  a doubted resume journals `sweep-ledger-commit-withheld` with the close message,
+  `file`, `reason="ledger-in-doubt"` and a `dw_ids` list naming every cached id it
+  declined to prove, instead of publishing the whole ledger — unaudited flip included
+  — on an already-resolved id that read `done`, or returning silently on a
+  decisions-only plan; an empty plan and a fresh sweep still reach no read and no
+  row. The decision term is now an `any` over the plan's decision ids (the
+  already-resolved term and the close phase's own arm keep their `all`), so one
+  decision id absent from the ledger or carrying an unparseable status no longer
+  vetoes a stranded close under its sibling; the decision set is still read once,
+  an empty list still authorizes nothing, and read faults still degrade to
+  `sweep-resolved-close-unavailable` with the union of ids.
+- Route a deferred-work ledger read fault at the engine's own sites and at the resume
+  gate (DW-231, DW-234). The base engine now catches `LedgerReadError` at its four
+  direct `read_for_write` sites: observation reads (proof-of-work digest, pre-harvest
+  and defer snapshots, both restores) degrade to a typed answer nothing can write back
+  and journal `ledger-read-degraded`; the two publish reads (spec-deferral harvest,
+  isolated carry) journal `ledger-read-refused`, notify `ACTION REQUIRED` and pause
+  the run without changing the task's phase, so `bmad-loop resume` retries the write
+  instead of crashing as `run-crash` — replaying the recorded session result where
+  one exists (dev and review legs), re-driving the leg otherwise. The residual —
+  `deferredwork` mutators' own locked re-reads and the review-timeout salvage refile
+  still raised — was recorded as a deferral and is closed by DW-259 (entry above).
+  `runs.unreadable_sweep_ledger` gains the `except OSError` arm — its own
+  permissions-or-storage attribution on the `bmad-loop sweep`
+  route the sweep's own stop already gives — a recorded reversal: the arm was
+  written, struck by the DW-204 resolution on scope grounds, and is restored under
+  DW-234's accepted decision; the TUI's stopgap `except OSError` around the probe is
+  removed as dead.
+- Propagate ledger metadata refusals consistently across supported Python versions
+  (DW-221). Treat ELOOP and EBADF as errors; a cyclic ledger symlink is a refusal
+  rather than an absence at every `read_for_write` site — routed where the harvest
+  reads (DW-258 above: degraded observation, paused publish); where no publish read
+  is reached, the story completes and a declared close journals the outage.
+- Report refused sweep ledger metadata as `ledger-inaccessible` with error details
+  and arm ledger doubt through the existing reader handlers (DW-253).
+- Report directories, FIFOs and sockets at the ledger path as `target-not-a-file`.
+  Preserve `target-unreadable` when metadata becomes inaccessible between probes
+  (DW-238).
+- Guard the five remaining `verify.commit_paths` callers with the publishable-target
+  check their sibling publishers already take, so a directory left at a ledger, board,
+  spec or park-record name is no longer handed to `git add` as a literal pathspec and
+  staged recursively under a `chore(...)` message. A refusal is journaled
+  (`harvest-carry-refused`, `story-deferred-close-carry-refused`,
+  `sweep-bundle-close-carry-refused`, `board-advance-carry-refused`) or, in `confirm`,
+  drops that operand alone; it never raises, and `confirm` still commits an ABSENT park
+  record's deletion. The guard's ledger leg now tells a DURABLE decode fault
+  (`target-undecodable`, a fourth `refuse_cause`) from a TRANSIENT OS fault
+  (`target-unreadable`), so the harvested-deferral carry refuses the former outright
+  and hands only the latter back to git, where its commit latch survives — an
+  undecodable ledger no longer reaches HEAD through that fall-through (DW-237).
+- Probe operand presence in `commit_paths` with `lstat`, which suppresses nothing on
+  any interpreter, so a tracked candidate under an unsearchable parent is reported as
+  uncertain instead of being ruled missing and staged as a deletion on Python 3.14
+  (DW-239).
+- Take the readable-ledger refusal at `bmad-loop resolve`'s entry and at the TUI's
+  re-arm gesture, ahead of the interactive session and of `rearm_escalation`, so an
+  escalated sweep over an undecodable ledger keeps its escalation instead of spending
+  it; one shared probe now serves all three surfaces, and `docs/FEATURES.md` documents
+  the refusal, its declines and its precedence (DW-229, DW-230, DW-235).
+- Screen an adopted `build` answer against the ledger's live open set before it mints a
+  bundle, dropping an id the ledger no longer holds open under a fifth `drop_cause`,
+  `entry-not-open`; a ledger read that refuses screens nothing and journals
+  `sweep-decision-open-set-refused` (DW-214).
+- Recover stranded decision closes at the sweep's no-open exit, withholding the
+  whole recovery publish — its already-resolved term too, since the commit is of
+  the file — while the run retains ledger doubt; the close phase's own two commit
+  arms read the same verdict, so a resume that inherited a doubt no longer walks a
+  half-landed decision flip into HEAD ahead of the dispatch gate (DW-222).
+- Retry ledger publication before repeating sweeps stop on `no-progress` or
+  `max-cycles`; rename the commit message to
+  `chore(sweep): commit ledger at the sweep cycle boundary` (DW-223).
+- Degrade triage-cache metadata read failures to `sweep-triage-reload-failed` and
+  fresh triage, with absent caches remaining silent (DW-224).
+- Degrade a refused triage-cache write-back to a new `sweep-triage-cache-write-failed`
+  journal kind and still return the validated plan, instead of crashing the sweep
+  after a healthy triage; a directory planted at the cache path lands on the same
+  row (DW-247).
+- Pause a resume at the story gate when an in-flight bundle's intent document must
+  be regenerated and the ledger read refuses, journaling `sweep-intent-ledger-refused`
+  (`ledger-unreadable` / `ledger-inaccessible`) and leaving the run resumable and the
+  bundle task PENDING, instead of crashing at that read ahead of every cycle gate;
+  `bmad-loop resume` after the repair re-drives the same bundle (DW-243).
+- Screen every bundle reaching the final keep loop — a cached plan's own bundles
+  included — against the ledger's live open set, skipping one whose ids are not all
+  open under `sweep-bundle-skipped` `reason="entry-not-open"`; `_write_intent` now
+  refuses (`MissingLedgerEntriesError`) to render a document for a bundle id with no
+  ledger entry, and the regeneration path journals that refusal as
+  `sweep-intent-regen-refused` and pauses the run the same way rather than dispatching
+  a session briefed on an empty entries section or letting fresh triage run beside
+  the refused bundle (DW-252).
+- Unlink a triage cache whose read faults before re-triaging
+  (`sweep-triage-cache-invalidated`, or `sweep-triage-cache-unlink-failed` on a refused
+  unlink) and write the cache back atomically, so a refused or short overwrite can no
+  longer leave an older or torn plan for the next resume to replay (DW-263).
+- Probe `<run>/decisions.json`'s metadata with `stat()` rather than `is_file()` so a
+  refusal of that probe degrades to `sweep-decisions-reload-failed` and the pending path on
+  Python 3.11–3.13 instead of aborting the sweep over a bookkeeping read (DW-248).
+- Degrade a refused SEEDED write-back of `<run>/decisions.json` (a directory planted at
+  the store; a refused or redirected parent — `UnconfinedWriteError`, the #593 confinement
+  refusal) to a new `sweep-decisions-store-write-failed` journal kind naming the adopted
+  ids, and carry on with the answers in memory, instead of aborting an otherwise healthy
+  sweep; the interactive write-back stays bare so a human's answer whose write FAILS still
+  stops the sweep loudly (DW-262).
+- Withhold the seeded `<run>/decisions.json` write-back for the cycle when the store's
+  metadata probe or content read was refused with an `OSError`, journaling
+  `sweep-decisions-store-write-withheld` with the adopted ids whose answers stay in memory,
+  so a transient read refusal no longer replaces a store of valid answers with an empty
+  map; decode faults and a non-object top level still replace the file wholesale (DW-264).
+  In the same cycle the interactive prompt is not put at all
+  (`sweep-decisions-prompt-withheld`, ATTENTION notice): an answer that cannot be
+  persisted is not taken, so a crash can no longer lose a `build` authorization held only
+  in memory; the decisions stay pending for the next interactive sweep.
+- Raise a refused ledger out of the five write-bearing mutators (`mark_done_many`,
+  `mark_seen_again_many`, `mark_open_many`, `record_decision`, `archive_closed`) on
+  every interpreter: their pre-lock presence guard is `stat()` + `S_ISREG` and the
+  under-lock guard is the reader's own absence answer, so on Python 3.14 an `EACCES`
+  ledger no longer takes the no-op return — `sweep --archive` reporting success having
+  archived nothing, `record_decision` answering "no such entry" — and ELOOP and EBADF
+  move to the fault side on Python 3.11–3.13 too, so a symlink loop at the ledger's name
+  now raises out of all five instead of taking the no-op return. An absent ledger still
+  returns the no-op value without a lock (DW-255).
+- Answer the publishable-target guard's store leg from one `lstat()`, so a refused
+  store is `target-unreadable` on Python 3.14 too, where the
+  `is_file()`/`is_symlink()`/`exists()` probes suppressed the refusal and degraded it to
+  `target-absent`; a regular file and the 3.13+ symlink-loop link entry still publish,
+  a directory or FIFO is still `target-not-a-file` (DW-257).
+- Probe the project-level pre-answer store's metadata inside `load_pre_answers`' own
+  guard, so a refusal degrades to `{}` as the docstring promises instead of re-raising
+  out of `_decisions_phase` on Python 3.11–3.13 (DW-261).
+- Probe the ledger's metadata with `stat()` + `S_ISREG` in `read_for_observation`, so a
+  refused ledger degrades to an attributed `PermissionError:` fault on Python 3.14
+  instead of silent absence; `ENOENT`/`ENOTDIR` and a non-regular file stay absence,
+  and a symlink loop is now an attributed fault at the observation arm as it already
+  was at the write arm (DW-254).
+- Probe the ledger's metadata with `stat()` + `S_ISREG` inside `Engine._refuse_gated_story`'s
+  own `try`, so a refused ledger pauses the run at `PAUSE_STORY_GATE` on Python 3.14 too,
+  where `is_file()` suppressed the refusal and the `gate:` hard gate failed OPEN — the story
+  dispatched and `story-gate-unreadable` was unreachable; `ENOENT`/`ENOTDIR` and a
+  non-regular file stay the empty ledger, and a symlink loop at the ledger's name now
+  pauses at the gate instead of passing it (DW-266; also closes DW-276). A configured
+  ledger path the OS cannot encode takes the same pause instead of crashing the run.
+- Same probe inside `validate`'s deferred-ledger read and `verify_review_bundle`'s, so on
+  Python 3.14 a refused ledger is the `deferred.ledger-unreadable` problem rather than a
+  clean deferred check, and the non-fixable "deferred-work ledger unreadable" retry rather
+  than the fixable "entries not marked done" one (DW-267). A configured ledger path the
+  OS cannot encode is that problem and that retry rather than a crash.
+- Take ledger absence from the observation reader's own answer in `sweep --dry-run` and
+  `SweepEngine._non_write_state`, and probe the archive's post-report presence inside its
+  `try`, so a refused ledger is the attributed `error: ... cannot be read` failure, the
+  "holds no entry" fallthrough and the `cannot archive` failure respectively — not "no
+  deferred-work ledger" / "the ledger file is gone" on Python 3.14, and at the two CLI
+  sites not a `PermissionError` traceback on 3.11–3.13 (`_non_write_state` already
+  degraded there). A 0-byte ledger now reads as "no deferred-work ledger" in the dry-run
+  listing (DW-265).
+- Retire the two decision non-write `is_file()` probes that DW-265 left behind: the
+  sweep's interactive decision arm now takes its `sweep-decision-effect-unavailable`
+  sentence from `_non_write_state`, and `bmad-loop decisions`' outcome line asks the
+  observation reader, so a refused ledger reads "holds no entry for this id" and
+  "no decision line was written; ledger state unavailable" respectively on Python 3.14
+  — not "the ledger file is gone" — and the sweep arm no longer ends `run()` with a
+  `PermissionError` on 3.11–3.13. The sweep-arm exposure is the window between the
+  recorder's False answer and the diagnostic probe (a ledger refused at the recorder
+  itself already took the `except` arm). Absence still reads "gone" at both sites, and
+  a present 0-byte ledger reads "holds no entry" at both — the recorder reached it and
+  found nothing — through a presence-aware sibling of the observation reader
+  (`deferredwork.observe_ledger`, `None` text for absence) rather than the text-only
+  reader's empty text, which had made an empty ledger read as gone (DW-281, DW-282).
+- Absorb pathlib's ignored winerrors (21 `ERROR_NOT_READY`, 123 `ERROR_INVALID_NAME`,
+  1921 `ERROR_CANT_RESOLVE_FILENAME`) and the `ValueError` a non-encodable path raises as
+  ABSENCE at the ledger's repair/write reader, the five mutators' pre-lock guard and both
+  legs of the publishable-target guard, through one shared `deferredwork.probe_absence`
+  — the set `is_file()` absorbed before the `stat()` probes replaced it — so a ledger on
+  a disconnected mapped drive or at a lexically invalid Windows path now READS AS ABSENCE
+  (an empty ledger) at every `read_for_write` consumer, as it did before DW-221: the
+  sweep's cycle gates end on `no-open` instead of `ledger-inaccessible`, the resume entry
+  gate admits the resume instead of refusing with the DW-234 storage-fault route, and the
+  mutators take their no-op return. A NUL in the store path no longer escapes the guard
+  as a `ValueError` (the publishers' own `resolve()` arms still raise it on POSIX,
+  unchanged).
+  `EACCES`/`EIO`/`ESTALE`/`EBADF`/`ELOOP` and every other winerror still raise or fold
+  to `target-unreadable`; `commit_paths` keeps reporting the winerrors into uncertainty
+  (DW-256, DW-268).
+
+- Mirror a sweep cycle's ledger-in-doubt verdict onto run state at every site that
+  ARMS it — not at the dispatch gate, and not at the decision phase's tail publish,
+  whose span contains a human at a prompt — so a stop or crash between the arm and
+  the gate's report resumes into the same withholding rather than into a dispatch
+  that publishes a half-written ledger. Released again by the two sites that clear
+  the walk's own verdict — but only for an arm THIS process made: the mirror is
+  held while the close phase's latch is armed this cycle, and whenever it was
+  inherited across a resume, so in those two states it is deliberately stickier and
+  waits for a human repair plus a fresh sweep. The mirror also outranks the
+  persisted commit debt (`sweep_ledger_commit_owed`): a resume that inherits both
+  skips the top-of-`_loop` settle, since the doubted bytes are the debt. And it
+  withholds the resume's in-flight recovery pass whole: a bundle re-armed out of
+  band by `bmad-loop resolve` is not re-driven while the mirror is on disk — its
+  own commit is a whole-tree `git add -A` — and is journaled as withheld and then
+  stranded rather than dispatched around the gate. Legacy prose met on such a
+  resume is not migrated either: the rewrite session and its commit are refused
+  on the doubt's own `ledger-unreadable` stop and repair notice (DW-218/219).
+
+- Withhold sweep bundles and ledger commits after close, re-apply, or idle decision
+  faults; preserve pre-answers while the ledger is in doubt (DW-216/217/220).
+
+- Publish the out-of-band decisions answer ONE OPERAND AT A TIME, each rooted at that
+  operand's own resolved parent, and report a publish git could not make. One
+  `commit_paths(project, ...)` call over both operands failed two ways: a ledger
+  configured outside the project (or inside a disjoint `repo_root`) was relativized
+  away by `commit_paths`' `except ValueError: continue`, so the `decision:` line
+  reached no history and neither surface said so; and a gitignored operand made
+  `git add` exit 1 and took its publishable sibling down with it, swallowed by a bare
+  `except GitError: pass`. A `GitError` is now caught per operand into a
+  `PublishFailure` that the CLI line and the TUI toast both print through the shared
+  `publish_note()`, under a `commit-unavailable` token beside the existing refusals.
+  A `build`/`keep-open` answer whose operands share a repository now makes two commits
+  carrying the same message (DW-225, DW-226).
+
+- Refuse to publish a decisions store that is present but not a REGULAR FILE, under a
+  third `refuse_cause` token, `target-not-a-file`, preserving the existing symlink-loop
+  exception. The publishable-target guard checked
+  existence only, so a store replaced by a directory (or by a symlink to one) passed it
+  and `commit_paths` handed that literal pathspec to `git add`, which stages the
+  directory's descendants recursively. `is_file()` follows symlinks, so a store
+  symlinked to a regular file still publishes, and the store's bytes are still never
+  examined (DW-211, DW-228).
+
+- Fold a metadata-probe fault into a refusal instead of letting it escape a best-effort
+  publisher. On Python 3.11-3.13, `Path.exists()`/`is_file()`/`is_symlink()` raise on
+  anything outside the `ENOENT`/`ENOTDIR`/`ELOOP` class, so an `EACCES` arriving after a
+  successful write aborted `bmad-loop decisions`' walk or undercounted a TUI answer; the
+  store guard now answers `target-unreadable` and `commit_paths` omits only the faulted
+  candidate, raising just when no usable operand survives. Python 3.14 suppresses all OS
+  errors inside those three convenience probes, so both sites have since moved to `lstat`
+  instead (`commit_paths` under DW-239, the store guard under DW-257), which reports the
+  fault on every interpreter and makes this fold uniform across them
+  (DW-227).
+
+- Refuse `bmad-loop resume` for a sweep run whose deferred-work ledger does not decode,
+  naming the file, the decode fault and the repair. Such a resume used to arm the run (pid
+  publication, policy re-stamp, `run-resume` row) and only then meet the ledger, stopping
+  with no repair route offered from this surface. An absent ledger is not a refusal and
+  story runs are unaffected (DW-204). DW-234 also routes OS refusal at this entry
+  gate with a permissions/storage repair notice; DW-279 preserves that attribution
+  when `read_for_write` wraps the original `OSError` as `LedgerReadFault`. The
+  metadata probe reports refusal on every supported interpreter since DW-221.
+
+- Diagnose a `null` or bare-string member of a migration result's `mapping` list as the
+  shape fault it is — `mapping[0] not an object: NoneType` — instead of reporting
+  `mapping invents unknown key ''` into the migrate-decision journal record, the retry
+  feedback the next migration session is handed, and the attempt-cap escalation
+  reason (DW-190).
+
+- Prevent out-of-band decision answers from committing a vanished ledger's deletion
+  or files the answer did not write. Report refused publication in the CLI and TUI,
+  preserving the recorded count and decision walk (DW-209, DW-213).
+
+- Commit an already-resolved close whose ledger write landed but whose commit never
+  ran. A crash between the two left the resume replaying a triage plan that flipped
+  nothing, so the durable write stayed off HEAD for the rest of a single-cycle run.
+  The close now also publishes when every id the plan named already reads `done` on
+  disk — proved per id, never from ledger dirtiness — and a read fault there degrades
+  through the existing `sweep-resolved-close-unavailable` row. Where the stranded
+  close retired the LAST open entry the phase never ran at all, so the same publish
+  now also happens at the sweep loop's nothing-open exit, gated on this cycle's
+  triage cache already being on disk: a fresh sweep has none and still spawns no git,
+  and a cache or probe fault there journals `sweep-triage-reload-failed` /
+  `sweep-resolved-close-unavailable` and publishes nothing (DW-193).
+
+- Degrade a sweep's ledger read when the OS refuses it, at the three sites that GATE a
+  cycle: the pre-answer prune and `_loop`'s two top-of-cycle reads. The other
+  `read_for_write` calls in `sweep.py` are unchanged and an OS refusal there still ends
+  a run as crashed. An EACCES/EIO reported a completed cycle — or a whole run whose
+  earlier cycles had completed — as crashed. The refusal is journaled
+  (`sweep-preanswer-prune-refused` / `sweep-cycle-ledger-refused`) and ends a run on a
+  new `ledger-inaccessible` stop token, kept distinct from `ledger-unreadable` because
+  the operator repair differs. `deferredwork.read_for_write` is unwidened (DW-197).
+
+- Withhold sweep bundles when a decision effect leaves the ledger unfit to publish,
+  and stop repeating sweeps with repair instructions (DW-194/202/210).
+
+- Stop a decision effect that never landed from speaking for the human at its two
+  stored-answer consumers. A stored `close` for an entry the ledger still lists as
+  open is re-applied on resume instead of being counted consumed, so a crash between
+  the answer write and the effect no longer leaves the decision permanently
+  unapplied and never re-asked (`sweep-decision-effect-reapplied`; the write order is
+  unchanged, and an unreadable or absent ledger re-applies nothing and journals one
+  `sweep-decision-effect-unavailable` per candidate id) — DW-167. That replay is the
+  one caller of `record_decision`'s new keyword-only `require_open`, which re-checks
+  the still-open premise inside the same locked read/edit/write as the mutation, so a
+  rival writer closing the entry between the walk's gate and its write is refused
+  rather than given a second `decision:` line; every other caller is unchanged and
+  still records on an already-closed entry. Keep metadata faults in the refusal's
+  diagnostic probe from aborting the sweep. A `build` answer whose `record_decision`
+  reported writing no line now takes a fourth drop lane
+  (`drop_cause: effect-unlanded`) rather than materializing a bundle and spending a
+  dev session on an id the ledger holds no entry for — DW-200. That verdict is
+  persisted where it is observed (`sweep_unlanded_decisions` on run state, cleared by
+  the drop that announces it), so an interruption between the non-write and the drop
+  resumes into the same refusal instead of reviving the bundle.
+
+- Report a ledger that took no `decision:` line at the two surfaces that answer
+  decisions outside a sweep (DW-198). `decisions.apply_pre_answer` returns
+  `record_decision`'s boolean instead of discarding it, so `bmad-loop decisions` no
+  longer prints `closed now` and the TUI modal no longer counts the answer into
+  `recorded N decision(s)` when the ledger file is gone or a rival writer retired the
+  entry while the prompt blocked. Keep walking with exit 0 even if the CLI's later
+  diagnostic probe fails. Report saved store answers only for build/keep-open;
+  preserve the existing best-effort commit.
+
+- Commit a ledger write an interrupted sweep phase left unpublished. The
+  already-resolved close and the decision phase gate their commit on the write THIS
+  invocation made (DW-183/DW-185), and a process that died between the publish and
+  the commit replayed as a phase that wrote nothing — the ids already `done`, the
+  answer already saved — leaving the closure dirty ahead of the cycle's bundles, to
+  be absorbed by a story commit, discarded by a rollback, or left at run end. Both
+  sites now persist the debt on `state.json` (`sweep_ledger_commit_owed`) before the
+  write; the ledger-family `_commit_ledger` clears it once git says the file is at
+  HEAD, and a resume settles an outstanding one at the top of `_loop`, before triage
+  or a bundle baseline reads the ledger. An outcome that definitively published
+  nothing — a fault ahead of the write, a failed atomic write, a mutator that flipped
+  no ids — retracts the debt in the same invocation, so a false one never survives to
+  be settled against an operator's edit; a debt inherited from an earlier invocation
+  is never retracted by a replay that closes nothing.
+
+- Handle non-dictionary session result documents through existing empty-document
+  paths (DW-206/DW-207). Share read-time normalization across engine, stories,
+  sweep, and verification consumers so malformed results reach the existing
+  refusal paths instead of crashing; preserve dictionary identity and snapshots.
+
+- Validate the target before publishing it in every sweep ledger/pre-answer-store
+  commit (DW-199/203/205). `commit_paths` keeps a missing-but-tracked path as a
+  deletion to stage, so a ledger removed after the phase wrote it was committed AWAY
+  under a `chore(sweep):` message — at the decision phase's commit gate and at the
+  repeat boundary — and a resume whose ledger held undecodable bytes published them
+  before raising on them. Each call site now declares its file family: the five
+  ledger publishers re-take the ledger's repair/write read, the two store prunes
+  check existence. A refusal spawns no git and journals
+  `sweep-ledger-commit-refused` with `refuse_cause` (`target-absent` |
+  `target-unreadable`). The sweep loop's own read still raises on undecodable bytes;
+  only the publish that preceded it is gone.
+
+- Make `escalation._escalation_list` and `sweep._normalize_bundle_names` total on a
+  non-dict JSON result document (DW-181). Return their existing empty results (`[]`
+  and `()`) for wrong-shaped documents, preserving dictionary and `None` behavior.
+  The normalizer previously guarded only `None`, so falsy non-dicts now return
+  `()` too. This hardened direct helper calls only; the earlier engine dereference
+  still crashed before a malformed session document could reach the sweep
+  validators, which DW-206 above closes.
+
+- Close the two ledger write-fault arms the DW-166 pass left bare (DW-182/186). A
+  deferred-work ledger holding undecodable bytes raised out of the pre-answer prune —
+  the LAST call of a sweep cycle — and reported a fully completed cycle as crashed;
+  it now takes the existing `sweep-preanswer-prune-refused` row under a second fixed
+  reason token (`ledger-unreadable`) and keeps every recorded answer, exactly as the
+  absent-ledger arm does. And `record_decision`'s boolean was discarded, so a
+  decision whose id the ledger no longer holds (or a ledger that is gone) counted as
+  closed and emitted `post_decision` for a `decision:` line that was never written;
+  the sweep now journals `sweep-decision-effect-unavailable` — naming which of the
+  two states it was, since a missing ledger loses every line the walk already wrote
+  where a missing entry loses one — and claims nothing. The commit withhold is left
+  untouched by a False return rather than tripped by it: the latch still reports the
+  last attempt that actually READ the ledger, which a False return may never have
+  done. The prune's undecodable refusal is also carried to the repeat boundary: a
+  `--repeat` run ends there on `sweep-repeat-done` `reason="ledger-unreadable"`
+  (counting the cycle that completed) with a best-effort repair notification, and
+  WITHOUT taking the cycle-boundary ledger commit — whose pathspec is the ledger, so
+  a purely local refusal published the very bytes it had just refused to read and
+  the next cycle crashed on them regardless. The completed cycle's work is kept and
+  the undecodable bytes stay dirty for a human to repair. The absent-ledger arm is
+  unchanged: it stays cycle-local and the next cycle ends on `no-open`.
+
+- Narrow every sweep bookkeeping commit to the file the phase actually published
+  (DW-183/185/187/188). `_commit_ledger` now takes that FILE rather than a root: it
+  resolves it — following symlinks, as the atomic writer already does, so a ledger
+  symlinked out of the project commits in the repository holding its target — roots
+  both git calls at the resolved parent, and pathspecs the dirty check and the commit
+  to that one literal name, including symlink targets with Git pathspec magic,
+  and include new files even when Git hides untracked files. Unrelated edits no longer ride into a
+  `chore(sweep):` commit and a prune later in the same cycle no longer publishes the
+  ledger the decision phase withheld. The already-resolved close and the decision
+  phase additionally commit only on a non-empty pass, so a phase that wrote nothing
+  spawns no git.
+
+- Sanitize bundle, untriaged-ID, and migration diagnostics so object values print
+  their position or type instead of their contents (DW-178–180). Preserve string
+  wording and acceptance behavior; render non-string scalar mapping keys without
+  stringification quotes.
+
+- Keep a sweep running when the deferred-work ledger will not read (DW-166). An
+  undecodable ledger during the already-resolved close, or during an attended
+  decision's effect, ended the whole sweep as crashed — on the decision path after the
+  human's answer had already been saved and journaled. Both now journal the fault
+  (`sweep-resolved-close-unavailable`, `sweep-decision-effect-unavailable`) and carry
+  on: the answers stay in the run's `decisions.json` and the entries stay open for the
+  next cycle. The PUBLISH is the exception: a ledger mutator whose atomic write fails
+  (`ENOSPC`, `EROFS`, a failed rename) now raises `deferredwork.LedgerWriteError` — an
+  `OSError` subclass, so the CLI and TUI degrade arms are unchanged — and both sweep
+  sites re-raise it ahead of the degrade, since a repair write that failed is not a
+  phase that closed nothing. Its sibling `LedgerLockReleaseError` covers the far side:
+  the publish landed and the ledger lock's release then faulted (Windows `LK_UNLCK`,
+  `os.close`), which the same arm had read as "nothing was written" while the closure
+  was already on disk.
+
+- Commit the deferred-work ledger in the tree that owns it (DW-175). `implementation_artifacts`
+  is configurable to any absolute path, so the ledger may sit under the project, inside
+  a disjoint `repo_root`, or in no git repository at all — and a single fixed root is
+  wrong in two of the three. Ledger commits now name the ledger's own directory and let
+  git resolve the enclosing repository; pre-answer-store commits keep naming the
+  project, which is the tree that store is a bare join off. Where no repository encloses
+  the file, the commit is skipped and journaled (`sweep-ledger-commit-unavailable`,
+  naming the directory and git's error) rather than ending the sweep. That degrade is
+  for a tree git cannot interrogate only: a ledger commit git was asked to make and
+  refused (a hook, the index, a full disk) still raises, as the publishers did before
+  re-rooting — the cycle's bundles would otherwise run against the dirty baseline the
+  commit was meant to clean. The store's commits keep degrading on both.
+
+- Stop a sweep wiping every recorded pre-answer when the ledger vanishes mid-cycle
+  (DW-176). An absent ledger read as "nothing is open" and dropped the whole store,
+  committing the wipe; it now journals `sweep-preanswer-prune-refused` and writes
+  nothing. An empty-but-present ledger still prunes.
+
+- Withhold the decision phase's ledger commit when the LAST decision effect faulted
+  (DW-166), so the ledger bytes that would not parse are never published; a later
+  effect that reads and writes the ledger settles the doubt and the commit happens,
+  carrying the earlier decisions' lines with it. The attended hand-back no longer
+  prints `✓ decisions recorded` when any effect missed the ledger — it reports that
+  the answers are saved, that not every decision reached the ledger, and which
+  journal kind names the misses.
+
+- Stop a re-dispatched sweep bundle from carrying the SUPERSEDED bundle's state
+  (DW-162, DW-163, DW-165). `Sweep._run_bundle` already adopted a different bundle's
+  `dw_ids` onto a task `_recover_inflight_bundle` had reset to PENDING, but every other
+  per-bundle field stayed: `bundle_closes_intended` (which the DONE-leg ledger carry and
+  the engine's replay predicate both read, so it closed ids this task never ran),
+  `spec_file` + `restore_patch` (which made the dispatch prompt select the superseded
+  amended contract, and `_record_dev_spec` — a no-op once set — refuse the replacement's
+  own spec). Reset `attempt`, `review_cycle` and `followup_reviews_spent`, clear
+  `defer_reason`, and advance `generation` to give replacement work fresh session ids
+  and review budgets, as a human-resolved re-arm does. Apply these changes through
+  `_reset_superseded_bundle_state` on the DIVERGENCE branch alone;
+  an agreeing or merely reordered re-dispatch is the same bundle and keeps everything,
+  and `resolved_redrive` stays latched because it records a HUMAN resolution, not spec
+  ownership. Defensive: no reachable sequence was demonstrated for the `spec_file` /
+  `restore_patch` half.
+
+- Grade a persisted sweep bundle intent document against the task that owns it (DW-164).
+  `_run_bundle` writes `task.bundle_file` and only then `_save()`s the adopted ids, so a
+  crash between them left `_ensure_bundle_intent` reusing a still-existing document whose
+  `dw_ids:` line named ids the task no longer carried. Re-ordering the two writes only
+  inverts that pairing, so the check is total instead: a new `_bundle_intent_reason`
+  compares the document's ids against `task.dw_ids` as a SET and regenerates on
+  disagreement, on an unreadable file, on a document with no `dw_ids:` line at all, or
+  when the file is gone — `sweep-intent-regenerated` now carries a `regen_cause` field
+  saying which. That is a closed slug rather than a free-text `reason`, which
+  `diagnostics._JOURNAL_DROP_FIELDS` would have rendered as a presence boolean, defeating
+  the field's whole purpose. An EMPTY `task.dw_ids` (the pre-`dw_ids` `state.json` shape)
+  is not an authority and keeps its real document.
+
+- Serialize the project pre-answer store's three writers (DW-161). `record_pre_answer`,
+  `prune_pre_answers` and `drop_pre_answer` each did an unlocked `load_pre_answers` ->
+  `_write_store`, so a `bmad-loop decisions` answer, a TUI decision modal or a second sweep
+  landing in that window was overwritten wholesale — the store read-modify-writes the WHOLE
+  file, so a lost update is a human's answer gone, not a stale field. Each now runs its read
+  and its write inside ONE `deferredwork.ledger_lock` hold keyed on the store path. The
+  ledger's helper is reused rather than twinned, and the two files share only its
+  path-agnostic NESTING guard — never an OS lock, since each sidecar is keyed on its own
+  resolved path — whose consequence is that no caller may hold both at once, in either
+  order. The two conditional writers keep a #736 advisory pre-lock probe, so a call a read
+  proves will write nothing still acquires nothing and still leaves the store's bytes and
+  mtime untouched. Readers stay lock-free; a real write can now surface a lock-acquisition
+  failure where none was possible before.
+
+- Commit the sweep's pre-answer prunes in the store's own tree (DW-160). Both prune sites
+  resolve the store under `_project_of_run_dir(self.run_dir)` but committed through
+  `_commit_ledger`, which checked and committed `self.workspace.root`: where `repo_root`
+  names a tree DISJOINT from the project those diverge, the clean check passed against the
+  untouched code repo, nothing was committed, and the project worktree was left dirty ahead
+  of this cycle's bundles. (The nested/monorepo shape was unaffected — `repo_root` is an
+  ancestor there, so the store edit was already visible.) `_commit_ledger` takes a
+  keyword-only `root` and both prune sites pass the store's own; a `verify.GitError` from an
+  explicitly-rooted call now degrades to a `sweep-ledger-commit-unavailable` journal row
+  naming the tree and the error, so a project that is not a git repository keeps its store
+  write instead of aborting the sweep.
+
+- Gate the stories E2E's detached-writer fakes on a completed `setsid` transition. `$!`
+  names the straggler the instant `fork` returns, but `setsid(2)` runs in that child
+  afterwards, so publishing the identity straight off `$!` only assumed the escape the
+  rows exist to prove — under a scheduler delay the reaper could be graded against a
+  child still inside the pane's session, covering the weaker same-pgid case. Both
+  detached fakes now bounded-poll the child's observed `/proc` session id, off the
+  shared real-tmux hang ceiling, and fail loudly rather than publish an ungraded
+  identity (DW-159). Three local-process rows drive that fragment directly — the
+  detached, the late-detaching and the never-detaching child — and the stories module's
+  xdist-group floor is re-pinned from 30 to its actual gated-def count, so it no longer
+  carries fourteen deletions' worth of silent slack. Synchronize retry coverage, grade
+  session identity independently of process groups, and kill unpublished children when
+  readiness times out.
+
+- Type-check the decision `question` and option `key` a triage plan carries instead of
+  `str(...)`-ing them: both are printed by `bmad-loop decisions`, announced by the
+  attention notifier and written to the `decision-pending`/`decision-answered` journal
+  records, so a list `question` used to validate cleanly and reach an operator as the
+  repr `['a', 'b']`. A non-string one is now refused through the existing `errors`
+  channel, one error per fault, with no repair path. This refuses triage plans the
+  previous release accepted: such a plan is re-driven, and a cached `triage*.json`
+  written before this release that carries such a value stops contributing its
+  decisions to `decisions --list`, `status` and the TUI until the next sweep re-triages
+  the still-open ids (DW-156).
+
+- Name a triage decision by its position when its `id` is not a string, in every
+  diagnostic the decisions loop emits, so an object-valued `id` can no longer print its
+  own contents into messages that promise type names only. Acceptance is unchanged: the
+  same plans validate and are refused, and a string id — the empty string included —
+  keeps today's wording byte for byte (DW-157).
+
+- **Refuse a migration result whose top level is the wrong shape** (DW-170), the DW-155
+  guard `validate_triage` got and its twin one function over did not. `rj = rj or {}`
+  substituted only on a falsy document, so a truthy non-object result — a list, a
+  string, a number — reached `.get` and raised `AttributeError` out of
+  `validate_migration`. It is now refused through the existing `errors` channel, which
+  for a list top level emits `migration result not a JSON object: list`, and an empty
+  list is refused by shape rather than reported as a `workflow` error. This makes the
+  function total over parseable JSON for its own callers rather than fixing a live
+  crash: `_ensure_migration`, its only production caller, screens the same result
+  through `critical_escalations` first, which raises on a truthy non-dict before this
+  guard is reached.
+
+- Extend DW-157's positional naming to the triage diagnostics it missed (DW-171): the
+  `already_resolved`, `blocked` and `skip` loops, the open-set mismatch's `not open in
+the ledger` list and the `workflow must be ...` refusal in BOTH validators used to
+  interpolate LLM-authored objects verbatim into strings that reach the journal. A
+  non-string identifier is now named by its position and type name (`already_resolved[0]
+(id not a string: dict)`, `open_ids[0] (not a string: dict)`) and a non-scalar
+  `workflow` prints as `a dict`. Acceptance is unchanged — the identifier fields are
+  still deliberately not type-checked, so the same plans validate and the same plans are
+  refused — and a string identifier, the empty string included, plus a scalar `workflow`
+  (`got None`, `got 'wrong'`) keep today's wording byte for byte.
+
+- Re-offer a decision hand-seeded as `effect: "close"` in `.bmad-loop/decisions.json`
+  (DW-147), instead of counting it answered while no sweep ever built, closed or re-asked
+  it. Re-answer it with `bmad-loop decisions`; the file is journaled, never edited.
+
+- Adopt the current bundle's deferred-work ids before writing a reset sweep task's
+  intent (DW-144). Keep dispatch and ledger-close ids aligned, and journal both
+  old and new ids as `sweep-bundle-dwids-adopted` when they differ.
+
+- **Retire stale keep-open pre-answers when dropped** (DW-143), so decisions are
+  offered again and fresh sweeps stop repeating stale-answer notifications. Journal
+  the removal and preserve run-local answers and ledger history. A read-only project
+  store raises `PermissionError` after the drop is announced and quarantined; a fresh
+  run retries once the store is writable. The retirement removes the entry only while
+  it still holds the value that was dropped: a paused run's stale run-local copy wins
+  over the store on resume, so a replacement a human recorded out of band meanwhile
+  is left in place for the next run instead of being deleted and committed away. The
+  compare and the delete are one step under the store's lock (DW-161 below), so that
+  compare-and-delete and a concurrent `bmad-loop decisions` re-answer cannot interleave.
+
+- **Skip an unreadable cached triage instead of failing the read** (DW-145). Widen
+  `decisions.pending_missed_decisions`' except tuple to include `UnicodeDecodeError` —
+  a `ValueError`, not an `OSError`, so non-UTF-8 bytes in one run's `triage*.json`
+  escaped past `cmd_decisions` and `cmd_status` (which catch `BmadConfigError` alone,
+  leaving `main`'s backstop to exit 1 with no `--json` document) and out of the TUI
+  uncaught. Degrades per file: the bad cache is skipped, the other runs still count.
+
+- **Refuse a triage plan whose free-text scalars are not strings** (DW-148). Type-check
+  bundle `name`/`intent`, option `effect`/`intent`/`label`/`resolution`/`bundle_name`
+  and decision `context`/`recommendation` in `validate_triage` instead of `str(...)`-ing
+  them — a list `intent` used to become a truthy Python repr that passed the
+  `effect == "build"` intent gate and rode into `Bundle.intent`, `intent.md` and a dev
+  session (the DW-141 harm, on the plan-input surface). Errors name the decision id or
+  the bundle's position, the field and the type name only, one per fault. Identifiers
+  and ledger-bound notes (`key`, `question`, `id`, `evidence`, `blocker`, `reason`,
+  `dw_ids` members) deliberately keep `str(...)`. Note: a pre-existing cached triage
+  that the stricter check now refuses is skipped by `pending_missed_decisions`, so its
+  decision drops out of `decisions --list`, `status` and the TUI until the next sweep
+  re-triages the still-open entry.
+
+- **Refuse a triage plan whose CONTAINERS are the wrong shape** (DW-155, DW-158), instead
+  of raising out of `validate_triage` and every caller of it. `rj = rj or {}` substituted
+  only on a falsy document, so a non-object top level raised `AttributeError`; a `null`
+  `open_ids`/`bundles`/`already_resolved`/`blocked`/`skip`/`decisions`/`options`/`dw_ids`
+  raised `TypeError`; and a `null` member of any list section raised `AttributeError` —
+  crashing the sweep run loop on a live triage session and taking `decisions --json`,
+  `status` and the TUI down on one bad cached `triage*.json`. The validator is now total
+  over parseable JSON: wrong shapes in these containers and object members are refused
+  as `(None, errors)`, with a shape diagnostic naming the location and type. Independent
+  partition errors can still be reported. Positions stay the document's, so a
+  dropped member does not renumber its siblings, and a shape-failed section no longer
+  double-reports its own `has no dw_ids` / `needs at least 2 options` value error.
+  `pending_missed_decisions` degrades per file, as it does for an unreadable cache.
+
+- **Close the last reuse-exposed test child identities** (DW-136, DW-137). Share the
+  pidfd-authentication helpers, publish identities atomically, and sweep authenticated
+  children abandoned during pre-bind failures. The OpenCode row is now Linux-only,
+  and no executable `os.kill(` call remains in `tests/`.
+
+- **A stored decision answer is now screened by SHAPE, not just by container type**
+  (DW-140/141/142). Three gaps behind DW-134's container-level check: a project
+  `.bmad-loop/decisions.json` holding non-UTF-8 bytes raised `UnicodeDecodeError` out of
+  `load_pre_answers` and aborted the whole sweep that read it; the build lane stringified
+  `key`/`label`/`intent`/`bundle_name`, so a list `intent` shipped its truthy Python repr
+  into `intent.md` and a dev session as prose no human wrote; and an answer with a missing
+  or unrecognized `effect` matched no materialize lane while `decisions.pending_missed_decisions`
+  counted it answered, so no reader ever surfaced the id again. `load_pre_answers` now
+  catches the decode fault, and one shared predicate (`sweep.unusable_answer_reason`)
+  screens both readers, so a value the sweep will not act on is one `bmad-loop decisions`
+  re-offers rather than counting answered. It screens only what a reader of THAT effect
+  consumes — `key`/`label` always, `intent`/`bundle_name` for `build` alone, `resolution`
+  and `answered_at` never — because a refused `keep-open` answer stops suppressing its
+  bundle, and `effect: "close"` stays usable (the in-run writer stores it). The lanes'
+  own typed reads (`""` rather than a repr) are now defense-in-depth rather than the
+  production path: the read site rejects such answers first, so the lanes matter only for
+  callers that bypass it — the test suite hands `_materialize_bundles` a map directly.
+  No new journal kinds and no new drop causes; the degrade stays per-value and in-memory,
+  so the two write-backs still re-publish an unusable value verbatim rather than repairing
+  the human's file.
+
+- **The re-stamp row that settles an owed code-root record now records THAT a move
+  happened** (DW-128) — not which trees: the row's `repo` is the new root and a dump
+  reduces it to `repo_present`. `runs.restamp_code_root`'s trailing `rearm-code-root-restamped`
+  append writes `code_root_changed` about THIS call, so the one path where the row is a
+  real move's sole durable trace — call one re-points the root, persists, and its append
+  raises; the retry discharges the record having moved nothing — recorded `false` and read
+  as "nothing moved". That append now also carries `discharged_owed_move`, true exactly
+  when the row settles a record owed by an earlier call's move. `code_root_changed` keeps
+  its exact current value at every append site, and the two sibling discharge appends
+  (which already assert `code_root_changed=true`) are untouched, so an absent key on those
+  rows means "not stated", not `false`.
+
+- **A regenerated sweep bundle no longer vanishes into a finished bundle's key** (DW-125).
+  `_run_bundle`'s terminal-task early return compared only the derived `dw-<name>` key, and
+  the key is a pure function of `(name, cycle)` — so a resume that lost `<run>/triage.json`
+  re-triaged, re-authored the remaining ids under freely chosen names, and any bundle that
+  happened to reuse a completed bundle's name was skipped with its deferred work never run.
+  The skip now also requires the persisted task's `dw_ids` to agree with the bundle's, as set
+  equality (a reordered plan is still the same bundle) and with an empty persisted list
+  counting as agreement (the pre-`dw_ids` `state.json` shape, so no paused run needs
+  migrating). On divergence the bundle takes the same bounded `-2` … `-9` name suffix the
+  decision-bundle site already uses, journaled `sweep-bundle-key-deduped`; exhausting the
+  bound journals `sweep-bundle-key-collision`, notifies, and leaves the ids open rather than
+  swallowing them. In-flight tasks are untouched — they still go through the existing
+  recovery — and the cycle's progress count now grades the key each bundle was resolved to
+  (the one it ran under, or the terminal one it was skipped at) rather than one re-derived
+  from the plan's name.
+
+- **A sweep's decision dispositions now survive a pause/resume of the same run** (DW-124).
+  The two quarantines — ids journaled `decision-skipped-unattended`, and ids whose recorded
+  answer was journaled `sweep-decision-answer-dropped` — moved from `SweepEngine.__init__`
+  set state onto `RunState` (`sweep_skipped_decisions` / `sweep_dropped_decisions`),
+  persisted immediately after each disposition is announced. Once that state publication
+  succeeds, a resumed run no longer re-journals a drop and re-fires its `gates.notify` for an
+  id it already reported, nor revives a bundle when the resumed cycle's re-triage happens to
+  mint an agreeing option. Deliberately
+  run-scoped: a NEW run still re-evaluates every decision, the human's answer in
+  `<run>/decisions.json` is untouched, and a pre-upgrade `state.json` loads both empty.
+
+- **Degrade a malformed `<run>/decisions.json` instead of aborting the sweep** (DW-134).
+  An unreadable file, a non-object top level or a non-object value journals
+  `sweep-decisions-reload-failed` (one record per fault class; per-value records name their
+  store and affected ids) and drops only the unusable answers; the well-shaped rest answer
+  as before, and both `_materialize_bundles` lanes shape-guard the map they are handed. A
+  per-value drop is re-published unchanged by the phase's own write-backs; a whole-file fault
+  has nothing per-value to carry. `bmad-loop decisions` re-offers an id whose stored
+  pre-answer value is unusable, instead of counting the bare key as answered. Also count
+  every decision-answer drop as repeat progress (DW-135): `_cycle` previously counted only
+  the keep-open lane, so a `--repeat` cycle whose sole event was a `no-intent` or
+  `name-collision` drop stopped at `no-progress` even though the drop frees the id for a
+  later cycle's fresh triage. All three lanes now signal, still bounded to one drop per id
+  per run.
+
+- **Make stories E2E reap identity reuse-proof and clean up a live child when either
+  protected reap assertion fires** (DW-126, DW-127).
+
+- **`runs.restamp_code_root` now warns only when THAT call moved the code root**
+  (DW-114). A set `code_root_restamp_pending` with the mirror already equal to the
+  incoming root made the function fall past the "already agrees" exit, discharge the
+  owed record with a hardcoded `code_root_changed=True`, and return the "the code root
+  in `_bmad/bmm/config.yaml` has changed" warning that `bmad-loop resolve` and the TUI's
+  re-arm print — on a call that re-pointed nothing, and on the same seam where
+  `cli._prepare_resume_locked` stays quiet. The marker is a record DEBT, not a move: the
+  trailing record now reports whether THIS invocation re-pointed the root, and the call
+  returns `None` when it did not, so the re-arm surfaces and plain `resume` now agree
+  about whether an operator is warned in that state. They still differ on the journal:
+  this record reads `code_root_changed=false` where resume's own discharge row keeps
+  `true`, because resume's names the pre-overwrite root and this one names the call that
+  moved nothing. The at-least-once discharge is unchanged — the record
+  still lands exactly once under the root now recorded, the marker still clears only
+  after the append returns, and the pre-overwrite discharge still names the previous
+  root with `code_root_changed=True`. A genuine move still warns.
+
+- **Stop stale `keep-open` answers from suppressing later deferred-work bundles**
+  when triage options are renumbered or removed (DW-123).
+
+- **A stored deferred-work decision answer is now validated against the triage
+  option its key resolves to before the two are blended** (DW-118). `Decision.option`
+  matches on key alone and a key is a position in a list every triage re-authors, so a
+  renumbering re-triage attributed one question's answer to another question's option:
+  on DW-55 a stored `build` answer keyed "1" met a fresh option "1" spelled "Close as
+  decayed", and the bundle shipped the stale review intent under the close label while
+  quoting a question the human never answered. The answer's own `label` and `effect` —
+  the two fields both provenances carry — are now compared first, and a disagreeing
+  option is discarded outright: it contributes no intent, label or bundle name, the
+  mismatch is journaled (`sweep-decision-option-mismatch`), and the decision note cites
+  the earlier triage rather than the current question. Precedence is flipped with it, so
+  even an agreeing option fills only the fields the stored answer omits and re-authored
+  triage prose can no longer reach a bundle the human chose against different prose.
+  Covers the in-run lane too — `--repeat` re-triages each cycle while answers persist for
+  the whole run — where a discarded option can leave nothing to build from: that answer
+  is journaled (`sweep-decision-answer-dropped`) and notified instead of vanishing, and
+  its ledger entry stays open for the next sweep to re-ask. A dropped decision is
+  quarantined for the rest of the sweep process, so a later cycle whose re-triage agrees
+  with it again neither revives it nor re-notifies it; the quarantine is instance state
+  and is never persisted, so a resumed run re-evaluates the decision. The
+  `decision-<id>` fallback name is also made unique now: it is a fallback, not a
+  reserved namespace, so a plan bundle may legally carry it and the two would have
+  hashed to one task key and one intent directory, silently losing the human's bundle. A
+  taken name gains a bounded numeric suffix (`-2` … `-9`, first free wins, journaled
+  `sweep-bundle-name-deduped`); exhausting the bound is the one point in name assignment
+  at which a buildable answer yields no bundle, journaled with
+  `drop_cause: name-collision` and notified.
+
+- Inventory keyword and splat journal kinds only over an empty positional slot,
+  preserving literalness and field findings (DW-109); give unresolved-kind failures
+  call-site advice and prohibit sentinel declarations (DW-113); remove stale guard
+  counts (DW-110, DW-112) and pin every kind covered by the by-name `patch` drop
+  (DW-78).
+
+- Name the property instead of counting siblings in the portability guard's last three
+  journal-kind comments (DW-120): a kind-only write is one passing no keyword arguments
+  at all, not even a `**` splat, and the other class is a literal reaching a declared
+  dynamic-kind position from outside its body — a caller's `kind=` keyword or the
+  position's own parameter default. A fifth of either no longer falsifies the prose.
+
+- Retire two unpinned prose claims in the portability guard (DW-130, DW-131): the
+  dynamic-kind literalness docstring no longer counts the writes it governs, keeping only
+  the ablation-pinned position count, and the kind-literal probe's ablation now maps each
+  feeding emit to the rows it reddens instead of crediting one emit with all of them.
+
+- Pin each declared dynamic-kind position's journal-write count in the portability
+  guard (DW-138). `JOURNAL_DYNAMIC_KIND_ALLOW` is now a mapping from position to its
+  expected number of `journalkind` findings, held against the tree by a new row, so a
+  write added or removed inside an already-declared position reddens instead of only
+  falsifying a comment — the waiver is granted per position, so the declaredness gate
+  passes on such a write by construction. Waiver semantics are unchanged.
+
+- Probe both existence arms of the accepted-spec worktree seed through the total
+  `_is_file` (DW-103), matching its structural siblings and the DW-101 supersession
+  warning. On Python <=3.13 a raw `Path.is_file` raises on an unreadable path, and
+  this call site sits outside every `except` in `run_isolated`, so the fault ended
+  the run instead of allowing dispatch to continue. No change on non-faulting paths.
+
+- Name the two silent refusals on the accepted-spec delivery path (DW-104, DW-115).
+  The worktree seed's containment refusal now nominates its rel anyway, so
+  `worktree-seed-dropped` reports it — the copier re-checks destination containment
+  itself, so still nothing is written outside the mount — and both that refusal and a
+  source the locator could not resolve at all (a swallowed filesystem fault, or a
+  spelling that no longer resolves) are journalled as
+  `accepted-spec-delivery-unreachable` on the non-relocated leg. Previously the rel reached no journal and, for a
+  project-relative spec, no gate either: the unit dispatched against a mount lacking
+  the operator's spec and fell back to the bare story key. Nothing new escalates.
+
+- Probe the accepted spec for file-ness inside `relativize_project_local_accepted_spec`'s
+  own `except` (DW-116). `run_isolated` calls the method before its first `try`, so a
+  TOCTOU or non-EACCES `OSError` at that probe ended the run; it now leaves the
+  spelling unchanged, as a false probe already did.
+
+- Discharge an owed code-root re-stamp record under its original root before
+  resuming (DW-100), preserving the record and integrity pin for retry on failure.
+  Warn only when the configured root differs from the recorded root; a pending
+  record alone no longer triggers the code-root warning.
+
+- **Stopped the real-tmux E2Es contending with each other under `-n logical`**
+  (DW-95). They shared the box with every other worker and could starve past their
+  fixed waits — a load flake, not a defect. All 23 collected cases now carry one
+  `xdist_group`, so loadgroup scheduling serializes them while the rest of the suite
+  still fans out; `--dist loadgroup` is declared in `pyproject.toml` `addopts`, without
+  which the marks are silently inert. Separately, the four completion- and crash-path
+  waits in `tests/test_generic_tmux.py` now share one named 90s hang ceiling — a hang
+  detector, not a performance budget — replacing per-site 30s and 20s walls; the
+  `tests/test_stories_e2e.py` subprocess `timeout=` budgets stay their own and rely on
+  the grouping alone. Guards in `tests/test_conftest.py` check repository scheduling
+  declarations and the synthetic scheduling mechanism, and prevent short completion
+  walls from returning while preserving the deliberate 6s triggers. Tests only; no
+  production change.
+
+- **Put the last two load-sensitive real-tmux walls on the shared hang ceiling**
+  (DW-108). The descendant-reap polls in `tests/test_stories_e2e.py` deadlined on a
+  fixed `time.monotonic() + 10`, which a starved scheduler can blow through — the class
+  DW-95 removed from the generic-tmux waits but left in the one module its guard
+  excludes. Both now spell the imported `REAL_MUX_HANG_CEILING_S`; the trade-off is
+  deliberate, a merely slow reaper is caught at 90s rather than at 10s while a broken
+  one still fails. A second scanner in `tests/test_conftest.py` keeps them there,
+  rejecting any `time.monotonic() + <budget>` in a tmux-gated test in that file that is
+  not the imported constant, with a named expected-site inventory so it cannot pass by
+  scanning nothing and must-flag / must-stay-silent probe rows through the same function.
+  The subprocess `timeout=` budgets in that file stay out of scope. Tests only; no
+  production change.
+
+- **Bound launch-marker snapshot retention in the dev adapters** (DW-96). Each dev
+  session start stored a park-marker snapshot under its task id and nothing removed it;
+  an unpinned launch (no `expected_spec`) snapshots every `*.md` in the artifacts dir,
+  so an adapter driving N such sessions over M files retained O(N x M) entries for its
+  lifetime. The mixin's `run()` now evicts the task's entry in a `finally`, holding only
+  launches still in flight. Eviction is scoped to the returning task id, so a concurrent
+  launch is untouched, and lands after `_post_kill_reconcile`, the last in-lifecycle
+  reader. No verdict changes.
+
+- **Bound four more per-task dev-adapter stores to the session** (DW-106, DW-107).
+  `_fm_fallback_obs`, `_fm_transition_obs`, `_contract_nudge_sent` and the OpenCode
+  transport's `_server_procs` (a live `Popen` per task) grew one entry per session for
+  the adapter's lifetime. All four are now evicted through one `_evict_task_state` seam
+  called from `run()`'s `finally` — past every in-lifecycle reader, including
+  `_post_kill_reconcile`, and still reached when `wait_for_completion` raises. Scoped to
+  the returning task id, so a concurrent session keeps its entries; within-session
+  semantics (the exactly-once contract nudge included) are unchanged.
+  `OpencodeHttpAdapter._usage` is a separate case: it is keyed by session id and read
+  after `run()` returns, so it cannot use this seam — it is capacity-bounded instead
+  (DW-117).
+
+- **Bound the OpenCode HTTP adapter's session usage stash** (DW-117).
+  `OpencodeHttpAdapter._usage` was written once per session in `_capture_usage` and
+  never popped, so it grew O(sessions) for the adapter's lifetime. It cannot join the
+  `_evict_task_state` seam — it is keyed by session id, not task id, and the engine
+  calls `read_usage(result)` after `run()` returns, so evicting there would zero token
+  accounting. The write site now enforces a fixed `USAGE_STASH_CAP` (256), dropping the
+  oldest entries first and only when the key is new, so a re-stash of a live session
+  never evicts a peer. The cap sits orders of magnitude above any plausible in-flight
+  session count, and `read_usage`'s contract — signature, idempotence, `None` for a
+  missing or absent session id — is unchanged.
+
+- Prevent harvest races from filing cross-spec duplicates for one fingerprint (DW-98).
+
+- **A partial journal flush no longer swallows the writer's next record** (DW-97). A
+  partially flushed `Journal.append` left an unterminated fragment, the next append
+  concatenated its own record onto it, and both readers dropped the combined line — so
+  one fault lost a record that was written whole (a swallowed `unit-merged` re-drives
+  already-merged work). `append` now terminates a fragment on its own line first. That
+  bounds the loss to the torn record for the writer's own next append only; another
+  process tearing a write concurrently can still produce the old pairing, and append
+  durability is unchanged (no fsync, no lock). Both readers (`Journal.entries`,
+  `tui.data.JournalTail.read_new`) now substitute a reader-minted
+  `journal-line-unreadable` marker — kind plus byte count, no timestamp, no line
+  content — for a complete line that will not parse, so the loss is counted in
+  `diagnose --json`'s `kind_histogram` and rendered red in the TUI. That count is a
+  floor on lost records, not an exact one: a single unparseable line can be two
+  concatenated records. An unterminated final line is still withheld by the TUI tail
+  until the heal terminates it; `Journal.entries`, which reads the file whole, marks a
+  trailing fragment straight away.
+- Preserve complete CRITICAL escalation detail in run records while visibly bounding human displays and naming the spec or journal that holds the recovery trail.
 
 - **The TUI's re-arm declines a contended run instead of waiting for it.** The
   gesture runs on Textual's message loop, so taking the run's state lock blocking
@@ -997,6 +2462,38 @@ decisions` and the TUI decision modal now also catch the state-root failure that
 
 ### Security
 
+- **Confine the sweep's triage-cache write-back and bundle intent write to the project
+  root** (DW-269). `_ensure_triage`'s `<run>/triage{suffix}.json` write-back and
+  `_write_intent`'s `<run>/bundles/<dirname>/intent.md` still went through the plain
+  `atomic_write_text`, which resolves every directory above the file by name, so a link
+  planted at any directory component below the project root (`.bmad-loop/`, `runs/`, the
+  run dir, `bundles/` or `bundles/<dirname>/`) aimed both the staged temp and the
+  published file out of the project — the escape #593 already closed for the sibling
+  `<run>/decisions.json` writes. Both now write through `atomic_write_text_confined`
+  against the project that owns the run dir. The cache write-back's refusal degrades on
+  its existing `sweep-triage-cache-write-failed` row (`UnconfinedWriteError` is an
+  `OSError`), costing the cycle its cache and nothing else; the intent write's refusal
+  propagates exactly as any other write fault there does (DW-243). No new journal kind,
+  pause stage or policy field.
+  A link (or symlink loop) planted at the file's OWN name is no longer followed either:
+  the plain writer resolved it and rewrote its target, the confined writer replaces the
+  name (DW-247's `RuntimeError` loop arm goes with the `resolve()` it guarded), and the
+  file lands `0600` with no mode inherited.
+  On POSIX the `sweep-triage-cache-write-failed` `errors[0]` text now names the bare
+  filename rather than the full path — the replace is dir_fd-relative.
+  Accepted residual, unchanged: the run dir's other writers — the journal, `state.json`,
+  and `ATTENTION` — still go through plain writers. The intent's preceding `mkdir` can
+  still create directories through a redirected parent; a failed cache read can still
+  unlink `triage{suffix}.json` through one. This change confines only the two file writes.
+- **Confine migration run-directory record writes to the project root** (DW-288).
+  `_ensure_migration`'s `<run>/migrate-manifest.json` and
+  `<run>/migrate-result.json` used bare `Path.write_text`, so a link planted at any
+  parent beneath the project could aim either record outside it. Both now publish
+  atomically through `atomic_write_text_confined`, rooted at the project that owns the
+  run directory. A manifest refusal still propagates before migration dispatch; a
+  successful-result refusal still propagates before the ledger commit. Their JSON
+  payloads and publication ordering are unchanged; unlike the old umask-derived files
+  (commonly `0644`), both records now land with private `0600` mode.
 - **`bmad-loop diagnose` no longer ships a merge record's target branch verbatim** (#640).
   The leak PRE-DATES the re-arm work this section is otherwise about: all three producers
   and the by-name routing shipped in earlier releases, so any dump of a run that merged a
@@ -4627,7 +6124,8 @@ enforced in CI.
   implementation phase, driven by a Python control loop with hook-based session transport and
   resumable on-disk run state.
 
-[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.12.0
 [0.11.1]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.11.1
 [0.11.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.11.0
 [0.10.0]: https://github.com/bmad-code-org/bmad-loop/releases/tag/v0.10.0

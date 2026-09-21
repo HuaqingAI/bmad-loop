@@ -15,7 +15,14 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
-from conftest import assert_run_state_lock_held, escalated_run, git, refuse_to_resolve
+from conftest import (
+    assert_run_state_lock_held,
+    escalated_run,
+    git,
+    patch_publish_rename,
+    real_publish_rename,
+    refuse_to_resolve,
+)
 
 from bmad_loop import envvars, platform_util, runs, verify
 from bmad_loop.adapters import tmux_base
@@ -48,11 +55,32 @@ def _make_state_run(project, run_id, **state_kwargs):
     return run_dir
 
 
+# Every `_dead_pid()` child, kept for the interpreter's lifetime: Windows recycles a
+# pid the moment the last handle to the exited process closes, and `Popen` holds
+# that handle only as long as the object lives. Dropping it let another xdist
+# worker's child take the "dead" pid and `psutil.pid_exists` call the engine alive
+# (test_prunable_sessions_claims_an_untagged_session_on_a_run_id_collision, Windows
+# py3.14). A held handle pins the pid to the exited process, which psutil reports as
+# not running. On POSIX the reaped child is gone either way; the list is harmless.
+_DEAD_CHILDREN: list[subprocess.Popen[bytes]] = []
+
+
 def _dead_pid() -> int:
     # A process that exits immediately, cross-platform (POSIX `true` isn't on
     # Windows). The interpreter is always present and on every host.
     proc = subprocess.Popen([sys.executable, "-c", ""])
     proc.wait()
+    _DEAD_CHILDREN.append(proc)
+    # `wait()` returns when the process object is signaled; on Windows the pid
+    # can still be enumerated for a moment after that, and a test probing it
+    # right away read the dead engine as running (test_discover_runs_classification,
+    # Windows py3.11). Hand back the pid only once the probe every consumer uses
+    # agrees it is dead — bounded, and loud rather than flaky if it never does.
+    deadline = time.monotonic() + 10.0
+    while platform_util.pid_alive(proc.pid):
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"exited child {proc.pid} still reads alive after 10s")
+        time.sleep(0.01)
     return proc.pid
 
 
@@ -1269,12 +1297,14 @@ def test_write_stop_request_survives_an_interleaved_concurrent_writer(tmp_path, 
     seam still covers the ablation the old dual patch existed for, and covers it
     better — `atomic_replace` is itself a wrapper around `os.replace`, so
     reverting `_write_stop_request` to the hand-rolled `tmp + atomic_replace`
-    routes through this same patch and must still redden this test.
+    routes through this same patch and must still redden this test. Through
+    `patch_publish_rename`, which also covers the Windows anchored arm's
+    `win32_at.replace_at` — there `os.replace` is never called at all.
 
     Filtered to the stop-request name so an unrelated replace during the test is
     not collateral."""
     run_dir = _make_state_run(tmp_path, "r1")
-    real_replace = os.replace
+    real_replace = real_publish_rename
     nested: list[str] = []
 
     def _interleave(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
@@ -1283,7 +1313,7 @@ def test_write_stop_request_survives_an_interleaved_concurrent_writer(tmp_path, 
             runs._write_stop_request(run_dir, "graceful")
         return real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
-    monkeypatch.setattr(os, "replace", _interleave)
+    patch_publish_rename(monkeypatch, _interleave)
 
     runs._write_stop_request(run_dir, "hard")  # writer A — must not raise
 
@@ -3024,10 +3054,14 @@ def test_restamp_code_root_aims_the_mirror_the_rearm_reads(tmp_path, recorded):
     NECESSARILY agrees. Without this line the one gesture where the root actually moved
     is the one that leaves no trace, while plain `resume` still writes one.
 
-    Ablation: drop the `if not moved: return None` arm and `legacy` reddens on the
-    message; return the message without the `save_state` and `moved` reddens on the
-    persisted root while the other two rows still pass; delete the `journal.append` and
-    `moved` reddens on the record alone, with every message assertion still green.
+    Ablation: `legacy` returns `None` at the `if not state.code_root_restamp_pending:
+    return None` guard — the marker reads False because `moved` is
+    `bool(state.repo_root)` and the recorded root was empty — so widen `moved` to a
+    bare `True` and `legacy` reddens on the message, while `unchanged` still exits
+    above at "already agrees"; return the message without the `save_state` and `moved`
+    reddens on the persisted root while the other two rows still pass; delete the
+    `journal.append` and `moved` reddens on the record alone, with every message
+    assertion still green.
     """
     from bmad_loop.journal import STATE_FILE, Journal
 
@@ -3078,9 +3112,21 @@ def test_restamp_code_root_keeps_the_move_retryable_when_the_record_fails(tmp_pa
     later `run-resume` line reporting `code_root_changed=False` — re-enters, writes
     the record the move still owes, and clears the marker.
 
+    The retry writes that record about ITSELF, though, and it moved nothing: the root
+    it is handed is the one already persisted. So the row reads `code_root_changed=
+    False` and the call returns `None` — the marker is a RECORD DEBT, not a move, and
+    letting it speak for one made the re-arm surfaces warn "the code root has changed"
+    on a call that changed nothing while `cli._prepare_resume_locked`, on the same
+    seam and the same state, stayed quiet.
+
     Ablations: drop the `or state.code_root_restamp_pending` half of the early
-    return and the retry reddens on `None`; clear the marker before the append and
-    it reddens the same way; never set it and the first assertion reddens."""
+    return and the retry reddens on the record list; clear the marker before the
+    append and it reddens the same way; never set it and the first assertion reddens;
+    hardcode the trailing append's `code_root_changed=True` or drop the `if not
+    moved: return None` arm and the retry reddens on the row's boolean or on the
+    silent return. Hardcode the trailing append's `discharged_owed_move=False`, or drop
+    the kwarg entirely, and the last assertion reddens — that boolean is the only thing
+    on this path that says a move happened at all."""
     from bmad_loop.journal import Journal
 
     run = escalated_run(tmp_path, "r1", story_key="s1")
@@ -3107,7 +3153,8 @@ def test_restamp_code_root_keeps_the_move_retryable_when_the_record_fails(tmp_pa
 
     message = runs.restamp_code_root(run.run_dir, now)  # the retry
 
-    assert message is not None
+    # the debt is discharged, but THIS call moved nothing, so nothing is printed
+    assert message is None
     persisted = load_state(run.run_dir)
     assert persisted.code_root == now
     assert persisted.code_root_restamp_pending is False
@@ -3115,6 +3162,78 @@ def test_restamp_code_root_keeps_the_move_retryable_when_the_record_fails(tmp_pa
         e for e in Journal(run.run_dir).entries() if e["kind"] == "rearm-code-root-restamped"
     ]
     assert [r["repo"] for r in records] == [str(now)]  # exactly once, on the retry
+    assert records[0]["code_root_changed"] is False  # ...and about the retry's own move
+    # ...while THIS row is the only durable trace call one's real move ever leaves:
+    # call one raised instead of returning the warning, this call returned `None`, and
+    # a later plain `resume` computes `code_root_changed=false` too because the mirror
+    # already agrees. Without this field the record reads as "nothing moved" (DW-128).
+    assert records[0]["discharged_owed_move"] is True
+
+
+def test_restamp_code_root_warns_for_this_calls_move_not_an_owed_record(tmp_path):
+    """Both halves of one seam, in one test, because they are one decision: what the
+    trailing `rearm-code-root-restamped` row asserts and whether the caller has a
+    string to print are the SAME question — did THIS call re-point the root? — and a
+    test that pins only one half lets the other regress back into reading the marker.
+
+    Phase one is a genuine move: the row says `code_root_changed=True` and a warning
+    string comes back. What makes that string matter is out of this test's scope but
+    covered at the call sites — `cli.cmd_resolve` and `TuiApp._do_rearm` print any
+    non-`None` return, so the return value here IS the operator-facing behavior, and
+    returning `None` is the whole silencing mechanism. Nothing below drives either
+    caller. Phase two re-arms in the very same tree with the marker set — the
+    shape a failed record-append leaves behind. The at-least-once discharge still fires,
+    exactly once, under the root now recorded; but the row says `False` and the return
+    is `None`, because `code_root_restamp_pending` is a record DEBT and not a move. That
+    is the same answer `cli._prepare_resume_locked` gives in this state (DW-100), so the
+    re-arm surfaces and plain `resume` no longer contradict each other on one seam.
+
+    Ablation: restore the trailing append's hardcoded `code_root_changed=True` and
+    phase two reddens on the row; drop the `if not moved: return None` arm and it
+    reddens on the return. Neither ablation touches phase one, which is the point —
+    the silencing may not reach a real move.
+    """
+    from bmad_loop.journal import Journal
+
+    def records():
+        return [
+            e for e in Journal(run.run_dir).entries() if e["kind"] == "rearm-code-root-restamped"
+        ]
+
+    run = escalated_run(tmp_path, "r1", story_key="s1")
+    now = tmp_path / "code"
+    now.mkdir()
+    run.state.repo_root = str(tmp_path / "was")
+    save_state(run.run_dir, run.state)
+
+    moved_message = runs.restamp_code_root(run.run_dir, now)
+
+    assert moved_message is not None
+    assert "the code root in _bmad/bmm/config.yaml has changed" in moved_message
+    assert [(r["repo"], r["code_root_changed"], r["discharged_owed_move"]) for r in records()] == [
+        (str(now), True, False)
+    ]
+    assert load_state(run.run_dir).code_root_restamp_pending is False
+
+    # ...now the state a failed record-append leaves: root already aimed, debt owed
+    owing = load_state(run.run_dir)
+    owing.code_root_restamp_pending = True
+    save_state(run.run_dir, owing)
+
+    unmoved_message = runs.restamp_code_root(run.run_dir, now)
+
+    assert unmoved_message is None  # nothing moved, so neither caller prints
+    persisted = load_state(run.run_dir)
+    assert persisted.code_root == now
+    assert persisted.code_root_restamp_pending is False  # the debt is discharged...
+    assert [(r["repo"], r["code_root_changed"], r["discharged_owed_move"]) for r in records()] == [
+        (str(now), True, False),
+        # ...exactly once, and truthfully about THIS call — which moved nothing but
+        # DID settle the record an earlier move owed, so the two booleans invert
+        # (DW-128). A regression that stamped `discharged_owed_move` on the real
+        # move in phase one reddens on the first tuple.
+        (str(now), False, True),
+    ]
 
 
 def test_restamp_code_root_records_no_move_the_state_write_did_not_make(tmp_path, monkeypatch):
@@ -3220,6 +3339,12 @@ def test_restamp_code_root_discharges_the_owed_record_before_moving_again(
     # gets its own row — one record per move, neither of them lost.
     assert [r["repo"] for r in records] == [str(owed), str(again)]
     assert all(r["code_root_changed"] is True for r in records)
+    # The pre-move discharge is the sibling `discharged_owed_move` deliberately does
+    # NOT reach: it already asserts `code_root_changed=True`, so the move it settles is
+    # named outright and a second boolean would be redundant. Only the trailing append
+    # carries the key, and here it carries it `False` — this call moved the root too.
+    assert "discharged_owed_move" not in records[0]
+    assert records[1]["discharged_owed_move"] is False
 
 
 def test_restamp_code_root_reloads_after_a_rival_writer(tmp_path, monkeypatch):

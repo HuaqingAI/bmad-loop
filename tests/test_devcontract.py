@@ -78,6 +78,66 @@ def test_parse_bold_status():
     assert arr.status == "blocked"
 
 
+def test_parse_independently_bold_status_value():
+    arr = devcontract.parse_auto_run_result(
+        "## Auto Run Result\n\n**Status:** **done**\n\nsummary\n"
+    )
+    assert arr.status == "done"
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("Status: done", "done"),
+        ("- Status: blocked", "blocked"),
+        ("**Status:** in-review", "in-review"),
+        ("Status: **done**", "done"),
+        ("**Status**: **done**", "done"),
+        ("- **Status: done**", "done"),
+        ("\t*\tStAtUs\u00a0:\u00a0DoNe trailing prose", "done"),
+    ],
+)
+def test_parse_status_preserves_existing_line_shapes(line, expected):
+    arr = devcontract.parse_auto_run_result(f"## Auto Run Result\n\n{line}\n")
+    assert arr.status == expected
+
+
+def test_parse_bare_status_label_does_not_consume_next_line():
+    r"""Ablation: restoring ``\s*`` to the post-colon structural gaps makes this
+    capture ``done`` from the next line instead of failing closed."""
+    arr = devcontract.parse_auto_run_result("## Auto Run Result\n\nStatus:\ndone\n")
+    assert arr.present and arr.status == ""
+
+
+@pytest.mark.parametrize(
+    "separator",
+    ["\r", "\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
+    ids=["cr", "lf", "vt", "ff", "fs", "gs", "rs", "nel", "ls", "ps"],
+)
+def test_parse_bare_status_label_rejects_vertical_separators(separator):
+    r"""Ablation: ``[^\S\r\n]`` still admits every row after LF, allowing
+    those split-line separators to join the bare label to ``done``."""
+    arr = devcontract.parse_auto_run_result(f"## Auto Run Result\n\nStatus:{separator}done\n")
+    assert arr.present and arr.status == ""
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["Status\n: done", "**Status\n:** done", "**Status**\n: **done**"],
+)
+def test_parse_status_colon_must_share_label_line(line):
+    r"""Ablation: restoring ``\s*`` before the colon makes both plain and
+    bold labels consume punctuation and values from the following line."""
+    arr = devcontract.parse_auto_run_result(f"## Auto Run Result\n\n{line}\n")
+    assert arr.present and arr.status == ""
+
+
+def test_parse_skips_bold_status_inside_fenced_marker_detail():
+    text = "## Auto Run Result\n\n" "```md\n**Status:** **blocked**\n```\n\n" "Status: done\n"
+    arr = devcontract.parse_auto_run_result(text)
+    assert arr.status == "done"
+
+
 def test_parse_last_section_wins():
     text = (
         "## Auto Run Result\n\nStatus: blocked\n\n"
@@ -257,6 +317,20 @@ def test_synth_blocked_frontmatter_becomes_critical(tmp_path):
     assert crits[0]["type"] == "blocked"
 
 
+def test_synth_blocked_preserves_full_detail_and_attaches_its_spec(tmp_path):
+    tail = "RECOVERY-TAIL"
+    detail = "x" * 2500 + tail
+    sp = _spec(tmp_path / "s.md", status="blocked", auto_run=None)
+    with sp.open("a", encoding="utf-8") as f:
+        f.write(f"\n## Auto Run Result\n\nStatus: blocked\n\n{detail}\n")
+
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+    (critical,) = rj["escalations"]
+    assert critical["detail"].endswith(tail)
+    assert len(critical["detail"]) > 2000
+    assert critical["spec_file"] == str(sp)
+
+
 def test_synth_blocked_prose_only_still_escalates(tmp_path):
     # frontmatter not yet flipped, but the prose says blocked: still PAUSE-worthy
     sp = _spec(tmp_path / "s.md", status="in-progress", auto_run="blocked")
@@ -275,6 +349,34 @@ def test_synth_status_inconsistent_flagged(tmp_path):
     sp = _spec(tmp_path / "s.md", status="done", auto_run="blocked")
     out = devcontract.synthesize_result(sp, story_key="1-1-a")
     assert out.status_consistent is False
+
+
+def test_synth_bold_marker_mismatch_keeps_frontmatter_authoritative(tmp_path):
+    """Ablation: removing the value-bold opener makes the marker unreadable, so
+    the mismatch disappears and ``status_consistent`` incorrectly becomes true."""
+    sp = _spec(
+        tmp_path / "s.md",
+        status="done",
+        auto_run=None,
+        body_extra="\n## Auto Run Result\n\n**Status:** **blocked**\n",
+    )
+    out = devcontract.synthesize_result(sp, story_key="1-1-a")
+
+    assert out.result_json["status"] == "done"
+    assert out.status_consistent is False
+
+
+def test_synth_bare_status_label_does_not_consume_next_line(tmp_path):
+    sp = _spec(
+        tmp_path / "s.md",
+        status="blocked",
+        auto_run=None,
+        body_extra="\n## Auto Run Result\n\nStatus:\ndone\n",
+    )
+    out = devcontract.synthesize_result(sp, story_key="1-1-a")
+
+    assert out.result_json["status"] == "blocked"
+    assert out.status_consistent is True
 
 
 def test_synth_blank_frontmatter_status_falls_back_to_prose_done(tmp_path):
@@ -437,6 +539,275 @@ def test_synth_genuine_park_marker_defaults_to_unasserted_without_session_proven
     rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
 
     assert rj["park_asserted"] is False
+
+
+# ------------------------------------- the bundle's artifact-only mint (DW-273)
+
+
+def _artifact_only_spec(tmp_path, *, line: str | None = "Artifact only: true", extra: str = ""):
+    """A done spec whose genuine marker carries (or omits) the artifact-only line."""
+    marker = "\n## Auto Run Result\n\n- Status: done\n"
+    if line is not None:
+        marker += f"- {line}\n"
+    marker += extra
+    return _spec(tmp_path / "s.md", status="done", auto_run=None, body_extra=marker)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Artifact only: true",
+        "artifact_only: true",
+        "**Artifact only:** TRUE",
+        "Artifact-only: true",
+        "**Artifact only:** **true**",
+        "**Artifact only: true**",
+        "Artifact only: **true**",
+        "Artifact only:\u00a0true",  # a non-ASCII horizontal space, as `Status:` tolerates
+    ],
+    ids=[
+        "prose",
+        "snake",
+        "bold-upper",
+        "hyphen",
+        "balanced-bold",
+        "bold-whole-line",
+        "bold-value",
+        "nbsp",
+    ],
+)
+def test_synth_mints_artifact_only_from_a_genuine_session_authored_marker(tmp_path, line):
+    """The four-part shape `park_asserted` uses: a present, genuine (no synth
+    note), session-authored marker carrying the line. The line tolerates the
+    same bullet/bold spellings `STATUS_LINE_RE` does.
+
+    Ablation: drop the `"artifact_only"` key from the result and every parameter
+    fails on the `is True`."""
+    sp = _artifact_only_spec(tmp_path, line=line)
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj is not None and rj["status"] == "done"
+    assert rj["artifact_only"] is True
+    assert rj["park_asserted"] is False  # a done marker is no park
+
+
+def test_synth_artifact_only_missing_separator_fails_closed(tmp_path):
+    """The public grammar requires a separator between ``Artifact`` and ``only``.
+
+    Ablation: restore ``[ _-]*`` in ``ARTIFACT_ONLY_LINE_RE`` and both assertions
+    fail because the concatenated label mints an artifact-only receipt again.
+    """
+    sp = _artifact_only_spec(tmp_path, line="Artifactonly: true")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert devcontract._artifact_only_asserted("Artifactonly: true") is False
+    assert rj is not None and rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_balanced_bold_shapes_mint(tmp_path):
+    """The advertised Status-like bold shapes include a closing delimiter after
+    the value (`**Artifact only:** **true**`, `- **Artifact only: true**`); the
+    regex consumes it before the end-of-line anchor, so the value is still
+    `true` alone on the line.
+
+    Ablation: drop the trailing `(?:\\*\\*)?` from `ARTIFACT_ONLY_LINE_RE` and
+    both shapes fall to the `$` anchor."""
+    sp = _artifact_only_spec(tmp_path, line="**Artifact only:** **true**")
+    assert "- **Artifact only:** **true**\n" in sp.read_text(encoding="utf-8")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is True
+    assert devcontract._artifact_only_asserted("**Artifact only:** **true**") is True
+    assert devcontract._artifact_only_asserted("- **Artifact only: true**") is True
+
+
+def test_synth_artifact_only_newline_separated_value_fails_closed(tmp_path):
+    """The label and its value must share one line. `Artifact only:` with `true`
+    on the NEXT line — or `Artifact only` with `: true` on the next line — is a
+    bare label and a stray token: every gap in the regex is horizontal
+    whitespace (`[^\\S\\r\\n]*`), so the match cannot cross the boundary the `$`
+    anchor holds, on either side of the colon.
+
+    Ablation: restore `\\s*` AFTER the colon and the spec row mints; restore
+    `\\s*` BEFORE the colon and the pre-colon assertion mints."""
+    sp = _artifact_only_spec(tmp_path, line="Artifact only:\ntrue")
+    assert "Artifact only:\ntrue\n" in sp.read_text(encoding="utf-8")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+    assert devcontract._artifact_only_asserted("Artifact only:\ntrue") is False
+    assert devcontract._artifact_only_asserted("Artifact only\n: true") is False
+
+
+@pytest.mark.parametrize(
+    "separator",
+    ["\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"],
+    ids=["vt", "ff", "fs", "gs", "rs", "nel", "ls", "ps"],
+)
+@pytest.mark.parametrize("gap", ["after-colon", "before-colon", "leading-bullet"])
+def test_artifact_only_rejects_vertical_separators(separator, gap):
+    r"""The same fail-open DW-285 closed for `Status:`: `[^\S\r\n]` admits
+    every separator `str.splitlines` treats as a line boundary except CR/LF,
+    while MULTILINE `$` anchors on LF alone — so `Artifact only:\x0btrue` read
+    as one line and minted the receipt where every other reader of the marker
+    sees a bare label and a stray token (#795 review). Every gap now takes
+    `_HORIZONTAL_WS_RE`; NBSP and tab still assert.
+
+    Ablation: restore `[^\S\r\n]` to any one gap and its row mints."""
+    if gap == "after-colon":
+        line = f"Artifact only:{separator}true"
+    elif gap == "before-colon":
+        line = f"Artifact only{separator}: true"
+    else:
+        line = f"-{separator}Artifact only: true"
+    assert devcontract._artifact_only_asserted(line) is False
+    assert devcontract._artifact_only_asserted(line.replace(separator, "\u00a0")) is True
+
+
+def test_synth_artifact_only_trailing_prose_fails_closed(tmp_path):
+    """The value is anchored to end of line: `true` followed by prose is a
+    sentence, not an assertion."""
+    sp = _artifact_only_spec(tmp_path, line="Artifact only: true for the ledger, false for code")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_fenced_example_inside_the_marker_fails_closed(tmp_path):
+    """A pasted example inside the genuine marker's own body is documentation:
+    a match inside a fenced block mints nothing when no real line follows."""
+    sp = _artifact_only_spec(tmp_path, line=None, extra="\n```\n- Artifact only: true\n```\n")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_tolerates_a_run_of_separators(tmp_path):
+    sp = _artifact_only_spec(tmp_path, line="Artifact  only: true")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is True
+
+
+def test_synth_artifact_only_absent_line_fails_closed(tmp_path):
+    sp = _artifact_only_spec(tmp_path, line=None)
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["Artifactonly: true", "artifactonly: true", "**Artifactonly:** **true**"],
+    ids=["fused", "fused-lower", "fused-bold"],
+)
+def test_synth_artifact_only_fused_words_fail_closed(tmp_path, line):
+    """The contract's spellings put at least one space, underscore or hyphen
+    between the two words; the fused `Artifactonly` is none of them, and a
+    malformed or accidental token must not relax the bundle gate (#794 review).
+    Ablation: `[ _-]+` back to `[ _-]*` in `ARTIFACT_ONLY_LINE_RE` and every row
+    reds on `is True`."""
+    sp = _artifact_only_spec(tmp_path, line=line)
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+    assert devcontract._artifact_only_asserted(line) is False
+
+
+def test_synth_artifact_only_false_value_fails_closed(tmp_path):
+    sp = _artifact_only_spec(tmp_path, line="Artifact only: false")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_repaired_marker_fails_closed(tmp_path):
+    """The orchestrator's missing-marker repair cannot retroactively assert on the
+    session's behalf, exactly as it cannot for a park."""
+    sp = _artifact_only_spec(tmp_path, extra=f"\n{devcontract.ORCHESTRATOR_SYNTH_NOTE}\n")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_defaults_to_unasserted_without_session_provenance(tmp_path):
+    """`park_marker_session_authored` is the ONE authorship proof serving both
+    mints: without it a genuine-looking marker asserts nothing."""
+    sp = _artifact_only_spec(tmp_path)
+
+    rj = devcontract.synthesize_result(sp, story_key="dw-bundle").result_json
+
+    assert rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_frontmatter_never_mints(tmp_path):
+    """Frontmatter-only fallback (no marker at all) mints nothing, even with the
+    key spelled in the frontmatter."""
+    sp = _spec(tmp_path / "s.md", status="done", auto_run=None)
+    text = sp.read_text(encoding="utf-8").replace(
+        "status: 'done'\n", "status: 'done'\nartifact_only: true\n"
+    )
+    sp.write_text(text, encoding="utf-8")
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj is not None and rj["artifact_only"] is False
+
+
+def test_synth_artifact_only_reads_only_the_last_real_marker(tmp_path):
+    """A fenced example and an older genuine marker cannot authorize a later
+    result, mirroring the park row above."""
+    sp = _spec(
+        tmp_path / "s.md",
+        status="done",
+        auto_run=None,
+        body_extra=(
+            "\n```md\n## Auto Run Result\n\nStatus: done\nArtifact only: true\n```\n"
+            "\n## Auto Run Result\n\nStatus: done\nArtifact only: true\n"
+            "\n## Auto Run Result\n\nStatus: done\n"
+        ),
+    )
+
+    rj = devcontract.synthesize_result(
+        sp, story_key="dw-bundle", park_marker_session_authored=True
+    ).result_json
+
+    assert rj["artifact_only"] is False
 
 
 def test_auto_run_result_fingerprint_detects_an_identical_appended_marker():
